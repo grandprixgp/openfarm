@@ -1,1 +1,6 @@
+# The specification is the user's document and is not committed; the code and
+# docs/openfarm-internals.md are written to stand on their own without it.
 openfarm spec v0.3.md
+
+__pycache__/
+*.py[cod]
