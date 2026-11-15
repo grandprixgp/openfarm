@@ -2,6 +2,10 @@
 # docs/openfarm-internals.md are written to stand on their own without it.
 openfarm spec v0.3.md
 openfarm spec v0.4.md
+openfarm spec v0.5.md
 
 __pycache__/
 *.py[cod]
+build/
+dist/
+*.egg-info/

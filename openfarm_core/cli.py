@@ -1,4 +1,4 @@
-"""The `openfarm` command: one entry point, twelve subcommands, shared exit codes.
+"""The `openfarm` command: one entry point, fourteen subcommands, shared exit codes.
 
 Exit codes are the same for every command:
 
@@ -25,6 +25,13 @@ from .adapters.files import FileCardSource, open_card_source
 from .adapters.jsonl import TelemetrySink, open_telemetry
 from .adapters.openai_compat import open_backend
 from .adapters.direct import open_runner
+from .bootstrap import (
+    INSTALL_TARGETS,
+    MUTATION_MODES,
+    PROFILES,
+    initialize_project,
+    install_skill_bundle,
+)
 from .briefs import BriefBook
 from .budget import NightBudget
 from .cards import Card
@@ -1216,7 +1223,94 @@ def build_parser() -> argparse.ArgumentParser:
     harness.add_argument("--reason", default="manual")
     harness.add_argument("--yes", action="store_true")
 
+    init = sub.add_parser("init", help="scaffold a new openfarm Rust project")
+    init.add_argument("name", help="project name or slug (e.g. calorie-log)")
+    init.add_argument("--dir", default=None,
+                      help="target directory (default: <repo>/<project_slug> or current repo)")
+    init.add_argument("--idea", default="", help="plain-English project idea")
+    init.add_argument("--profile", choices=PROFILES, default="auto",
+                      help="micromanager profile (default: auto)")
+    init.add_argument("--state-dir", default=None, help="external state directory")
+    init.add_argument("--secrets-dir", default=None, help="external secrets directory")
+    init.add_argument("--endpoint", default="https://api.example.invalid/v1",
+                      help="ZDR OpenAI-compatible base URL")
+    init.add_argument("--model", default="lesser-coder",
+                      help="default lesser coding model name")
+    init.add_argument("--key-file", default=None, help="external API key file path")
+    init.add_argument("--base-branch", default="main", help="git base branch name")
+    init.add_argument("--mutation", choices=MUTATION_MODES, default="auto",
+                      help="mutation gate mode (default: auto)")
+    init.add_argument("--no-git", action="store_true", help="skip git init")
+    init.add_argument("--commit", action="store_true",
+                      help="commit initial scaffold on base branch")
+    init.add_argument("--force", action="store_true",
+                      help="overwrite scaffold files in non-empty directory")
+
+    install_skill = sub.add_parser(
+        "install-skill", help="install bundled agent skills, commands, and optional bin shim"
+    )
+    install_skill.add_argument("--target", choices=INSTALL_TARGETS, default="all",
+                               help="runtime destination (default: all)")
+    install_skill.add_argument("--dest", default=None,
+                               help="override base home or workspace directory")
+    install_skill.add_argument("--install-bin", default=None,
+                               help="install executable openfarm shim into this folder")
+    install_skill.add_argument("--dry-run", action="store_true",
+                               help="plan installation without writing files")
+
     return parser
+
+
+def _emit_standalone(payload: dict, want_json: bool) -> None:
+    if want_json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return
+    for key, value in payload.items():
+        if isinstance(value, (dict, list)):
+            print(f"{key}: {json.dumps(value, ensure_ascii=False)}")
+        else:
+            print(f"{key}: {value}")
+
+
+def cmd_init(args) -> int:
+    directory = Path(args.dir) if args.dir else None
+    repo_base = Path(args.repo) if getattr(args, "repo", None) else Path.cwd()
+    payload = initialize_project(
+        args.name,
+        directory=directory,
+        repo_base=repo_base,
+        idea=args.idea,
+        profile=args.profile,
+        state_dir=Path(args.state_dir) if args.state_dir else None,
+        secrets_dir=Path(args.secrets_dir) if args.secrets_dir else None,
+        endpoint=args.endpoint,
+        model=args.model,
+        key_file=Path(args.key_file) if args.key_file else None,
+        base_branch=args.base_branch,
+        mutation=args.mutation,
+        no_git=bool(args.no_git),
+        commit=bool(args.commit),
+        force=bool(args.force),
+    )
+    _emit_standalone(payload, bool(getattr(args, "json", False)))
+    return EXIT_OK
+
+
+def cmd_install_skill(args) -> int:
+    payload = install_skill_bundle(
+        target=args.target,
+        dest=Path(args.dest) if args.dest else None,
+        install_bin=Path(args.install_bin) if args.install_bin else None,
+        dry_run=bool(args.dry_run),
+    )
+    _emit_standalone(payload, bool(getattr(args, "json", False)))
+    return EXIT_OK
+
+
+PRE_CONFIG_COMMANDS = {
+    "init": cmd_init,
+    "install-skill": cmd_install_skill,
+}
 
 
 COMMANDS = {
@@ -1311,6 +1405,26 @@ def main(argv: list[str] | None = None) -> int:
             return _emit_error("usage error", "no subcommand specified", EXIT_USAGE)
         parser.print_help()
         return EXIT_USAGE
+
+    if args.command in PRE_CONFIG_COMMANDS:
+        try:
+            return PRE_CONFIG_COMMANDS[args.command](args)
+        except UsageError as exc:
+            return _emit_error("usage error", str(exc), EXIT_USAGE)
+        except ConfigError as exc:
+            return _emit_error("config error", str(exc), EXIT_USAGE)
+        except GitRefused as exc:
+            return _emit_error("refused", str(exc), EXIT_REFUSED)
+        except Refused as exc:
+            return _emit_error("refused", exc.message, EXIT_REFUSED)
+        except Invalid as exc:
+            return _emit_error("adapter trouble", exc.message, EXIT_TROUBLE)
+        except Infra as exc:
+            return _emit_error("trouble", exc.message, EXIT_TROUBLE)
+        except AdapterError as exc:
+            return _emit_error("trouble", exc.message, EXIT_TROUBLE)
+        except OSError as exc:
+            return _emit_error("trouble", str(exc), EXIT_TROUBLE)
 
     try:
         ctx = Context(Path(args.repo), Path(args.config) if args.config else None,

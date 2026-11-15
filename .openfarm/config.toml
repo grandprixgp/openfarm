@@ -35,6 +35,7 @@ forbidden_files = [
   "tests/toy.py",
   "openfarm spec v0.3.md",
   "openfarm spec v0.4.md",
+  "openfarm spec v0.5.md",
 ]
 known_failing = []
 flagged_patterns = []

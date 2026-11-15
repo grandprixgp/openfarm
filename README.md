@@ -1,6 +1,15 @@
-# Openfarm (v0.4)
+# Openfarm (v0.5)
 
-Openfarm is a standalone, fail-closed pipeline that turns eligible work cards in a git repository into verified branches ready for human review. It isolates a lesser code-writing model in a disposable git worktree, enforces strict write boundaries and deterministic verification gates, and pairs the runner with a bounded supervisory micromanager (`claude-acp` over Agent Client Protocol v1, or `off` / `scripted` / `cmd:<argv>`).
+Openfarm is a standalone, fail-closed pipeline that turns a plain-English project idea or eligible work cards in a git repository into verified branches ready for human review. It isolates a cheaper code-writing model in a disposable git worktree, enforces strict write boundaries and deterministic verification gates, pairs the runner with a bounded supervisory micromanager (`claude-acp` over Agent Client Protocol v1, or `off` / `scripted` / `cmd:<argv>`), and ships as a single-target stdlib-only Python package + frontier agent skill (`SKILL.md`, `openfarm install-skill`, `openfarm init`).
+
+## Two-Step Conception-to-Completion Quickstart
+
+From an empty directory and a plain-English idea (for example `"An app to track my calories"`):
+
+1. Ask your frontier agent: `"Read and install this skill <github_or_local_link>"` (runs [`SKILL.md`](SKILL.md) -> `openfarm install-skill --target all` via `uv`/`pipx`/`pip`, or zero-`pip` `python3 -m openfarm_core.cli install-skill --target all --install-bin ~/.local/bin --json`).
+2. Ask your frontier agent: `"/openfarm-initialize calorie-log An app to track my calories"` (runs `openfarm init`, builds a `never_touch` seam + golden reference slice, decomposes Wave 1–3 cards, commits on `main`, and validates all cards with `openfarm check` and `openfarm run --dry-run`).
+
+See [docs/FROM-IDEA-TO-SHIPPED-APP.md](docs/FROM-IDEA-TO-SHIPPED-APP.md) for the complete dual-audience walkthrough.
 
 ## Core Workflow
 
@@ -38,12 +47,14 @@ Core card metadata fields (`category`, `reference`, `tests`, `test_edits`, `fron
 
 Multi-file `new_symbols` declarations are allowed when `type_changes = true` or `[micromanager] scaffold_contracts = true`.
 
-## CLI Commands (12 Subcommands)
+## CLI Commands (14 Subcommands)
 
 Run `python3 -m openfarm_core.cli --help` (or `openfarm` when installed):
 
 | Command | Purpose |
 | --- | --- |
+| `openfarm init <name> [--dir PATH] [--idea TEXT] [--profile auto\|solo\|advisory\|active] [--mutation auto\|off\|report\|required] [--endpoint URL] [--model NAME] [--commit] [--force]` | Scaffold a validated project skeleton (`.openfarm/config.toml`, `src/invariants.rs` in `never_touch`, `.openfarm/PROJECT_SPEC.md`, `AGENTS.md`, `Cargo.toml`, `Git.init`) |
+| `openfarm install-skill [--target claude\|antigravity\|agents\|workspace\|all] [--dest PATH] [--install-bin PATH] [--dry-run]` | Deploy bundled skills, `/openfarm-initialize` slash command, Antigravity plugin, and optional executable `openfarm` launcher shim |
 | `openfarm run [--script <path>] [--mm-script <path>] [--dry-run]` | Run the card queue once (or with scripted model/micromanager harnesses) |
 | `openfarm status` | Show card states, queue counts, spend, circuit-breaker status, and harness status |
 | `openfarm pause` / `openfarm resume` | Pause or resume queue scheduling without touching active leases |
@@ -96,12 +107,14 @@ The core Python implementation and deterministic test suites verify:
 - `tests/test_acp_micromanager.py` and `tests/acp_stand_in.py`: ACP JSON-RPC security containment, capability denial, isolated `$HOME`, and all micromanager operations.
 - `tests/test_harness_efficiency.py`: `[harness]` config contracts, `StateDir.harness`, `extract_contrast`, `HarnessLedger` metrics, `sanitize_lesson_text` / `validate_harness_proposal`, `reflect_harness`, intra-run transfer, cross-launch persistence, probe-window confirm/rollback, `Infra` isolation, and `openfarm harness` CLI.
 - `tests/test_v04_e2e.py`: end-to-end ACP stand-in orchestration, multi-step checkpoints, Phase A retry, `revert-check`, counter-test adjudication, and `openfarm supervise`.
+- `tests/test_v05_skill_bootstrap.py`: `pyproject.toml` offline wheel packaging & `skill_assets` bundling, repo `skills/` byte parity, `openfarm install-skill` (`--target all|workspace`, `--install-bin` shim), `openfarm init` validation/containment/`Git.init`, and `OPENFARM_E2E=1` `calorie-log` Rust compilation/`clippy`/`rustfmt`/`check`/`run --dry-run`/scripted card E2E.
 
 The following integrations are **untested** against live external binaries/services in this repository:
+- **Live remote GitHub URL installs via `uv`/`pipx`/`pip`** and **live unattended multi-wave LLM execution of generated apps (`calorie-log`)**: verified up to offline wheel build, local `install-skill`, `openfarm init`, Rust verification, `openfarm check`, `--dry-run`, and scripted single-card execution; live remote/LLM execution is **untested**.
 - **Live `claude-agent-acp` binary with real Anthropic credentials**: verified only against `tests/acp_stand_in.py` over real stdio NDJSON-RPC pipes; live `claude-agent-acp` execution is **untested**.
 - **Live hosted ZDR OpenAI-compatible model endpoints**: verified against local HTTP test servers and `ScriptedBackend`; live hosted endpoints are **untested**.
 - **Live `cargo-mutants` binary runs**: output parsing and mutation gates are tested with synthetic outputs; live `cargo-mutants` execution is **untested**.
 - **TypeScript language pack**: explicitly unimplemented (`Invalid("no-typescript-pack")`).
 - **External `cmd:` adapters in production**: verified via subprocess test harnesses; real external `cmd:` binaries beyond test harnesses are **untested**.
 
-See [docs/USAGE-AND-FIRST-DEPLOYMENT.md](docs/USAGE-AND-FIRST-DEPLOYMENT.md) for the user-friendly usage & operations guide and executable first-deployment runbook (`tallybox`), [docs/openfarm-internals.md](docs/openfarm-internals.md) for module architecture, and [docs/HANDOFF.md](docs/HANDOFF.md) for engineering handoff notes.
+See [docs/FROM-IDEA-TO-SHIPPED-APP.md](docs/FROM-IDEA-TO-SHIPPED-APP.md) for the greenfield conception-to-completion starter guide (`calorie-log`), [docs/USAGE-AND-FIRST-DEPLOYMENT.md](docs/USAGE-AND-FIRST-DEPLOYMENT.md) for the user-friendly usage & operations guide and executable first-deployment runbook (`tallybox`), [docs/openfarm-internals.md](docs/openfarm-internals.md) for module architecture, and [docs/HANDOFF.md](docs/HANDOFF.md) for engineering handoff notes.

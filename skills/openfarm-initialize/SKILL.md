@@ -1,0 +1,90 @@
+---
+name: openfarm-initialize
+description: >-
+  Initialize a new software project from an empty directory and a plain-English
+  idea (invoked via /openfarm-initialize <project_name> <project_idea> or when
+  starting a fresh app with Openfarm v0.5). Scaffolds validated config, seam
+  invariants, a golden reference slice, and verified dependency-ordered cards
+  for lesser coding models and Claude ACP micromanagement.
+---
+
+# Openfarm Project Initialization (`/openfarm-initialize`)
+
+Use this workflow to turn a plain-English project idea inside an empty directory into a validated, gate-enforced Openfarm repository ready for autonomous wave execution by lesser coding models, ACP micromanagement, and Recursive Harness Memory.
+
+> **Token-Efficiency Principle**: Spend ~3–8k frontier tokens **once** on architecture, protected seam invariants, public API types, and a verified golden reference slice + pre-checked card queue. Do **not** burn frontier tokens implementing routine cards or iterating compiler errors—Openfarm runs lesser models, ACP coaching, and `HarnessLibrary` outside your context window.
+
+## Workflow Steps
+
+### 1. Parse Arguments & Check Environment
+
+Extract `<project_name>` (normalized to ASCII slug, e.g. `calorie-log`) and `<project_idea>` (e.g. `"An app to track my calories"`).
+
+Check toolchain and endpoint readiness once:
+```bash
+rustc --version && cargo --version && cargo clippy --version && rustfmt --version
+command -v claude-agent-acp || echo "no claude-agent-acp (will default to solo profile unless configured)"
+command -v cargo-mutants || echo "no cargo-mutants (will default mutation=off)"
+ls -la ~/.config/openfarm/ 2>/dev/null || true
+```
+
+Ask the human owner **at most once** if a ZDR OpenAI-compatible endpoint URL / API key file for lesser models is not yet configured—unless they want an offline dry-run or scripted setup (`--script`), in which case proceed immediately using default placeholder endpoints.
+
+### 2. Run Deterministic Bootstrap (`openfarm init`)
+
+Run `openfarm init` in the target empty directory (never let a frontier model hand-write `.openfarm/config.toml` from memory):
+
+```bash
+openfarm init <project_name> \
+  --dir . \
+  --idea "<project_idea>" \
+  --json
+```
+
+Add `--endpoint <URL> --model <MODEL_NAME>` if known, or `--profile solo|advisory|active` if overriding auto-detection. Confirm the JSON response reports `"config_valid": true`.
+
+Remind the user (if `"key_file_present": false`) to place their ZDR API key outside the repository at the printed `key_file` path with `chmod 600`.
+
+### 3. Frontier Architect Pass (Seam + Thin Skeleton + Golden Reference Slice)
+
+Read [architect_system.md](./prompts/architect_system.md), then design and write:
+1. Complete `.openfarm/PROJECT_SPEC.md` (domain invariants, module ownership map, wave breakdown).
+2. Expand `src/invariants.rs` (**protected by `never_touch`**) with exact types, arithmetic/bounds checks, and invariant validators that lesser models must never relax.
+3. Add thin skeleton modules with **well-typed `pub` exports** (required because `rust_tests_in_separate_files = true` means `tests/*.rs` integration tests can only reach `pub` crate items) plus **one complete golden reference vertical slice** (`src/<ref_module>.rs`) that pattern cards can imitate cleanly.
+4. Keep skeleton code small (~100–250 LOC total; leave ≥85% of application behavior for cards) with **zero** `.unwrap()`, `.expect()`, `todo!()`, or `#[allow(...)]` in `src/`.
+5. Update `tests/baseline_tests.rs` so the baseline compiles and passes cleanly, then verify:
+   ```bash
+   cargo test
+   cargo clippy --all-targets -- -D warnings
+   rustfmt --edition 2021 --check src/**/*.rs tests/*.rs
+   ```
+   Every command above **must exit `0`**.
+
+### 4. Card Decomposition Pass (Contrast Seed + Core + Polish Waves)
+
+Read [card_decomposer.md](./prompts/card_decomposer.md), then author `cards/CARD-001.md`..`cards/CARD-NNN.md`:
+- **Wave 1 (2 cards)**: High-contrast starter cards (`pinned-bugfix` or `small-feature`, plus `pattern` referencing your golden slice) that prove the pipeline end-to-end and seed `<state_dir>/harness/` contrast cues cleanly.
+- **Wave 2 (`feature` / `pattern` / `integration` / `port`)**: Core application features with explicit `pub` function signatures, concrete assertions, separate `tests/<subject>_tests.rs` files per card, and `type_changes = true` where cross-file structs/enums evolve.
+- **Wave 3 (`refactor` / `test-backfill`)**: Cleanup and edge-case coverage cards (set `[gates] mutation = "off"` or omit blocking `test-backfill` if `cargo-mutants` is absent).
+
+### 5. Commit Baseline on `main` & Run 100% Pre-Flight Verification
+
+> **Critical**: `FileCardSource` seeds the `openfarm-cards` branch from `main` on first prepare. Always commit the clean skeleton, config, conventions, and cards on `main` **before** running `openfarm check` or `openfarm run`.
+
+```bash
+git add .
+git commit -m "chore: initial architecture, config, and wave cards"
+
+for card_file in cards/CARD-*.md; do
+  cid=$(basename "$card_file" .md)
+  openfarm check "$cid" --json
+done
+
+openfarm run --dry-run --cards 3 --json
+```
+
+If any card fails `openfarm check`, fix its frontmatter or `Done` text immediately before finishing initialization.
+
+### 6. Hand Off or Start Wave 1
+
+Summarize the created files, `never_touch` seam (`src/invariants.rs`), verified card count, external `state_dir` / `key_file` paths, and ask the owner whether to launch Wave 1 immediately (via the [openfarm](../openfarm/SKILL.md) skill) or stop after setup.

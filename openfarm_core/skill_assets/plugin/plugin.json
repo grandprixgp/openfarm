@@ -1,0 +1,5 @@
+{
+  "name": "openfarm",
+  "description": "Openfarm v0.5 project initializer (/openfarm-initialize), deterministic wave orchestrator, ACP micromanager integration, and recursive harness efficiency toolkit.",
+  "repository": "openfarm"
+}

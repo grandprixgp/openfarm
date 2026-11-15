@@ -1,15 +1,15 @@
-# Openfarm v0.4 Internals
+# Openfarm v0.5 Internals
 
-Technical reference for `openfarm_core`, its six protocol-versioned adapters, configuration schema, execution flow, security boundaries, and gate hardening.
+Technical reference for `openfarm_core`, packaging/bootstrap (`pyproject.toml`, `SKILL.md`, `skills/`, `bootstrap.py`, `skill_assets/`), its six protocol-versioned adapters, configuration schema, execution flow, security boundaries, and gate hardening.
 
-## Module Layout (`openfarm_core/`)
+## Module Layout (`openfarm_core/` & Packaging)
 
 - `config.py`: Strict TOML loader (`KNOWN_TABLES`, `_TABLE_KEYS`, `Config`, `HarnessConfig`) with fail-closed rejection (`ConfigError`) on unknown tables, unknown keys, conflicting keys (e.g. `timeout` vs `timeout_s`), invalid bounds/choices (including `[harness]` `min_confidence`, `probe_window`, `capture_on`, `editable_surfaces`), invalid policy/globs, or paths escaping the repo root.
 - `cards.py`: Card data models (`Card`, `TestRef`), `canonical_json`, `hash_value`, `CARD_FIELDS` and `OPTIONAL_CARD_FIELDS` (`unit`, `context_files`, `type_changes`), and fenced TOML block extractor (`extract_fenced_fields` supporting ` ```openfarm ` and ` ```toml `). Markdown/`+++` TOML parsing (`parse_card_file`) lives in `adapters/files.py`.
 - `errors.py`: `StopCode` enum (17 per-card stop codes including `supervisor-reject`, plus `killed`, `released`, `paused`), `RELEASING_CODES`, and typed exception hierarchy (`AdapterError`, `Refused`, `Infra`, `Invalid`, `Unsupported`, `ConfigError`, `UsageError`, `GateFailure`).
 - `protocol.py`: `PROTOCOL_VERSION = 1`, `REQUIRED_OPS` / `OPTIONAL_OPS` for all 6 adapters (`cards`, `runner`, `pack`, `model`, `telemetry`, `micromanager`), and JSON-over-stdio `CmdAdapter` wrappers (`CmdCardSource`, `CmdModelBackend`, `CmdTelemetry`, `CmdPack`). `CmdRunner` lives in `adapters/direct.py` and `CmdMicromanager` lives in `micromanager.py`.
 - `globs.py`: Repo-relative glob normalization, `resolves_within` path-traversal guard, and matchers for `never_touch` / `forbidden_files`.
-- `git.py`: Git worktree lifecycle (`worktree_add`, `worktree_remove`, baseline reset), commit helpers, safe flag/config allowlisting (rejecting arbitrary `-c` / unsafe options), and repo lock coordination.
+- `git.py`: Git worktree lifecycle (`worktree_add`, `worktree_remove`, baseline reset), `Git.init` (`git init -q -b <branch>`), commit helpers, safe flag/config allowlisting (rejecting arbitrary `-c` / unsafe options), and repo lock coordination.
 - `state.py`: On-disk state under `state_dir` (`cards/<safe_id>/<run_id>/`, `runs/<run_id>/`, `checks/<safe_id>/`, `worktrees/`, `baseline-cache/`, `breaker.json`, `config.lock.toml`, `run.lock`, `paused`, `STOP`, and `harness/` via `StateDir.harness(tag="")`), card ID path sanitization (`_safe_id` preventing path traversal), atomic writes, and disk-space floor enforcement (`[state] min_free_mb`).
 - `budget.py`: Per-card and nightly token/spend/build/wall-clock accounting (`Budget`, `NightBudget` with separate `micromanager_spend`), frontier cost ratio checks, and lease TTL checks.
 - `edits.py`: Structured `search_replace`, `whole_file`, and `append_stub` edit parser (`parse_edits`) and atomic multi-file `apply_edits` (rolling back all files in a batch if any edit fails or touches a forbidden path).
@@ -31,7 +31,8 @@ Technical reference for `openfarm_core`, its six protocol-versioned adapters, co
   - `checks.py`: Deterministic gate helpers including `revert-check` against `base + frozen-tests` (after formatting), mutation kill-rate enforcement (`mutation_required_for`), counter-test bounce-back handling, `workspace_lint`, `baseline_cache`, `catch_up`, `extra` custom gates, and circuit breaker tracking keyed by real card IDs in `breaker.json`.
 - `dossier.py`: Structured per-card artifact and Markdown/JSON dossier writer (including micromanager calls, scaffolds, coaching hints, verdicts, and optional `harness` summary).
 - `flow.py`: End-to-end card scheduler, worktree manager, Phase A fail-before loop, `scaffold_commit`, checkpointed Phase B step execution, checker/adjudicator loop, pre-review, `HarnessLibrary` cue selection (with dynamic retry failure-class lookup) and non-`Infra` outcome recording, and dossier finalization.
-- `cli.py`: 12-subcommand CLI (`run`, `status`, `pause`, `resume`, `stop`, `release`, `dossier`, `check`, `verdict`, `escape`, `supervise`, `harness`).
+- `bootstrap.py`: Greenfield initializer (`initialize_project`, `validate_project_name`) enforcing Rust 2021 keyword checks, non-empty directory refusal, external `0o700` `state_dir`/`secrets_dir` creation, validated 13-table `.openfarm/config.toml` generation, `never_touch` `src/invariants.rs` seam scaffolding, and `Git.init`, plus `install_skill_bundle` deploying `openfarm_core/skill_assets/` (mirrored at repo-root `skills/` alongside root `SKILL.md` and PEP 621 `pyproject.toml`) to Claude Code, Antigravity (skills + plugin), `.agents`, or workspace destinations with optional `--install-bin` shim.
+- `cli.py`: 14-subcommand CLI with `PRE_CONFIG_COMMANDS` pre-`Context` dispatch for `init` and `install-skill`, alongside `run`, `status`, `pause`, `resume`, `stop`, `release`, `dossier`, `check`, `verdict`, `escape`, `supervise`, `harness`.
 
 ## Configuration Schema (13 Tables)
 
@@ -103,9 +104,11 @@ Inspired by `google-research/harness2` (`arXiv:2610.14224`), `openfarm_core/harn
 | `RustPack` signatures/split diagnostics, atomic `apply_edits`, briefs, eligibility, `revert-check`/gates | `tests/test_pack_gates_v04.py`, `tests/test_edits.py`, `tests/test_eligibility.py`, `tests/test_gates.py`, `tests/test_rust_pack.py` |
 | ACP JSON-RPC security isolation (`clientCapabilities: {}`, `tool_policy`, isolated `$HOME`), 6 micromanager ops | `tests/test_acp_micromanager.py`, `tests/acp_stand_in.py` |
 | Recursive Harness Efficiency (`HarnessLibrary`, `HarnessLedger`, sanitization, `reflect_harness`, probe rollback, `Infra` isolation, `openfarm harness`) | `tests/test_harness_efficiency.py` |
+| Packaging (`pyproject.toml`, `skill_assets/`), repo `skills/` parity, `openfarm install-skill`, `openfarm init` (`Git.init`, strict 13-table config, Rust compile/clippy/fmt, `calorie-log` check/E2E) | `tests/test_v05_skill_bootstrap.py` |
 | End-to-end orchestration, multi-step checkpoints, Phase A retries, counter-test adjudication, `openfarm supervise`, regressions | `tests/test_v04_e2e.py`, `tests/test_e2e.py`, `tests/test_regressions.py`, `tests/test_flow_edges.py` |
 
 Explicitly **untested** against live external targets on this machine:
+- Live remote GitHub URL installs via `uv`/`pipx`/`pip` and live multi-wave LLM execution of `calorie-log` (**untested**).
 - Live `claude-agent-acp` binary with real Anthropic credentials (**untested**).
 - Live hosted ZDR OpenAI-compatible endpoints (**untested**).
 - Live `cargo-mutants` binary runs (**untested**).

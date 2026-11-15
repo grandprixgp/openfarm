@@ -173,6 +173,9 @@ class Git:
 
     # -- queries --------------------------------------------------------------
 
+    def init(self, branch: str = "main") -> None:
+        self._run(["init", "-q", "-b", branch])
+
     def head(self, ref: str = "HEAD") -> str:
         return self._run(["rev-parse", ref]).stdout.strip()
 

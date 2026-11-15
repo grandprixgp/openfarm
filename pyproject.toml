@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openfarm"
+version = "0.5.0"
+description = "Deterministic local-only orchestrator, ACP micromanager, recursive harness memory, and frontier skill bundle for narrowly scoped model work."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+openfarm = "openfarm_core.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["openfarm_core*"]
+
+[tool.setuptools.package-data]
+openfarm_core = ["skill_assets/**/*"]
