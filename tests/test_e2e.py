@@ -87,10 +87,17 @@ def run_cli(repo: Path, *args: str) -> subprocess.CompletedProcess:
         capture_output=True, text=True)
 
 
+def _register(case, toy):
+    """Remember a toy so the case's tearDown removes it."""
+    case._toys = getattr(case, "_toys", []) + [toy]
+    return toy
+
+
 @unittest.skipUnless(ENABLED, "set OPENFARM_E2E=1 to run the cargo-backed tests")
 class HappyPathTests(unittest.TestCase):
     def setUp(self) -> None:
         self.toy = build_toy()
+        self._toys = [self.toy]
         self.toy.write_card(
             "CARD-1",
             title="A full fascicle refuses a push",
@@ -101,6 +108,12 @@ class HappyPathTests(unittest.TestCase):
                     "asserts": "push returns Err(FascicleError::Full)"}],
             done_text="push on a full fascicle returns `Err(FascicleError::Full)`.")
         self.toy.commit("toy: CARD-1")
+
+    def tearDown(self) -> None:
+        """Each toy carries a build target; /tmp here is a small tmpfs."""
+        for toy in getattr(self, "_toys", []):
+            toy.cleanup()
+        self._toys = []
 
     def test_a_clean_card_reaches_in_review(self) -> None:
         """The whole flow, with a model that behaves."""
@@ -182,12 +195,19 @@ class HappyPathTests(unittest.TestCase):
         self.assertEqual(base_before, base_after)
 
 
+def _register(case, toy):
+    """Remember a toy so the case's tearDown removes it."""
+    case._toys = getattr(case, "_toys", []) + [toy]
+    return toy
+
+
 @unittest.skipUnless(ENABLED, "set OPENFARM_E2E=1")
 class GamingTrickTests(unittest.TestCase):
     """Each planted card asserts one trap is caught, not that the run is tidy."""
 
     def setUp(self) -> None:
         self.toy = build_toy()
+        self._toys = getattr(self, '_toys', []) + [self.toy]
 
     def plant(self, card_id: str, **overrides) -> None:
         payload = dict(
@@ -207,6 +227,12 @@ class GamingTrickTests(unittest.TestCase):
                          "--script", str(script_path), "--cards", "1")
         payload = json.loads(result.stdout) if result.stdout else {}
         return payload.get("outcomes", [{}])[0]
+
+    def tearDown(self) -> None:
+        """Each toy carries a build target; /tmp here is a small tmpfs."""
+        for toy in getattr(self, "_toys", []):
+            toy.cleanup()
+        self._toys = []
 
     def test_a_test_that_passes_on_base_is_not_proof(self) -> None:
         self.plant("CARD-BASE")
@@ -315,10 +341,22 @@ class GamingTrickTests(unittest.TestCase):
         self.assertEqual(outcome["stop_code"], "refused")
 
 
+def _register(case, toy):
+    """Remember a toy so the case's tearDown removes it."""
+    case._toys = getattr(case, "_toys", []) + [toy]
+    return toy
+
+
 @unittest.skipUnless(ENABLED, "set OPENFARM_E2E=1")
 class NoPushEndToEndTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        """Each toy carries a build target; /tmp here is a small tmpfs."""
+        for toy in getattr(self, "_toys", []):
+            toy.cleanup()
+        self._toys = []
+
     def test_the_remote_stays_empty_after_a_run(self) -> None:
-        toy = build_toy()
+        toy = _register(self, build_toy())
         toy.write_card(
             "CARD-1", title="A full fascicle refuses a push",
             category="pinned-bugfix", touches=["src/fascicle.rs"],

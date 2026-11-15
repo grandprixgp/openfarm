@@ -223,10 +223,23 @@ def _run(args: list[str], cwd: Path, check: bool = True) -> subprocess.Completed
 class ToyRepo:
     """A generated toy repository, ready for a card to run in."""
 
-    def __init__(self, root: Path, state_dir: Path, origin: Path | None = None) -> None:
+    def __init__(self, root: Path, state_dir: Path, origin: Path | None = None,
+                 base: Path | None = None) -> None:
         self.root = Path(root)
         self.state_dir = Path(state_dir)
         self.origin = Path(origin) if origin else None
+        #: The folder holding the repo, its state and its remote. A test removes it
+        #: when it is done, because each toy carries a build target and the VM's
+        #: `/tmp` is a small tmpfs with a per-user quota.
+        self.base = Path(base) if base else self.root.parent
+
+    def cleanup(self) -> None:
+        """Remove this toy and everything built beside it."""
+        import shutil
+        for path in (self.root, self.state_dir, self.origin):
+            if path is None:
+                continue
+            shutil.rmtree(path, ignore_errors=True)
 
     @property
     def config(self) -> Path:
@@ -290,13 +303,22 @@ def build_toy(root: Path | None = None, state_dir: Path | None = None,
 
     The remote is a bare repository nothing is ever pushed to. The no-push test
     checks it stays empty, which is a stronger claim than grepping for `git push`.
+
+    Everything lives under one folder, so `ToyRepo.cleanup()` removes all of it. The
+    tests call it, because each toy carries a build target and `/tmp` on this machine
+    is a small tmpfs with a per-user quota.
     """
-    root = Path(root) if root else Path(tempfile.mkdtemp(prefix="openfarm-toy-"))
-    state_dir = Path(state_dir) if state_dir else root.parent / f"{root.name}-state"
+    if root is None:
+        base = Path(tempfile.mkdtemp(prefix="openfarm-toy-"))
+        root = base / "repo"
+    else:
+        base = Path(root).parent
+    root = Path(root)
+    state_dir = Path(state_dir) if state_dir else base / "repo-state"
     root.mkdir(parents=True, exist_ok=True)
     state_dir.mkdir(parents=True, exist_ok=True)
 
-    repo = ToyRepo(root, state_dir)
+    repo = ToyRepo(root, state_dir, base=base)
 
     repo.write("Cargo.toml", CARGO_TOML)
     repo.write("src/lib.rs", LIB_RS)
@@ -320,10 +342,10 @@ def build_toy(root: Path | None = None, state_dir: Path | None = None,
 
     origin = None
     if with_origin:
-        origin = root.parent / f"{root.name}-origin.git"
+        origin = base / "origin.git"
         if origin.exists():
             shutil.rmtree(origin, ignore_errors=True)
-        _run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], root.parent)
+        _run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], base)
         _run(["git", "remote", "add", "origin", str(origin)], root)
     repo.origin = origin
     return repo
@@ -332,14 +354,20 @@ def build_toy(root: Path | None = None, state_dir: Path | None = None,
 def copy_toy(source: ToyRepo, destination: Path) -> ToyRepo:
     """A copy of a built toy, for a case that mutates it."""
     destination = Path(destination)
+    base = destination.parent
     if destination.exists():
         shutil.rmtree(destination)
     shutil.copytree(source.root, destination)
-    state = destination.parent / f"{destination.name}-state"
+    state = base / "repo-state"
     state.mkdir(parents=True, exist_ok=True)
     config = destination / ".openfarm" / "config.toml"
     config.write_text(CONFIG.format(state_dir=state))
-    return ToyRepo(destination, state)
+    origin = base / "origin.git"
+    if source.origin and source.origin.exists():
+        shutil.copytree(source.origin, origin)
+        _run(["git", "remote", "set-url", "origin", str(origin)], destination)
+    return ToyRepo(destination, state, origin=origin if origin.exists() else None,
+                   base=base)
 
 
 def cargo_available() -> bool:

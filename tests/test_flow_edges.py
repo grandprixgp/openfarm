@@ -111,10 +111,23 @@ class ScriptedBackend:
                           tokens_out=10)
 
 
+def _register(case, toy):
+    """Remember a toy so the case's tearDown removes it."""
+    case._toys = getattr(case, "_toys", []) + [toy]
+    return toy
+
+
 @unittest.skipUnless(ENABLED, "set OPENFARM_E2E=1")
 class FlowEdgeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.toy = build_toy()
+        self._toys = [self.toy]
+
+    def tearDown(self) -> None:
+        """Each toy carries a build target; /tmp here is a small tmpfs."""
+        for toy in getattr(self, "_toys", []):
+            toy.cleanup()
+        self._toys = []
 
     def add_card(self, card_id: str = "CARD-1", **overrides) -> None:
         payload = dict(
@@ -317,10 +330,22 @@ on_fail = "ineligible"
         self.assertEqual(outcome["stop_code"], "ineligible")
 
 
+def _register(case, toy):
+    """Remember a toy so the case's tearDown removes it."""
+    case._toys = getattr(case, "_toys", []) + [toy]
+    return toy
+
+
 @unittest.skipUnless(ENABLED, "set OPENFARM_E2E=1")
 class BudgetAndBreakerTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        """Each toy carries a build target; /tmp here is a small tmpfs."""
+        for toy in getattr(self, "_toys", []):
+            toy.cleanup()
+        self._toys = []
+
     def test_a_build_cap_blocks_with_its_own_code(self) -> None:
-        toy = build_toy()
+        toy = _register(self, build_toy())
         config = toy.config.read_text().replace(
             "model_build_calls_per_card = 10",
             "model_build_calls_per_card = 1")

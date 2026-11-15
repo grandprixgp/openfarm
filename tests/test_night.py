@@ -85,12 +85,25 @@ def add_card(toy, card_id: str, title: str = "A full fascicle refuses a push",
     toy.write_card(card_id, **payload)
 
 
+def _register(case, toy):
+    """Remember a toy so the case's tearDown removes it."""
+    case._toys = getattr(case, "_toys", []) + [toy]
+    return toy
+
+
 @unittest.skipUnless(ENABLED, "set OPENFARM_E2E=1")
 class NightTests(unittest.TestCase):
     def setUp(self) -> None:
         self.toy = build_toy()
+        self._toys = [self.toy]
         add_card(self.toy, "CARD-1")
         self.toy.commit("toy: CARD-1")
+
+    def tearDown(self) -> None:
+        """Each toy carries a build target; /tmp here is a small tmpfs."""
+        for toy in getattr(self, "_toys", []):
+            toy.cleanup()
+        self._toys = []
 
     def test_one_night_claims_and_drives_several_cards(self) -> None:
         for index in range(2, 4):
@@ -203,10 +216,22 @@ class NightTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
 
+def _register(case, toy):
+    """Remember a toy so the case's tearDown removes it."""
+    case._toys = getattr(case, "_toys", []) + [toy]
+    return toy
+
+
 @unittest.skipUnless(ENABLED, "set OPENFARM_E2E=1")
 class BreakerTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        """Each toy carries a build target; /tmp here is a small tmpfs."""
+        for toy in getattr(self, "_toys", []):
+            toy.cleanup()
+        self._toys = []
+
     def test_three_blocks_for_one_reason_pause_the_queue(self) -> None:
-        toy = build_toy()
+        toy = _register(self, build_toy())
         # Three cards that will each be blocked for the same reason: a test that
         # passes on base proves nothing.
         for index in (1, 2, 3):

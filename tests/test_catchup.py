@@ -125,10 +125,17 @@ class MovingBaseBackend:
                        check=True, capture_output=True)
 
 
+def _register(case, toy):
+    """Remember a toy so the case's tearDown removes it."""
+    case._toys = getattr(case, "_toys", []) + [toy]
+    return toy
+
+
 @unittest.skipUnless(ENABLED, "set OPENFARM_E2E=1")
 class CatchUpTests(unittest.TestCase):
     def setUp(self) -> None:
         self.toy = build_toy()
+        self._toys = [self.toy]
         self.toy.write_card(
             "CARD-1", title="A full fascicle refuses a push",
             category="pinned-bugfix", touches=["src/fascicle.rs"],
@@ -137,6 +144,12 @@ class CatchUpTests(unittest.TestCase):
                     "asserts": "push returns Err(FascicleError::Full)"}],
             done_text="push on a full fascicle returns `Err(FascicleError::Full)`.")
         self.toy.commit("toy: CARD-1")
+
+    def tearDown(self) -> None:
+        """Each toy carries a build target; /tmp here is a small tmpfs."""
+        for toy in getattr(self, "_toys", []):
+            toy.cleanup()
+        self._toys = []
 
     def run_card(self, backend) -> dict:
         context = Context(self.toy.root)
