@@ -70,10 +70,17 @@ def _toml_value(value) -> str:
         return "true" if value else "false"
     if isinstance(value, (int, float)):
         return repr(value)
+    if isinstance(value, dict):
+        return "{ " + ", ".join(f"{key} = {_toml_value(item)}"
+                                for key, item in sorted(value.items())) + " }"
     if isinstance(value, list):
         return "[" + ", ".join(_toml_value(v) for v in value) + "]"
-    text = str(value).replace("\\", "\\\\").replace('"', '\\"')
-    return f'"{text}"'
+    text = str(value)
+    # TOML basic strings have no `\n` escape, so text with newlines (a note, a done
+    # text) goes in a multi-line literal string instead.
+    if "\n" in text:
+        return "'''\n" + text.replace("'''", "''\\'") + "'''"
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 class FileCardSource:

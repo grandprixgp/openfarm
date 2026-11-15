@@ -212,6 +212,12 @@ class Git:
             args += ["--", *paths]
         return self._run(args).stdout
 
+    def diff_name_only(self, ref: str = "HEAD") -> list[str]:
+        """Tracked paths that differ from `ref`, by name."""
+        return [line.strip() for line in
+                self._run(["diff", "--name-only", ref]).stdout.splitlines()
+                if line.strip()]
+
     def show_blob(self, spec: str) -> str | None:
         """A file's content at a commit, or None when it did not exist."""
         result = self._run(["show", spec], check=False)

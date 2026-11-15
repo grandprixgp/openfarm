@@ -274,16 +274,17 @@ def _added_lines(path: str, before: str, after: str) -> list[dict]:
     return out
 
 
-def diff_text(worktree: Path, paths: list[str]) -> str:
-    """A unified diff of the working tree against HEAD, plus new files.
+def diff_text(worktree: Path, paths: list[str], ref: str = "HEAD") -> str:
+    """A unified diff against `ref`, plus any new files.
 
     All git access goes through `Git`, which is the module that holds the no-push
-    allowlist.
+    allowlist. `ref` is HEAD for a per-attempt check and the base commit for the
+    card's whole diff once the implementer has committed.
     """
     from .git import Git
     worktree = Path(worktree)
     git = Git(worktree)
-    chunks: list[str] = [git.diff(paths)]
+    chunks: list[str] = [git.diff(paths, ref=ref)]
     for path in git.untracked_files(paths):
         try:
             content = (worktree / path).read_text()

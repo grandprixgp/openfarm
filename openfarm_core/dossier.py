@@ -28,7 +28,8 @@ def build_dossier(card_run, final_state: str) -> dict:
     except Exception:  # noqa: BLE001
         card_hash_at_end = None
 
-    changed = card_run._changed() if hasattr(card_run, "_changed") else []
+    changed = (card_run._changed_since_base()
+               if hasattr(card_run, "_changed_since_base") else [])
     touches_check = _touches_check(card_run, changed)
     banned = _evidence(card_run, "banned-patterns")
 
@@ -152,8 +153,10 @@ def _not_checked(card_run) -> list[str]:
 def _test_diff(card_run) -> str:
     from .edits import diff_text
     try:
-        paths = [path for path in card_run._changed() if card_run._is_test_path(path)]
-        return diff_text(card_run.worktree, paths)
+        paths = [path for path in card_run._changed_since_base()
+                 if card_run._is_test_path(path)]
+        return diff_text(card_run.worktree, paths,
+                         ref=card_run.base_commit or "HEAD")
     except Exception:  # noqa: BLE001
         return ""
 
@@ -161,9 +164,10 @@ def _test_diff(card_run) -> str:
 def _production_diff(card_run) -> str:
     from .edits import diff_text
     try:
-        paths = [path for path in card_run._changed()
+        paths = [path for path in card_run._changed_since_base()
                  if not card_run._is_test_path(path)]
-        return diff_text(card_run.worktree, paths)
+        return diff_text(card_run.worktree, paths,
+                         ref=card_run.base_commit or "HEAD")
     except Exception:  # noqa: BLE001
         return ""
 

@@ -36,6 +36,25 @@ MODEL_BUILD_KINDS = ("test", "lint", "build")
 #: Fixed gates. Outside the model cap so a healthy card isn't stopped by them.
 FIXED_BUILD_KINDS = ("list", "ws-lint", "typecheck", "extra")
 
+#: A pack's purpose, and the runner kind it runs as. The two vocabularies differ:
+#: a pack knows `ws-lint`, the runner knows `lint`.
+_RUNNER_KIND = {
+    "test": "test",
+    "list": "list",
+    "build": "build",
+    "lint": "lint",
+    "ws-lint": "lint",
+    "typecheck": "typecheck",
+    "format": "extra",
+    "fmt-check": "extra",
+    "mutation": "mutation",
+    "extra": "extra",
+}
+
+
+def runner_kind(purpose: str) -> str:
+    return _RUNNER_KIND.get(purpose, "extra")
+
 
 class CardRun:
     """One card's whole run, from claim to in-review or blocked."""
@@ -77,6 +96,7 @@ class CardRun:
         self.attempts: list[dict] = []
         self.frozen_tests: dict[str, str] = {}
         self.frozen_hash = ""
+        self.frozen_commit = ""
         self.base_commit = ""
         self.branch = ""
         self.base_test_list: dict = {"tests": []}
@@ -137,6 +157,22 @@ class CardRun:
             return self.runner.read_output(result)
         return out, err
 
+    def _test_writer_paths(self) -> list[str]:
+        """What the test writer may write: the named test files, plus touches.
+
+        A test file the card names is answerable even when it isn't in `touches`,
+        because the done text named it. Production files stay additions-only, and
+        `tests-locked` still stops the implementer from touching either.
+        """
+        paths = list(self.card.touches)
+        for test in self.card.tests:
+            if test.file and test.file not in paths:
+                paths.append(normalise(test.file))
+        for path in self.card.test_edits:
+            if path not in paths:
+                paths.append(normalise(path))
+        return paths
+
     def _stub_inserter(self):
         """`append_stub` for this language, or None where it isn't offered."""
         if not hasattr(self.pack, "append_stub"):
@@ -156,8 +192,7 @@ class CardRun:
             if full.exists():
                 hashes[path] = hashlib.sha256(full.read_bytes()).hexdigest()
         self.frozen_tests = hashes
-        self.frozen_hash = hashlib.sha256(
-            json.dumps(hashes, sort_keys=True).encode("utf-8")).hexdigest()
+        self.frozen_hash = _tests_hash(hashes)
         write_json(self.card_layout / "frozen" / "tests.sha256",
                    {"hash": self.frozen_hash, "files": hashes})
 
@@ -173,7 +208,25 @@ class CardRun:
             normalise(path)) == "test"
 
     def _changed(self) -> list[str]:
+        """Changes in the working tree right now, against HEAD.
+
+        This is what a per-attempt gate wants: after `reset --hard` it is exactly
+        the attempt's own edits, committed or not.
+        """
         return self.git.changed_files()
+
+    def _changed_since_base(self) -> list[str]:
+        """Every path the card has touched, from the base commit to now.
+
+        Once the implementer commits, `git diff HEAD` is empty, so the end gates and
+        the dossier have to look back to the base to see the card's whole diff.
+        """
+        start = self.base_commit or "HEAD"
+        names = self.git.diff_name_only(start)
+        for path in self.git.untracked_files():
+            if path not in names:
+                names.append(path)
+        return sorted(names)
 
     def _commit(self, message: str) -> str:
         self.git.stage_all()
@@ -282,7 +335,7 @@ class CardRun:
 
         runs = []
         for index in (1, 2):
-            result = self._run("test",
+            result = self._run(runner_kind("test"),
                                self.pack.commands("test", unit=unit)["argv"],
                                counted="fixed")
             out, err = self._output(result)
@@ -310,7 +363,7 @@ class CardRun:
                                           "disagreed": disagree}))
             raise GateFailure(StopCode.DIRTY_BASELINE, detail)
 
-        list_result = self._run("list",
+        list_result = self._run(runner_kind("list"),
                                 self.pack.commands("list", unit=unit)["argv"],
                                 counted="fixed")
         out, err = self._output(list_result)
@@ -393,8 +446,8 @@ class CardRun:
                 continue
 
             report = apply_edits(
-                self.worktree, edits, self.card.touches, self.cfg.never_touch,
-                self.cfg.forbidden_files,
+                self.worktree, edits, self._test_writer_paths(),
+                self.cfg.never_touch, self.cfg.forbidden_files,
                 additions_only=set(self.card.touches) if self.card.new_symbols else set(),
                 allow_stubs=self.card.new_symbols,
                 stub_inserter=self._stub_inserter())
@@ -414,7 +467,10 @@ class CardRun:
                         + ", ".join(report.outside_touches or report.not_additions_only))
                 continue
 
+            # Freeze, then commit: an attempt starts from a clean tree, so the
+            # frozen tests must be in the commit or `reset --hard` would delete them.
             self._freeze()
+            self.frozen_commit = self._commit(f"{self.card.id}: freeze the tests")
             return
 
         raise GateFailure(StopCode.TESTS_UNPROVABLE,
@@ -427,7 +483,7 @@ class CardRun:
         self.phase = "prove"
         unit = self.card.unit
 
-        list_result = self._run("list",
+        list_result = self._run(runner_kind("list"),
                                 self.pack.commands("list", unit=unit)["argv"],
                                 counted="fixed")
         out, err = self._output(list_result)
@@ -457,7 +513,7 @@ class CardRun:
             return
 
         base = self._base_ref()
-        rerun = self._run("test", self.pack.commands("test", unit=unit)["argv"]
+        rerun = self._run(runner_kind("test"), self.pack.commands("test", unit=unit)["argv"]
                           + ["--", *self.card.test_names], counted="fixed")
         out, err = self._output(rerun)
         parsed = self.pack.parse_tests(out, err)
@@ -508,9 +564,13 @@ class CardRun:
             attempt_no = self.budget.take_implementer_attempt()
             self._begin_attempt(attempt_no)
 
+            # A retry with no edits to show would leave the model with nothing, so
+            # the first attempt's shape is used whenever the tree is clean.
+            showing_diff = bool(stashed["diff"])
             brief = build_implementer_brief(
                 self.card, self.book, self._frozen_texts(),
-                attempt=attempt, diff=stashed["diff"],
+                attempt=attempt_no if showing_diff else 1,
+                diff=stashed["diff"],
                 failure=last_failure, counter_tests=counter_tests)
             write_json(self.card_layout / "briefs" / f"{attempt_no}-implementer.md",
                        {"brief": brief.body})
@@ -616,7 +676,7 @@ class CardRun:
 
         # The suite and lint a model's edit caused. These count against the cap.
         unit = self.card.unit
-        test_result = self._run("test",
+        test_result = self._run(runner_kind("test"),
                                 self.pack.commands("test", unit=unit)["argv"])
         out, err = self._output(test_result)
         parsed = self.pack.parse_tests(out, err)
@@ -626,7 +686,7 @@ class CardRun:
         self.named_passing = passing
         self.best_named_passing = max(self.best_named_passing, passing)
 
-        lint_result = self._run("lint",
+        lint_result = self._run(runner_kind("lint"),
                                 self.pack.commands("lint", unit=unit)["argv"])
         lint_out, lint_err = self._output(lint_result)
         lint_gate = self._record_gate(
@@ -683,15 +743,16 @@ class CardRun:
     def _step_end_gates(self) -> None:
         self.phase = "check"
         unit = self.card.unit
-        changed = self._changed()
-        full_diff = diff_text(self.worktree, changed)
+        changed = self._changed_since_base()
+        full_diff = diff_text(self.worktree, changed,
+                              ref=self.base_commit or "HEAD")
         self.current_diff = full_diff
         added, removed = line_counts(full_diff)
 
         # pass-after: the named tests, twice, per the spec's flakiness rule.
         named_ok = True
         for index in (1, 2):
-            result = self._run("test",
+            result = self._run(runner_kind("test"),
                                self.pack.commands("test", unit=unit)["argv"]
                                + ["--", *self.card.test_names], counted="fixed")
             out, err = self._output(result)
@@ -703,7 +764,7 @@ class CardRun:
                                   f"named tests not passing at the end: {gate.detail}")
 
         # Suite and lint, then workspace lint.
-        suite_result = self._run("test",
+        suite_result = self._run(runner_kind("test"),
                                  self.pack.commands("test", unit=unit)["argv"],
                                  counted="fixed")
         out, err = self._output(suite_result)
@@ -717,7 +778,7 @@ class CardRun:
         self._format_touched(changed)
 
         if self.cfg.workspace_lint:
-            ws = self._run("ws-lint",
+            ws = self._run(runner_kind("ws-lint"),
                            self.pack.commands("ws-lint")["argv"], counted="fixed")
             ws_out, ws_err = self._output(ws)
             ws_gate = self._record_gate(GateResult(
@@ -733,7 +794,8 @@ class CardRun:
 
         # No test loss, against the list taken on base.
         final_list_result = self._run(
-            "list", self.pack.commands("list", unit=unit)["argv"], counted="fixed")
+            runner_kind("list"),
+            self.pack.commands("list", unit=unit)["argv"], counted="fixed")
         list_out, list_err = self._output(final_list_result)
         final_list = self.pack.parse_list(list_out)
         loss = self._record_gate(
@@ -744,13 +806,11 @@ class CardRun:
         # Revert check: skipped for test-backfill, by the spec.
         if self.cfg.revert_check == "required" and self.card.category != "test-backfill":
             current = self._current_test_hashes()
-            gate = self._record_gate(
-                frozen_check(self.frozen_tests, current))
+            gate = self._record_gate(frozen_check(self.frozen_tests, current))
             if not gate.ok:
                 raise GateFailure(StopCode.REFUSED, gate.detail)
             self._record_gate(revert_check(
-                self.frozen_hash,
-                hashlib.sha256(str(sorted(current.items())).encode()).hexdigest()))
+                self.frozen_hash, _tests_hash(current)))
 
         self._mutation_gate(changed)
 
@@ -786,7 +846,7 @@ class CardRun:
 
         if not clean:
             return
-        result = self._run("extra",
+        result = self._run(runner_kind("extra"),
                            self.pack.commands("format", files=clean)["argv"],
                            counted="fixed")
         if result.cls != PASS:
@@ -802,7 +862,7 @@ class CardRun:
         scratch.mkdir(parents=True, exist_ok=True)
         temp = scratch / Path(path).name
         temp.write_text(blob)
-        result = self._run("extra",
+        result = self._run(runner_kind("extra"),
                            self.pack.commands("fmt-check", files=[str(temp)])["argv"],
                            counted="fixed")
         return result.cls == PASS
@@ -812,7 +872,7 @@ class CardRun:
             if not paths_touched_by_extra_gate(changed, extra.paths):
                 continue
             argv = _split_command(extra.run)
-            result = self._run("extra", argv, counted="fixed")
+            result = self._run(runner_kind("extra"), argv, counted="fixed")
             out, err = self._output(result)
             passed = result.cls == PASS
             gate = self._record_gate(extra_gate_result(
@@ -839,7 +899,7 @@ class CardRun:
 
         try:
             argv = self.pack.commands("mutation", files=production)["argv"]
-            result = self._run("mutation", argv, counted="mutation")
+            result = self._run(runner_kind("mutation"), argv, counted="mutation")
         except (Infra, Invalid) as exc:
             self._record_gate(GateResult(
                 "mutation", FAIL if breaking else PASS,
@@ -859,7 +919,21 @@ class CardRun:
                 raise Infra("mutation-infra", "the mutation tool failed")
             return
 
-        parsed = self.pack.parse_mutation(out)
+        try:
+            parsed = self.pack.parse_mutation(out)
+        except Invalid as exc:
+            # A tool that is not installed, or prints nothing, is not a finding
+            # about the code. In report mode that is recorded and the card carries
+            # on; when mutation is this card's only proof, it blocks.
+            self._record_gate(GateResult(
+                "mutation", FAIL if breaking else PASS,
+                f"the mutation tool's output could not be read: {exc.message}"))
+            if breaking:
+                raise GateFailure(
+                    StopCode.MUTATION_CAP,
+                    "mutation is this card's only proof and its output could not "
+                    "be read") from exc
+            return
         self.mutation_summary = {
             "killed": parsed.get("killed", 0), "total": parsed.get("total", 0),
             "capped": parsed.get("capped", False)}
@@ -936,7 +1010,7 @@ class CardRun:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(content)
                 result = self._run(
-                    "test",
+                    runner_kind("test"),
                     self.pack.commands("test", unit=self.card.unit)["argv"]
                     + ["--test", path],
                     counted="model")
@@ -1098,7 +1172,7 @@ class CardRun:
             "tokens_in": self.budget.tokens_in,
             "tokens_out": self.budget.tokens_out,
             "spend": round(self.budget.spend, 6),
-            "files_changed": len(self.gates and self._changed() or []),
+            "files_changed": len(self._changed_since_base()),
             "lines_added": 0,
             "lines_removed": 0,
             "named_tests": self.card.test_names,
@@ -1113,6 +1187,13 @@ class CardRun:
 
 
 # -- helpers -------------------------------------------------------------------
+
+def _tests_hash(hashes: dict[str, str]) -> str:
+    """One hash for a whole set of frozen test files, so two can be compared."""
+    import json
+    return hashlib.sha256(
+        json.dumps(hashes, sort_keys=True).encode("utf-8")).hexdigest()
+
 
 def _summarise(failures: list[dict]) -> str:
     return "; ".join(f"{entry['rule']}: {entry['detail']}" for entry in failures)

@@ -316,11 +316,11 @@ def cmd_status(ctx: Context, args) -> int:
         "last_run": _last_run(ctx),
     }
     if args.card:
-        payload["card"] = ctx.state.card_dir(args.card, "")
+        payload["card"] = str(ctx.state.card_dir(args.card, ""))
         payload["history"] = [
-            {"run": path.parent.name, "state": (read_json(path) or {}).get(
-                "final_state", ""), "stop_code": (read_json(path) or {}).get(
-                "stop_code", "")}
+            {"run": path.parent.name,
+             "state": (read_json(path) or {}).get("final_state", ""),
+             "stop_code": (read_json(path) or {}).get("stop_code", "")}
             for path in sorted(ctx.state.cards.glob(f"{args.card}/*/card-record.json"))
         ]
     ctx.emit(payload)

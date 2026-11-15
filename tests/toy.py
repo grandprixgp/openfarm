@@ -72,6 +72,9 @@ impl Spine {
 
 FASCICLE_RS = '''\
 //! A fascicle: a bounded bundle of segments. The subject of most cards.
+//!
+//! The base has a real bug on purpose: `push` ignores its own capacity, so a card
+//! that pins the refusal has something genuine to turn from red to green.
 
 /// A bounded bundle of up to `capacity` segments.
 #[derive(Debug)]
@@ -100,11 +103,8 @@ impl Fascicle {
         self.capacity
     }
 
-    /// Add a segment, or refuse with `Full`.
+    /// Add a segment.
     pub fn push(&mut self, value: u32) -> Result<usize, FascicleError> {
-        if self.segments.len() >= self.capacity {
-            return Err(FascicleError::Full);
-        }
         self.segments.push(value);
         Ok(self.segments.len() - 1)
     }
@@ -304,8 +304,16 @@ def build_toy(root: Path | None = None, state_dir: Path | None = None,
     repo.write("src/fascicle.rs", FASCICLE_RS)
     repo.write("src/seam.rs", SEAM_RS)
     repo.write("tests/existing.rs", EXISTING_TEST)
-    repo.write(".gitignore", "/target\nCargo.lock\n")
+    repo.write(".gitignore", "/target\n")
     repo.write(".openfarm/config.toml", CONFIG.format(state_dir=state_dir))
+
+    # A real repository commits its lock file, and every pack command passes
+    # `--locked`, so the toy needs one too.
+    generated = subprocess.run(
+        ["cargo", "generate-lockfile"], cwd=str(root), capture_output=True,
+        text=True)
+    if generated.returncode != 0:
+        raise RuntimeError(f"cargo generate-lockfile failed:\n{generated.stderr}")
 
     _run(["git", "init", "-q", "-b", "main"], root)
     repo.commit("toy: the base everything starts from")
