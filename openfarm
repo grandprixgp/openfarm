@@ -1,0 +1,16 @@
+#!/usr/bin/env python3
+"""openfarm, run from a repository root with no install.
+
+This shim puts its own folder on `sys.path` so the package imports from wherever it
+sits, which is what lets openfarm drop into any repository or worktree.
+"""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from openfarm_core.cli import main  # noqa: E402
+
+if __name__ == "__main__":
+    raise SystemExit(main())

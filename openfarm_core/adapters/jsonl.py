@@ -1,0 +1,148 @@
+"""Telemetry: one record per attempt and per card.
+
+If telemetry fails, the core keeps writing local JSONL and notes it in the run
+record. Telemetry trouble never stops a card.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from ..state import append_jsonl, write_json
+
+
+STREAM_ATTEMPT = "attempt"
+STREAM_CARD = "card"
+STREAM_RUN = "run"
+
+
+class JsonlTelemetry:
+    """JSONL in the run folder. Optional SQLite is a later adapter, not this one."""
+
+    name = "jsonl"
+
+    def __init__(self, run_dir: Path) -> None:
+        self.run_dir = Path(run_dir)
+        (self.run_dir / "telemetry").mkdir(parents=True, exist_ok=True)
+        self.problems: list[str] = []
+
+    def hello(self) -> dict:
+        return {"name": self.name, "versions": [1], "ops": ["hello", "write", "flush"]}
+
+    def write(self, stream: str, record: dict) -> dict:
+        if stream not in (STREAM_ATTEMPT, STREAM_CARD, STREAM_RUN):
+            raise ValueError(f"{stream!r} is not a telemetry stream")
+        path = self.run_dir / "telemetry" / f"{stream}s.jsonl"
+        try:
+            append_jsonl(path, record)
+        except OSError as exc:
+            self.problems.append(f"{path}: {exc}")
+        return {"written": True}
+
+    def flush(self) -> dict:
+        return {"flushed": True, "problems": list(self.problems)}
+
+
+class MemoryTelemetry:
+    """Telemetry held in memory, for tests."""
+
+    name = "memory"
+
+    def __init__(self) -> None:
+        self.records: dict[str, list[dict]] = {"attempt": [], "card": [], "run": []}
+
+    def hello(self) -> dict:
+        return {"name": self.name, "versions": [1], "ops": ["hello", "write", "flush"]}
+
+    def write(self, stream: str, record: dict) -> dict:
+        self.records.setdefault(stream, []).append(record)
+        return {"written": True}
+
+    def flush(self) -> dict:
+        return {"flushed": True}
+
+    def attempts(self) -> list[dict]:
+        return self.records.get("attempt", [])
+
+    def cards(self) -> list[dict]:
+        return self.records.get("card", [])
+
+
+#: Fields every attempt record carries. A reader ignores what it doesn't know.
+ATTEMPT_FIELDS = (
+    "schema_version", "run_id", "card_id", "card_hash", "attempt", "phase",
+    "started_at", "ended_at", "model", "temperature", "seed", "tokens_in",
+    "tokens_out", "spend", "edit_format", "files_changed", "lines_added",
+    "lines_removed", "diff_hash", "model_builds", "fixed_builds",
+    "runner_seconds", "gates", "named_tests_passing", "error_signature",
+    "outcome", "stop_code",
+)
+
+CARD_FIELDS = (
+    "schema_version", "run_id", "card_id", "card_hash_at_claim",
+    "card_hash_at_end", "category", "unit", "claimed_at", "ended_at",
+    "final_state", "stop_code", "attempts", "depth", "planner_used",
+    "builds", "runner_seconds", "wall_clock_s", "tokens_in", "tokens_out",
+    "spend", "files_changed", "lines_added", "lines_removed", "named_tests",
+    "known_failing_excluded", "counter_tests", "mutation", "findings_filed",
+    "frontier_estimate", "dossier_path",
+)
+
+
+def complete_record(record: dict, fields: tuple[str, ...], schema_version: int = 1) -> dict:
+    """Fill in every documented field, so a record is never a partial one."""
+    out = {"schema_version": schema_version}
+    for field in fields:
+        value = record.get(field)
+        if value is None:
+            value = _default_for(field)
+        out[field] = value
+    for key, value in record.items():
+        if key not in out:
+            out[key] = value
+    return out
+
+
+def _default_for(field: str):
+    if field in ("attempt", "tokens_in", "tokens_out", "lines_added",
+                 "lines_removed", "model_builds", "fixed_builds",
+                 "runner_seconds", "depth", "named_tests_passing"):
+        return 0
+    if field in ("spend", "wall_clock_s"):
+        return 0.0
+    if field == "gates":
+        return []
+    if field == "builds":
+        return {"model": 0, "fixed": 0, "mutation": 0}
+    if field == "counter_tests":
+        return {"written": 0, "dropped_uncompiled": 0, "passed": 0, "failed": 0}
+    if field == "mutation":
+        return {"killed": 0, "total": 0, "capped": False}
+    if field == "planner_used":
+        return False
+    if field in ("findings_filed", "known_failing_excluded", "named_tests"):
+        return []
+    if field == "files_changed":
+        return []
+    return ""
+
+
+class TelemetrySink:
+    """Wraps a sink so a failure is noted and never stops a card."""
+
+    def __init__(self, inner) -> None:
+        self.inner = inner
+        self.problems: list[str] = []
+
+    def write(self, stream: str, record: dict) -> None:
+        try:
+            self.inner.write(stream, record)
+        except Exception as exc:  # noqa: BLE001 - telemetry must never stop a card
+            self.problems.append(f"{stream}: {exc}")
+
+    def flush(self) -> None:
+        try:
+            self.inner.flush()
+        except Exception as exc:  # noqa: BLE001
+            self.problems.append(f"flush: {exc}")
