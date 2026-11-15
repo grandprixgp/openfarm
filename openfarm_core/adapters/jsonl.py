@@ -90,6 +90,7 @@ CARD_FIELDS = (
     "micromanager_calls", "micromanager_tokens_in",
     "micromanager_tokens_out", "micromanager_spend",
     "false_rejects_dismissed",
+    "harness_revision", "harness_cues_applied", "harness_lessons_added",
 )
 
 
@@ -112,7 +113,8 @@ def _default_for(field: str):
                  "lines_removed", "model_builds", "fixed_builds",
                  "runner_seconds", "depth", "named_tests_passing",
                  "micromanager_calls", "micromanager_tokens_in",
-                 "micromanager_tokens_out", "false_rejects_dismissed"):
+                 "micromanager_tokens_out", "false_rejects_dismissed",
+                 "harness_revision"):
         return 0
     if field in ("spend", "wall_clock_s", "micromanager_spend"):
         return 0.0
@@ -126,7 +128,8 @@ def _default_for(field: str):
         return {"killed": 0, "survived": 0, "total": 0, "capped": False}
     if field == "planner_used":
         return False
-    if field in ("findings_filed", "known_failing_excluded", "named_tests"):
+    if field in ("findings_filed", "known_failing_excluded", "named_tests",
+                 "harness_cues_applied", "harness_lessons_added"):
         return []
     if field == "files_changed":
         return []

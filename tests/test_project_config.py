@@ -47,6 +47,10 @@ SPEC_KEYS = {
                      "scaffold_contracts", "coach_on_stall",
                      "adjudicate_counter_tests", "pre_review"},
     "state": {"min_free_mb"},
+    "harness": {"enabled", "dir", "capture_on", "max_cues_per_brief",
+                "max_active_adaptations", "min_confidence", "probe_window",
+                "auto_demote", "allow_micromanager_reflection",
+                "editable_surfaces"},
 }
 
 

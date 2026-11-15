@@ -34,8 +34,13 @@ from .edits import (
     FORMAT_WHOLE_FILE,
     parse_edits,
 )
-from .errors import Infra, Invalid, Refused
+from .errors import Infra, Invalid, Refused, Unsupported
 from .globs import escapes, matches_any, normalise
+from .harness_memory import (
+    EDITABLE_SURFACES,
+    sanitize_lesson_text,
+    validate_harness_proposal,
+)
 from .protocol import CmdAdapter
 from .state import utc_now, write_json
 
@@ -499,6 +504,14 @@ def _build_op_prompt(op: str, payload: dict) -> str:
             '{"summary": "...", "recommendations": [{"card_id": "...", "action": "..."}], '
             '"findings": [{"title": "...", "body": "..."}]}'
         ),
+        "reflect_harness": (
+            '{"summary": "...", "lessons": [{"title": "...", '
+            '"surface": "test_writer_guidance|implementer_guidance|planner_guidance|context_hints|micromanager_context", '
+            '"role": "planner|test_writer|implementer|micromanager", '
+            '"language": "*", "kind": "*", "failure_class": "", '
+            '"cue": "...", "lesson": "...", "evidence": "...", '
+            '"confidence": 0.75, "tags": ["..."], "proposed_patch": {}}]}'
+        ),
     }
     schema = schemas.get(op, "{}")
     body = json.dumps(payload, indent=2, ensure_ascii=False, default=str)
@@ -667,6 +680,7 @@ class Micromanager:
         card_dir: Path | str | None = None,
         mode: str = "active",
         feature_flags: dict[str, bool] | None = None,
+        harness_context: dict | None = None,
     ) -> None:
         self.backend = backend
         self.budget = budget or MicromanagerBudget()
@@ -677,6 +691,7 @@ class Micromanager:
         self.card_dir = Path(card_dir) if card_dir is not None else None
         self.mode = str(mode or "active").strip().lower()
         self.feature_flags = dict(feature_flags or {})
+        self.harness_context: dict = dict(harness_context or {})
 
     @property
     def enabled(self) -> bool:
@@ -742,6 +757,8 @@ class Micromanager:
             "context_contents": context_contents,
             "known_tests": list(known_tests) if known_tests is not None else [],
         }
+        if self.harness_context:
+            payload["harness_context"] = dict(self.harness_context)
         raw = self._call_backend("shape_and_plan", card.id, payload)
 
         verdict = str(raw.get("verdict", "")).strip()
@@ -942,6 +959,8 @@ class Micromanager:
             "failed_diff": failed_diff,
             "failure_output": failure_output,
         }
+        if self.harness_context:
+            payload["harness_context"] = dict(self.harness_context)
         raw = self._call_backend("coach", card.id, payload)
 
         # Reject if coaching tries to smuggle touches outside bounds.
@@ -1035,7 +1054,10 @@ class Micromanager:
             payload.get("card_id")
             or (payload.get("card") or {}).get("id", "")
         )
-        raw = self._call_backend(op, card_id, dict(payload))
+        req_payload = dict(payload)
+        if self.harness_context and "harness_context" not in req_payload:
+            req_payload["harness_context"] = dict(self.harness_context)
+        raw = self._call_backend(op, card_id, req_payload)
 
         nt, fb = self._effective_lists()
         card_touches = None
@@ -1105,6 +1127,114 @@ class Micromanager:
             findings=_normalise_findings(raw.get("findings")),
         )
 
+    # -- 6. reflect_harness ---------------------------------------------------
+
+    def reflect_harness(
+        self,
+        card,
+        contrast: dict,
+        active_overlay: dict,
+        index_md: str,
+        metrics: dict,
+        cfg=None,
+    ) -> dict:
+        """Reflect on a card's contrast evidence and propose sanitized harness adaptations."""
+        if not self.enabled or not self._feature_enabled("reflect_harness"):
+            return {}
+        if cfg is not None:
+            h_cfg = getattr(cfg, "harness", None)
+            if h_cfg is not None and not getattr(h_cfg, "allow_micromanager_reflection", True):
+                return {}
+
+        if isinstance(card, dict):
+            card_id = str(card.get("id") or card.get("card_id") or "")
+            card_payload = dict(card)
+        elif card is None:
+            card_id = ""
+            card_payload = {}
+        else:
+            card_id = str(getattr(card, "id", ""))
+            card_payload = card.as_dict() if hasattr(card, "as_dict") else {}
+
+        contrast_dict = dict(contrast or {})
+        if not card_id:
+            card_id = str(contrast_dict.get("card_id", ""))
+
+        payload = {
+            "card_id": card_id,
+            "card": card_payload,
+            "contrast": contrast_dict,
+            "active_overlay": dict(active_overlay or {}),
+            "index_md": str(index_md or ""),
+            "metrics": dict(metrics or {}),
+        }
+        if self.harness_context:
+            payload["harness_context"] = dict(self.harness_context)
+
+        try:
+            raw = self._call_backend("reflect_harness", card_id, payload)
+        except Unsupported:
+            return {}
+
+        if not isinstance(raw, dict) or not raw:
+            return {}
+
+        nt, fb = self._effective_lists(cfg=cfg)
+        h_cfg = getattr(cfg, "harness", None) if cfg is not None else None
+        allowed_surfaces = tuple(
+            getattr(h_cfg, "editable_surfaces", EDITABLE_SURFACES) or EDITABLE_SURFACES
+        )
+
+        if isinstance(raw.get("lessons"), list):
+            raw_lessons = raw["lessons"]
+        elif isinstance(raw.get("adaptations"), list):
+            raw_lessons = raw["adaptations"]
+        elif any(k in raw for k in ("surface", "cue", "lesson")):
+            raw_lessons = [raw]
+        else:
+            raw_lessons = []
+
+        cleaned_lessons: list[dict] = []
+        rejected: list[dict] = []
+        default_lang = str(contrast_dict.get("language") or "*")
+        default_kind = str(contrast_dict.get("kind") or "*")
+
+        for entry in raw_lessons:
+            if not isinstance(entry, dict):
+                rejected.append({"reason": "lesson entry is not an object", "raw": entry})
+                continue
+            pre_cleaned = dict(entry)
+            for txt_key in ("title", "cue", "lesson", "evidence"):
+                if txt_key in pre_cleaned and pre_cleaned[txt_key] is not None:
+                    pre_cleaned[txt_key] = _strip_edit_blocks(str(pre_cleaned[txt_key]))
+            if "proposed_patch" in pre_cleaned and pre_cleaned["proposed_patch"] is not None:
+                pre_cleaned["proposed_patch"] = _strip_edit_blocks_recursive(
+                    pre_cleaned["proposed_patch"]
+                )
+            cleaned, reason = validate_harness_proposal(
+                pre_cleaned,
+                allowed_surfaces=allowed_surfaces,
+                never_touch=nt,
+                forbidden_files=fb,
+                default_language=default_lang,
+                default_kind=default_kind,
+            )
+            if cleaned is None:
+                rejected.append({"reason": reason, "raw": entry})
+            else:
+                cleaned["source"] = "micromanager"
+                cleaned_lessons.append(cleaned)
+
+        summary = sanitize_lesson_text(
+            _strip_edit_blocks(str(raw.get("summary", ""))),
+            max_len=400,
+        )
+        return {
+            "summary": summary,
+            "lessons": cleaned_lessons,
+            "rejected": rejected,
+        }
+
 
 def _valid_production_scaffold(body: str) -> bool:
     """Allow todo!/unimplemented! stubs or pure type/module declarations without fn bodies."""
@@ -1115,6 +1245,16 @@ def _valid_production_scaffold(body: str) -> bool:
     if re.search(r"\bfn\b", cleaned):
         return False
     return bool(re.search(r"\b(?:struct|enum|trait|type|mod|use)\b", cleaned))
+
+
+def _strip_edit_blocks_recursive(value):
+    if isinstance(value, str):
+        return _strip_edit_blocks(value)
+    if isinstance(value, list):
+        return [_strip_edit_blocks_recursive(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _strip_edit_blocks_recursive(v) for k, v in value.items()}
+    return value
 
 
 def _normalise_findings(raw_findings) -> list[dict]:

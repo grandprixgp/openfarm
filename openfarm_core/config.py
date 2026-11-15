@@ -7,6 +7,7 @@ silently ignored key is a gate whose meaning the operator thinks they changed.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import os
 import re
@@ -21,7 +22,7 @@ CONFIG_PATH = Path(".openfarm") / "config.toml"
 #: Tables a repo may have at the top level of the config.
 KNOWN_TABLES = {
     "project", "adapters", "model", "policy", "eligibility", "brief",
-    "runner", "budget", "gates", "cards", "micromanager", "state",
+    "runner", "budget", "gates", "cards", "micromanager", "state", "harness",
 }
 
 _TABLE_KEYS = {
@@ -56,6 +57,10 @@ _TABLE_KEYS = {
                      "scaffold_contracts", "coach_on_stall",
                      "adjudicate_counter_tests", "pre_review"},
     "state": {"min_free_mb"},
+    "harness": {"enabled", "dir", "capture_on", "max_cues_per_brief",
+                "max_active_adaptations", "min_confidence", "probe_window",
+                "auto_demote", "allow_micromanager_reflection",
+                "editable_surfaces"},
 }
 _ROLE_MODEL_KEYS = {"model", "temperature", "vary_seed"}
 _EXTRA_GATE_KEYS = {"name", "run", "via", "paths", "on_fail"}
@@ -209,6 +214,52 @@ class MicromanagerConfig:
                    if slot == "auth_file" and getattr(self, slot) is not None
                    else getattr(self, slot))
             for slot in self.__slots__
+        }
+
+
+VALID_HARNESS_CAPTURE_ON = ("retry_recovery", "fail", "counter_fail", "pass")
+VALID_HARNESS_SURFACES = (
+    "test_writer_guidance",
+    "implementer_guidance",
+    "planner_guidance",
+    "context_hints",
+    "micromanager_context",
+)
+
+
+@dataclasses.dataclass
+class HarnessConfig:
+    """Settings for the recursive harness efficiency subsystem."""
+
+    enabled: bool = True
+    dir: str = ""
+    capture_on: tuple[str, ...] = ("retry_recovery", "fail", "counter_fail", "pass")
+    max_cues_per_brief: int = 4
+    max_active_adaptations: int = 8
+    min_confidence: float = 0.55
+    probe_window: int = 3
+    auto_demote: bool = True
+    allow_micromanager_reflection: bool = True
+    editable_surfaces: tuple[str, ...] = (
+        "test_writer_guidance",
+        "implementer_guidance",
+        "planner_guidance",
+        "context_hints",
+        "micromanager_context",
+    )
+
+    def as_dict(self) -> dict:
+        return {
+            "enabled": self.enabled,
+            "dir": self.dir,
+            "capture_on": list(self.capture_on),
+            "max_cues_per_brief": self.max_cues_per_brief,
+            "max_active_adaptations": self.max_active_adaptations,
+            "min_confidence": self.min_confidence,
+            "probe_window": self.probe_window,
+            "auto_demote": self.auto_demote,
+            "allow_micromanager_reflection": self.allow_micromanager_reflection,
+            "editable_surfaces": list(self.editable_surfaces),
         }
 
 
@@ -436,6 +487,77 @@ class Config:
         self.micromanager_enabled = (
             self.micromanager_adapter != "off"
             and self.micromanager.mode != "off"
+        )
+        self.harness = self._parse_harness(self._table("harness"))
+
+    def _parse_harness(self, h: dict) -> HarnessConfig:
+        enabled = _as_bool(h.get("enabled"), "[harness] enabled", True)
+        raw_dir = h.get("dir", "")
+        if raw_dir is None:
+            raw_dir = ""
+        if not isinstance(raw_dir, str):
+            raise ConfigError("[harness] dir: expected a string")
+        if "\x00" in raw_dir:
+            raise ConfigError("[harness] dir: invalid null byte")
+
+        if "capture_on" in h and h["capture_on"] is not None:
+            raw_capture = _as_str_list(h["capture_on"], "[harness] capture_on")
+            for item in raw_capture:
+                if item not in VALID_HARNESS_CAPTURE_ON:
+                    raise ConfigError(
+                        f"[harness] capture_on: {item!r} is not one of "
+                        f"{', '.join(VALID_HARNESS_CAPTURE_ON)}"
+                    )
+            capture_on = tuple(dict.fromkeys(raw_capture))
+        else:
+            capture_on = VALID_HARNESS_CAPTURE_ON
+
+        max_cues = _nonneg_int(
+            h.get("max_cues_per_brief"), "[harness] max_cues_per_brief", 4
+        )
+        max_active = _nonneg_int(
+            h.get("max_active_adaptations"), "[harness] max_active_adaptations", 8
+        )
+        min_confidence = _as_float(
+            h.get("min_confidence"), "[harness] min_confidence", 0.55
+        )
+        if not (0.0 <= min_confidence <= 1.0):
+            raise ConfigError("[harness] min_confidence: must be between 0.0 and 1.0")
+        probe_window = _as_int(h.get("probe_window"), "[harness] probe_window", 3)
+        if probe_window < 1:
+            raise ConfigError("[harness] probe_window: must be >= 1")
+        auto_demote = _as_bool(h.get("auto_demote"), "[harness] auto_demote", True)
+        allow_mm_refl = _as_bool(
+            h.get("allow_micromanager_reflection"),
+            "[harness] allow_micromanager_reflection",
+            True,
+        )
+
+        if "editable_surfaces" in h and h["editable_surfaces"] is not None:
+            raw_surfaces = _as_str_list(
+                h["editable_surfaces"], "[harness] editable_surfaces"
+            )
+            for item in raw_surfaces:
+                if item not in VALID_HARNESS_SURFACES:
+                    raise ConfigError(
+                        f"[harness] editable_surfaces: {item!r} is not one of "
+                        f"{', '.join(VALID_HARNESS_SURFACES)}"
+                    )
+            editable_surfaces = tuple(dict.fromkeys(raw_surfaces))
+        else:
+            editable_surfaces = VALID_HARNESS_SURFACES
+
+        return HarnessConfig(
+            enabled=enabled,
+            dir=raw_dir,
+            capture_on=capture_on,
+            max_cues_per_brief=max_cues,
+            max_active_adaptations=max_active,
+            min_confidence=min_confidence,
+            probe_window=probe_window,
+            auto_demote=auto_demote,
+            allow_micromanager_reflection=allow_mm_refl,
+            editable_surfaces=editable_surfaces,
         )
 
     def _parse_micromanager(self, mm: dict) -> MicromanagerConfig:

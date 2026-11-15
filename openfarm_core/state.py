@@ -93,6 +93,11 @@ class StateDir:
     def check_dir(self, card_id: str) -> Path:
         return self.checks / _safe_id(card_id, "card_id")
 
+    def harness(self, tag: str = "") -> Path:
+        if tag == "":
+            return self.root / "harness"
+        return self.root / "harness" / _safe_id(tag, "harness tag")
+
     def create_run(self, run_id: str) -> Path:
         path = self.run_dir(run_id)
         (path / "telemetry").mkdir(parents=True, exist_ok=True)

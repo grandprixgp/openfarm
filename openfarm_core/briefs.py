@@ -172,7 +172,7 @@ def _merged_context_files(card: Card, extra: list[str] | None) -> list[str]:
     return list(dict.fromkeys(normalise(p) for p in merged if p))
 
 
-def planner_brief(card: Card, book: BriefBook) -> Brief:
+def planner_brief(card: Card, book: BriefBook, harness_guidance: str = "") -> Brief:
     parts = [ROLE_HEADERS["planner"], "", _card_section(card), "",
              "Files in your touches, by signature:"]
     for path in card.touches:
@@ -181,6 +181,9 @@ def planner_brief(card: Card, book: BriefBook) -> Brief:
         parts.append(f"\n### {path}\n{book.signatures(path, _EXPECTED_PACK)}")
     if card.reference and not book.is_hidden(card.reference):
         parts.append(f"\nReference (do not copy wholesale): {card.reference}")
+    if harness_guidance and harness_guidance.strip():
+        parts.append("\nHarness adaptations (data):\n"
+                     + fence(harness_guidance, "harness adaptations"))
     return Brief("planner", "\n".join(parts))
 
 
@@ -188,7 +191,8 @@ def test_writer_brief(card: Card, book: BriefBook, pack,
                       conventions: str = "", attempt: int = 1,
                       previous_failure: str = "",
                       guidance: str = "",
-                      context_files: list[str] | None = None) -> Brief:
+                      context_files: list[str] | None = None,
+                      harness_guidance: str = "") -> Brief:
     parts = [ROLE_HEADERS["test_writer"], "", _card_section(card), ""]
 
     classified = pack.classify_paths(card.touches) if hasattr(pack, "classify_paths") else {}
@@ -262,6 +266,10 @@ def test_writer_brief(card: Card, book: BriefBook, pack,
     if guidance:
         parts.append("\nCoaching guidance (data):\n" + fence(guidance, "guidance"))
 
+    if harness_guidance and harness_guidance.strip():
+        parts.append("\nHarness adaptations (data):\n"
+                     + fence(harness_guidance, "harness adaptations"))
+
     if attempt > 1 and previous_failure:
         parts.append("\nYour previous attempt failed. Its output:\n"
                      + fence(previous_failure, "failure output"))
@@ -283,7 +291,8 @@ def implementer_brief(card: Card, book: BriefBook, frozen_tests: dict[str, str],
                       step: dict | None = None,
                       guidance: str = "",
                       step_context: str = "",
-                      context_files: list[str] | None = None) -> Brief:
+                      context_files: list[str] | None = None,
+                      harness_guidance: str = "") -> Brief:
     parts = [ROLE_HEADERS["implementer"], "", _card_section(card), ""]
 
     if attempt == 1:
@@ -347,6 +356,10 @@ def implementer_brief(card: Card, book: BriefBook, frozen_tests: dict[str, str],
 
     if guidance:
         parts.append("\nCoaching guidance (data):\n" + fence(guidance, "guidance"))
+
+    if harness_guidance and harness_guidance.strip():
+        parts.append("\nHarness adaptations (data):\n"
+                     + fence(harness_guidance, "harness adaptations"))
 
     if step:
         parts.append(f"\nCurrent step {step.get('n')}: {step.get('does')}\n"

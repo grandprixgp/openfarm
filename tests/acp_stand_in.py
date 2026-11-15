@@ -263,6 +263,88 @@ def main() -> int:
                         "missed_clause": "",
                         "findings": [],
                     }
+                elif "Operation: reflect_harness" in prompt_text:
+                    data_payload = {}
+                    marker_start = "--- BEGIN DATA ---"
+                    marker_end = "--- END DATA ---"
+                    if marker_start in prompt_text and marker_end in prompt_text:
+                        raw_json = (
+                            prompt_text.split(marker_start, 1)[1]
+                            .split(marker_end, 1)[0]
+                            .strip()
+                        )
+                        try:
+                            data_payload = json.loads(raw_json)
+                        except ValueError:
+                            data_payload = {}
+                    contrast = data_payload.get("contrast") or {}
+                    card_id = str(
+                        data_payload.get("card_id") or contrast.get("card_id") or "CARD"
+                    )
+                    outcome_kind = str(contrast.get("outcome_kind") or "retry_recovery")
+                    failure_class = str(contrast.get("failure_class") or "type-mismatch")
+                    lang = str(contrast.get("language") or "rust")
+                    kind = str(contrast.get("kind") or "pinned-bugfix")
+                    if outcome_kind == "counter_fail":
+                        surface = "implementer_guidance"
+                        role = "implementer"
+                        cue = (
+                            f"Guard edge-case and boundary inputs before returning in {kind} changes "
+                            f"so counter-tests cannot trigger uncaught branches."
+                        )
+                        lesson = f"Card {card_id} failed counter-test verification ({failure_class})."
+                        conf = 0.78
+                    elif outcome_kind == "retry_recovery":
+                        surface = "implementer_guidance"
+                        role = "implementer"
+                        cue = (
+                            f"Verify {failure_class} constraints and exact return variants on attempt 1 "
+                            f"before submitting edits."
+                        )
+                        lesson = (
+                            f"Card {card_id} hit {failure_class} on attempt 1 and recovered on retry."
+                        )
+                        conf = 0.84
+                    elif outcome_kind == "fail":
+                        surface = "planner_guidance"
+                        role = "planner"
+                        cue = (
+                            f"Break down {kind} cards encountering {failure_class} into smaller explicit "
+                            f"steps with verified helper signatures."
+                        )
+                        lesson = f"Card {card_id} failed with {failure_class}; finer scoping helps."
+                        conf = 0.72
+                    else:
+                        surface = "context_hints"
+                        role = "*"
+                        cue = f"Keep {kind} changes minimal and check existing module conventions first."
+                        lesson = f"Card {card_id} passed cleanly."
+                        conf = 0.68
+                    answer = {
+                        "summary": f"Reflected on {outcome_kind} ({failure_class}) for {card_id}",
+                        "lessons": [
+                            {
+                                "title": f"Reflect {outcome_kind}: {failure_class}",
+                                "surface": surface,
+                                "role": role,
+                                "language": lang,
+                                "kind": kind,
+                                "failure_class": failure_class,
+                                "cue": cue,
+                                "lesson": lesson,
+                                "evidence": str(
+                                    (contrast.get("evidence_pair") or {}).get("delta", "")
+                                ),
+                                "confidence": conf,
+                                "tags": (
+                                    [outcome_kind, failure_class]
+                                    if failure_class
+                                    else [outcome_kind]
+                                ),
+                                "proposed_patch": {surface: cue},
+                            }
+                        ],
+                    }
                 else:
                     answer = {
                         "echo": prompt_text,
