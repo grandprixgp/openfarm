@@ -10,12 +10,16 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
 from ..errors import Infra, Invalid, Refused
+
+_RETRYABLE_HTTP_CODES = frozenset({429, 502, 503, 504})
+_MAX_RETRY_DELAY_S = 30.0
 
 
 class Completion:
@@ -50,15 +54,52 @@ def _origin(url: str) -> str:
 
 
 def _within(url: str, allowed: list[str]) -> bool:
-    """True when `url` is one of the allowed endpoints or sits under one."""
-    target = url.rstrip("/")
+    """True when `url` is one of the allowed endpoints or sits strictly under one."""
+    target = urllib.parse.urlsplit(url)
+    if not target.scheme or not target.netloc or target.fragment:
+        return False
+    if "\\" in target.path:
+        return False
+    target_segs = [seg for seg in target.path.split("/") if seg]
+    if any(urllib.parse.unquote(seg) in (".", "..") for seg in target_segs):
+        return False
+    target_scheme = target.scheme.lower()
+    target_netloc = target.netloc.lower()
+
     for entry in allowed:
-        base = entry.rstrip("/")
-        if target == base:
-            return True
-        if target.startswith(base + "/"):
+        base = urllib.parse.urlsplit(entry)
+        if not base.scheme or not base.netloc or base.fragment:
+            continue
+        if target_scheme != base.scheme.lower():
+            continue
+        if target_netloc != base.netloc.lower():
+            continue
+        if target.query and target.query != base.query:
+            continue
+        base_segs = [seg for seg in base.path.split("/") if seg]
+        if len(target_segs) >= len(base_segs) and target_segs[:len(base_segs)] == base_segs:
             return True
     return False
+
+
+def _retry_delay(attempt: int, headers=None) -> float:
+    if headers is not None:
+        raw = headers.get("Retry-After")
+        if raw is not None:
+            try:
+                return min(_MAX_RETRY_DELAY_S, max(0.0, float(str(raw).strip())))
+            except ValueError:
+                pass
+    return min(_MAX_RETRY_DELAY_S, 0.5 * (2 ** attempt))
+
+
+def _safe_int(value) -> int:
+    if value is None or isinstance(value, bool):
+        return 0
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 
 class _AllowlistRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -83,7 +124,8 @@ class OpenAICompatibleBackend:
 
     def __init__(self, endpoint: str, allowed_endpoints: list[str],
                  key_file: Path | None = None, timeout_s: float = 300.0,
-                 cost_per_1k_in: float = 0.0, cost_per_1k_out: float = 0.0) -> None:
+                 cost_per_1k_in: float = 0.0, cost_per_1k_out: float = 0.0,
+                 retries: int = 2, sleep_fn=None) -> None:
         if not endpoint:
             raise Invalid("no-endpoint", "the model backend needs an endpoint")
         if not allowed_endpoints:
@@ -101,6 +143,8 @@ class OpenAICompatibleBackend:
         self.timeout_s = timeout_s
         self.cost_per_1k_in = cost_per_1k_in
         self.cost_per_1k_out = cost_per_1k_out
+        self.retries = max(0, int(retries))
+        self._sleep = sleep_fn if sleep_fn is not None else time.sleep
         self._opener = urllib.request.build_opener(
             _AllowlistRedirectHandler(self.allowed_endpoints))
 
@@ -148,17 +192,28 @@ class OpenAICompatibleBackend:
                      "Authorization": f"Bearer {self._key()}"},
             method="POST")
 
-        import time
         started = time.monotonic()
-        try:
-            with self._opener.open(request, timeout=self.timeout_s) as response:
-                body = response.read().decode("utf-8", errors="replace")
-        except urllib.error.HTTPError as exc:
-            raise Infra("http-error", f"the endpoint answered {exc.code}") from exc
-        except urllib.error.URLError as exc:
-            raise Infra("endpoint-unreachable", f"{exc.reason}") from exc
-        except TimeoutError as exc:
-            raise Infra("timeout", "the endpoint did not answer in time") from exc
+        body = ""
+        for attempt in range(self.retries + 1):
+            try:
+                with self._opener.open(request, timeout=self.timeout_s) as response:
+                    body = response.read().decode("utf-8", errors="replace")
+                break
+            except urllib.error.HTTPError as exc:
+                if exc.code in _RETRYABLE_HTTP_CODES and attempt < self.retries:
+                    self._sleep(_retry_delay(attempt, exc.headers))
+                    continue
+                raise Infra("http-error", f"the endpoint answered {exc.code}") from exc
+            except urllib.error.URLError as exc:
+                if attempt < self.retries:
+                    self._sleep(_retry_delay(attempt))
+                    continue
+                raise Infra("endpoint-unreachable", f"{exc.reason}") from exc
+            except TimeoutError as exc:
+                if attempt < self.retries:
+                    self._sleep(_retry_delay(attempt))
+                    continue
+                raise Infra("timeout", "the endpoint did not answer in time") from exc
         latency = time.monotonic() - started
 
         try:
@@ -170,9 +225,10 @@ class OpenAICompatibleBackend:
                           "the endpoint did not answer an OpenAI-shaped completion"
                           ) from exc
 
-        usage = answer.get("usage") or {}
-        tokens_in = int(usage.get("prompt_tokens", 0))
-        tokens_out = int(usage.get("completion_tokens", 0))
+        raw_usage = answer.get("usage")
+        usage = raw_usage if isinstance(raw_usage, dict) else {}
+        tokens_in = _safe_int(usage.get("prompt_tokens"))
+        tokens_out = _safe_int(usage.get("completion_tokens"))
         cost = (tokens_in / 1000.0 * self.cost_per_1k_in
                 + tokens_out / 1000.0 * self.cost_per_1k_out)
         return Completion(
@@ -267,6 +323,14 @@ def open_backend(cfg, script_path: Path | None = None):
         return ScriptedBackend(load_script(script_path))
     if cfg.model_adapter in ("scripted", "stub"):
         return ScriptedBackend()
+    if cfg.model_adapter.startswith("cmd:"):
+        from ..protocol import CmdModelBackend
+        return CmdModelBackend(
+            cfg.model_adapter,
+            cfg.repo,
+            cost_per_1k_in=getattr(cfg, "cost_per_1k_in", 0.0),
+            cost_per_1k_out=getattr(cfg, "cost_per_1k_out", 0.0),
+        )
     return OpenAICompatibleBackend(
         endpoint=cfg.endpoint,
         allowed_endpoints=cfg.allowed_endpoints,

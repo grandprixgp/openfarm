@@ -35,7 +35,6 @@ INFRA_PATTERNS = (
     r"error: failed to download",
     r"failed to clone into",
     r"Blocking waiting for file lock",
-    r"linker command failed",
     r"internal compiler error",
     r"network failure",
     r"connection refused",
@@ -124,8 +123,8 @@ class DirectRunner:
             exit_code = completed.returncode
             timed_out = False
         except subprocess.TimeoutExpired as exc:
-            stdout = (exc.stdout or "") if isinstance(exc.stdout, str) else ""
-            stderr = (exc.stderr or "") if isinstance(exc.stderr, str) else ""
+            stdout = _decode_output(exc.stdout)
+            stderr = _decode_output(exc.stderr)
             exit_code = -1
             timed_out = True
         except OSError as exc:
@@ -150,10 +149,14 @@ class DirectRunner:
         """
         if exit_code == 0:
             return PASS
+        if exit_code == -9:
+            return INFRA
         combined = f"{stdout}\n{stderr}"
         for pattern in INFRA_PATTERNS:
             if re.search(pattern, combined):
                 return INFRA
+        if exit_code in (-6, -11):
+            return FAIL if kind == "test" else INFRA
         return FAIL
 
     def _save(self, kind: str, stdout: str,
@@ -179,6 +182,7 @@ class CmdRunner:
         from ..protocol import CmdAdapter
         self.adapter = CmdAdapter(spec, repo, timeout_s=timeout_s)
         self.repo = Path(repo)
+        self.timeout_s = timeout_s
 
     def hello(self) -> dict:
         result = self.adapter.hello("runner", {"exec"})
@@ -217,6 +221,14 @@ class CmdRunner:
         if result.stderr_path and result.stderr_path.exists():
             err = result.stderr_path.read_text(errors="replace")
         return out, err
+
+
+def _decode_output(data) -> str:
+    if data is None:
+        return ""
+    if isinstance(data, bytes):
+        return data.decode("utf-8", errors="replace")
+    return str(data)
 
 
 def open_runner(cfg, worktree: Path, output_dir: Path | None = None):

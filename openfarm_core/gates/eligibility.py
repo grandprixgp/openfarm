@@ -10,20 +10,32 @@ globs are the backstop.
 
 from __future__ import annotations
 
+import tomllib
 from pathlib import Path
 
 from ..cards import Card
-from ..globs import first_match, matches_any, normalise
+from ..globs import escapes, first_match, matches_any, normalise
 
 #: Categories the diet allows at all.
-KNOWN_CATEGORIES = ("test-backfill", "pattern", "pinned-bugfix", "mechanical",
-                    "small-feature")
+KNOWN_CATEGORIES = (
+    "test-backfill",
+    "pattern",
+    "pinned-bugfix",
+    "mechanical",
+    "small-feature",
+    "feature",
+    "refactor",
+    "integration",
+    "port",
+)
 
 #: Done text that promises rather than states, and so can't be tested.
 VAGUE_WORDS = ("handle", "properly", "robust")
 
 #: Ways of writing a done text that leaves design work to the model.
 DESIGN_WORDS = ("decide how", "design", "choose an approach", "figure out how")
+
+_SOURCE_CONTAINERS = ("src", "tests", "benches", "examples")
 
 
 class EligibilityResult:
@@ -43,6 +55,46 @@ class EligibilityResult:
         return {"eligible": self.ok, "failures": list(self.failures)}
 
 
+def _check_path_field(entry: str, field_label: str, cfg, root: Path | None,
+                      result: EligibilityResult,
+                      never_rule: str = "never-touch",
+                      forbidden_rule: str = "forbidden-file") -> None:
+    if not entry:
+        return
+    if escapes(entry):
+        result.fail("path-escape",
+                    f"{field_label} {entry!r} climbs above the repository root")
+        return
+
+    norm = normalise(entry)
+    pattern = first_match(norm, cfg.never_touch)
+    if pattern:
+        result.fail(never_rule,
+                    f"{field_label} {entry!r} matches the never-touch glob "
+                    f"{pattern!r}")
+    if matches_any(norm, cfg.forbidden_files):
+        result.fail(forbidden_rule,
+                    f"{field_label} {entry!r} is a forbidden path")
+
+    if root is not None:
+        target = (root / norm).resolve()
+        if not target.is_relative_to(root):
+            result.fail("path-escape",
+                        f"{field_label} {entry!r} resolves outside the worktree")
+            return
+        resolved_rel = normalise(target.relative_to(root).as_posix())
+        if resolved_rel != norm:
+            res_pattern = first_match(resolved_rel, cfg.never_touch)
+            if res_pattern:
+                result.fail(never_rule,
+                            f"{field_label} {entry!r} resolves to {resolved_rel!r}, "
+                            f"which matches never-touch glob {res_pattern!r}")
+            if matches_any(resolved_rel, cfg.forbidden_files):
+                result.fail(forbidden_rule,
+                            f"{field_label} {entry!r} resolves to {resolved_rel!r}, "
+                            f"which is a forbidden path")
+
+
 def check_eligibility(card: Card, cfg, deps_done: bool = True,
                       card_count: int | None = None,
                       known_failing: list[str] | None = None,
@@ -50,6 +102,7 @@ def check_eligibility(card: Card, cfg, deps_done: bool = True,
     """Every rule, in the order that catches the cheapest thing first."""
     result = EligibilityResult()
     known = list(cfg.known_failing if known_failing is None else known_failing)
+    root = Path(worktree).resolve() if worktree is not None else None
 
     # 1. Seam prefixes in touches. Cheap and certain, and normalised first so
     # `./seam:gestures` cannot slip past a plain startswith.
@@ -61,7 +114,7 @@ def check_eligibility(card: Card, cfg, deps_done: bool = True,
                             f"touches entry {entry!r} starts with the refused "
                             f"prefix {prefix!r}")
 
-    # 2. Category.
+    # 2. Category & frontier estimate validity.
     if not card.category:
         result.fail("category", "the card declares no category")
     elif card.category not in KNOWN_CATEGORIES:
@@ -70,6 +123,10 @@ def check_eligibility(card: Card, cfg, deps_done: bool = True,
     elif card.category not in cfg.categories:
         result.fail("category",
                     f"{card.category!r} is not enabled in this repository's config")
+
+    if not getattr(card, "frontier_estimate_valid", True):
+        result.fail("frontier-estimate",
+                    "the card's frontier_estimate is invalid")
 
     # 3. Shape: one unit, a handful of files, at least one touch.
     if not card.touches:
@@ -83,31 +140,51 @@ def check_eligibility(card: Card, cfg, deps_done: bool = True,
         result.fail("max-units",
                     f"touches spans {len(units)} units ({', '.join(sorted(units))}), "
                     f"over the limit of {cfg.max_units}")
+    if card.unit and worktree is not None and Path(worktree).is_dir():
+        derived = derive_cargo_unit(card.touches, Path(worktree))
+        if derived and card.unit != derived:
+            result.fail(
+                "unit-mismatch",
+                f"card declares unit {card.unit!r}, but Cargo.toml at that unit "
+                f"names package {derived!r}")
 
-    # 4. Never-touch and forbidden paths, against touches.
+    # 4. Path safety (escapes, symlinks, never-touch, forbidden) on all path fields.
     for entry in card.touches:
-        pattern = first_match(entry, cfg.never_touch)
-        if pattern:
-            result.fail("never-touch",
-                        f"touches entry {entry!r} matches the never-touch glob "
-                        f"{pattern!r}")
-        if matches_any(entry, cfg.forbidden_files):
-            result.fail("forbidden-file",
-                        f"touches entry {entry!r} is a forbidden path")
+        _check_path_field(entry, "touches entry", cfg, root, result)
 
-    # 5. The reference example, checked against never-touch too.
+    # 5. The reference example, checked against never-touch/forbidden/escape too.
     if card.reference:
-        pattern = first_match(card.reference, cfg.never_touch)
-        if pattern:
-            result.fail("reference-never-touch",
-                        f"the reference {card.reference!r} is on the never-touch "
-                        f"list ({pattern!r})")
-        if matches_any(card.reference, cfg.forbidden_files):
-            result.fail("reference-forbidden",
-                        f"the reference {card.reference!r} is a forbidden path")
+        _check_path_field(card.reference, "the reference", cfg, root, result,
+                          never_rule="reference-never-touch",
+                          forbidden_rule="reference-forbidden")
     elif card.category in cfg.require_reference:
         result.fail("reference-required",
                     f"a {card.category} card needs a reference example")
+
+    for test in card.tests:
+        if test.file:
+            _check_path_field(test.file, f"test {test.name!r} file", cfg, root, result)
+
+    for entry in card.test_edits:
+        _check_path_field(entry, "test_edits entry", cfg, root, result)
+
+    context_files = getattr(card, "context_files", None)
+    if context_files is None:
+        context_files = card.fields.get("context_files", [])
+    context_files = [str(p) for p in (context_files or [])]
+    max_context = getattr(cfg, "max_context_files", 8)
+    if len(context_files) > max_context:
+        result.fail("max-context-files",
+                    f"{len(context_files)} context_files entries, over the limit of "
+                    f"{max_context}")
+    for entry in context_files:
+        _check_path_field(entry, "context_files entry", cfg, root, result)
+
+    type_changes = bool(getattr(card, "type_changes",
+                                card.fields.get("type_changes", False)))
+    if type_changes and not getattr(cfg, "allow_type_changes", True):
+        result.fail("type-changes",
+                    "type_changes is not enabled in this repository's config")
 
     # 6. Named tests. A mechanical card is a compiler-guided edit, and the existing
     # suite judging it is the point; every other category must name its tests.
@@ -132,11 +209,12 @@ def check_eligibility(card: Card, cfg, deps_done: bool = True,
     if not deps_done:
         result.fail("deps", "a dependency is not done")
 
-    # 9. Pilot rules: no new symbols unless declared, and Rust tests in files.
+    # 9. Pilot & v0.4 rules: no new symbols unless declared, and Rust tests in files.
     if card.new_symbols and card.category in ("pinned-bugfix", "test-backfill"):
         result.fail("new-symbols",
                     "a pinned-bugfix or test-backfill card may not declare new "
-                    "symbols: only pattern, mechanical and small-feature may")
+                    "symbols: only pattern, mechanical, small-feature, feature, "
+                    "refactor, integration and port may")
     if cfg.rust_tests_in_separate_files and "rust" in cfg.languages:
         for test in card.tests:
             if test.file and not _is_integration_test_file(test.file):
@@ -144,7 +222,11 @@ def check_eligibility(card: Card, cfg, deps_done: bool = True,
                     "rust-tests-in-separate-files",
                     f"test {test.name!r} is declared in {test.file!r}; pilot tests "
                     f"go in a crate's tests/ folder")
-    if card.new_symbols and len(card.touches) > 1:
+    allow_multi_new_symbols = type_changes or (
+        getattr(cfg, "micromanager_adapter", "off") != "off"
+        and getattr(getattr(cfg, "micromanager", None), "scaffold_contracts", False)
+    )
+    if card.new_symbols and len(card.touches) > 1 and not allow_multi_new_symbols:
         result.fail(
             "new-symbols-touches",
             "a card that declares new symbols must touch exactly one file, because "
@@ -196,9 +278,10 @@ def _units_of(touches: list[str], worktree=None) -> set[str]:
     first path segment would make every workspace crate one unit and let a card span
     three crates at `max_units = 1`.
     """
-    from pathlib import Path
-
     units: set[str] = set()
+    base = Path(worktree) if worktree is not None else None
+    has_tree = base is not None and base.is_dir()
+
     for entry in touches:
         path = normalise(entry)
         parts = [part for part in path.split("/") if part and part != "**"]
@@ -206,31 +289,53 @@ def _units_of(touches: list[str], worktree=None) -> set[str]:
             units.add(".")
             continue
 
-        # A file in the crate root is that crate; a file under src/ or tests/ belongs
-        # to the crate those directories sit in.
-        directory = parts[:-1]
-        while directory and directory[-1] in ("src", "tests", "benches",
-                                              "examples"):
-            directory = directory[:-1]
+        raw_dir = parts[:-1]
+        if has_tree and base is not None:
+            found = None
+            for depth in range(len(raw_dir), -1, -1):
+                candidate = base / "/".join(raw_dir[:depth]) if depth > 0 else base
+                if (candidate / "Cargo.toml").exists() or (
+                        candidate / "package.json").exists():
+                    found = "/".join(raw_dir[:depth]) if depth > 0 else "."
+                    break
+            if found is not None:
+                units.add(found)
+                continue
+
+        directory = list(raw_dir)
+        for idx, seg in enumerate(directory):
+            if seg in _SOURCE_CONTAINERS:
+                directory = directory[:idx]
+                break
         if not directory:
             units.add(".")
             continue
-
-        # Where the tree is readable, walk up to the crate root by its Cargo.toml,
-        # so `crates/a/src/deep/x.rs` and `crates/a/tests/y.rs` are one unit.
-        if worktree is not None:
-            base = Path(worktree)
-            for depth in range(len(directory), 0, -1):
-                candidate = base / "/".join(directory[:depth])
-                if (candidate / "Cargo.toml").exists() or \
-                        (candidate / "package.json").exists():
-                    units.add("/".join(directory[:depth]))
-                    break
-            else:
-                units.add("/".join(directory))
-            continue
         units.add("/".join(directory))
     return units or {"."}
+
+
+def derive_cargo_unit(touches: list[str], worktree: Path | None) -> str:
+    """Read `[package].name` from the crate's Cargo.toml for single-unit touches."""
+    if worktree is None or not touches:
+        return ""
+    base = Path(worktree)
+    if not base.is_dir():
+        return ""
+    units = _units_of(touches, base)
+    if len(units) != 1:
+        return ""
+    unit_dir = next(iter(units))
+    manifest = (base / "Cargo.toml") if unit_dir == "." else (base / unit_dir / "Cargo.toml")
+    if not manifest.is_file():
+        return ""
+    try:
+        data = tomllib.loads(manifest.read_text(errors="replace"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return ""
+    package = data.get("package")
+    if not isinstance(package, dict):
+        return ""
+    return str(package.get("name") or "").strip()
 
 
 def _is_integration_test_file(path: str) -> bool:

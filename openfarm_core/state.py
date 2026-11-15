@@ -12,7 +12,7 @@ import os
 import shutil
 from pathlib import Path
 
-from .errors import Infra
+from .errors import Infra, Invalid
 
 SCHEMA_VERSION = 1
 
@@ -82,13 +82,16 @@ class StateDir:
     # -- run and card folders -------------------------------------------------
 
     def run_dir(self, run_id: str) -> Path:
-        return self.runs / run_id
+        return self.runs / _safe_id(run_id, "run_id")
 
     def card_dir(self, card_id: str, run_id: str) -> Path:
-        return self.cards / card_id / run_id
+        card = _safe_id(card_id, "card_id")
+        if run_id == "":
+            return self.cards / card
+        return self.cards / card / _safe_id(run_id, "run_id")
 
     def check_dir(self, card_id: str) -> Path:
-        return self.checks / card_id
+        return self.checks / _safe_id(card_id, "card_id")
 
     def create_run(self, run_id: str) -> Path:
         path = self.run_dir(run_id)
@@ -96,8 +99,10 @@ class StateDir:
         return path
 
     def create_card(self, card_id: str, run_id: str) -> Path:
+        _safe_id(run_id, "run_id")
         path = self.card_dir(card_id, run_id)
-        for sub in ("frozen", "briefs", "responses", "edits", "gates", "partial"):
+        for sub in ("frozen", "briefs", "responses", "edits", "gates", "partial",
+                    "micromanager", "attempts"):
             (path / sub).mkdir(parents=True, exist_ok=True)
         return path
 
@@ -186,6 +191,24 @@ class StateDir:
         except OSError as exc:
             raise Infra("state-dir", f"cannot read free space: {exc}") from exc
         return usage.free
+
+    def check_disk_space(self, min_free_mb: int) -> int:
+        free = self.free_bytes()
+        if min_free_mb > 0 and free < min_free_mb * 1024 * 1024:
+            free_mb = free / (1024 * 1024)
+            raise Infra(
+                "disk-full",
+                f"state dir has {free_mb:.1f} MiB free, below {min_free_mb} MiB",
+            )
+        return free
+
+
+def _safe_id(name: str, what: str) -> str:
+    if not isinstance(name, str) or not name:
+        raise Invalid("bad-id", f"{what} must not be empty")
+    if "/" in name or "\\" in name or "\x00" in name or ".." in name or name.startswith("."):
+        raise Invalid("bad-id", f"{what} {name!r} is not a safe identifier")
+    return name
 
 
 def _safe(name: str) -> str:

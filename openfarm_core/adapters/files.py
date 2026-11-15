@@ -28,7 +28,7 @@ import shutil
 import tomllib
 from pathlib import Path
 
-from ..cards import Card, hash_value
+from ..cards import Card, extract_fenced_fields, hash_value
 from ..errors import Infra, Invalid, Refused, Unsupported
 from ..git import Git
 from ..state import utc_after, utc_now
@@ -59,18 +59,32 @@ READY = "ready"
 DONE_STATES = ("done",)
 
 
-def parse_card_file(text: str) -> tuple[dict, str]:
-    """The TOML header and the Markdown body of a card file."""
-    match = HEADER_RE.match(text)
-    if not match:
-        raise Invalid("no-header", "a card file needs a +++ TOML header")
-    try:
-        header = tomllib.loads(match.group(1))
-    except tomllib.TOMLDecodeError as exc:
-        raise Invalid("bad-header", f"card header is not TOML: {exc}") from exc
-    if not isinstance(header, dict):
-        raise Invalid("bad-header", "card header must be a table")
-    return header, text[match.end():]
+_TOML_ESCAPES = {
+    "\\": "\\\\",
+    "\b": "\\b",
+    "\t": "\\t",
+    "\f": "\\f",
+    "\r": "\\r",
+}
+
+
+def _escape_toml_text(text: str, multiline: bool) -> str:
+    out: list[str] = []
+    for ch in text:
+        if ch in _TOML_ESCAPES:
+            out.append(_TOML_ESCAPES[ch])
+        elif ch == "\n":
+            out.append("\n" if multiline else "\\n")
+        elif ch == '"' and not multiline:
+            out.append('\\"')
+        elif ord(ch) < 0x20 or ord(ch) == 0x7F:
+            out.append(f"\\u{ord(ch):04x}")
+        else:
+            out.append(ch)
+    result = "".join(out)
+    if multiline:
+        result = re.sub(r'"{3,}', lambda m: '\\"' * len(m.group(0)), result)
+    return result
 
 
 def render_card_file(header: dict, body: str) -> str:
@@ -98,10 +112,8 @@ def _toml_value(value) -> str:
     # backslashes. Only a multi-line *basic* string can hold that: it allows escapes,
     # while a literal string has none and ends at the first `'''`.
     if "\n" in text:
-        escaped = (text.replace("\\", "\\\\").replace('"""', '\\"\\"\\"')
-                   .replace("\t", "\\t").replace("\r", "\\r"))
-        return '"""\n' + escaped + '"""'
-    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+        return '"""\n' + _escape_toml_text(text, multiline=True) + '"""'
+    return '"' + _escape_toml_text(text, multiline=False) + '"'
 
 
 class FileCardSource:
@@ -110,12 +122,14 @@ class FileCardSource:
     name = "files"
 
     def __init__(self, repo: Path, folder: str, branch: str = "openfarm-cards",
-                 worktree: Path | None = None, base_branch: str = "main") -> None:
+                 worktree: Path | None = None, base_branch: str = "main",
+                 fields_block: str = "") -> None:
         self.repo = Path(repo)
         self.folder = folder.strip("/")
         self.branch = branch
         self.base_branch = base_branch
         self.worktree = Path(worktree) if worktree else None
+        self.fields_block = fields_block
         self.git = Git(self.repo)
 
     # -- setup ---------------------------------------------------------------
@@ -203,23 +217,32 @@ class FileCardSource:
         return header, body, path
 
     def _card_from(self, header: dict, body: str, path: Path) -> Card:
-        fields = {k: header[k] for k in
+        merged = dict(header)
+        if self.fields_block == "toml":
+            block_fields, body = extract_fenced_fields(body, self.fields_block)
+            if block_fields:
+                merged = {**block_fields, **header}
+        fields = {k: merged[k] for k in
                   ("category", "reference", "tests", "test_edits",
-                   "frontier_estimate", "new_symbols", "unit") if k in header}
+                   "frontier_estimate", "new_symbols", "unit",
+                   "context_files", "type_changes") if k in merged}
+        deps = [str(d) for d in merged.get("depends", merged.get("deps", [])) or []]
+        touches = [str(t) for t in merged.get("touches", []) or []]
+        done_body = body.strip()
         return Card(
-            id=str(header.get("id", path.stem)),
-            title=str(header.get("title", "")),
-            state=str(header.get("state", "backlog")),
-            done_text=body.strip() or str(header.get("done", "")),
-            touches=[str(t) for t in header.get("touches", []) or []],
-            deps=[str(d) for d in header.get("depends", header.get("deps", [])) or []],
+            id=str(merged.get("id", path.stem)),
+            title=str(merged.get("title", "")),
+            state=str(merged.get("state", "backlog")),
+            done_text=done_body or str(merged.get("done", "")),
+            touches=touches,
+            deps=deps,
             fields=fields,
-            raw={"id": str(header.get("id", path.stem)),
-                 "title": str(header.get("title", "")),
-                 "state": str(header.get("state", "backlog")),
-                 "done_text": body.strip(),
-                 "touches": [str(t) for t in header.get("touches", []) or []],
-                 "deps": [str(d) for d in header.get("depends", []) or []],
+            raw={"id": str(merged.get("id", path.stem)),
+                 "title": str(merged.get("title", "")),
+                 "state": str(merged.get("state", "backlog")),
+                 "done_text": done_body,
+                 "touches": touches,
+                 "deps": [str(d) for d in merged.get("depends", []) or []],
                  "fields": fields},
         )
 
@@ -238,11 +261,11 @@ class FileCardSource:
         for path in sorted(self.cards_dir.glob("*.md")):
             try:
                 header, body = parse_card_file(path.read_text())
+                if not header.get("id"):
+                    header["id"] = path.stem
+                out.append(self._card_from(header, body, path))
             except Invalid:
                 continue
-            if not header.get("id"):
-                header["id"] = path.stem
-            out.append(self._card_from(header, body, path))
         return out
 
     def next(self, lane: str = "", limit: int = 10) -> dict:
@@ -412,7 +435,7 @@ class FileCardSource:
             "depends": list(card.deps),
         }
         for key in ("category", "reference", "test_edits", "frontier_estimate",
-                    "new_symbols", "unit"):
+                    "new_symbols", "unit", "context_files", "type_changes"):
             if key in card.fields:
                 header[key] = card.fields[key]
         if "tests" in card.fields:
@@ -457,4 +480,14 @@ def open_file_source(cfg, state_root: Path) -> FileCardSource:
         branch=getattr(cfg, "cards_branch", "openfarm-cards"),
         worktree=worktree,
         base_branch=cfg.base_branch,
+        fields_block=getattr(cfg, "fields_block", ""),
     )
+
+
+def open_card_source(cfg, state_root: Path):
+    """Build the card source from config (`files:` or `cmd:<argv>`)."""
+    spec = cfg.cards_adapter
+    if spec.startswith("cmd:"):
+        from ..protocol import CmdCardSource
+        return CmdCardSource(spec, cfg.repo)
+    return open_file_source(cfg, state_root)

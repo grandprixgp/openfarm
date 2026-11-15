@@ -224,17 +224,41 @@ def test_loss(before: dict, after: dict,
                       f"{len(after_names)} test(s), none lost")
 
 
-def ignored_or_filtered(parsed: dict, named: list[str]) -> GateResult:
+def ignored_or_filtered(parsed: dict, named: list) -> GateResult:
     """The named tests must be reported passed, not ignored, filtered or absent."""
-    by_name = {r["name"]: r["status"] for r in parsed.get("results", [])}
+    results = parsed.get("results", [])
+    by_name: dict[str, list[dict]] = {}
+    by_pair: dict[tuple[str, str], list[dict]] = {}
+    for entry in results:
+        r_name = entry.get("name", "")
+        r_bin = entry.get("binary", "")
+        by_name.setdefault(r_name, []).append(entry)
+        by_pair.setdefault((r_bin, r_name), []).append(entry)
+
     failed: list[str] = []
     missing: list[str] = []
-    for name in named:
-        status = by_name.get(name)
-        if status is None:
-            missing.append(name)
-        elif status != "ok":
-            failed.append(f"{name} ({status})")
+    for item in named:
+        if isinstance(item, tuple) and len(item) == 2:
+            binary, name = str(item[0]), str(item[1])
+            matches = by_pair.get((binary, name), []) if binary else by_name.get(name, [])
+            label = f"{binary}::{name}" if binary else name
+        elif isinstance(item, dict):
+            binary = str(item.get("binary", ""))
+            name = str(item.get("name", ""))
+            matches = by_pair.get((binary, name), []) if binary else by_name.get(name, [])
+            label = f"{binary}::{name}" if binary else name
+        else:
+            name = str(item)
+            matches = by_name.get(name, [])
+            label = name
+
+        if not matches:
+            missing.append(label)
+            continue
+        bad = [m.get("status", "unknown") for m in matches if m.get("status") != "ok"]
+        if bad:
+            failed.append(f"{label} ({bad[0]})")
+
     if missing:
         return GateResult("pass-after", FAIL,
                           f"named test(s) never reported: {', '.join(missing[:10])}",
@@ -246,20 +270,25 @@ def ignored_or_filtered(parsed: dict, named: list[str]) -> GateResult:
     return GateResult("pass-after", PASS, f"all {len(named)} named test(s) passed")
 
 
-def suite_green(parsed: dict, known_failing: list[str]) -> GateResult:
+def suite_green(parsed: dict, known_failing: list[str],
+                run_cls: str = "pass", exit_code: int = 0) -> GateResult:
     """Every failure must be on `known_failing`, by exact name.
 
-    A missing footer is infra **only when nothing compiled**. A test binary that
-    failed to compile has a compile error and no footer, and that is the model's
-    edit being wrong, not the machine: the card must go back to the implementer with
-    the compiler output, which is the single most useful thing it can be told.
+    A missing footer is infra **only when nothing compiled** and the binary did
+    not die from a non-SIGKILL crash signal (such as SIGABRT/SIGSEGV). A test
+    binary that failed to compile has a compile error and no footer, and that is
+    the model's edit being wrong, not the machine: the card must go back to the
+    implementer with the compiler output, which is the single most useful thing
+    it can be told.
     """
     known = set(known_failing)
     unexpected: list[str] = []
     known_red: list[str] = []
+    failed_results: list[dict] = []
     for entry in parsed.get("results", []):
         if entry.get("status") != "FAILED":
             continue
+        failed_results.append(entry)
         name = entry.get("name", "")
         if name in known:
             known_red.append(name)
@@ -268,6 +297,7 @@ def suite_green(parsed: dict, known_failing: list[str]) -> GateResult:
 
     compile_errors = parsed.get("compile_errors", [])
     missing_footers = parsed.get("missing_footers", [])
+    footers = parsed.get("footers", [])
 
     if compile_errors:
         targets = sorted({_compile_name(entry) for entry in compile_errors})
@@ -279,6 +309,13 @@ def suite_green(parsed: dict, known_failing: list[str]) -> GateResult:
              "known-red": known_red})
 
     if missing_footers:
+        if run_cls == FAIL and exit_code < 0 and exit_code != -9:
+            return GateResult(
+                "suite", FAIL,
+                f"test binary crashed with signal {-exit_code}: "
+                + ", ".join(missing_footers[:8]),
+                {"missing_footers": missing_footers, "unexpected": unexpected,
+                 "exit_code": exit_code})
         return GateResult(
             "suite", INFRA,
             "a test binary printed no footer, so the run died partway: "
@@ -290,6 +327,19 @@ def suite_green(parsed: dict, known_failing: list[str]) -> GateResult:
                           f"{len(unexpected)} red test(s) not on known_failing: "
                           + ", ".join(unexpected[:10]),
                           {"unexpected": unexpected, "known-red": known_red})
+
+    footer_failed = sum(int(f.get("failed", 0)) for f in footers)
+    if footer_failed > len(failed_results):
+        return GateResult(
+            "suite", FAIL,
+            "test footer reported failures not matched cleanly",
+            {"footers": footers, "unexpected": unexpected, "known-red": known_red})
+    if any(f.get("status") == "FAILED" for f in footers) and not failed_results:
+        return GateResult(
+            "suite", FAIL,
+            "test footer reported failures not matched cleanly",
+            {"footers": footers, "unexpected": unexpected, "known-red": known_red})
+
     detail = "suite green"
     if known_red:
         detail += f"; {len(known_red)} known red left out"
@@ -333,8 +383,10 @@ def revert_check(expected_hash: str, current_hash: str,
 
 
 def mutation_gate(parsed: dict, min_kill_rate: float, mode: str,
-                  category: str) -> GateResult:
-    """Mutation: blocking for test-backfill, report-only for the rest in the pilot."""
+                  category: str,
+                  required_for: list[str] | tuple[str, ...] = ("test-backfill",)
+                  ) -> GateResult:
+    """Mutation: blocking when mode is required or category is in `required_for`."""
     killed = int(parsed.get("killed", 0))
     survived = int(parsed.get("survived", 0))
     total = int(parsed.get("total", killed + survived))
@@ -344,7 +396,7 @@ def mutation_gate(parsed: dict, min_kill_rate: float, mode: str,
     evidence = {"killed": killed, "survived": survived, "total": total,
                 "capped": capped, "kill_rate": rate}
     blocking = mode == "required" or (
-        category in ("test-backfill",) and mode != "off")
+        category in tuple(required_for) and mode != "off")
 
     if mode == "off":
         return GateResult("mutation", PASS, "mutation is off in this config",

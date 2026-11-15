@@ -112,8 +112,19 @@ class UnsupportedPack(Pack):
         self._refuse("parse_tests")
 
 
-def pack_for(language: str, cargo_flags: list[str] | None = None) -> Pack:
+def pack_for(language: str, cargo_flags: list[str] | None = None,
+             spec: str = "") -> Pack:
     """The pack for a language. `cargo_flags` comes from `[runner] cargo_flags`."""
+    cmd_spec = spec if str(spec).startswith("cmd:") else (
+        language if str(language).startswith("cmd:") else "")
+    if cmd_spec:
+        try:
+            from ..protocol import CmdPack
+        except ImportError:
+            CmdPack = None
+        if CmdPack is not None:
+            return CmdPack(cmd_spec)
+        return UnsupportedPack(cmd_spec)
     if language == "rust":
         from .rust import RustPack
         return RustPack(cargo_flags)

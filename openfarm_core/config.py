@@ -14,14 +14,51 @@ import tomllib
 from pathlib import Path
 
 from .errors import ConfigError
+from .globs import escapes, resolves_within
 
 CONFIG_PATH = Path(".openfarm") / "config.toml"
 
 #: Tables a repo may have at the top level of the config.
 KNOWN_TABLES = {
     "project", "adapters", "model", "policy", "eligibility", "brief",
-    "runner", "budget", "gates", "cards",
+    "runner", "budget", "gates", "cards", "micromanager", "state",
 }
+
+_TABLE_KEYS = {
+    "project": {"name", "lane", "base_branch", "state_dir"},
+    "adapters": {"cards", "runner", "languages", "model",
+                 "micromanager", "telemetry", "pack"},
+    "model": {"endpoint", "allowed_endpoints", "key_file", "test_writer",
+              "implementer", "checker", "planner", "cost_per_1k_in",
+              "cost_per_1k_out"},
+    "policy": {"never_touch", "forbidden_files", "known_failing",
+               "flagged_patterns", "categories"},
+    "eligibility": {"max_files", "max_units", "require_reference",
+                    "refuse_touches_prefixes", "rust_tests_in_separate_files",
+                    "allow_type_changes", "max_context_files"},
+    "brief": {"test_conventions"},
+    "runner": {"env", "cargo_flags"},
+    "budget": {"implementer_attempts", "test_writer_attempts",
+               "model_build_calls_per_card", "mutation_build_calls_per_card",
+               "tokens_per_card", "wall_clock_per_card", "frontier_cost_ratio",
+               "spend_per_night", "concurrent_builds", "concurrent_cards",
+               "lease_ttl", "kill_switch"},
+    "gates": {"revert_check", "mutation", "mutation_required_for",
+              "mutation_min_kill_rate", "counter_tests", "coverage",
+              "workspace_lint", "baseline_cache", "catch_up",
+              "findings_per_card", "circuit_breaker", "extra", "planner"},
+    "cards": {"fields_block", "required_fields"},
+    "micromanager": {"mode", "binary", "args", "model", "effort",
+                     "tool_policy", "timeout_s", "timeout",
+                     "max_calls_per_card", "tokens_per_card",
+                     "spend_per_night", "cost_per_1k_in", "cost_per_1k_out",
+                     "auth_file", "isolate_home", "shape_cards",
+                     "scaffold_contracts", "coach_on_stall",
+                     "adjudicate_counter_tests", "pre_review"},
+    "state": {"min_free_mb"},
+}
+_ROLE_MODEL_KEYS = {"model", "temperature", "vary_seed"}
+_EXTRA_GATE_KEYS = {"name", "run", "via", "paths", "on_fail"}
 
 _DURATION_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smhd])\s*$")
 _DURATION_UNITS = {"s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0}
@@ -83,6 +120,40 @@ def _as_choice(value, what: str, default: str, choices: tuple[str, ...]) -> str:
     return value
 
 
+def _as_adapter(value, what: str, default: str, built_in: tuple[str, ...]) -> str:
+    if value is None:
+        return default
+    if not isinstance(value, str):
+        raise ConfigError(f"{what}: expected a string")
+    if value in built_in:
+        return value
+    if value.startswith("cmd:") and value[4:].strip():
+        return value
+    choices = ", ".join(repr(c) for c in built_in)
+    raise ConfigError(f"{what}: {value!r} must be one of {choices} or 'cmd:<argv>'")
+
+
+def _check_keys(table: dict, allowed: set[str], what: str) -> None:
+    unknown = set(table) - allowed
+    if unknown:
+        raise ConfigError(
+            f"{what}: unknown key(s): {', '.join(sorted(unknown))}")
+
+
+def _nonneg_int(value, what: str, default: int) -> int:
+    result = _as_int(value, what, default)
+    if result < 0:
+        raise ConfigError(f"{what}: must be >= 0")
+    return result
+
+
+def _nonneg_float(value, what: str, default: float) -> float:
+    result = _as_float(value, what, default)
+    if result < 0.0:
+        raise ConfigError(f"{what}: must be >= 0")
+    return result
+
+
 class RoleModel:
     """One model role's settings."""
 
@@ -117,6 +188,30 @@ class ExtraGate:
                 "paths": self.paths, "on_fail": self.on_fail}
 
 
+class MicromanagerConfig:
+    """Settings for the optional v0.4 micromanager supervisor."""
+
+    __slots__ = (
+        "mode", "binary", "args", "model", "effort", "tool_policy",
+        "timeout_s", "max_calls_per_card", "tokens_per_card",
+        "spend_per_night", "cost_per_1k_in", "cost_per_1k_out",
+        "auth_file", "isolate_home", "shape_cards", "scaffold_contracts",
+        "coach_on_stall", "adjudicate_counter_tests", "pre_review",
+    )
+
+    def __init__(self, **kwargs) -> None:
+        for slot in self.__slots__:
+            setattr(self, slot, kwargs[slot])
+
+    def as_dict(self) -> dict:
+        return {
+            slot: (str(getattr(self, slot))
+                   if slot == "auth_file" and getattr(self, slot) is not None
+                   else getattr(self, slot))
+            for slot in self.__slots__
+        }
+
+
 class Config:
     """The repository's whole configuration, already validated."""
 
@@ -134,6 +229,8 @@ class Config:
             return {}
         if not isinstance(value, dict):
             raise ConfigError(f"[{name}] must be a table")
+        if name in _TABLE_KEYS:
+            _check_keys(value, _TABLE_KEYS[name], f"[{name}]")
         return value
 
     def _parse(self) -> None:
@@ -159,6 +256,15 @@ class Config:
         self.languages = _as_str_list(adapters.get("languages", ["rust"]),
                                       "[adapters] languages") or ["rust"]
         self.model_adapter = str(adapters.get("model", "openai-compatible"))
+        self.micromanager_adapter = _as_adapter(
+            adapters.get("micromanager"), "[adapters] micromanager",
+            "off", ("off", "claude-acp", "scripted"))
+        self.telemetry_adapter = _as_adapter(
+            adapters.get("telemetry"), "[adapters] telemetry",
+            "jsonl", ("jsonl",))
+        self.pack_adapter = _as_adapter(
+            adapters.get("pack"), "[adapters] pack",
+            "", ("",))
 
         model = self._table("model")
         self.endpoint = str(model.get("endpoint", ""))
@@ -172,8 +278,15 @@ class Config:
                                         "[model] cost_per_1k_in", 0.0)
         self.cost_per_1k_out = _as_float(model.get("cost_per_1k_out"),
                                          "[model] cost_per_1k_out", 0.0)
+        implementer_role = self._role_model(model.get("implementer"), "implementer")
         self.role_models = {
-            role: self._role_model(model.get(role), role)
+            role: (
+                implementer_role
+                if role == "implementer"
+                else self._role_model(
+                    model.get(role), role, default_model=implementer_role.model
+                )
+            )
             for role in ("test_writer", "implementer", "checker", "planner")
         }
 
@@ -212,10 +325,27 @@ class Config:
         self.rust_tests_in_separate_files = _as_bool(
             elig.get("rust_tests_in_separate_files"),
             "[eligibility] rust_tests_in_separate_files", True)
+        self.allow_type_changes = _as_bool(
+            elig.get("allow_type_changes"),
+            "[eligibility] allow_type_changes", True)
+        self.max_context_files = _nonneg_int(
+            elig.get("max_context_files"),
+            "[eligibility] max_context_files", 8)
 
         brief = self._table("brief")
         conventions = brief.get("test_conventions")
-        self.test_conventions_path = Path(conventions) if conventions else None
+        if conventions is None or conventions == "":
+            self.test_conventions_path = None
+        else:
+            if not isinstance(conventions, str):
+                raise ConfigError("[brief] test_conventions must be a path string")
+            if (escapes(conventions)
+                    or Path(conventions.replace("\\", "/")).is_absolute()
+                    or resolves_within(self.repo, conventions) is None):
+                raise ConfigError(
+                    f"[brief] test_conventions {conventions!r} must stay within the repository"
+                )
+            self.test_conventions_path = Path(conventions)
 
         runner = self._table("runner")
         self.cargo_flags = _as_str_list(runner.get("cargo_flags", []),
@@ -288,12 +418,75 @@ class Config:
             gates.get("findings_per_card"), "[gates] findings_per_card", 2)
         self.circuit_breaker = _as_int(
             gates.get("circuit_breaker"), "[gates] circuit_breaker", 3)
+        self.planner = _as_choice(
+            gates.get("planner"), "[gates] planner", "auto", ("off", "auto", "on"))
         self.extra_gates = self._parse_extra_gates(gates.get("extra", []))
 
         cards = self._table("cards")
-        self.fields_block = str(cards.get("fields_block", ""))
+        self.fields_block = _as_choice(
+            cards.get("fields_block"), "[cards] fields_block", "", ("", "toml"))
         self.required_fields = _as_str_list(
             cards.get("required_fields", []), "[cards] required_fields")
+
+        state = self._table("state")
+        self.min_free_mb = _nonneg_int(
+            state.get("min_free_mb"), "[state] min_free_mb", 256)
+
+        self.micromanager = self._parse_micromanager(self._table("micromanager"))
+        self.micromanager_enabled = (
+            self.micromanager_adapter != "off"
+            and self.micromanager.mode != "off"
+        )
+
+    def _parse_micromanager(self, mm: dict) -> MicromanagerConfig:
+        if "timeout_s" in mm and "timeout" in mm:
+            raise ConfigError("[micromanager] specify either timeout_s or timeout, not both")
+        raw_timeout = mm.get("timeout_s", mm.get("timeout", 180.0))
+        timeout_s = parse_duration(raw_timeout, "[micromanager] timeout_s")
+        if timeout_s <= 0:
+            raise ConfigError("[micromanager] timeout_s must be > 0")
+        auth_file = mm.get("auth_file")
+        resolved_auth = (
+            self._outside_repo(auth_file, "[micromanager] auth_file")
+            if auth_file else None
+        )
+        return MicromanagerConfig(
+            mode=_as_choice(mm.get("mode"), "[micromanager] mode",
+                            "active", ("off", "advisory", "active")),
+            binary=str(mm.get("binary", "claude-agent-acp")),
+            args=_as_str_list(mm.get("args", []), "[micromanager] args"),
+            model=str(mm.get("model", "")),
+            effort=_as_choice(mm.get("effort"), "[micromanager] effort",
+                              "medium", ("low", "medium", "high")),
+            tool_policy=_as_choice(mm.get("tool_policy"),
+                                   "[micromanager] tool_policy",
+                                   "none", ("none", "read-only")),
+            timeout_s=timeout_s,
+            max_calls_per_card=_nonneg_int(
+                mm.get("max_calls_per_card"), "[micromanager] max_calls_per_card", 4),
+            tokens_per_card=_nonneg_int(
+                mm.get("tokens_per_card"), "[micromanager] tokens_per_card", 120_000),
+            spend_per_night=_nonneg_float(
+                mm.get("spend_per_night"), "[micromanager] spend_per_night", 10.0),
+            cost_per_1k_in=_nonneg_float(
+                mm.get("cost_per_1k_in"), "[micromanager] cost_per_1k_in", 0.0),
+            cost_per_1k_out=_nonneg_float(
+                mm.get("cost_per_1k_out"), "[micromanager] cost_per_1k_out", 0.0),
+            auth_file=resolved_auth,
+            isolate_home=_as_bool(mm.get("isolate_home"),
+                                  "[micromanager] isolate_home", True),
+            shape_cards=_as_bool(mm.get("shape_cards"),
+                                 "[micromanager] shape_cards", True),
+            scaffold_contracts=_as_bool(mm.get("scaffold_contracts"),
+                                        "[micromanager] scaffold_contracts", True),
+            coach_on_stall=_as_bool(mm.get("coach_on_stall"),
+                                    "[micromanager] coach_on_stall", True),
+            adjudicate_counter_tests=_as_bool(
+                mm.get("adjudicate_counter_tests"),
+                "[micromanager] adjudicate_counter_tests", True),
+            pre_review=_as_bool(mm.get("pre_review"),
+                                "[micromanager] pre_review", True),
+        )
 
     def _parse_extra_gates(self, value) -> list[ExtraGate]:
         if value is None:
@@ -304,6 +497,7 @@ class Config:
         for entry in value:
             if not isinstance(entry, dict):
                 raise ConfigError("[[gates.extra]] entries must be tables")
+            _check_keys(entry, _EXTRA_GATE_KEYS, "[[gates.extra]]")
             name = entry.get("name")
             run = entry.get("run")
             if not name or not run:
@@ -321,19 +515,29 @@ class Config:
             ))
         return out
 
-    def _role_model(self, value, role: str) -> RoleModel:
+    def _role_model(self, value, role: str, default_model: str = "") -> RoleModel:
+        default_temp = 0.35 if role == "checker" else 0.2
+        default_vary = role == "checker"
         if value is None:
-            return RoleModel(model="", temperature=0.2)
+            return RoleModel(model=default_model, temperature=default_temp,
+                             vary_seed=default_vary)
         if isinstance(value, str):
-            return RoleModel(model=value)
+            return RoleModel(model=value or default_model,
+                             temperature=default_temp,
+                             vary_seed=default_vary)
         if not isinstance(value, dict):
             raise ConfigError(f"[model] {role} must be a table or a model name")
+        _check_keys(value, _ROLE_MODEL_KEYS, f"[model.{role}]")
+        raw_model = value.get("model")
+        model_name = str(raw_model) if raw_model is not None else default_model
+        if not model_name and default_model:
+            model_name = default_model
         return RoleModel(
-            model=str(value.get("model", "")),
+            model=model_name,
             temperature=_as_float(value.get("temperature"),
-                                  f"[model] {role}.temperature", 0.2),
+                                  f"[model] {role}.temperature", default_temp),
             vary_seed=_as_bool(value.get("vary_seed"),
-                               f"[model] {role}.vary_seed", False),
+                               f"[model] {role}.vary_seed", default_vary),
         )
 
     def _outside_repo(self, value, what: str) -> Path:

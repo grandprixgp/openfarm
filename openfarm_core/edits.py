@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import difflib
 import re
+import tempfile
 from pathlib import Path
 
 from .errors import Invalid, Refused
@@ -168,6 +169,8 @@ def apply_edits(worktree: Path, edits: list[Edit], allowed_paths: list[str],
                 forbid_production: bool = False) -> ApplyReport:
     """Apply edits inside the allowed paths, refusing everything else.
 
+    All edits in a batch are validated and staged in memory first so either the
+    whole batch lands or nothing on disk changes (`report.ok` is all-or-nothing).
     `allowed_paths` is the card's `touches` for that phase. `additions_only` names
     the files where a change must not delete or modify a line (production files the
     test writer may only append a stub to). `allow_stubs` is true only on cards that
@@ -178,9 +181,14 @@ def apply_edits(worktree: Path, edits: list[Edit], allowed_paths: list[str],
     there would land in the frozen commit and be invisible to every diff gate.
     """
     worktree = Path(worktree)
+    root = worktree.resolve()
     report = ApplyReport()
     additions = set(additions_only or ())
     production = list(production_paths or ())
+
+    pending: dict[Path, str] = {}
+    orig_disk: dict[Path, str | None] = {}
+    addition_targets: set[Path] = set()
 
     for edit in edits:
         path = edit.path
@@ -214,8 +222,7 @@ def apply_edits(worktree: Path, edits: list[Edit], allowed_paths: list[str],
             continue
 
         target = (worktree / path).resolve()
-        root = worktree.resolve()
-        if root not in target.parents and target != root:
+        if not target.is_relative_to(root):
             report.refused.append({
                 "path": path, "code": "path-escape",
                 "message": "this path resolves outside the worktree"})
@@ -225,34 +232,53 @@ def apply_edits(worktree: Path, edits: list[Edit], allowed_paths: list[str],
                 "path": path, "code": "not-a-file",
                 "message": "this path is a directory, not a file"})
             continue
+
+        resolved_rel = normalise(target.relative_to(root).as_posix())
+        if matches_any(resolved_rel, forbidden):
+            report.refused.append({"path": path, "code": "forbidden-file",
+                                   "message": "this path resolves to a forbidden path"})
+            continue
+        if matches_any(resolved_rel, never_touch):
+            report.refused.append({"path": path, "code": "never-touch",
+                                   "message": "this path resolves to a never-touch path"})
+            continue
+        if forbid_production and production and matches_any(resolved_rel, production):
+            report.refused.append({
+                "path": path, "code": "production-not-writable",
+                "message": "this path resolves to production code, which is not writable"})
+            continue
+        if allowed_paths and not matches_any(resolved_rel, allowed_paths):
+            report.outside_touches.append(path)
+            continue
+
+        if target not in orig_disk:
+            orig_disk[target] = target.read_text() if target.exists() else None
+        current = pending[target] if target in pending else orig_disk[target]
+
         # A glob in `additions_only` still means its files are additions-only.
-        is_addition = path in additions or (
-            additions and matches_any(path, additions))
+        is_addition = (
+            path in additions
+            or (bool(additions) and matches_any(path, additions))
+            or resolved_rel in additions
+            or (bool(additions) and matches_any(resolved_rel, additions))
+        )
         if is_addition:
+            addition_targets.add(target)
             # A file that does not exist yet is *not* additions-only by construction:
             # every line of a brand-new file is an "addition", so a whole-file edit
             # would pass. It is refused instead, because the only additions the test
             # writer may make to production code are stubs.
-            if not target.exists():
+            if current is None:
                 report.refused.append({
                     "path": path, "code": "additions-only-new-file",
                     "message": "the test writer may not create a production file: "
                                "only append a stub to one that exists"})
                 continue
-            existing = target.read_text()
-            before = existing
-        else:
-            before = target.read_text() if target.exists() else None
 
         try:
+            new_content = _stage_one(edit, target, current, stub_inserter)
             if edit.format == FORMAT_APPEND_STUB:
-                if stub_inserter is None:
-                    raise Invalid("no-stub-inserter",
-                                  "this language has no append_stub")
-                stub_inserter(target, edit.test_name, edit.content or "")
                 report.stubs.append(path)
-            else:
-                _apply_one(edit, target)
         except Refused as exc:
             report.refused.append({"path": path, "code": exc.code,
                                    "message": exc.message})
@@ -262,34 +288,76 @@ def apply_edits(worktree: Path, edits: list[Edit], allowed_paths: list[str],
                                    "message": exc.message})
             continue
 
-        after = target.read_text() if target.exists() else ""
-        if is_addition and not _is_additions_only(before or "", after):
-            report.not_additions_only.append(path)
-        report.added_lines.extend(_added_lines(path, before or "", after))
+        pending[target] = new_content
+        if is_addition and not _is_additions_only(current or "", new_content):
+            if path not in report.not_additions_only:
+                report.not_additions_only.append(path)
+        report.added_lines.extend(_added_lines(path, current or "", new_content))
         report.applied.append(path)
+
+    for target in addition_targets:
+        if target in pending and not _is_additions_only(orig_disk[target] or "", pending[target]):
+            rel = normalise(target.relative_to(root).as_posix())
+            if rel not in report.not_additions_only:
+                report.not_additions_only.append(rel)
+
+    if not report.ok:
+        report.applied.clear()
+        report.stubs.clear()
+        return report
+
+    written: list[tuple[Path, str | None]] = []
+    try:
+        for target, content in pending.items():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            prior = orig_disk[target]
+            target.write_text(content)
+            written.append((target, prior))
+    except OSError as exc:
+        for target, prior in reversed(written):
+            if prior is None:
+                target.unlink(missing_ok=True)
+            else:
+                target.write_text(prior)
+        raise Invalid("write-failed", f"cannot write edit batch: {exc}") from exc
 
     return report
 
 
-def _apply_one(edit: Edit, target: Path) -> None:
+def _stage_one(edit: Edit, target: Path, current: str | None,
+               stub_inserter) -> str:
+    if edit.format == FORMAT_APPEND_STUB:
+        if stub_inserter is None:
+            raise Invalid("no-stub-inserter", "this language has no append_stub")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            staged = Path(tmp_dir) / target.name
+            if current is not None:
+                staged.write_text(current)
+            stub_inserter(staged, edit.test_name, edit.content or "")
+            return staged.read_text() if staged.exists() else ""
+
     if edit.format == FORMAT_WHOLE_FILE:
         if edit.content is None:
             raise Invalid("bad-edit", "whole_file needs content")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(edit.content)
-        return
+        return edit.content
 
     if edit.format == FORMAT_SEARCH_REPLACE:
-        text = target.read_text() if target.exists() else ""
-        count = text.count(edit.search)
+        base_text = current or ""
+        count = base_text.count(edit.search)
         if count != 1:
             raise Refused("no-unique-match",
                           f"{edit.path}: search block matched {count} times, "
                           f"not exactly once")
-        target.write_text(text.replace(edit.search, edit.replace, 1))
-        return
+        return base_text.replace(edit.search, edit.replace, 1)
 
     raise Invalid("bad-format", f"{edit.format!r} is not an edit format")
+
+
+def _apply_one(edit: Edit, target: Path) -> None:
+    current = target.read_text() if target.exists() else None
+    content = _stage_one(edit, target, current, None)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content)
 
 
 def _is_additions_only(before: str, after: str) -> bool:
