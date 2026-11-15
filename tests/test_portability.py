@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
+import tempfile
 import sys
 import unittest
 from pathlib import Path
@@ -36,6 +38,43 @@ def cli(*args: str, repo: Path = SECOND) -> subprocess.CompletedProcess:
 
 def available() -> bool:
     return ENABLED and (SECOND / ".openfarm" / "config.toml").exists()
+
+
+def _reset_card(card_id: str) -> None:
+    """Put a card back on the cards branch and clear its state, so a case repeats.
+
+    Uses the same card source the run uses, and removes the branch it produced, so
+    the next run starts from a clean base rather than from the last run's branch.
+    """
+    from openfarm_core.config import load_config
+
+    cfg = load_config(SECOND)
+    worktree = Path(cfg.state_dir) / "cards-source"
+    if worktree.exists():
+        subprocess.run(["git", "worktree", "remove", "--force", str(worktree)],
+                       cwd=str(SECOND), capture_output=True)
+        subprocess.run(["git", "worktree", "prune"], cwd=str(SECOND),
+                       capture_output=True)
+    if subprocess.run(["git", "rev-parse", "--verify", "--quiet",
+                       "refs/heads/openfarm-cards"], cwd=str(SECOND),
+                      capture_output=True).returncode == 0:
+        subprocess.run(["git", "branch", "-D", "openfarm-cards"],
+                       cwd=str(SECOND), capture_output=True)
+    shutil.rmtree(Path(cfg.state_dir), ignore_errors=True)
+
+    # Any work branch a previous run left is removed, so the next run makes a fresh
+    # one from the base rather than reusing a branch that already has the edit.
+    branches = subprocess.run(
+        ["git", "branch", "--list", f"openfarm/{card_id}*"], cwd=str(SECOND),
+        capture_output=True, text=True).stdout
+    for line in branches.splitlines():
+        name = line.lstrip("*+ ").strip()
+        if name:
+            subprocess.run(["git", "worktree", "remove", "--force",
+                            str(Path("/tmp") / f"wt-{card_id}")],
+                           cwd=str(SECOND), capture_output=True)
+            subprocess.run(["git", "branch", "-D", name], cwd=str(SECOND),
+                           capture_output=True)
 
 
 @unittest.skipUnless(ENABLED, "set OPENFARM_E2E=1")
@@ -113,6 +152,73 @@ class PortabilityTests(unittest.TestCase):
         from openfarm_core.config import load_config
         cfg = load_config(SECOND)
         self.assertTrue(cfg.is_forbidden(".openfarm/config.toml"))
+
+    def test_workspace_style_paths_classify_like_the_real_crate(self) -> None:
+        """This crate is flat, so its own paths must come out as one unit."""
+        from openfarm_core.config import load_config
+        from openfarm_core.gates.eligibility import _units_of
+
+        cfg = load_config(SECOND)
+        self.assertEqual(_units_of(["src/error.rs", "tests/test_chain.rs"],
+                                   SECOND), {"."})
+
+    def test_a_card_run_on_the_real_crate_leaves_openfarm_untouched(self) -> None:
+        """The strongest form of the claim: a run, in another repo, changes nothing.
+
+        The card is the one the pilot would use here: `root_cause` reads the end of
+        the chain directly and drops its `#[allow]`. The model is scripted, because
+        no real model has run yet; what this proves is the harness, not the model.
+
+        The card is put back to Ready first, so the case can run more than once.
+        """
+        # Put the card back to Ready and forget the previous run's folders.
+        _reset_card("MECH-1")
+
+        before = subprocess.run(
+            ["git", "status", "--porcelain"], cwd=str(REPO_ROOT),
+            capture_output=True, text=True).stdout
+        script = Path(tempfile.mkdtemp()) / "anyhow.json"
+        script.write_text(json.dumps({
+            "MECH-1/implementer": (
+                "=== search_replace: src/error.rs\n"
+                "<<< SEARCH\n"
+                "    #[cfg(any(feature = \"std\", not(anyhow_no_core_error)))]\n"
+                "    #[allow(clippy::double_ended_iterator_last)]\n"
+                "    pub fn root_cause(&self) -> &(dyn StdError + 'static) {\n"
+                "        self.chain().last().unwrap()\n"
+                "    }\n"
+                ">>> REPLACE\n"
+                "    #[cfg(any(feature = \"std\", not(anyhow_no_core_error)))]\n"
+                "    pub fn root_cause(&self) -> &(dyn StdError + 'static) {\n"
+                "        self.chain().next_back().unwrap()\n"
+                "    }\n"),
+            "MECH-1/checker_pass1":
+                "RESTATEMENT: root_cause returns the last error in the chain",
+            "MECH-1/checker_pass2": "{}",
+        }))
+        result = cli("run", "--card", "MECH-1", "--script", str(script),
+                     "--cards", "1")
+        payload = json.loads(result.stdout) if result.stdout else {}
+        outcome = payload.get("outcomes", [{}])[0]
+        self.assertEqual(outcome.get("final_state"), "in-review",
+                         f"{outcome.get('stop_code')}: {outcome.get('detail')}")
+
+        after = subprocess.run(
+            ["git", "status", "--porcelain"], cwd=str(REPO_ROOT),
+            capture_output=True, text=True).stdout
+        self.assertEqual(before, after,
+                         "the core ran unchanged: openfarm's own tree is untouched")
+
+        # The branch carries the edit, and the base does not.
+        branch = subprocess.run(
+            ["git", "branch", "--list", "openfarm/MECH-1*"], cwd=str(SECOND),
+            capture_output=True, text=True).stdout
+        self.assertIn("openfarm/MECH-1", branch)
+        diff = subprocess.run(
+            ["git", "diff", "master.." + branch.split()[0].lstrip("*").strip()],
+            cwd=str(SECOND), capture_output=True, text=True).stdout
+        self.assertIn("-    #[allow(clippy::double_ended_iterator_last)]", diff)
+        self.assertIn("+        self.chain().next_back().unwrap()", diff)
 
 
 if __name__ == "__main__":
