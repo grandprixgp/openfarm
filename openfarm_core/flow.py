@@ -19,6 +19,7 @@ from .errors import (AdapterError, GateFailure, Infra, Invalid, Refused,
                      StopCode, Unsupported)
 from .gates.checks import (PASS, FAIL, INFRA, GateResult, banned_patterns_rust,
                            diff_within_touches, extra_gate_result, frozen_check,
+                           _code_of,
                            ignored_or_filtered, mutation_gate,
                            paths_touched_by_extra_gate, revert_check,
                            suite_green, test_loss)
@@ -847,7 +848,8 @@ class CardRun:
         added = added_lines_from_diff(diff["diff"])
         production = {path for path in changed
                       if self.pack.classify_paths([path]).get(path) == "production"}
-        banned = self._record_gate(banned_patterns_rust(added, self.cfg, production))
+        banned = self._record_gate(banned_patterns_rust(
+            added, self.cfg, production, base_counts=self._base_banned(changed)))
         if not banned.ok:
             return banned.detail
 
@@ -926,6 +928,33 @@ class CardRun:
                 raise GateFailure(
                     StopCode.NO_PROGRESS,
                     f"passing named tests did not rise: {previous} then {current}")
+
+    def _base_banned(self, paths: list[str]) -> dict[str, dict[str, int]]:
+        """How often each banned pattern already appeared in each file at base.
+
+        Used so a banned pattern the file already had is flagged rather than blamed
+        on this card: a `mechanical` edit that renames the call before an existing
+        `.unwrap()` did not introduce it.
+        """
+        from .packs.rust import RustPack
+        pack = RustPack()
+        out: dict[str, dict[str, int]] = {}
+        for path in paths:
+            blob = self.git.show_blob(f"{self.base_commit}:{path}")
+            if blob is None:
+                continue
+            production = ({path} if pack.classify_paths([path]).get(path)
+                          == "production" else set())
+            lines = [{"path": path, "line": number, "text": line}
+                     for number, line in enumerate(blob.splitlines(), start=1)]
+            found = pack.patterns(lines, [], production)
+            counts: dict[str, int] = {}
+            for entry in found.get("banned", []):
+                label = entry["pattern"]
+                counts[label] = counts.get(label, 0) + 1
+            if counts:
+                out[path] = counts
+        return out
 
     def _current_test_hashes(self) -> dict[str, str]:
         hashes = {}
@@ -1007,7 +1036,8 @@ class CardRun:
             path for path in changed
             if self.pack.classify_paths([path]).get(path) == "production"}
         final_banned = self._record_gate(
-            banned_patterns_rust(whole_added, self.cfg, production_all))
+            banned_patterns_rust(whole_added, self.cfg, production_all,
+                                 base_counts=self._base_banned(changed)))
         if not final_banned.ok:
             raise GateFailure(StopCode.REFUSED, final_banned.detail)
 

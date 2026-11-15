@@ -73,16 +73,61 @@ def _blocked(path: str, cfg) -> str | None:
     return None
 
 
+def _code_of(line: str) -> str:
+    """A line's code, without indentation or trailing comment.
+
+    Whitespace differs between a base file and a re-indented diff line, so comparing
+    the raw text would miss a pattern that merely moved.
+    """
+    text = str(line).strip()
+    for marker in ("//", "#"):
+        index = text.find(marker)
+        if index > 0:
+            text = text[:index].strip()
+    return text
+
+
 def banned_patterns_rust(added_lines: list[dict], cfg,
-                         production_paths: set[str]) -> GateResult:
+                         production_paths: set[str],
+                         base_lines: dict[str, set[str]] | None = None,
+                         base_counts: dict[str, dict[str, int]] | None = None
+                         ) -> GateResult:
+    """Added lines, scanned by the Rust pack.
+
+    `base_counts` holds, per changed file, how many times each banned label already
+    appeared at the base commit. A hit that does not raise a file's count is
+    **flagged, not banned**: a mechanical edit that renames the call before an
+    existing `.unwrap()` did not introduce it, and banning it would block honest work
+    on a file the card never made worse.
+    """
     from ..packs.rust import RustPack
     pack = RustPack()
     found = pack.patterns(added_lines, cfg.flagged_patterns, production_paths)
-    banned = found.get("banned", [])
-    flagged = found.get("flagged", [])
+    banned: list[dict] = []
+    pre_existing: list[dict] = []
 
+    per_file: dict[str, dict[str, int]] = {}
+    for entry in found.get("banned", []):
+        path = entry.get("file", "")
+        label = entry.get("pattern", "")
+        per_file.setdefault(path, {})
+        per_file[path][label] = per_file[path].get(label, 0) + 1
+
+    counts = base_counts or {}
+    for entry in found.get("banned", []):
+        path = entry.get("file", "")
+        label = entry.get("pattern", "")
+        allowed = counts.get(path, {}).get(label, 0)
+        if allowed > 0:
+            counts[path][label] = allowed - 1
+            pre_existing.append(entry)
+        else:
+            banned.append(entry)
+
+    flagged = list(found.get("flagged", [])) + pre_existing
     evidence = {"banned": banned, "flagged": flagged,
-                "flagged_count": len(flagged)}
+                "flagged_count": len(flagged),
+                "pre_existing": pre_existing}
     if banned:
         lines = "; ".join(
             f"{entry['file']}:{entry['line']} {entry['pattern']}"
@@ -90,8 +135,11 @@ def banned_patterns_rust(added_lines: list[dict], cfg,
         return GateResult("banned-patterns", FAIL,
                           f"{len(banned)} banned pattern(s): {lines}", evidence)
     detail = "no banned patterns"
-    if flagged:
-        detail += f"; {len(flagged)} flagged for the reviewer"
+    if pre_existing:
+        detail += (f"; {len(pre_existing)} pattern(s) already on the line at base, "
+                   f"flagged for the reviewer")
+    if flagged and len(flagged) > len(pre_existing):
+        detail += f"; {len(flagged) - len(pre_existing)} flagged"
     return GateResult("banned-patterns", PASS, detail, evidence)
 
 

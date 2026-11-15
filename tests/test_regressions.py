@@ -229,5 +229,48 @@ class SeamPrefixTests(unittest.TestCase):
                           [f["rule"] for f in result.failures], touch)
 
 
+class PreExistingPatternTests(unittest.TestCase):
+    """A pattern the file already had is flagged, not blamed on the card."""
+
+    def setUp(self) -> None:
+        self.cfg = Config({
+            "project": {"name": "t", "state_dir": "/tmp/openfarm-pattern-state"},
+            "adapters": {"languages": ["rust"]},
+            "policy": {"categories": ["mechanical"]},
+        }, Path("/tmp/none"))
+
+    def test_a_moved_unwrap_is_flagged_not_banned(self) -> None:
+        from openfarm_core.gates.checks import banned_patterns_rust
+        lines = [{"path": "src/a.rs", "line": 4,
+                  "text": "        self.chain().next_back().unwrap()"}]
+        gate = banned_patterns_rust(
+            lines, self.cfg, {"src/a.rs"},
+            base_counts={"src/a.rs": {"production-unwrap": 1}})
+        self.assertEqual(gate.result, "pass", gate.detail)
+        self.assertEqual(len(gate.evidence["pre_existing"]), 1)
+        self.assertIn("already on the line at base", gate.detail)
+
+    def test_one_more_unwrap_than_base_is_banned(self) -> None:
+        from openfarm_core.gates.checks import banned_patterns_rust
+        lines = [
+            {"path": "src/a.rs", "line": 4,
+             "text": "        let a = first.unwrap();"},
+            {"path": "src/a.rs", "line": 9,
+             "text": "        let b = second.unwrap();"},
+        ]
+        gate = banned_patterns_rust(
+            lines, self.cfg, {"src/a.rs"},
+            base_counts={"src/a.rs": {"production-unwrap": 1}})
+        self.assertEqual(gate.result, "fail")
+        self.assertEqual(len(gate.evidence["banned"]), 1)
+
+    def test_a_new_unwrap_with_no_base_count_is_banned(self) -> None:
+        from openfarm_core.gates.checks import banned_patterns_rust
+        lines = [{"path": "src/a.rs", "line": 1,
+                  "text": "    let x = y.unwrap();"}]
+        gate = banned_patterns_rust(lines, self.cfg, {"src/a.rs"})
+        self.assertEqual(gate.result, "fail")
+
+
 if __name__ == "__main__":
     unittest.main()
