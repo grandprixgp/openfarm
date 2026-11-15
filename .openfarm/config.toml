@@ -26,6 +26,7 @@ never_touch = [
   "openfarm_core/packs/rust.py",
   "openfarm_core/adapters/acp.py",
   "openfarm_core/micromanager.py",
+  "openfarm_core/harness_memory.py",
   "openfarm",
 ]
 forbidden_files = [

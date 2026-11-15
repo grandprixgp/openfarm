@@ -11,7 +11,8 @@ from pathlib import Path
 from .state import write_json
 
 
-def build_dossier(card_run, final_state: str) -> dict:
+def build_dossier(card_run, final_state: str,
+                  harness: dict | None = None) -> dict:
     """Every section, as data. `dossier.md` and `dossier.json` carry the same thing."""
     stored_card = {}
     try:
@@ -106,6 +107,34 @@ def build_dossier(card_run, final_state: str) -> dict:
             "test_diff": _test_diff(card_run),
             "production_diff": _production_diff(card_run),
         },
+        "harness": _harness_summary(card_run, harness),
+    }
+
+
+def _harness_summary(card_run, harness: dict | None) -> dict:
+    raw = harness if harness is not None else getattr(card_run, "harness_summary", None)
+    if not isinstance(raw, dict) or not raw:
+        return {}
+    metrics = raw.get("metrics") or {}
+    efficiency_score = raw.get("efficiency_score")
+    if efficiency_score is None and isinstance(metrics, dict):
+        efficiency_score = metrics.get(
+            "harness_efficiency", metrics.get("efficiency_score", 0.0)
+        )
+    probe_tr = raw.get("probe_transition")
+    probe_val: dict | str
+    if isinstance(probe_tr, dict):
+        probe_val = dict(probe_tr)
+    else:
+        probe_val = str(probe_tr or "")
+    return {
+        "revision": int(raw.get("revision", 0) or 0),
+        "state": str(raw.get("state", "") or ""),
+        "cues_applied": list(raw.get("cues_applied") or []),
+        "lessons_added": list(raw.get("lessons_added") or []),
+        "probe_transition": probe_val,
+        "efficiency_score": float(efficiency_score or 0.0),
+        "skipped_reason": str(raw.get("skipped_reason", "") or ""),
     }
 
 
@@ -324,6 +353,26 @@ def render_markdown(payload: dict) -> str:
               payload["9_diffs"]["test_diff"].rstrip() or "(none)",
               "```", "", "### Production diff", "", "```diff",
               payload["9_diffs"]["production_diff"].rstrip() or "(none)", "```", ""]
+
+    harness = payload.get("harness") or {}
+    if harness:
+        cues = ", ".join(harness.get("cues_applied") or []) or "(none)"
+        lessons = ", ".join(harness.get("lessons_added") or []) or "(none)"
+        probe = harness.get("probe_transition")
+        if isinstance(probe, dict):
+            probe_text = str(probe.get("action") or probe)
+        else:
+            probe_text = str(probe or "none")
+        lines += [
+            "## Harness efficiency",
+            "",
+            f"- Revision: {harness.get('revision', 0)} ({harness.get('state', '') or 'n/a'})",
+            f"- Cues applied: {cues}",
+            f"- Lessons added: {lessons}",
+            f"- Probe transition: {probe_text}",
+            f"- Efficiency score: {float(harness.get('efficiency_score', 0.0) or 0.0):.4f}",
+            "",
+        ]
     return "\n".join(lines)
 
 

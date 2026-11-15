@@ -27,6 +27,7 @@ from .gates.eligibility import (check_eligibility, derive_cargo_unit,
                                 file_is_blocked)
 from .git import Git, GitRefused
 from .globs import matches_any, normalise, resolves_within
+from .harness_memory import GuidanceSelection, HarnessLibrary, _classify_failure
 from .micromanager import open_micromanager
 from .roles import (Plan, Roles, build_checker_pass1_brief,
                     build_checker_pass2_brief, build_implementer_brief,
@@ -71,7 +72,8 @@ class CardRun:
                  runner, pack, backend, book: BriefBook, run_id: str,
                  telemetry, budget: Budget | None = None,
                  deps_done: bool = True, conventions: str = "",
-                 log=None, micromanager=None) -> None:
+                 log=None, micromanager=None,
+                 harness_library: HarnessLibrary | None = None) -> None:
         self.card = card
         self.cfg = cfg
         self.state = state
@@ -105,6 +107,8 @@ class CardRun:
             self.micromanager = micromanager
             if hasattr(self.micromanager, "card_dir"):
                 self.micromanager.card_dir = self.card_layout
+        if hasattr(self.micromanager, "harness_context"):
+            self.micromanager.harness_context = {}
 
         if hasattr(self.book, "allowed_extra_reads") and getattr(self.card, "context_files", None):
             self.book.allowed_extra_reads.update(
@@ -171,7 +175,205 @@ class CardRun:
         self.existing_tests_changed: list[str] = []
         self.ended_at = ""
 
+        harness_cfg = getattr(cfg, "harness", None)
+        harness_enabled = bool(getattr(harness_cfg, "enabled", False))
+        if harness_library is not None:
+            self.harness_library = harness_library
+        elif harness_enabled:
+            hdir_raw = str(getattr(harness_cfg, "dir", "") or "").strip()
+            hdir = (
+                Path(hdir_raw).expanduser()
+                if hdir_raw
+                else self.state.harness()
+            )
+            self.harness_library = HarnessLibrary(hdir, config=cfg)
+        else:
+            self.harness_library = None
+        self.harness_cues_applied: list[str] = []
+        self.harness_lessons_added: list[str] = []
+        self.harness_revision: int = int(
+            self.harness_library.status().get("revision", 0)
+            if self.harness_library is not None
+            else 0
+        )
+        self.harness_summary: dict = {}
+        self.attempt_records: list[dict] = []
+
     # -- helpers --------------------------------------------------------------
+
+    def _harness_enabled(self) -> bool:
+        harness_cfg = getattr(self.cfg, "harness", None)
+        return (
+            self.harness_library is not None
+            and bool(getattr(harness_cfg, "enabled", False))
+        )
+
+    def _harness_query_attrs(self) -> tuple[str, str, tuple[str, ...]]:
+        langs = getattr(self.cfg, "languages", None) or ("rust",)
+        language = str(langs[0] or "rust")
+        kind = str(getattr(self.card, "category", "") or "*")
+        raw_tags = (
+            self.card.fields.get("tags", ())
+            if isinstance(getattr(self.card, "fields", None), dict)
+            else getattr(self.card, "tags", ())
+        )
+        if isinstance(raw_tags, str):
+            tags = tuple(t.strip() for t in raw_tags.split(",") if t.strip())
+        else:
+            tags = tuple(str(t).strip() for t in (raw_tags or ()) if str(t).strip())
+        return language, kind, tags
+
+    def _add_harness_cues(self, cue_ids: list[str]) -> None:
+        for cid in cue_ids:
+            if cid and cid not in self.harness_cues_applied:
+                self.harness_cues_applied.append(cid)
+
+    def _refresh_micromanager_harness_context(
+        self,
+        role: str = "micromanager",
+        *,
+        failure_class: str = "",
+        role_sel: GuidanceSelection | None = None,
+    ) -> None:
+        if not self._harness_enabled() or self.harness_library is None:
+            return
+        language, kind, tags = self._harness_query_attrs()
+        mm_sel = self.harness_library.select_guidance(
+            language=language,
+            kind=kind,
+            role="micromanager",
+            failure_class=failure_class,
+            tags=tags,
+        )
+        if self.micromanager.enabled:
+            mm_specific = [
+                str(c.get("id", ""))
+                for c in (mm_sel.micromanager_context.get("cues") or ())
+                if isinstance(c, dict)
+                and (
+                    c.get("surface") == "micromanager_context"
+                    or c.get("role") == "micromanager"
+                )
+            ]
+            self._add_harness_cues(mm_specific)
+
+        merged_cues: list[dict] = []
+        seen: set[str] = set()
+        existing_ctx = (
+            self.micromanager.harness_context
+            if isinstance(getattr(self.micromanager, "harness_context", None), dict)
+            else {}
+        )
+        for ctx_obj in (
+            mm_sel.micromanager_context,
+            role_sel.micromanager_context if role_sel is not None else {},
+            existing_ctx,
+        ):
+            if not isinstance(ctx_obj, dict):
+                continue
+            for cue in ctx_obj.get("cues") or ():
+                if not isinstance(cue, dict):
+                    continue
+                cid = str(cue.get("id", ""))
+                if cid and cid in seen:
+                    continue
+                if cid:
+                    seen.add(cid)
+                merged_cues.append(cue)
+
+        if merged_cues:
+            rev = (
+                mm_sel.micromanager_context.get("revision")
+                or (role_sel.micromanager_context.get("revision") if role_sel else 0)
+                or self.harness_revision
+            )
+            state_str = (
+                mm_sel.micromanager_context.get("state")
+                or (role_sel.micromanager_context.get("state") if role_sel else "confirmed")
+            )
+            self.micromanager.harness_context = {
+                "revision": int(rev or 0),
+                "state": str(state_str or "confirmed"),
+                "cues": merged_cues,
+            }
+        else:
+            self.micromanager.harness_context = {}
+
+    def _select_harness_guidance(self, role: str, *, failure_class: str = "") -> str:
+        if not self._harness_enabled() or self.harness_library is None:
+            return ""
+        language, kind, tags = self._harness_query_attrs()
+        sel = self.harness_library.select_guidance(
+            language=language,
+            kind=kind,
+            role=role,
+            failure_class=failure_class,
+            tags=tags,
+        )
+        self._add_harness_cues(list(sel.cue_ids))
+        self._refresh_micromanager_harness_context(
+            role=role,
+            failure_class=failure_class,
+            role_sel=sel,
+        )
+        return sel.brief_text
+
+    def _record_contrast_attempt(
+        self,
+        *,
+        attempt: int,
+        phase: str,
+        role: str,
+        outcome: str,
+        error_signature: str = "",
+        detail: str = "",
+        stop_code: StopCode | None = None,
+        gates: list[GateResult] | None = None,
+        call=None,
+    ) -> None:
+        self.attempt_records.append({
+            "attempt": int(attempt),
+            "phase": phase,
+            "role": role,
+            "outcome": outcome,
+            "status": outcome,
+            "error_signature": error_signature,
+            "detail": detail[-2000:] if detail else "",
+            "stop_code": stop_code.value if stop_code else "",
+            "tokens_in": int(getattr(call, "tokens_in", 0) or 0) if call is not None else 0,
+            "tokens_out": int(getattr(call, "tokens_out", 0) or 0) if call is not None else 0,
+            "spend": float(getattr(call, "spend", 0.0) or 0.0) if call is not None else 0.0,
+            "gates": [g.as_dict() for g in (gates or ())],
+        })
+
+    def _should_reflect_harness(self) -> bool:
+        if not getattr(self.micromanager, "enabled", False):
+            return False
+        harness_cfg = getattr(self.cfg, "harness", None)
+        if not bool(getattr(harness_cfg, "allow_micromanager_reflection", True)):
+            return False
+        backend = getattr(self.micromanager, "backend", None)
+        if backend is None:
+            return True
+        if hasattr(backend, "script") and isinstance(getattr(backend, "script"), dict):
+            script = backend.script
+            keys = (
+                f"{self.card.id}/reflect_harness",
+                f"micromanager/{self.card.id}/reflect_harness",
+                "micromanager/reflect_harness",
+                "reflect_harness",
+                "*",
+            )
+            return any(k in script for k in keys)
+        cmd = getattr(backend, "command", None)
+        if isinstance(cmd, (list, tuple)):
+            cmd_tokens = [str(tok) for tok in cmd]
+            for idx, tok in enumerate(cmd_tokens):
+                if tok == "--mode" and idx + 1 < len(cmd_tokens) and cmd_tokens[idx + 1] == "script":
+                    return False
+                if tok.startswith("--mode=script"):
+                    return False
+        return True
 
     def _effective_unit(self) -> str:
         if self.card.unit:
@@ -444,11 +646,6 @@ class CardRun:
             self.detail = exc.message
             final_state = "blocked"
         finally:
-            if self._owns_micromanager:
-                try:
-                    self.micromanager.close()
-                except Exception:
-                    pass
             self.budget.stop_clock()
             self.ended_at = utc_now()
 
@@ -456,7 +653,14 @@ class CardRun:
                 StopCode.INELIGIBLE,):
             final_state = "released"
 
-        return self._finish(final_state)
+        try:
+            return self._finish(final_state)
+        finally:
+            if self._owns_micromanager:
+                try:
+                    self.micromanager.close()
+                except Exception:
+                    pass
 
     # -- step 1: claim and eligibility ----------------------------------------
 
@@ -640,6 +844,7 @@ class CardRun:
                 for t in self.base_test_list.get("tests", [])
                 if t.get("name")
             ]
+            self._refresh_micromanager_harness_context("planner")
             decision = self.micromanager.shape_and_plan(
                 self.card, sigs, ctx_contents, known_tests=known_tests, cfg=self.cfg
             )
@@ -682,7 +887,10 @@ class CardRun:
             self.planner_used = False
             self.depth = 1
             return
-        brief = build_planner_brief(self.card, self.book)
+        planner_harness = self._select_harness_guidance("planner")
+        brief = build_planner_brief(
+            self.card, self.book, harness_guidance=planner_harness
+        )
         try:
             call = self.roles.call("planner", brief, response_format="json")
         except (Infra, Invalid):
@@ -742,10 +950,19 @@ class CardRun:
             # so a failed or refused attempt cannot leave an edit behind.
             self.git.reset_hard(self.scaffold_commit)
             self.budget.take_test_writer_attempt()
+            tw_fc = (
+                _classify_failure(failure=last_failure)
+                if (attempt > 1 or last_failure)
+                else ""
+            )
+            tw_harness = self._select_harness_guidance(
+                "test_writer", failure_class=tw_fc
+            )
             brief = build_test_writer_brief(
                 self.card, self.book, self.pack, self.conventions,
                 attempt=attempt, previous_failure=last_failure,
-                guidance=tw_guidance, context_files=self.extra_context_files)
+                guidance=tw_guidance, context_files=self.extra_context_files,
+                harness_guidance=tw_harness)
             call = self.roles.call("test_writer", brief, attempt=attempt)
             self.budget.note_tokens(call.tokens_in, call.tokens_out, call.spend)
             write_json(self.card_layout / "responses" / f"A{attempt}-test-writer.json",
@@ -758,7 +975,13 @@ class CardRun:
                 self.budget.test_writer_attempts -= 1
                 self._record_attempt("test-writer", "refused",
                                      StopCode.TESTS_UNPROVABLE, role="test_writer",
-                                     attempt=attempt)
+                                     attempt=attempt, detail=last_failure)
+                self._record_contrast_attempt(
+                    attempt=attempt, phase="test_writer", role="test_writer",
+                    outcome="refused", error_signature="parse-edits-invalid",
+                    detail=last_failure, stop_code=StopCode.TESTS_UNPROVABLE,
+                    call=call,
+                )
                 free_retries -= 1
                 if free_retries <= 0:
                     raise GateFailure(
@@ -788,9 +1011,20 @@ class CardRun:
 
             if not report.ok:
                 last_failure = _report_detail(report)
+                tw_stop = (
+                    StopCode.REFUSED
+                    if (report.outside_touches or report.not_additions_only)
+                    else StopCode.TESTS_UNPROVABLE
+                )
                 self._record_attempt("test-writer", "refused",
-                                     StopCode.TESTS_UNPROVABLE, role="test_writer",
-                                     attempt=attempt)
+                                     tw_stop, role="test_writer",
+                                     attempt=attempt, detail=last_failure)
+                self._record_contrast_attempt(
+                    attempt=attempt, phase="test_writer", role="test_writer",
+                    outcome="refused",
+                    error_signature=last_failure[:120] or "edit-refused",
+                    detail=last_failure, stop_code=tw_stop, call=call,
+                )
                 if report.outside_touches or report.not_additions_only:
                     raise GateFailure(
                         StopCode.REFUSED,
@@ -820,11 +1054,21 @@ class CardRun:
                     raise
                 self._record_attempt("test-writer", "failed-gates",
                                      StopCode.TESTS_UNPROVABLE, role="test_writer",
-                                     attempt=attempt)
+                                     attempt=attempt, detail=exc.detail)
+                self._record_contrast_attempt(
+                    attempt=attempt, phase="test_writer", role="test_writer",
+                    outcome="fail", error_signature="tests-unprovable",
+                    detail=exc.detail, stop_code=StopCode.TESTS_UNPROVABLE,
+                    call=call,
+                )
                 if free_sends <= 0:
                     raise
                 last_failure = exc.detail
                 if self.micromanager.enabled:
+                    self._refresh_micromanager_harness_context(
+                        "test_writer",
+                        failure_class=_classify_failure(failure=last_failure),
+                    )
                     advice = self.micromanager.coach(
                         self.card, "test-writer", attempt,
                         self._working_test_texts(), "", last_failure, cfg=self.cfg)
@@ -852,6 +1096,11 @@ class CardRun:
             self._tests_proven_in_phase_a = True
             self._record_attempt("test-writer", "passed-gates", role="test_writer",
                                  attempt=attempt)
+            if self.card.category == "test-backfill":
+                self._record_contrast_attempt(
+                    attempt=attempt, phase="test_writer", role="test_writer",
+                    outcome="pass", call=call,
+                )
             return
 
         raise GateFailure(StopCode.TESTS_UNPROVABLE,
@@ -1048,6 +1297,17 @@ class CardRun:
             showing_diff = bool(last_failed_diff)
             step = self._current_step()
             guidance = self.coaching_guidance or self.clarified_notes
+            impl_fc = (
+                _classify_failure(
+                    self.error_signatures[-1] if self.error_signatures else "",
+                    failure=last_failure,
+                )
+                if (attempt_no > 1 or last_failure or self.error_signatures)
+                else ""
+            )
+            impl_harness = self._select_harness_guidance(
+                "implementer", failure_class=impl_fc
+            )
             brief = build_implementer_brief(
                 self.card, self.book, self._frozen_texts(),
                 attempt=max(2, attempt_no) if showing_diff else 1,
@@ -1056,7 +1316,8 @@ class CardRun:
                 step=step,
                 guidance=guidance,
                 step_context="\n".join(self.step_summaries),
-                context_files=self.extra_context_files)
+                context_files=self.extra_context_files,
+                harness_guidance=impl_harness)
             write_json(self.card_layout / "briefs" / f"{attempt_no}-implementer.md",
                        {"brief": brief.body})
 
@@ -1072,7 +1333,13 @@ class CardRun:
                 self.budget.implementer_attempts -= 1
                 attempt_seq -= 1
                 self._record_attempt("implement", "refused",
-                                     role="implementer", attempt=attempt_no)
+                                     role="implementer", attempt=attempt_no,
+                                     detail=last_failure)
+                self._record_contrast_attempt(
+                    attempt=attempt_no, phase="implementer", role="implementer",
+                    outcome="refused", error_signature="parse-edits-invalid",
+                    detail=last_failure, stop_code=StopCode.REFUSED, call=call,
+                )
                 free_retries -= 1
                 if free_retries <= 0:
                     raise GateFailure(
@@ -1093,7 +1360,15 @@ class CardRun:
                     self.budget.implementer_attempts -= 1
                     attempt_seq -= 1
                     self._record_attempt("implement", "refused",
-                                         role="implementer", attempt=attempt_no)
+                                         role="implementer", attempt=attempt_no,
+                                         detail=last_failure)
+                    self._record_contrast_attempt(
+                        attempt=attempt_no, phase="implementer",
+                        role="implementer", outcome="refused",
+                        error_signature="no-unique-match",
+                        detail=last_failure, stop_code=StopCode.REFUSED,
+                        call=call,
+                    )
                     free_retries -= 1
                     if free_retries <= 0:
                         raise GateFailure(
@@ -1103,12 +1378,25 @@ class CardRun:
                             f"tries: {last_failure}")
                     free_calls += 1
                     continue
-                raise GateFailure(StopCode.REFUSED, _report_detail(report))
+                refused_detail = _report_detail(report)
+                self._record_contrast_attempt(
+                    attempt=attempt_no, phase="implementer", role="implementer",
+                    outcome="refused",
+                    error_signature=refused_detail[:120] or "edit-refused",
+                    detail=refused_detail, stop_code=StopCode.REFUSED, call=call,
+                )
+                raise GateFailure(StopCode.REFUSED, refused_detail)
             if report.outside_touches:
-                raise GateFailure(
-                    StopCode.REFUSED,
+                outside_detail = (
                     "the implementer edited outside touches: "
-                    + ", ".join(report.outside_touches))
+                    + ", ".join(report.outside_touches)
+                )
+                self._record_contrast_attempt(
+                    attempt=attempt_no, phase="implementer", role="implementer",
+                    outcome="refused", error_signature="outside-touches",
+                    detail=outside_detail, stop_code=StopCode.REFUSED, call=call,
+                )
+                raise GateFailure(StopCode.REFUSED, outside_detail)
 
             outcome = self._judge_attempt(attempt_no, report)
             if outcome is None:
@@ -1222,7 +1510,8 @@ class CardRun:
                         stop_code: StopCode | None = None, *,
                         diff: dict | None = None, gates: list[GateResult] | None = None,
                         role: str = "", started: str = "",
-                        attempt: int | None = None) -> None:
+                        attempt: int | None = None,
+                        detail: str = "") -> None:
         """Write one attempt record, in the fields the spec fixes.
 
         `attempt` is passed explicitly by the implementer, because a refused answer
@@ -1245,6 +1534,9 @@ class CardRun:
                         if phase in ("implement", "fix")
                         else self.budget.test_writer_attempts),
             "phase": phase,
+            "role": role or phase,
+            "status": outcome,
+            "detail": detail[-2000:] if detail else "",
             "started_at": started or self.started_at,
             "ended_at": utc_now(),
             "model": calls[-1].model if calls else "",
@@ -1298,10 +1590,21 @@ class CardRun:
             base_counts=self._banned_counts(changed, at_base=True),
             head_counts=self._banned_counts(changed, at_base=False)))
         if not banned.ok:
-            self.error_signatures.append("banned:" + banned.detail[:120])
+            sig = "banned:" + banned.detail[:120]
+            self.error_signatures.append(sig)
             self._check_progress_with_coach(diff, banned.detail, attempt_no)
             self._record_attempt("fix", "failed-gates", diff=diff,
-                                 attempt=attempt_no)
+                                 attempt=attempt_no, role="implementer",
+                                 detail=banned.detail)
+            last_call = next(
+                (c for c in reversed(self.roles.calls) if c.role == "implementer"),
+                None,
+            )
+            self._record_contrast_attempt(
+                attempt=attempt_no, phase="implementer", role="implementer",
+                outcome="fail", error_signature=sig, detail=banned.detail,
+                gates=[banned], call=last_call,
+            )
             return banned.detail
 
         frozen_gate = self._record_gate(
@@ -1344,6 +1647,11 @@ class CardRun:
             lint_err + "\n" + err + "\n" + out)["signature"]
         self.error_signatures.append(signature)
 
+        last_impl_call = next(
+            (c for c in reversed(self.roles.calls) if c.role == "implementer"),
+            None,
+        )
+
         all_named = all(_status_of(parsed, name) == "ok"
                         for name in self.card.test_names)
         if suite.ok and lint_gate.ok and all_named:
@@ -1351,7 +1659,12 @@ class CardRun:
                 self.step_index = len(self.plan.steps)
             self._commit(f"{self.card.id}: make the frozen tests pass")
             self._record_attempt("implement", "passed-gates", diff=diff,
-                                 attempt=attempt_no)
+                                 attempt=attempt_no, role="implementer")
+            self._record_contrast_attempt(
+                attempt=attempt_no, phase="implementer", role="implementer",
+                outcome="pass", error_signature=signature,
+                gates=[suite, lint_gate], call=last_impl_call,
+            )
             return None
 
         if self.plan is not None and self.step_index + 1 < len(self.plan.steps):
@@ -1389,7 +1702,12 @@ class CardRun:
                 self.step_failures = 0
                 self.coach_used_for_stall = False
                 self._record_attempt("implement", "passed-gates", diff=diff,
-                                     attempt=attempt_no)
+                                     attempt=attempt_no, role="implementer")
+                self._record_contrast_attempt(
+                    attempt=attempt_no, phase="implementer", role="implementer",
+                    outcome="pass", error_signature=signature,
+                    gates=[suite, lint_gate], call=last_impl_call,
+                )
                 self.log(f"{self.card.id}: planner step done, checkpointed, now on "
                          f"{self.step_index + 1} of {len(self.plan.steps)}")
                 return _STEP_ADVANCED
@@ -1402,7 +1720,13 @@ class CardRun:
             # signals have to be checked on this path too.
             self._check_progress_with_coach(diff, detail, attempt_no)
             self._record_attempt("fix", "failed-gates", diff=diff,
-                                 attempt=attempt_no)
+                                 attempt=attempt_no, role="implementer",
+                                 detail=detail)
+            self._record_contrast_attempt(
+                attempt=attempt_no, phase="implementer", role="implementer",
+                outcome="fail", error_signature=signature or "named-test-fail",
+                detail=detail, gates=[suite, lint_gate], call=last_impl_call,
+            )
             return detail
 
         compile_output = ""
@@ -1414,7 +1738,13 @@ class CardRun:
             detail += "\n\n" + compile_output[-6000:]
         self._check_progress_with_coach(diff, detail, attempt_no)
         self._record_attempt("fix", "failed-gates", diff=diff,
-                             attempt=attempt_no)
+                             attempt=attempt_no, role="implementer",
+                             detail=detail)
+        self._record_contrast_attempt(
+            attempt=attempt_no, phase="implementer", role="implementer",
+            outcome="fail", error_signature=signature,
+            detail=detail, gates=[suite, lint_gate], call=last_impl_call,
+        )
         return detail
 
     def _check_progress_with_coach(self, diff: dict, detail: str,
@@ -1426,6 +1756,13 @@ class CardRun:
                     and self.micromanager.enabled
                     and not self.coach_used_for_stall
                     and self.budget.implementer_attempts_left() > 0):
+                self._refresh_micromanager_harness_context(
+                    "implementer",
+                    failure_class=_classify_failure(
+                        self.error_signatures[-1] if self.error_signatures else "",
+                        failure=detail,
+                    ),
+                )
                 advice = self.micromanager.coach(
                     self.card, "implementer", attempt_no,
                     self._frozen_texts(), diff.get("diff", ""), detail,
@@ -1687,6 +2024,7 @@ class CardRun:
             return checker_bounce
 
         if self.micromanager.enabled:
+            self._refresh_micromanager_harness_context("micromanager")
             report = self.micromanager.triage_and_review("pre_review", {
                 "card_id": self.card.id,
                 "card": self.card.as_dict(),
@@ -1960,6 +2298,9 @@ class CardRun:
                 and self.counter_summary["failed"] > 0):
             fix_hint = ""
             if self.micromanager.enabled:
+                self._refresh_micromanager_harness_context(
+                    "checker", failure_class="counter-test"
+                )
                 verdict = self.micromanager.adjudicate_checker(
                     self.card, full_diff, restatement,
                     self._last_failing_counters,
@@ -2132,12 +2473,88 @@ class CardRun:
 
     # -- finishing ------------------------------------------------------------
 
+    def _record_harness_outcome(self, final_state: str) -> None:
+        if not self._harness_enabled() or self.harness_library is None:
+            return
+        if self.stop_code in (StopCode.INFRA, StopCode.KILLED) or final_state == "released":
+            status = self.harness_library.status()
+            self.harness_revision = int(status.get("revision", self.harness_revision) or 0)
+            self.harness_summary = {
+                "revision": self.harness_revision,
+                "state": str(status.get("state", "confirmed")),
+                "cues_applied": list(self.harness_cues_applied),
+                "lessons_added": [],
+                "probe_transition": None,
+                "metrics": dict(status.get("metrics") or {}),
+                "skipped_reason": (
+                    self.stop_code.value if self.stop_code else final_state
+                ),
+            }
+            return
+
+        language, kind, tags = self._harness_query_attrs()
+        attempts_count = (
+            max(1, int(self.budget.implementer_attempts))
+            if self.budget.implementer_attempts > 0
+            else max(1, len(self.attempt_records))
+        )
+        card_meta = {
+            "card_id": self.card.id,
+            "id": self.card.id,
+            "kind": kind,
+            "category": self.card.category,
+            "language": language,
+            "unit": self._effective_unit(),
+            "touches": list(self.card.touches),
+            "tags": list(tags),
+            "final_state": final_state,
+            "stop_code": self.stop_code.value if self.stop_code else "",
+            "passed": final_state == "in-review",
+            "attempts": attempts_count,
+            "tokens_in": self.budget.tokens_in,
+            "tokens_out": self.budget.tokens_out,
+            "spend": round(self.budget.spend, 6),
+            "counter_tests": dict(self.counter_summary),
+            "mutation": dict(self.mutation_summary),
+        }
+        res = self.harness_library.record_card_outcome(
+            card_meta,
+            self.attempt_records,
+            cues_applied=list(self.harness_cues_applied),
+            failure=self.detail,
+            micromanager=self.micromanager,
+            reflect=self._should_reflect_harness(),
+        )
+        self.harness_revision = int(res.get("revision", self.harness_revision) or 0)
+        self.harness_lessons_added = list(res.get("lessons_added") or ())
+        self.harness_summary = {
+            **res,
+            "cues_applied": list(self.harness_cues_applied),
+        }
+        metrics = res.get("metrics") or {}
+        eff = float(metrics.get("harness_efficiency", 0.0) or 0.0)
+        self._record_gate(GateResult(
+            "harness-efficiency",
+            PASS,
+            f"rev={self.harness_revision} cues={len(self.harness_cues_applied)} "
+            f"lessons={len(self.harness_lessons_added)} eff={eff:.3f}",
+            {
+                "revision": self.harness_revision,
+                "state": str(res.get("state", "")),
+                "cues_applied": list(self.harness_cues_applied),
+                "lessons_added": list(self.harness_lessons_added),
+                "probe_transition": res.get("probe_transition"),
+                "efficiency_score": eff,
+            },
+        ))
+
     def _finish(self, final_state: str) -> dict:
         from .dossier import build_dossier, write_dossier
 
         self.budget.stop_clock()
         if not self.ended_at:
             self.ended_at = utc_now()
+        self._record_harness_outcome(final_state)
         mm_budget = getattr(self.micromanager, "budget", None)
         if mm_budget is not None and hasattr(mm_budget, "as_dict"):
             self.micromanager_summary = {
@@ -2158,6 +2575,8 @@ class CardRun:
             self._mover(status, note)
         except AdapterError as exc:
             self.log(f"{self.card.id}: could not move the card: {exc.message}")
+        if self.harness_summary:
+            return {**record, "harness": dict(self.harness_summary)}
         return record
 
     def _mover(self, status: str, note: str) -> None:
@@ -2199,7 +2618,7 @@ class CardRun:
 
     def _write_dossier(self, final_state: str) -> None:
         from .dossier import build_dossier, write_dossier
-        payload = build_dossier(self, final_state)
+        payload = build_dossier(self, final_state, harness=self.harness_summary)
         self.dossier_payload = payload
         md_path, json_path = write_dossier(self.card_layout, payload)
         self.dossier_path = str(md_path)
@@ -2249,6 +2668,9 @@ class CardRun:
             "findings_filed": list(self.findings_filed),
             "frontier_estimate": self.card.frontier_estimate or "",
             "dossier_path": self.dossier_path,
+            "harness_revision": int(self.harness_revision or 0),
+            "harness_cues_applied": list(self.harness_cues_applied),
+            "harness_lessons_added": list(self.harness_lessons_added),
         }
         return complete_record(record, CARD_FIELDS)
 
