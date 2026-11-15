@@ -89,55 +89,88 @@ def _code_of(line: str) -> str:
 
 def banned_patterns_rust(added_lines: list[dict], cfg,
                          production_paths: set[str],
-                         base_lines: dict[str, set[str]] | None = None,
-                         base_counts: dict[str, dict[str, int]] | None = None
+                         base_counts: dict[str, dict[str, int]] | None = None,
+                         head_counts: dict[str, dict[str, int]] | None = None
                          ) -> GateResult:
     """Added lines, scanned by the Rust pack.
 
-    `base_counts` holds, per changed file, how many times each banned label already
-    appeared at the base commit. A hit that does not raise a file's count is
-    **flagged, not banned**: a mechanical edit that renames the call before an
-    existing `.unwrap()` did not introduce it, and banning it would block honest work
-    on a file the card never made worse.
+    The decision is a **count comparison per file**, not a search for new-looking
+    lines. `base_counts` and `head_counts` hold how many times each banned label
+    appeared in each file at the base commit and at head. A label whose count rose
+    was introduced by this card and is banned; one whose count did not rise was
+    already there and is flagged for the reviewer.
+
+    Counting is what makes a moved line safe to allow: a `mechanical` edit that
+    renames the call before an existing `.unwrap()` keeps the count at one, so it is
+    flagged, while a file with three `.unwrap()`s that gains a fourth goes to four
+    and is banned. Comparing *added lines* against a base allowance instead would let
+    a file with three swallow a fourth for free.
+
+    When `head_counts` is absent the gate falls back to added lines alone, and every
+    hit is banned: fewer allowances is the safe direction.
     """
     from ..packs.rust import RustPack
     pack = RustPack()
     found = pack.patterns(added_lines, cfg.flagged_patterns, production_paths)
-    banned: list[dict] = []
+    evidence_counts = {"base": base_counts or {}, "head": head_counts or {}}
+
+    if head_counts is None:
+        banned = list(found.get("banned", []))
+        flagged = list(found.get("flagged", []))
+        evidence = {"banned": banned, "flagged": flagged,
+                    "flagged_count": len(flagged), "pre_existing": [],
+                    "counts": evidence_counts}
+        if banned:
+            lines = "; ".join(
+                f"{entry['file']}:{entry['line']} {entry['pattern']}"
+                for entry in banned[:12])
+            return GateResult("banned-patterns", FAIL,
+                              f"{len(banned)} banned pattern(s): {lines}", evidence)
+        detail = "no banned patterns"
+        if flagged:
+            detail += f"; {len(flagged)} flagged for the reviewer"
+        return GateResult("banned-patterns", PASS, detail, evidence)
+
+    introduced: list[dict] = []
     pre_existing: list[dict] = []
+    for path, labels in (head_counts or {}).items():
+        for label, count in labels.items():
+            base = (base_counts or {}).get(path, {}).get(label, 0)
+            if count > base:
+                introduced.append({"file": path, "pattern": label,
+                                   "base": base, "head": count,
+                                   "added": count - base})
+            elif count:
+                pre_existing.append({"file": path, "pattern": label,
+                                     "count": count})
 
-    per_file: dict[str, dict[str, int]] = {}
+    # Where a line is known, name it: a reviewer wants the line, not just the count.
+    located: dict[tuple[str, str], list[dict]] = {}
     for entry in found.get("banned", []):
-        path = entry.get("file", "")
-        label = entry.get("pattern", "")
-        per_file.setdefault(path, {})
-        per_file[path][label] = per_file[path].get(label, 0) + 1
-
-    counts = base_counts or {}
-    for entry in found.get("banned", []):
-        path = entry.get("file", "")
-        label = entry.get("pattern", "")
-        allowed = counts.get(path, {}).get(label, 0)
-        if allowed > 0:
-            counts[path][label] = allowed - 1
-            pre_existing.append(entry)
-        else:
-            banned.append(entry)
+        located.setdefault((entry.get("file", ""), entry.get("pattern", "")),
+                           []).append(entry)
+    for entry in introduced:
+        hits = located.get((entry["file"], entry["pattern"]), [])
+        entry["line"] = hits[-1]["line"] if hits else 0
 
     flagged = list(found.get("flagged", [])) + pre_existing
-    evidence = {"banned": banned, "flagged": flagged,
-                "flagged_count": len(flagged),
-                "pre_existing": pre_existing}
-    if banned:
+    evidence = {"banned": introduced, "flagged": flagged,
+                "flagged_count": len(flagged), "pre_existing": pre_existing,
+                "counts": evidence_counts}
+
+    if introduced:
         lines = "; ".join(
-            f"{entry['file']}:{entry['line']} {entry['pattern']}"
-            for entry in banned[:12])
+            f"{entry['file']}"
+            + (f":{entry['line']}" if entry.get("line") else "")
+            + f" {entry['pattern']} ({entry['base']} -> {entry['head']})"
+            for entry in introduced[:12])
         return GateResult("banned-patterns", FAIL,
-                          f"{len(banned)} banned pattern(s): {lines}", evidence)
-    detail = "no banned patterns"
+                          f"{len(introduced)} banned pattern(s) introduced: {lines}",
+                          evidence)
+    detail = "no banned patterns introduced"
     if pre_existing:
-        detail += (f"; {len(pre_existing)} pattern(s) already on the line at base, "
-                   f"flagged for the reviewer")
+        detail += (f"; {len(pre_existing)} already present at base, flagged for the "
+                   f"reviewer")
     if flagged and len(flagged) > len(pre_existing):
         detail += f"; {len(flagged) - len(pre_existing)} flagged"
     return GateResult("banned-patterns", PASS, detail, evidence)

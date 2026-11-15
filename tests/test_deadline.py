@@ -57,6 +57,20 @@ class DeadlineTests(unittest.TestCase):
         deadline = _deadline(self.make(until=future.strftime("%Y-%m-%dT%H:%M:%S")))
         self.assertAlmostEqual(deadline - time.monotonic(), 7200.0, delta=5.0)
 
+    def test_the_deadline_is_in_the_same_clock_the_run_checks(self) -> None:
+        """`_deadline` answers in `time.monotonic()` and the run compares to it.
+
+        Mixing the two clocks (a monotonic deadline against `time.time()`) makes
+        every card look overdue, which is how `--for` once turned a night into a
+        no-op.
+        """
+        import time
+        deadline = _deadline(self.make(for_duration="1h"))
+        self.assertGreater(deadline, time.monotonic())
+        self.assertLess(deadline, time.monotonic() + 3700)
+        # A wall-clock value would be around 1.7e9, three orders larger.
+        self.assertLess(deadline, 1e8)
+
     def test_a_bad_time_is_a_usage_error(self) -> None:
         with self.assertRaises(UsageError):
             _deadline(self.make(until="half past"))

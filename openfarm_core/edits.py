@@ -220,11 +220,26 @@ def apply_edits(worktree: Path, edits: list[Edit], allowed_paths: list[str],
                 "path": path, "code": "path-escape",
                 "message": "this path resolves outside the worktree"})
             continue
+        if target == root or target.is_dir():
+            report.refused.append({
+                "path": path, "code": "not-a-file",
+                "message": "this path is a directory, not a file"})
+            continue
         # A glob in `additions_only` still means its files are additions-only.
         is_addition = path in additions or (
             additions and matches_any(path, additions))
         if is_addition:
-            existing = target.read_text() if target.exists() else ""
+            # A file that does not exist yet is *not* additions-only by construction:
+            # every line of a brand-new file is an "addition", so a whole-file edit
+            # would pass. It is refused instead, because the only additions the test
+            # writer may make to production code are stubs.
+            if not target.exists():
+                report.refused.append({
+                    "path": path, "code": "additions-only-new-file",
+                    "message": "the test writer may not create a production file: "
+                               "only append a stub to one that exists"})
+                continue
+            existing = target.read_text()
             before = existing
         else:
             before = target.read_text() if target.exists() else None

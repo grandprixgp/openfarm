@@ -21,8 +21,8 @@ from .errors import Infra
 #: Every git subcommand the core is allowed to run.
 ALLOWED_SUBCOMMANDS = frozenset({
     "init", "add", "commit", "status", "diff", "rev-parse", "rev-list",
-    "checkout", "switch", "branch", "worktree", "merge", "reset", "clean",
-    "ls-files", "show", "cat-file", "hash-object", "for-each-ref",
+    "checkout", "switch", "branch", "worktree", "merge", "merge-base", "reset",
+    "clean", "ls-files", "show", "cat-file", "hash-object", "for-each-ref",
     "update-ref", "symbolic-ref", "log", "config", "stash", "rm", "mv",
     "describe", "tag", "apply", "restore",
 })
@@ -48,26 +48,43 @@ class GitRefused(Exception):
 
 
 #: Options that consume the next argument, so that argument is a value, not a
-#: subcommand. Every other word after a `-`-prefixed token is treated as a candidate
-#: subcommand, because an allowlist that guesses wrong is worse than a strict one.
+#: subcommand. `-m` is here because a commit message can be any word at all.
 _OPTIONS_TAKING_A_VALUE = frozenset({
     "-C", "--git-dir", "--work-tree", "--namespace", "--exec-path",
     "--config-env", "-c", "--super-prefix", "--shallow-file",
+    "-m", "--message", "-F", "--file", "--author", "--date", "-t",
+})
+
+
+#: Subcommands whose arguments are paths or refs, never further subcommands. For
+#: these the scan stops at the subcommand, so a file named `remote` is a file.
+_LEAF_SUBCOMMANDS = frozenset({
+    "add", "commit", "diff", "show", "ls-files", "log", "status", "reset",
+    "clean", "checkout", "switch", "branch", "worktree", "merge", "merge-base",
+    "rev-parse", "rev-list", "cat-file", "hash-object", "for-each-ref",
+    "update-ref", "symbolic-ref", "stash", "rm", "mv", "describe", "tag",
+    "apply", "restore", "init", "config",
 })
 
 
 def _check_subcommand(args: list[str]) -> str:
-    """Check every word of a git argv, not just the first one.
+    """Check the words git will read as a subcommand, and only those.
 
-    A single-token check is not enough: `git --namespace config push` passes
-    `config` to a first-token reader and then runs `push`. Every non-option word is
-    therefore checked against both lists, and the option values that `git` would
-    treat as data are the only ones skipped.
+    Three things this must do, because git's own grammar is the only thing that
+    decides which word is a subcommand:
+
+    - Refuse `push` (and the rest) wherever it *is* the subcommand, including after
+      global options: `git --namespace config push` runs `push`.
+    - Stop scanning after the subcommand when that subcommand takes paths, so a
+      repository with a file called `push` or `remote` works.
+    - Skip option values, because a commit message can be any word at all.
     """
     subcommands: list[str] = []
     index = 0
     while index < len(args):
         token = args[index]
+        if token == "--":
+            break
         if token in _OPTIONS_TAKING_A_VALUE:
             index += 2
             continue
@@ -76,6 +93,9 @@ def _check_subcommand(args: list[str]) -> str:
             continue
         subcommands.append(token)
         index += 1
+        # A leaf subcommand's remaining words are its arguments, not subcommands.
+        if token in _LEAF_SUBCOMMANDS:
+            break
 
     if not subcommands:
         raise GitRefused("git was called with no subcommand")

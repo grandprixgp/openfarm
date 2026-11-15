@@ -188,9 +188,17 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
     identifiers = [args.card] if args.card else source.next(cfg.lane,
                                                            limit=args.cards)["cards"]
     # `--spend` may lower the night's cap but never raise the config's, because the
-    # config is the operator's standing limit and the flag is one night's.
+    # config is the operator's standing limit and the flag is one night's. A zero or
+    # negative flag is a usage error rather than "no cap": silently turning a limit
+    # off is the one thing a spend flag must never do.
     cap = cfg.spend_per_night
     if args.spend is not None:
+        if args.spend < 0:
+            raise UsageError("--spend must be zero or more")
+        if args.spend == 0:
+            raise UsageError(
+                "--spend 0 would remove the cap; set spend_per_night in the config "
+                "and pass a positive --spend to lower it")
         cap = (min(args.spend, cfg.spend_per_night) if cfg.spend_per_night > 0
                else args.spend)
     night = NightBudget(cap, cards_cap=args.cards)
@@ -203,7 +211,9 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
             outcomes.append({"card": card_id, "final_state": "blocked",
                              "stop_code": StopCode.KILLED.value})
             break
-        if deadline is not None and _time.time() >= deadline:
+        # `_deadline` answers in `time.monotonic()`, so it must be compared to the
+        # same clock. Comparing it to `time.time()` would skip every card at once.
+        if deadline is not None and _time.monotonic() >= deadline:
             outcomes.append({"card": card_id,
                              "skipped": "the run's time ran out"})
             continue

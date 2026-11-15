@@ -24,7 +24,7 @@ from .gates.checks import (PASS, FAIL, INFRA, GateResult, banned_patterns_rust,
                            paths_touched_by_extra_gate, revert_check,
                            suite_green, test_loss)
 from .gates.eligibility import check_eligibility, file_is_blocked
-from .git import Git
+from .git import Git, GitRefused
 from .globs import matches_any, normalise
 from .roles import (Roles, build_checker_pass1_brief, build_checker_pass2_brief,
                     build_implementer_brief, build_planner_brief,
@@ -253,9 +253,12 @@ class CardRun:
             self._step_catch_up()
             final_state = "in-review"
             self.stop_code = None
-        except Refused as exc:
+        except (Refused, GitRefused) as exc:
+            # A git refusal is the same class of thing as an adapter refusal: a rule
+            # said no. Letting it escape would leave the card claimed and no run
+            # record written.
             self.stop_code = StopCode.REFUSED
-            self.detail = exc.message
+            self.detail = getattr(exc, "message", None) or str(exc)
             final_state = "blocked"
         except BudgetExceeded as exc:
             self.stop_code = exc.code
@@ -482,13 +485,23 @@ class CardRun:
                                      StopCode.TESTS_UNPROVABLE, role="test_writer")
                 continue
 
+            # Production files in touches are not the test writer's to rewrite. On a
+            # card that declares new symbols it may only append a stub there; on any
+            # other card it may not write them at all. The set is classified rather
+            # than taken from the raw touches: a test-backfill card's touches *are*
+            # test files, and treating those as production would make that category
+            # unrunnable.
+            production = {
+                path for path in self.card.touches
+                if self.pack.classify_paths([path]).get(
+                    normalise(path), "") == "production"}
             report = apply_edits(
                 self.worktree, edits, self._test_writer_paths(),
                 self.cfg.never_touch, self.cfg.forbidden_files,
-                additions_only=set(self.card.touches) if self.card.new_symbols else set(),
+                additions_only=production if self.card.new_symbols else set(),
                 allow_stubs=self.card.new_symbols,
                 stub_inserter=self._stub_inserter(),
-                production_paths=set(self.card.touches),
+                production_paths=production,
                 forbid_production=not self.card.new_symbols)
             write_json(self.card_layout / "edits" / f"A{attempt}.json",
                        report.as_dict())
@@ -620,6 +633,15 @@ class CardRun:
 
     def _step_phase_b(self) -> None:
         self.phase = "implement"
+        if self.card.category == "test-backfill":
+            # A backfill card adds tests to code that already works: there is no
+            # production change to make, and its proof is mutation at the end.
+            self._record_gate(GateResult(
+                "implementer", PASS,
+                "skipped for test-backfill: the code already works and mutation is "
+                "the proof"))
+            return
+
         last_failure = ""
         counter_tests = ""
         # Bounded by a free-slots budget rather than by the config number, so a
@@ -662,7 +684,7 @@ class CardRun:
                 last_failure = exc.message
                 self.budget.implementer_attempts -= 1
                 self._record_attempt("implement", "refused",
-                                     role="implementer")
+                                     role="implementer", attempt=attempt_no)
                 free_retries -= 1
                 if free_retries <= 0:
                     raise GateFailure(
@@ -784,8 +806,14 @@ class CardRun:
     def _record_attempt(self, phase: str, outcome: str,
                         stop_code: StopCode | None = None, *,
                         diff: dict | None = None, gates: list[GateResult] | None = None,
-                        role: str = "", started: str = "") -> None:
-        """Write one attempt record, in the fields the spec fixes."""
+                        role: str = "", started: str = "",
+                        attempt: int | None = None) -> None:
+        """Write one attempt record, in the fields the spec fixes.
+
+        `attempt` is passed explicitly by the implementer, because a refused answer
+        gives the attempt back and the budget's counter is then decremented: reading
+        it here would number two different records the same.
+        """
         from .adapters.jsonl import ATTEMPT_FIELDS, complete_record
         from .edits import line_counts
 
@@ -797,8 +825,10 @@ class CardRun:
             "run_id": self.run_id,
             "card_id": self.card.id,
             "card_hash": getattr(self, "card_hash_at_claim", ""),
-            "attempt": self.budget.implementer_attempts
-            if phase in ("implement", "fix") else self.budget.test_writer_attempts,
+            "attempt": (attempt if attempt is not None else
+                        self.budget.implementer_attempts
+                        if phase in ("implement", "fix")
+                        else self.budget.test_writer_attempts),
             "phase": phase,
             "started_at": started or self.started_at,
             "ended_at": utc_now(),
@@ -849,7 +879,9 @@ class CardRun:
         production = {path for path in changed
                       if self.pack.classify_paths([path]).get(path) == "production"}
         banned = self._record_gate(banned_patterns_rust(
-            added, self.cfg, production, base_counts=self._base_banned(changed)))
+            added, self.cfg, production,
+            base_counts=self._banned_counts(changed, at_base=True),
+            head_counts=self._banned_counts(changed, at_base=False)))
         if not banned.ok:
             return banned.detail
 
@@ -869,7 +901,11 @@ class CardRun:
                       if _status_of(parsed, name) == "ok")
         self.named_passing = passing
         self.best_named_passing = max(self.best_named_passing, passing)
-        self.named_history.append(passing)
+        # Only cards with named tests have a count that can rise. A mechanical card
+        # or a backfill card would sit at zero for ever, and the "not rising" rule
+        # would then stop it on its second attempt whatever it had achieved.
+        if self.card.test_names:
+            self.named_history.append(passing)
 
         lint_result = self._run(runner_kind("lint"),
                                 self.pack.commands("lint", unit=unit)["argv"])
@@ -891,7 +927,8 @@ class CardRun:
                             for name in self.card.test_names)
             if all_named:
                 self._commit(f"{self.card.id}: make the frozen tests pass")
-                self._record_attempt("implement", "passed-gates", diff=diff)
+                self._record_attempt("implement", "passed-gates", diff=diff,
+                                         attempt=attempt_no)
                 return None
             detail = ("named tests still failing: " + ", ".join(
                 name for name in self.card.test_names
@@ -899,13 +936,15 @@ class CardRun:
             # The suite can be green while a named test is still red, so the progress
             # signals have to be checked on this path too.
             self._check_progress()
-            self._record_attempt("fix", "failed-gates", diff=diff)
+            self._record_attempt("fix", "failed-gates", diff=diff,
+                                         attempt=attempt_no)
             return detail
 
         self._check_progress()
         detail = (suite.detail or "") + (
             " | " + lint_gate.detail if lint_gate.detail else "")
-        self._record_attempt("fix", "failed-gates", diff=diff)
+        self._record_attempt("fix", "failed-gates", diff=diff,
+                                         attempt=attempt_no)
         return detail
 
     def _check_progress(self) -> None:
@@ -929,24 +968,29 @@ class CardRun:
                     StopCode.NO_PROGRESS,
                     f"passing named tests did not rise: {previous} then {current}")
 
-    def _base_banned(self, paths: list[str]) -> dict[str, dict[str, int]]:
-        """How often each banned pattern already appeared in each file at base.
+    def _banned_counts(self, paths: list[str], at_base: bool
+                       ) -> dict[str, dict[str, int]]:
+        """How often each banned pattern appears in each file, at base or at head.
 
-        Used so a banned pattern the file already had is flagged rather than blamed
-        on this card: a `mechanical` edit that renames the call before an existing
-        `.unwrap()` did not introduce it.
+        The gate compares the two counts. A label whose count rose was introduced by
+        this card; one that did not was already there and is flagged. Counting the
+        file's whole content is what makes a moved line safe to allow.
         """
         from .packs.rust import RustPack
         pack = RustPack()
         out: dict[str, dict[str, int]] = {}
         for path in paths:
-            blob = self.git.show_blob(f"{self.base_commit}:{path}")
-            if blob is None:
+            if at_base:
+                content = self.git.show_blob(f"{self.base_commit}:{path}")
+            else:
+                full = self.worktree / path
+                content = full.read_text() if full.exists() else None
+            if content is None:
                 continue
             production = ({path} if pack.classify_paths([path]).get(path)
                           == "production" else set())
             lines = [{"path": path, "line": number, "text": line}
-                     for number, line in enumerate(blob.splitlines(), start=1)]
+                     for number, line in enumerate(content.splitlines(), start=1)]
             found = pack.patterns(lines, [], production)
             counts: dict[str, int] = {}
             for entry in found.get("banned", []):
@@ -1036,8 +1080,10 @@ class CardRun:
             path for path in changed
             if self.pack.classify_paths([path]).get(path) == "production"}
         final_banned = self._record_gate(
-            banned_patterns_rust(whole_added, self.cfg, production_all,
-                                 base_counts=self._base_banned(changed)))
+            banned_patterns_rust(
+                whole_added, self.cfg, production_all,
+                base_counts=self._banned_counts(changed, at_base=True),
+                head_counts=self._banned_counts(changed, at_base=False)))
         if not final_banned.ok:
             raise GateFailure(StopCode.REFUSED, final_banned.detail)
 
@@ -1066,7 +1112,7 @@ class CardRun:
             self._record_gate(revert_check(
                 self.frozen_hash, _tests_hash(current)))
 
-        self._mutation_gate(changed)
+        self._mutation_gate(changed, test_paths=self._test_paths())
 
         # Checker pass 1, then pass 2 with counter-tests.
         self._checker(changed, full_diff)
@@ -1142,7 +1188,8 @@ class CardRun:
                     raise GateFailure(StopCode.INELIGIBLE, gate.detail)
                 raise GateFailure(StopCode.EXTRA_GATE, gate.detail)
 
-    def _mutation_gate(self, changed: list[str]) -> None:
+    def _mutation_gate(self, changed: list[str],
+                       test_paths: list[str] | None = None) -> None:
         mode = self.cfg.mutation
         if mode == "off":
             self._record_gate(GateResult("mutation", PASS, "off in this config"))
@@ -1151,6 +1198,11 @@ class CardRun:
                     or mode == "required")
         production = [path for path in changed
                       if self.pack.classify_paths([path]).get(path) == "production"]
+        if not production and breaking:
+            # A test-backfill card changes no production code, and its whole proof is
+            # that its new tests kill mutants in the code they cover. That code is the
+            # card's unit, not its diff.
+            production = self._mutated_unit_files()
         if not production:
             self._record_gate(GateResult(
                 "mutation", PASS, "no production lines changed"))
@@ -1171,11 +1223,16 @@ class CardRun:
 
         out, err = self._output(result)
         if result.cls == INFRA:
+            detail = ("the mutation tool reported an infra error: "
+                      + (err or out).strip()[:300])
             self._record_gate(GateResult(
-                "mutation", FAIL if breaking else PASS,
-                "the mutation tool reported an infra error"))
+                "mutation", FAIL if breaking else PASS, detail))
             if breaking:
-                raise Infra("mutation-infra", "the mutation tool failed")
+                # Mutation is this card's only proof, so a tool that cannot run
+                # leaves it unproven. That is a card-level block, not infra: infra
+                # would pause the queue and spend no attempt, and retrying would meet
+                # the same missing tool.
+                raise GateFailure(StopCode.MUTATION_CAP, detail)
             return
 
         try:
@@ -1206,6 +1263,29 @@ class CardRun:
             code = StopCode.MUTATION_CAP if parsed.get("capped") else \
                 StopCode.TESTS_UNPROVABLE
             raise GateFailure(code, gate.detail)
+
+    def _mutated_unit_files(self) -> list[str]:
+        """The production files of the card's unit, for a card that changed none.
+
+        A `test-backfill` card's diff is all tests, so its mutation target has to come
+        from the unit it covers. The card may name them in `touches` alongside the
+        tests; otherwise every `.rs` file under the unit's `src/` is the target.
+        """
+        named = [path for path in self.card.touches
+                 if self.pack.classify_paths([path]).get(path) == "production"]
+        if named:
+            return named
+        unit = self.card.unit
+        roots = [self.worktree / unit / "src", self.worktree / "src"] \
+            if unit and unit != "." else [self.worktree / "src"]
+        out: list[str] = []
+        for root in roots:
+            if not root.is_dir():
+                continue
+            for path in sorted(root.rglob("*.rs")):
+                out.append(str(path.relative_to(self.worktree)))
+            break
+        return out
 
     def _checker(self, changed: list[str], full_diff: str) -> None:
         test_diff = diff_text(

@@ -69,6 +69,11 @@ test that never compiled, a frozen test rewritten, an ignored test, a production
 
 ## Status
 
-Core and adapters, with the Rust pack, on a real public crate. **Unproven:** no real
-model has run through it, mutation testing is not installed here, and cards run one at
-a time. `docs/openfarm-internals.md` lists the rest.
+The core and adapters, with the Rust pack, running cards to `in-review` on a real toy
+repository and on a real public crate (`dtolnay/anyhow`), whose branch passes
+`clippy -D warnings` when checked by hand.
+
+**Unproven:** no real model has run through it (every gate is proven against scripted
+answers), mutation testing is not installed on this machine, cards run one at a time,
+and spend caps need prices in the config to mean anything. `docs/openfarm-internals.md`
+lists the rest, with the tests that back each claim.

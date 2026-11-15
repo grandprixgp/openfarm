@@ -110,6 +110,26 @@ class ProductionWriteTests(unittest.TestCase):
         self.assertTrue(report.ok, report.as_dict())
         self.assertIn("pub fn b()", (self.wt / "src" / "lib.rs").read_text())
 
+    def test_the_test_writer_may_not_create_a_production_file(self) -> None:
+        """Every line of a new file is an "addition", so a whole-file edit would pass.
+
+        A production file that does not exist yet is refused, because the only
+        addition the test writer may make to production code is a stub on a file that
+        already exists.
+        """
+        edit = Edit("whole_file", "src/brand_new.rs", content="pub fn new() {}")
+        report = apply_edits(self.wt, [edit], ["src/**"], [], [],
+                             additions_only={"src/**"},
+                             production_paths={"src/**"})
+        self.assertIn("additions-only-new-file",
+                      [entry["code"] for entry in report.refused])
+        self.assertFalse((self.wt / "src" / "brand_new.rs").exists())
+
+    def test_a_directory_target_is_refused_not_a_crash(self) -> None:
+        edit = Edit("whole_file", "src", content="x")
+        report = apply_edits(self.wt, [edit], ["src"], [], [])
+        self.assertIn("not-a-file", [entry["code"] for entry in report.refused])
+
     def test_additions_only_works_for_a_glob(self) -> None:
         edit = Edit("search_replace", "src/lib.rs",
                     search="pub fn a() {}\n",
@@ -207,6 +227,47 @@ class GitAllowlistTests(unittest.TestCase):
         with self.assertRaises(GitRefused):
             git._run(["push", "origin", "main"])
 
+    def test_a_path_named_push_is_not_a_subcommand(self) -> None:
+        """A repository may hold a file called `push`. Nothing after `--` is one."""
+        self.assertEqual(_check_subcommand(["diff", "HEAD", "--", "push"]), "diff")
+        self.assertEqual(
+            _check_subcommand(["ls-files", "--others", "--", "fetch"]), "ls-files")
+        self.assertEqual(_check_subcommand(["add", "-A", "remote"]), "add")
+
+    def test_a_commit_message_named_push_is_not_a_subcommand(self) -> None:
+        self.assertEqual(
+            _check_subcommand(["commit", "-q", "-m", "push the thing"]), "commit")
+        self.assertEqual(_check_subcommand(["commit", "-m", "fetch"]), "commit")
+
+    def test_every_argv_openfarm_builds_is_accepted(self) -> None:
+        """The allowlist must not refuse the calls the core actually makes."""
+        for argv in (
+            ["add", "-A"],
+            ["commit", "-q", "-m", "CARD-1: make the frozen tests pass"],
+            ["reset", "--hard", "HEAD"],
+            ["clean", "-fd"],
+            ["checkout", "--detach", "openfarm/CARD-1-x"],
+            ["branch", "--force", "openfarm/CARD-1-x", "abc123"],
+            ["worktree", "add", "--force", "/tmp/wt", "openfarm/CARD-1-x"],
+            ["worktree", "remove", "--force", "/tmp/wt"],
+            ["worktree", "list", "--porcelain"],
+            ["merge", "--no-commit", "--no-ff", "refs/heads/main"],
+            ["merge", "--abort"],
+            ["diff", "HEAD", "--", "src/a.rs"],
+            ["diff", "--name-only", "HEAD"],
+            ["diff", "--cached", "--quiet"],
+            ["show", "abc123:src/a.rs"],
+            ["ls-files", "--others", "--exclude-standard"],
+            ["rev-parse", "--verify", "--quiet", "refs/heads/main"],
+            ["rev-parse", "--abbrev-ref", "HEAD"],
+            ["rev-list", "--count", "main..HEAD"],
+            ["for-each-ref"],
+            ["status", "--porcelain"],
+            ["merge-base", "HEAD", "main"],
+            ["update-ref", "refs/heads/main", "abc123"],
+        ):
+            _check_subcommand(argv)
+
 
 class SeamPrefixTests(unittest.TestCase):
     """A seam prefix is caught however the path is written."""
@@ -240,36 +301,50 @@ class PreExistingPatternTests(unittest.TestCase):
         }, Path("/tmp/none"))
 
     def test_a_moved_unwrap_is_flagged_not_banned(self) -> None:
+        """The file's count stays at one, so the card did not introduce it."""
         from openfarm_core.gates.checks import banned_patterns_rust
         lines = [{"path": "src/a.rs", "line": 4,
                   "text": "        self.chain().next_back().unwrap()"}]
         gate = banned_patterns_rust(
             lines, self.cfg, {"src/a.rs"},
-            base_counts={"src/a.rs": {"production-unwrap": 1}})
+            base_counts={"src/a.rs": {"production-unwrap": 1}},
+            head_counts={"src/a.rs": {"production-unwrap": 1}})
         self.assertEqual(gate.result, "pass", gate.detail)
         self.assertEqual(len(gate.evidence["pre_existing"]), 1)
-        self.assertIn("already on the line at base", gate.detail)
+        self.assertIn("already present at base", gate.detail)
 
-    def test_one_more_unwrap_than_base_is_banned(self) -> None:
+    def test_a_file_that_gains_a_fourth_unwrap_is_banned(self) -> None:
+        """Three at base, four at head: the card added one, whoever wrote the rest."""
         from openfarm_core.gates.checks import banned_patterns_rust
-        lines = [
-            {"path": "src/a.rs", "line": 4,
-             "text": "        let a = first.unwrap();"},
-            {"path": "src/a.rs", "line": 9,
-             "text": "        let b = second.unwrap();"},
-        ]
+        lines = [{"path": "src/a.rs", "line": 40,
+                  "text": "    let v = get().unwrap();"}]
         gate = banned_patterns_rust(
             lines, self.cfg, {"src/a.rs"},
-            base_counts={"src/a.rs": {"production-unwrap": 1}})
+            base_counts={"src/a.rs": {"production-unwrap": 3}},
+            head_counts={"src/a.rs": {"production-unwrap": 4}})
         self.assertEqual(gate.result, "fail")
         self.assertEqual(len(gate.evidence["banned"]), 1)
+        self.assertEqual(gate.evidence["banned"][0]["added"], 1)
 
     def test_a_new_unwrap_with_no_base_count_is_banned(self) -> None:
         from openfarm_core.gates.checks import banned_patterns_rust
         lines = [{"path": "src/a.rs", "line": 1,
                   "text": "    let x = y.unwrap();"}]
-        gate = banned_patterns_rust(lines, self.cfg, {"src/a.rs"})
+        gate = banned_patterns_rust(
+            lines, self.cfg, {"src/a.rs"},
+            base_counts={}, head_counts={"src/a.rs": {"production-unwrap": 1}})
         self.assertEqual(gate.result, "fail")
+
+    def test_the_caller_s_counts_are_not_mutated(self) -> None:
+        from openfarm_core.gates.checks import banned_patterns_rust
+        base = {"src/a.rs": {"production-unwrap": 2}}
+        head = {"src/a.rs": {"production-unwrap": 2}}
+        lines = [{"path": "src/a.rs", "line": 2,
+                  "text": "    let x = y.unwrap();"}]
+        banned_patterns_rust(lines, self.cfg, {"src/a.rs"},
+                             base_counts=base, head_counts=head)
+        self.assertEqual(base, {"src/a.rs": {"production-unwrap": 2}},
+                         "the base counts must survive the gate")
 
 
 if __name__ == "__main__":

@@ -339,6 +339,105 @@ def _register(case, toy):
 
 
 @unittest.skipUnless(ENABLED, "set OPENFARM_E2E=1")
+class TestBackfillTests(unittest.TestCase):
+    """A backfill card touches only test files and has no production work.
+
+    This category was briefly unrunnable: the test writer's production check treated
+    its test files as production, and the implementer phase then had nothing to do.
+    """
+
+    def setUp(self) -> None:
+        self.toy = build_toy()
+        self._toys = [self.toy]
+
+    def tearDown(self) -> None:
+        for toy in getattr(self, "_toys", []):
+            toy.cleanup()
+        self._toys = []
+
+    def test_a_backfill_card_reaches_in_review(self) -> None:
+        self.toy.write_card(
+            "BACK-1", title="Pin the empty fascicle length",
+            category="test-backfill",
+            touches=["tests/existing.rs"],
+            tests=[{"name": "an_empty_fascicle_has_length_zero",
+                    "file": "tests/existing.rs", "asserts": "len() == 0"}],
+            done_text="An empty fascicle has `len()` zero.")
+        self.toy.commit("toy: BACK-1")
+
+        backend = ScriptedBackend({
+            "test_writer": (
+                "=== whole_file: tests/existing.rs\n"
+                "use toy::fascicle::Fascicle;\n\n"
+                "#[test]\n"
+                "fn an_empty_fascicle_has_length_zero() {\n"
+                "    let fascicle = Fascicle::new(3);\n"
+                "    assert_eq!(fascicle.len(), 0);\n"
+                "}\n"),
+            "checker_pass1": "RESTATEMENT: an empty fascicle has length zero",
+            "checker_pass2": "{}",
+        })
+        from openfarm_core.adapters.files import open_file_source
+        from openfarm_core.adapters.jsonl import JsonlTelemetry, TelemetrySink
+        context = Context(self.toy.root)
+        source = open_file_source(context.cfg, context.state.root)
+        source.prepare()
+        run_id = "run-backfill"
+        run_dir = context.state.create_run(run_id)
+        outcome = _run_card(context, source, "BACK-1", run_id,
+                            TelemetrySink(JsonlTelemetry(run_dir)), run_dir, None,
+                            backend=backend)
+        # Mutation is a test-backfill card's only blocking proof, and no mutation
+        # tool is installed on this machine. So the honest outcome is a block, not a
+        # pass: a backfill card that cannot be proven must not reach review. The
+        # dossier says which gate stopped it.
+        self.assertEqual(outcome["final_state"], "blocked")
+        self.assertIn(outcome["stop_code"], ("mutation-cap", "tests-unprovable"))
+        self.assertEqual(outcome["mutation"]["total"], 0)
+
+    def test_a_backfill_card_reaches_in_review_when_mutation_is_off(self) -> None:
+        """With mutation off, the same card runs through — the rest of the flow works."""
+        config = self.toy.config.read_text().replace(
+            'mutation = "report"', 'mutation = "off"').replace(
+            'mutation_required_for = ["test-backfill"]',
+            'mutation_required_for = []')
+        self.toy.config.write_text(config)
+        self.toy.write_card(
+            "BACK-2", title="Pin the empty fascicle length",
+            category="test-backfill",
+            touches=["tests/existing.rs"],
+            tests=[{"name": "an_empty_fascicle_has_length_zero",
+                    "file": "tests/existing.rs", "asserts": "len() == 0"}],
+            done_text="An empty fascicle has `len()` zero.")
+        self.toy.commit("toy: BACK-2")
+
+        backend = ScriptedBackend({
+            "test_writer": (
+                "=== whole_file: tests/existing.rs\n"
+                "use toy::fascicle::Fascicle;\n\n"
+                "#[test]\n"
+                "fn an_empty_fascicle_has_length_zero() {\n"
+                "    let fascicle = Fascicle::new(3);\n"
+                "    assert_eq!(fascicle.len(), 0);\n"
+                "}\n"),
+            "checker_pass1": "RESTATEMENT: an empty fascicle has length zero",
+            "checker_pass2": "{}",
+        })
+        from openfarm_core.adapters.files import open_file_source
+        from openfarm_core.adapters.jsonl import JsonlTelemetry, TelemetrySink
+        context = Context(self.toy.root)
+        source = open_file_source(context.cfg, context.state.root)
+        source.prepare()
+        run_id = "run-backfill-2"
+        run_dir = context.state.create_run(run_id)
+        outcome = _run_card(context, source, "BACK-2", run_id,
+                            TelemetrySink(JsonlTelemetry(run_dir)), run_dir, None,
+                            backend=backend)
+        self.assertEqual(outcome["final_state"], "in-review",
+                         f"{outcome.get('stop_code')}: {outcome.get('detail')}")
+
+
+@unittest.skipUnless(ENABLED, "set OPENFARM_E2E=1")
 class BudgetAndBreakerTests(unittest.TestCase):
     def tearDown(self) -> None:
         """Each toy carries a build target; /tmp here is a small tmpfs."""

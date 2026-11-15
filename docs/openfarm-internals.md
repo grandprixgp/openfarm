@@ -111,23 +111,49 @@ is a small tmpfs with a per-user quota.
 (`dtolnay/anyhow`, cloned to `~/projects/openfarm-second`) to show nothing about the
 core is toy-shaped. That repository's config and cards live in it, not here.
 
-## What is not proven
+## What is proven, and what is not
 
-- **No real model has run.** Every gate is proven against scripted answers. Whether
-  a cheap model can clear the gates is the pilot's question.
+**Proven**, with tests in this repository:
+
+- The per-card flow reaches `in-review` on a real toy repository and on a real public
+  crate (`dtolnay/anyhow`), with the branch carrying exactly the intended edit and the
+  base left alone.
+- Every gaming trick in the matrix is caught: a test that passes on base, a test that
+  never compiled, an ignored test, a frozen test rewritten, a production `.unwrap()`,
+  a leftover stub, an edit outside touches, a non-unique search block, a deleted test.
+- The no-push guarantee: the bare remote is empty after a full run, and the git
+  allowlist refuses `push` in every argv shape.
+- The catch-up trial merge: skipped when the base is still, merged green when it moved
+  harmlessly, blocked on a real conflict, and it commits nothing.
+- The circuit breaker, the kill switch, the pause, one run at a time, a dry run that
+  touches nothing, and an ineligible card released rather than blocked.
+- The adapter protocol, its four error kinds, and the `hash` fallback.
+
+**Not proven:**
+
+- **No real model has run.** Every gate is proven against scripted answers. Whether a
+  cheap model can clear them is the pilot's question.
 - **Mutation is unverified end to end.** The gate and its parser are implemented and
   tested against a fake tool, but `cargo-mutants` is not installed on this machine and
   installing it is a system change. On Atlas it must also build through `tools/heavy`.
-- **Concurrency is sequential.** `concurrent_cards` and `concurrent_builds` are in the
-  config and the budget, but cards run one after another. The per-card state is
-  already isolated enough for a pool; the loop in `cli._do_run` is what would change.
-- **Leases are implemented and dormant.** The file card source keeps a lease; a card
-  source without one falls back to its own stale list.
+- **Concurrency is sequential.** `concurrent_cards` and `concurrent_builds` are parsed
+  and a run records a note that they are inert. The per-card state is isolated enough
+  for a pool; the loop in `cli._do_run` is what would change.
+- **Leases are implemented and dormant.** The file card source keeps and renews a
+  lease; a card source without one falls back to its own stale list.
+- **Spend caps cannot fire without prices.** `[model] cost_per_1k_in` and
+  `cost_per_1k_out` are what make a spend cap mean anything; with both at zero the run
+  record says `spend_measured: false` rather than pretending.
 - **The two diagrams in the spec are missing** from the file, so the flow's step order
   was reconstructed from the prose in *Per-card flow*, *Roles*, *Gates* and the
   stop-code table.
 - **The TypeScript pack does not exist.** It comes after the pilot, and `pack_for`
   refuses it plainly rather than pretending.
+- **Cutting cards is real work.** Four cards were written for the second repository;
+  one was eligible and correct. The other three were a bad premise about the API, an
+  illegal edit to a trait item, and a production `.unwrap()` the file already had. The
+  gates caught all three, which is the system working, but it is the spec's warning
+  that a card is harder to cut than it looks.
 
 ## Adding a language pack
 
