@@ -1,4 +1,4 @@
-"""The `openfarm` command: one entry point, eleven subcommands, shared exit codes.
+"""The `openfarm` command: one entry point, twelve subcommands, shared exit codes.
 
 Exit codes are the same for every command:
 
@@ -37,6 +37,7 @@ from .gates.checks import suite_green
 from .gates.eligibility import check_eligibility, derive_cargo_unit
 from .git import Git, GitRefused
 from .globs import matches_any
+from .harness_memory import HarnessLibrary
 from .micromanager import open_micromanager
 from .packs.base import pack_for
 from .state import (StateDir, _safe_id, read_json, utc_now, utc_after,
@@ -83,6 +84,18 @@ def _check_id(value: str, what: str = "card id") -> str:
         return _safe_id(value, what)
     except Invalid as exc:
         raise Refused("bad-id", exc.message) from exc
+
+
+def _open_harness_library(
+    ctx: Context, *, require_enabled: bool = True
+) -> HarnessLibrary | None:
+    hcfg = getattr(ctx.cfg, "harness", None)
+    enabled = bool(getattr(hcfg, "enabled", False))
+    if require_enabled and not enabled:
+        return None
+    hdir_raw = str(getattr(hcfg, "dir", "") or "").strip() if hcfg else ""
+    hdir = Path(hdir_raw).expanduser() if hdir_raw else ctx.state.harness()
+    return HarnessLibrary(hdir, config=ctx.cfg)
 
 
 # -- commands ------------------------------------------------------------------
@@ -303,6 +316,7 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
     script_path = Path(args.script) if getattr(args, "script", None) else None
     mm_script_path = (Path(args.mm_script)
                       if getattr(args, "mm_script", None) else None)
+    harness_lib = _open_harness_library(ctx, require_enabled=True)
 
     for card_id in identifiers:
         if ctx.state.kill_requested(cfg.kill_switch):
@@ -334,7 +348,8 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
             continue
 
         outcome = _run_card(ctx, source, card_id, run_id, telemetry,
-                            run_dir, script_path, mm_script=mm_script_path)
+                            run_dir, script_path, mm_script=mm_script_path,
+                            harness_library=harness_lib)
         outcomes.append(outcome)
         final_state = outcome.get("final_state")
         if final_state == "blocked":
@@ -375,7 +390,9 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
               "notes": notes,
               "outcomes": outcomes,
               "dry_run": bool(args.dry_run),
-              "telemetry_problems": telemetry.problems}
+              "telemetry_problems": telemetry.problems,
+              "harness": (harness_lib.status()
+                          if harness_lib is not None else {"enabled": False})}
     write_json(run_dir / "run.json", record)
     telemetry.write("run", record)
     telemetry.flush()
@@ -414,7 +431,8 @@ def _dry_run(ctx: Context, source: FileCardSource, card_id: str) -> dict:
 def _run_card(ctx: Context, source: FileCardSource, card_id: str, run_id: str,
               telemetry, run_dir: Path, script: Path | None,
               backend=None, mm_script: Path | None = None,
-              micromanager=None) -> dict:
+              micromanager=None,
+              harness_library: HarnessLibrary | None = None) -> dict:
     """Claim one card and drive it. `backend` overrides the configured one."""
     cfg = ctx.cfg
     holder = f"openfarm:{run_id}"
@@ -452,13 +470,18 @@ def _run_card(ctx: Context, source: FileCardSource, card_id: str, run_id: str,
         cfg, card_dir, ctx.repo, script=mm_script,
         worktree=worktree, card_dir=card_dir,
     ))
+    resolved_harness = (
+        harness_library
+        if harness_library is not None
+        else _open_harness_library(ctx, require_enabled=True)
+    )
     run = CardRun(
         card=card, cfg=cfg, state=ctx.state, card_dir=card_dir,
         worktree=worktree, runner=runner, pack=pack, backend=backend,
         book=book, run_id=run_id, telemetry=telemetry,
         deps_done=_deps_done(source, card), conventions=conventions,
         log=lambda message: print(message, file=sys.stderr),
-        micromanager=mm)
+        micromanager=mm, harness_library=resolved_harness)
     run.card_source = source
     try:
         record = run.run(claim=claim)
@@ -650,6 +673,7 @@ def _update_breaker(ctx: Context, consecutive: list[tuple[str, str, str]]) -> No
 def cmd_status(ctx: Context, args) -> int:
     """Read-only: the live run, the caps, and the farm's own state."""
     holder = ctx.state.lock_holder()
+    harness_lib = _open_harness_library(ctx, require_enabled=True)
     payload = {
         "run": holder or {},
         "paused": ctx.state.is_paused(),
@@ -658,6 +682,8 @@ def cmd_status(ctx: Context, args) -> int:
         "spend_cap": ctx.cfg.spend_per_night,
         "concurrent_cards": ctx.cfg.concurrent_cards,
         "last_run": _last_run(ctx),
+        "harness": (harness_lib.status()
+                    if harness_lib is not None else {"enabled": False}),
     }
     if args.card:
         card_id = _check_id(args.card, "card id")
@@ -841,7 +867,49 @@ def cmd_supervise(ctx: Context, args) -> int:
         ctx.cfg, ctx.state.root, ctx.repo,
         script=mm_script, worktree=ctx.repo,
     )
+    harness_lib = _open_harness_library(ctx, require_enabled=True)
     all_cards = source.all_cards()
+    if harness_lib is not None:
+        langs = getattr(ctx.cfg, "languages", None) or ("rust",)
+        lang = str(langs[0] or "rust")
+        relevant_cards = [
+            c for c in all_cards
+            if (card_id is None or c.id == card_id)
+            and (
+                (args.triage_blocked and c.state == "blocked")
+                or (args.prepare_queue and c.state in ("ready", "backlog"))
+            )
+        ]
+        cats = list(dict.fromkeys([c.category for c in relevant_cards if c.category] + ["*"]))
+        merged_cues: list[dict] = []
+        seen_cues: set[str] = set()
+        rev_val = 0
+        state_val = "confirmed"
+        for cat in cats:
+            sel = harness_lib.select_guidance(
+                language=lang,
+                kind=cat,
+                role="micromanager",
+            )
+            ctx_part = sel.micromanager_context or {}
+            if ctx_part:
+                rev_val = ctx_part.get("revision", rev_val)
+                state_val = ctx_part.get("state", state_val)
+                for cue in ctx_part.get("cues") or ():
+                    if not isinstance(cue, dict):
+                        continue
+                    cid = str(cue.get("id", ""))
+                    if cid and cid in seen_cues:
+                        continue
+                    if cid:
+                        seen_cues.add(cid)
+                    merged_cues.append(cue)
+        if merged_cues:
+            mm.harness_context = {
+                "revision": rev_val,
+                "state": state_val,
+                "cues": merged_cues,
+            }
 
     def _file_supervise_findings(findings: list[dict], default_card: str) -> list[str]:
         filed: list[str] = []
@@ -919,6 +987,57 @@ def cmd_supervise(ctx: Context, args) -> int:
     return EXIT_OK
 
 
+def cmd_harness(ctx: Context, args) -> int:
+    """Inspect and manage the adaptive harness cue library."""
+    harness_lib = _open_harness_library(ctx, require_enabled=False)
+    assert harness_lib is not None
+    action = getattr(args, "action", "status") or "status"
+    target = getattr(args, "target", None)
+    reason = getattr(args, "reason", None) or "manual"
+
+    if action == "status":
+        ctx.emit(harness_lib.status())
+        return EXIT_OK
+
+    if action == "index":
+        ctx.emit({"index": harness_lib.format_index(), "status": harness_lib.status()})
+        return EXIT_OK
+
+    if action == "show":
+        if not target:
+            raise UsageError("harness show requires <id>")
+        safe = _check_id(target, "entry id")
+        entry = harness_lib.show_entry(safe)
+        if entry is None:
+            raise Refused("unknown-harness-entry",
+                          f"harness entry {safe!r} does not exist")
+        ctx.emit(entry)
+        return EXIT_OK
+
+    if action == "promote":
+        if not target:
+            raise UsageError("harness promote requires <id>")
+        res = harness_lib.promote_entry(target, reason=reason)
+        ctx.emit(res)
+        return EXIT_OK
+
+    if action == "demote":
+        if not target:
+            raise UsageError("harness demote requires <id_or_rev>")
+        res = harness_lib.demote_entry_or_revision(target, reason=reason)
+        ctx.emit(res)
+        return EXIT_OK
+
+    if action == "reset":
+        if not getattr(args, "yes", False):
+            raise UsageError("harness reset requires --yes to confirm")
+        res = harness_lib.reset()
+        ctx.emit(res)
+        return EXIT_OK
+
+    raise UsageError(f"unknown harness action: {action}")
+
+
 # -- the parser ----------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
@@ -994,6 +1113,17 @@ def build_parser() -> argparse.ArgumentParser:
     supervise.add_argument("--apply", action="store_true")
     supervise.add_argument("--mm-script", dest="mm_script", default=None)
 
+    harness = sub.add_parser("harness", help="inspect and manage harness adaptations")
+    harness.add_argument(
+        "action",
+        nargs="?",
+        default="status",
+        choices=("status", "index", "show", "promote", "demote", "reset"),
+    )
+    harness.add_argument("target", nargs="?", default=None)
+    harness.add_argument("--reason", default="manual")
+    harness.add_argument("--yes", action="store_true")
+
     return parser
 
 
@@ -1009,6 +1139,7 @@ COMMANDS = {
     "verdict": cmd_verdict,
     "escape": cmd_escape,
     "supervise": cmd_supervise,
+    "harness": cmd_harness,
 }
 
 

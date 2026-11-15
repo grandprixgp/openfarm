@@ -257,26 +257,30 @@ def _json_block(text: str) -> dict | None:
 
 # -- briefs, built here so the flow doesn't need to know the shapes ------------
 
-def build_planner_brief(card, book) -> Brief:
-    return planner_brief(card, book)
+def build_planner_brief(card, book, harness_guidance: str = "") -> Brief:
+    return planner_brief(card, book, harness_guidance=harness_guidance)
 
 
 def build_test_writer_brief(card, book, pack, conventions="", attempt=1,
                             previous_failure="", guidance: str = "",
-                            context_files: list[str] | None = None) -> Brief:
+                            context_files: list[str] | None = None,
+                            harness_guidance: str = "") -> Brief:
     return test_writer_brief(card, book, pack, conventions, attempt,
                              previous_failure, guidance=guidance,
-                             context_files=context_files)
+                             context_files=context_files,
+                             harness_guidance=harness_guidance)
 
 
 def build_implementer_brief(card, book, frozen_tests, attempt=1, diff="",
                             failure="", counter_tests="", step=None,
                             guidance: str = "", step_context: str = "",
-                            context_files: list[str] | None = None) -> Brief:
+                            context_files: list[str] | None = None,
+                            harness_guidance: str = "") -> Brief:
     return implementer_brief(card, book, frozen_tests, attempt, diff, failure,
                              counter_tests, step, guidance=guidance,
                              step_context=step_context,
-                             context_files=context_files)
+                             context_files=context_files,
+                             harness_guidance=harness_guidance)
 
 
 def build_checker_pass1_brief(card, test_diff) -> Brief:

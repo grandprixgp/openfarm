@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -11,7 +13,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from openfarm_core.adapters.jsonl import CARD_FIELDS, complete_record
+from openfarm_core.adapters.jsonl import CARD_FIELDS, TelemetrySink, complete_record, open_telemetry
 from openfarm_core.briefs import (
     BriefBook,
     DATA_FENCE,
@@ -21,8 +23,9 @@ from openfarm_core.briefs import (
     test_writer_brief,
 )
 from openfarm_core.cards import Card
+from openfarm_core.cli import Context, _run_card
 from openfarm_core.config import Config, ConfigError, HarnessConfig, load_config
-from openfarm_core.errors import Invalid, Refused, Unsupported
+from openfarm_core.errors import Infra, Invalid, Refused, Unsupported
 from openfarm_core.harness_memory import (
     EDITABLE_SURFACES,
     HarnessLedger,
@@ -37,9 +40,13 @@ from openfarm_core.micromanager import (
     NullMicromanager,
     ScriptedMicromanager,
 )
-from openfarm_core.state import StateDir
+from openfarm_core.state import StateDir, read_json
+from tests.toy import build_toy
 
+ROOT = Path(__file__).resolve().parent.parent
+OPENFARM = ROOT / "openfarm"
 STAND_IN = Path(__file__).resolve().parent / "acp_stand_in.py"
+E2E_ENABLED = os.environ.get("OPENFARM_E2E") == "1"
 
 
 def _base_config_data(state_dir: Path) -> dict:
@@ -789,6 +796,691 @@ class HarnessLibraryLifecycleTests(unittest.TestCase):
         self.assertEqual(rst["revision"], 0)
         self.assertEqual(lib.status()["active_entry_ids"], [])
         self.assertEqual(lib.select_guidance("rust", "pinned-bugfix", "implementer")[0], [])
+
+
+_GOOD_TEST_BODY = """\
+use toy::fascicle::{Fascicle, FascicleError};
+
+#[test]
+fn a_full_fascicle_refuses_a_push() {
+    let mut fascicle = Fascicle::new(1);
+    fascicle.push(7).unwrap();
+    assert_eq!(fascicle.push(8), Err(FascicleError::Full));
+}
+"""
+
+_SECOND_TEST_BODY = """\
+use toy::fascicle::{Fascicle, FascicleError};
+
+#[test]
+fn a_second_full_fascicle_refuses_a_push() {
+    let mut fascicle = Fascicle::new(2);
+    fascicle.push(1).unwrap();
+    fascicle.push(2).unwrap();
+    assert_eq!(fascicle.push(3), Err(FascicleError::Full));
+}
+"""
+
+_THIRD_TEST_BODY = """\
+use toy::fascicle::{Fascicle, FascicleError};
+
+#[test]
+fn a_third_full_fascicle_refuses_a_push() {
+    let mut fascicle = Fascicle::new(1);
+    fascicle.push(42).unwrap();
+    assert_eq!(fascicle.push(99), Err(FascicleError::Full));
+}
+"""
+
+_GOOD_IMPLEMENTATION = """\
+=== search_replace: src/fascicle.rs
+<<< SEARCH
+    /// Add a segment.
+    pub fn push(&mut self, value: u32) -> Result<usize, FascicleError> {
+        self.segments.push(value);
+        Ok(self.segments.len() - 1)
+    }
+>>> REPLACE
+    /// Add a segment, or refuse with `Full`.
+    pub fn push(&mut self, value: u32) -> Result<usize, FascicleError> {
+        if self.segments.len() >= self.capacity {
+            return Err(FascicleError::Full);
+        }
+        self.segments.push(value);
+        Ok(self.segments.len() - 1)
+    }
+"""
+
+_BROKEN_COMPILE_IMPL = """\
+=== search_replace: src/fascicle.rs
+<<< SEARCH
+    /// Add a segment.
+    pub fn push(&mut self, value: u32) -> Result<usize, FascicleError> {
+        self.segments.push(value);
+        Ok(self.segments.len() - 1)
+    }
+>>> REPLACE
+    /// Broken variant returns nonexistent enum variant.
+    pub fn push(&mut self, value: u32) -> Result<usize, FascicleError> {
+        if self.segments.len() >= self.capacity {
+            return Err(FascicleError::NonexistentVariant);
+        }
+        self.segments.push(value);
+        Ok(self.segments.len() - 1)
+    }
+"""
+
+_WRONG_BEHAVIOR_IMPL = """\
+=== search_replace: src/fascicle.rs
+<<< SEARCH
+    /// Add a segment.
+    pub fn push(&mut self, value: u32) -> Result<usize, FascicleError> {
+        self.segments.push(value);
+        Ok(self.segments.len() - 1)
+    }
+>>> REPLACE
+    /// Still ignores capacity check.
+    pub fn push(&mut self, value: u32) -> Result<usize, FascicleError> {
+        let _cap = self.capacity;
+        self.segments.push(value);
+        Ok(self.segments.len() - 1)
+    }
+"""
+
+
+def _run_cli(repo: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, str(OPENFARM), "--repo", str(repo), "--json", *args],
+        capture_output=True,
+        text=True,
+    )
+
+
+def _cleanup_case_toys(case: unittest.TestCase) -> None:
+    for toy in getattr(case, "_toys", []):
+        toy.cleanup()
+        if getattr(toy, "base", None) is not None:
+            shutil.rmtree(toy.base, ignore_errors=True)
+    case._toys = []
+    for folder in getattr(case, "_temp_dirs", []):
+        shutil.rmtree(folder, ignore_errors=True)
+    case._temp_dirs = []
+
+
+def _write_temp_file(case: unittest.TestCase, name: str, content: str) -> Path:
+    folder = Path(tempfile.mkdtemp(prefix="openfarm-toy-harness-"))
+    dirs = getattr(case, "_temp_dirs", [])
+    dirs.append(folder)
+    case._temp_dirs = dirs
+    path = folder / name
+    path.write_text(content, encoding="utf-8")
+    return path
+
+
+def _configure_toy_harness(
+    toy,
+    *,
+    mm_args: list[str] | None = None,
+    mm_mode: str = "active",
+    probe_window: int = 2,
+    auto_demote: bool = True,
+    implementer_attempts: int = 3,
+    circuit_breaker: int = 3,
+    capture_on: list[str] | None = None,
+) -> None:
+    cfg_path = toy.root / ".openfarm" / "config.toml"
+    text = cfg_path.read_text(encoding="utf-8")
+    if implementer_attempts != 3:
+        text = text.replace(
+            "implementer_attempts = 3",
+            f"implementer_attempts = {implementer_attempts}",
+        )
+    if circuit_breaker != 3:
+        text = text.replace(
+            "circuit_breaker = 3",
+            f"circuit_breaker = {circuit_breaker}",
+        )
+    if mm_args is not None:
+        text = text.replace(
+            'model = "scripted"',
+            'model = "scripted"\nmicromanager = "claude-acp"',
+        )
+        args_json = json.dumps(mm_args)
+        text += (
+            "\n[micromanager]\n"
+            f'mode = "{mm_mode}"\n'
+            f'binary = "{sys.executable}"\n'
+            f"args = {args_json}\n"
+            'tool_policy = "none"\n'
+            "cost_per_1k_in = 0.003\n"
+            "cost_per_1k_out = 0.015\n"
+            "isolate_home = true\n"
+        )
+    capture_line = (
+        f"capture_on = {json.dumps(capture_on)}\n" if capture_on is not None else ""
+    )
+    text += (
+        "\n[harness]\n"
+        "enabled = true\n"
+        f"probe_window = {probe_window}\n"
+        f"auto_demote = {'true' if auto_demote else 'false'}\n"
+        f"{capture_line}"
+        "allow_micromanager_reflection = true\n"
+    )
+    cfg_path.write_text(text, encoding="utf-8")
+    toy.commit("toy: configure harness integration")
+
+
+def _whole_file_edit(path: str, body: str) -> str:
+    return f"=== whole_file: {path}\n{body}"
+
+
+class HarnessCliAndInfraFastTests(unittest.TestCase):
+    """Fast integration tests for `openfarm harness`, `status`, `supervise`, and Infra isolation."""
+
+    def setUp(self) -> None:
+        self.toy = build_toy()
+        self._toys = [self.toy]
+        self._temp_dirs = []
+        self.addCleanup(_cleanup_case_toys, self)
+
+    def test_cli_harness_subcommands_status_and_supervise_context(self) -> None:
+        _configure_toy_harness(self.toy, probe_window=2, auto_demote=True)
+        lib = HarnessLibrary(self.toy.state_dir / "harness", config=load_config(self.toy.root))
+        mm = Micromanager(
+            ScriptedMicromanager(
+                {
+                    "reflect_harness": {
+                        "lessons": [
+                            {
+                                "title": "Inspect context first",
+                                "surface": "micromanager_context",
+                                "role": "micromanager",
+                                "cue": "Check card history and boundary preconditions before triaging.",
+                                "confidence": 0.90,
+                            },
+                            {
+                                "title": "Implementer guard",
+                                "surface": "implementer_guidance",
+                                "role": "implementer",
+                                "cue": "Return FascicleError::Full before appending when at capacity.",
+                                "confidence": 0.85,
+                            },
+                        ]
+                    }
+                }
+            )
+        )
+        res = lib.record_card_outcome(
+            {
+                "card_id": "SEED-1",
+                "category": "pinned-bugfix",
+                "language": "rust",
+                "final_state": "in-review",
+                "attempts": 2,
+            },
+            [
+                {"attempt": 1, "outcome": "fail", "error_signature": "E0308 mismatched types"},
+                {"attempt": 2, "outcome": "pass"},
+            ],
+            micromanager=mm,
+        )
+        self.assertEqual(res["revision"], 1)
+        entry_id = res["lessons_added"][0]
+        impl_id = res["lessons_added"][1]
+
+        # `openfarm status` includes harness summary
+        st_proc = _run_cli(self.toy.root, "status")
+        self.assertEqual(st_proc.returncode, 0, st_proc.stderr)
+        st_json = json.loads(st_proc.stdout)
+        self.assertIn("harness", st_json)
+        self.assertEqual(st_json["harness"]["revision"], 1)
+        self.assertTrue(st_json["harness"]["enabled"])
+
+        # `openfarm harness` default/status, index, show
+        h_status = _run_cli(self.toy.root, "harness")
+        self.assertEqual(h_status.returncode, 0, h_status.stderr)
+        self.assertEqual(json.loads(h_status.stdout)["revision"], 1)
+
+        h_index = _run_cli(self.toy.root, "harness", "index")
+        self.assertEqual(h_index.returncode, 0, h_index.stderr)
+        idx_payload = json.loads(h_index.stdout)
+        self.assertIn(entry_id, idx_payload["index"])
+
+        h_show = _run_cli(self.toy.root, "harness", "show", entry_id)
+        self.assertEqual(h_show.returncode, 0, h_show.stderr)
+        self.assertEqual(json.loads(h_show.stdout)["id"], entry_id)
+
+        h_show_missing = _run_cli(self.toy.root, "harness", "show", "nonexistent-entry")
+        self.assertNotEqual(h_show_missing.returncode, 0)
+
+        # `openfarm supervise` populates mm.harness_context via ACP proxy
+        prompt_log = _write_temp_file(self, "prompts.jsonl", "")
+        proxy_script = _write_temp_file(
+            self,
+            "acp_proxy.py",
+            (
+                "import json, subprocess, sys, threading\n"
+                "log_path = sys.argv[1]\n"
+                "target = sys.argv[2:]\n"
+                "proc = subprocess.Popen(target, stdin=subprocess.PIPE, stdout=sys.stdout, stderr=sys.stderr)\n"
+                "def pump():\n"
+                "    with open(log_path, 'a', encoding='utf-8') as f:\n"
+                "        for line in sys.stdin.buffer:\n"
+                "            try:\n"
+                "                f.write(line.decode('utf-8'))\n"
+                "                f.flush()\n"
+                "            except Exception:\n"
+                "                pass\n"
+                "            proc.stdin.write(line)\n"
+                "            proc.stdin.flush()\n"
+                "    proc.stdin.close()\n"
+                "t = threading.Thread(target=pump, daemon=True)\n"
+                "t.start()\n"
+                "raise SystemExit(proc.wait())\n"
+            ),
+        )
+        cfg_text = (self.toy.root / ".openfarm" / "config.toml").read_text(encoding="utf-8")
+        cfg_text = cfg_text.replace(
+            'model = "scripted"',
+            'model = "scripted"\nmicromanager = "claude-acp"',
+        )
+        proxy_args = [
+            str(proxy_script),
+            str(prompt_log),
+            sys.executable,
+            str(STAND_IN),
+            "--mode",
+            "normal",
+        ]
+        cfg_text += (
+            "\n[micromanager]\n"
+            'mode = "active"\n'
+            f'binary = "{sys.executable}"\n'
+            f"args = {json.dumps(proxy_args)}\n"
+            'tool_policy = "none"\n'
+            "isolate_home = true\n"
+        )
+        (self.toy.root / ".openfarm" / "config.toml").write_text(cfg_text, encoding="utf-8")
+        self.toy.write_card(
+            "BLK-1",
+            title="Blocked card",
+            category="pinned-bugfix",
+            touches=["src/fascicle.rs"],
+            tests=[{"name": "a_full_fascicle_refuses_a_push", "file": "tests/t.rs", "asserts": "Err(Full)"}],
+            done_text="Refuse full push.",
+            state="blocked",
+        )
+        self.toy.commit("toy: add blocked card and acp proxy")
+
+        sup_proc = _run_cli(self.toy.root, "supervise", "--triage-blocked")
+        self.assertEqual(sup_proc.returncode, 0, sup_proc.stderr)
+        logged = prompt_log.read_text(encoding="utf-8")
+        self.assertIn("harness_context", logged)
+        self.assertIn(entry_id, logged)
+
+        # `demote`, `promote`, and `reset` (--yes gate)
+        h_demote = _run_cli(self.toy.root, "harness", "demote", impl_id, "--reason", "manual-check")
+        self.assertEqual(h_demote.returncode, 0, h_demote.stderr)
+        self.assertIn(impl_id, json.loads(h_demote.stdout)["demoted_entry_ids"])
+
+        h_promote = _run_cli(self.toy.root, "harness", "promote", impl_id, "--reason", "restored")
+        self.assertEqual(h_promote.returncode, 0, h_promote.stderr)
+        self.assertEqual(json.loads(h_promote.stdout)["entry_id"], impl_id)
+
+        h_reset_refused = _run_cli(self.toy.root, "harness", "reset")
+        self.assertNotEqual(h_reset_refused.returncode, 0)
+
+        h_reset_ok = _run_cli(self.toy.root, "harness", "reset", "--yes")
+        self.assertEqual(h_reset_ok.returncode, 0, h_reset_ok.stderr)
+        self.assertEqual(json.loads(h_reset_ok.stdout)["revision"], 0)
+
+    def test_infra_abort_isolated_from_harness_ledger_and_auto_demote(self) -> None:
+        _configure_toy_harness(self.toy, probe_window=1, auto_demote=True)
+        cfg = load_config(self.toy.root)
+        lib = HarnessLibrary(self.toy.state_dir / "harness", config=cfg)
+        mm = Micromanager(
+            ScriptedMicromanager(
+                {
+                    "reflect_harness": {
+                        "lessons": [
+                            {
+                                "title": "Probing cue rev 1",
+                                "surface": "implementer_guidance",
+                                "role": "implementer",
+                                "cue": "Check capacity boundary before pushing.",
+                                "confidence": 0.90,
+                            }
+                        ]
+                    }
+                }
+            )
+        )
+        # Seed rev 1 in probing state (probe_window = 1), without recording card_outcome yet?
+        # Wait: record 1 seed recovery so baseline pass_rate = 1.0 and rev 1 is probing with probe_remaining = 1.
+        r1 = lib.record_card_outcome(
+            {"card_id": "SEED-OK", "category": "pinned-bugfix", "language": "rust", "final_state": "in-review", "attempts": 2},
+            [{"attempt": 1, "outcome": "fail", "error_signature": "E0308"}, {"attempt": 2, "outcome": "pass"}],
+            micromanager=mm,
+        )
+        self.assertEqual(r1["revision"], 1)
+        self.assertEqual(lib.status()["state"], "probing")
+        events_before = lib.ledger.read_events()
+
+        self.toy.write_card(
+            "INFRA-1",
+            title="Infra interrupted card",
+            category="pinned-bugfix",
+            touches=["src/fascicle.rs", "tests/infra_t.rs"],
+            tests=[{"name": "a_full_fascicle_refuses_a_push", "file": "tests/infra_t.rs", "asserts": "Err(Full)"}],
+            done_text="Refuse full push.",
+            state="ready",
+        )
+        self.toy.commit("toy: add infra test card")
+
+        class _InfraRunner:
+            def exec(self, kind, argv, **kwargs):
+                raise Infra("disk-io", "simulated runner infra failure")
+
+        ctx = Context(self.toy.root, json_output=True)
+        ctx.runner = lambda worktree, output_dir=None: _InfraRunner()
+        source = ctx.cards()
+        source.prepare()
+        run_id = "infra-isolation-run"
+        run_dir = ctx.state.create_run(run_id)
+        telemetry = TelemetrySink(open_telemetry(ctx.cfg, run_dir))
+
+        outcome = _run_card(
+            ctx,
+            source,
+            "INFRA-1",
+            run_id,
+            telemetry,
+            run_dir,
+            script=None,
+            harness_library=lib,
+        )
+        self.assertEqual(outcome["final_state"], "blocked")
+        self.assertEqual(outcome["stop_code"], "infra")
+        self.assertEqual(outcome["harness"]["skipped_reason"], "infra")
+
+        # Infra abort must NOT advance probe_window, record failure, or trigger auto_demote!
+        status_after = lib.status()
+        self.assertEqual(status_after["revision"], 1)
+        self.assertEqual(status_after["state"], "probing")
+        self.assertEqual(status_after["probe_remaining"], 1)
+        self.assertEqual(len(lib.ledger.read_events()), len(events_before))
+
+
+@unittest.skipUnless(E2E_ENABLED, "set OPENFARM_E2E=1 to run the cargo-backed tests")
+class HarnessIntegrationE2ETests(unittest.TestCase):
+    """End-to-end harness recursive adaptation, persistence, rollback, and CLI tests."""
+
+    def setUp(self) -> None:
+        self.toy = build_toy()
+        self._toys = [self.toy]
+        self._temp_dirs = []
+        self.addCleanup(_cleanup_case_toys, self)
+
+    def _make_acp_proxy(self) -> tuple[Path, Path]:
+        prompt_log = _write_temp_file(self, "acp_prompts.jsonl", "")
+        proxy_script = _write_temp_file(
+            self,
+            "acp_proxy.py",
+            (
+                "import subprocess, sys, threading\n"
+                "log_path = sys.argv[1]\n"
+                "target = sys.argv[2:]\n"
+                "proc = subprocess.Popen(target, stdin=subprocess.PIPE, stdout=sys.stdout, stderr=sys.stderr)\n"
+                "def pump():\n"
+                "    with open(log_path, 'a', encoding='utf-8') as f:\n"
+                "        for line in sys.stdin.buffer:\n"
+                "            try:\n"
+                "                f.write(line.decode('utf-8'))\n"
+                "                f.flush()\n"
+                "            except Exception:\n"
+                "                pass\n"
+                "            proc.stdin.write(line)\n"
+                "            proc.stdin.flush()\n"
+                "    proc.stdin.close()\n"
+                "t = threading.Thread(target=pump, daemon=True)\n"
+                "t.start()\n"
+                "raise SystemExit(proc.wait())\n"
+            ),
+        )
+        return proxy_script, prompt_log
+
+    def test_intrarun_adaptation_and_cross_launch_persistence(self) -> None:
+        proxy_script, prompt_log = self._make_acp_proxy()
+        _configure_toy_harness(
+            self.toy,
+            mm_args=[
+                str(proxy_script),
+                str(prompt_log),
+                sys.executable,
+                str(STAND_IN),
+                "--mode",
+                "normal",
+            ],
+            mm_mode="active",
+            probe_window=3,
+            auto_demote=True,
+        )
+
+        self.toy.write_card(
+            "TOY-01",
+            title="Card 1 recovers after attempt 1 compile error",
+            category="pinned-bugfix",
+            touches=["src/fascicle.rs", "tests/toy_one.rs"],
+            tests=[{"name": "a_full_fascicle_refuses_a_push", "file": "tests/toy_one.rs", "asserts": "Err(Full)"}],
+            done_text="Refuse pushing past capacity.",
+            state="ready",
+        )
+        self.toy.write_card(
+            "TOY-02",
+            title="Card 2 receives Card 1 adaptations in same run",
+            category="pinned-bugfix",
+            touches=["src/fascicle.rs", "tests/toy_two.rs"],
+            tests=[{"name": "a_second_full_fascicle_refuses_a_push", "file": "tests/toy_two.rs", "asserts": "Err(Full)"}],
+            done_text="Refuse pushing past capacity of 2.",
+            state="ready",
+        )
+        self.toy.write_card(
+            "TOY-03",
+            title="Card 3 loads persisted harness across launches",
+            category="pinned-bugfix",
+            touches=["src/fascicle.rs", "tests/toy_three.rs"],
+            tests=[{"name": "a_third_full_fascicle_refuses_a_push", "file": "tests/toy_three.rs", "asserts": "Err(Full)"}],
+            done_text="Refuse pushing past capacity on a later run.",
+            state="ready",
+        )
+        self.toy.commit("toy: add TOY-01, TOY-02, TOY-03")
+
+        script_path = _write_temp_file(
+            self,
+            "run_script.json",
+            json.dumps(
+                {
+                    "TOY-01/test_writer": _whole_file_edit("tests/toy_one.rs", _GOOD_TEST_BODY),
+                    "TOY-01/implementer/1": _BROKEN_COMPILE_IMPL,
+                    "TOY-01/implementer/2": _GOOD_IMPLEMENTATION,
+                    "TOY-01/checker_pass1": "RESTATEMENT: full fascicle refuses push",
+                    "TOY-01/checker_pass2": "{}",
+                    "TOY-02/test_writer": _whole_file_edit("tests/toy_two.rs", _SECOND_TEST_BODY),
+                    "TOY-02/implementer": _GOOD_IMPLEMENTATION,
+                    "TOY-02/checker_pass1": "RESTATEMENT: second full fascicle refuses push",
+                    "TOY-02/checker_pass2": "{}",
+                    "TOY-03/test_writer": _whole_file_edit("tests/toy_three.rs", _THIRD_TEST_BODY),
+                    "TOY-03/implementer": _GOOD_IMPLEMENTATION,
+                    "TOY-03/checker_pass1": "RESTATEMENT: third full fascicle refuses push",
+                    "TOY-03/checker_pass2": "{}",
+                }
+            ),
+        )
+
+        # Launch 1: TOY-01 recovers & reflects -> rev 1 promoted; TOY-02 consumes rev 1 in SAME run
+        run1 = _run_cli(self.toy.root, "run", "--cards", "2", "--script", str(script_path))
+        self.assertEqual(run1.returncode, 0, f"run1 failed:\n{run1.stdout}\n{run1.stderr}")
+        run1_json = json.loads(run1.stdout)
+        self.assertEqual(len(run1_json["outcomes"]), 2)
+        o1, o2 = run1_json["outcomes"]
+        self.assertEqual(o1["card_id"], "TOY-01")
+        self.assertEqual(o1["final_state"], "in-review")
+        self.assertGreaterEqual(o1["harness_revision"], 1)
+        self.assertTrue(o1["harness_lessons_added"])
+
+        self.assertEqual(o2["card_id"], "TOY-02")
+        self.assertEqual(o2["final_state"], "in-review")
+        self.assertGreaterEqual(o2["harness_revision"], 1)
+        self.assertTrue(o2["harness_cues_applied"])
+        for lesson_id in o1["harness_lessons_added"]:
+            self.assertIn(lesson_id, o2["harness_cues_applied"])
+
+        run1_id = run1_json["run_id"]
+        c2_brief = read_json(
+            self.toy.state_dir / "cards" / "TOY-02" / run1_id / "briefs" / "1-implementer.md"
+        )
+        self.assertIsNotNone(c2_brief)
+        self.assertIn("harness adaptations", c2_brief["brief"])
+        self.assertIn(o1["harness_lessons_added"][0], c2_brief["brief"])
+
+        # Dossier json & md include harness summary and informational gate
+        c2_dossier = read_json(
+            self.toy.state_dir / "cards" / "TOY-02" / run1_id / "dossier.json"
+        )
+        self.assertIn("harness", c2_dossier)
+        self.assertEqual(c2_dossier["harness"]["cues_applied"], o2["harness_cues_applied"])
+        self.assertIn(
+            "harness-efficiency",
+            {g["name"] for g in c2_dossier["2_gates"]},
+        )
+        c2_dossier_md = (
+            self.toy.state_dir / "cards" / "TOY-02" / run1_id / "dossier.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("## Harness efficiency", c2_dossier_md)
+
+        # ACP micromanager received populated harness_context on TOY-02
+        logged_prompts = [
+            json.loads(line)
+            for line in prompt_log.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        toy02_mm_prompts = [
+            p for p in logged_prompts
+            if p.get("method") == "session/prompt"
+            and "TOY-02" in json.dumps(p)
+            and "harness_context" in json.dumps(p)
+            and o1["harness_lessons_added"][0] in json.dumps(p)
+        ]
+        self.assertTrue(toy02_mm_prompts, "expected TOY-02 ACP micromanager prompt to contain harness_context cue")
+
+        # Launch 2: separate CLI invocation picks up remaining ready card TOY-03 with persisted harness
+        run2 = _run_cli(self.toy.root, "run", "--cards", "1", "--script", str(script_path))
+        self.assertEqual(run2.returncode, 0, f"run2 failed:\n{run2.stdout}\n{run2.stderr}")
+        run2_json = json.loads(run2.stdout)
+        o3 = run2_json["outcomes"][0]
+        self.assertEqual(o3["card_id"], "TOY-03")
+        self.assertEqual(o3["final_state"], "in-review")
+        self.assertTrue(o3["harness_cues_applied"])
+
+        c3_brief = read_json(
+            self.toy.state_dir / "cards" / "TOY-03" / run2_json["run_id"] / "briefs" / "1-implementer.md"
+        )
+        self.assertIn("harness adaptations", c3_brief["brief"])
+
+        metrics = read_json(self.toy.state_dir / "harness" / "metrics.json")
+        self.assertEqual(metrics["cards_total"], 3)
+        self.assertEqual(metrics["cards_passed"], 3)
+        ledger_lines = (
+            self.toy.state_dir / "harness" / "ledger.jsonl"
+        ).read_text(encoding="utf-8").splitlines()
+        self.assertGreaterEqual(len(ledger_lines), 4)
+
+        status_proc = _run_cli(self.toy.root, "status")
+        self.assertEqual(status_proc.returncode, 0, status_proc.stderr)
+        status_json = json.loads(status_proc.stdout)
+        self.assertEqual(status_json["harness"]["metrics"]["cards_total"], 3)
+
+    def test_probe_window_auto_demote_rollback_and_infra_isolation_e2e(self) -> None:
+        _configure_toy_harness(
+            self.toy,
+            mm_args=[str(STAND_IN), "--mode", "normal"],
+            mm_mode="active",
+            probe_window=2,
+            auto_demote=True,
+            implementer_attempts=2,
+            circuit_breaker=10,
+            capture_on=["retry_recovery"],
+        )
+        self.toy.write_card(
+            "TOY-01-LEARN",
+            title="Learn a cue via retry recovery",
+            category="pinned-bugfix",
+            touches=["src/fascicle.rs", "tests/toy_learn.rs"],
+            tests=[{"name": "a_full_fascicle_refuses_a_push", "file": "tests/toy_learn.rs", "asserts": "Err(Full)"}],
+            done_text="Refuse pushing past capacity.",
+            state="ready",
+        )
+        self.toy.write_card(
+            "TOY-02-FAIL1",
+            title="Probe failure 1",
+            category="pinned-bugfix",
+            touches=["src/fascicle.rs", "tests/toy_fail1.rs"],
+            tests=[{"name": "a_second_full_fascicle_refuses_a_push", "file": "tests/toy_fail1.rs", "asserts": "Err(Full)"}],
+            done_text="Refuse pushing past capacity of 2.",
+            state="ready",
+        )
+        self.toy.write_card(
+            "TOY-03-FAIL2",
+            title="Probe failure 2 triggers auto-demote",
+            category="pinned-bugfix",
+            touches=["src/fascicle.rs", "tests/toy_fail2.rs"],
+            tests=[{"name": "a_third_full_fascicle_refuses_a_push", "file": "tests/toy_fail2.rs", "asserts": "Err(Full)"}],
+            done_text="Refuse pushing past capacity on card 3.",
+            state="ready",
+        )
+        self.toy.commit("toy: add TOY-01-LEARN, TOY-02-FAIL1, TOY-03-FAIL2")
+
+        script_path = _write_temp_file(
+            self,
+            "rollback_script.json",
+            json.dumps(
+                {
+                    "TOY-01-LEARN/test_writer": _whole_file_edit("tests/toy_learn.rs", _GOOD_TEST_BODY),
+                    "TOY-01-LEARN/implementer/1": _BROKEN_COMPILE_IMPL,
+                    "TOY-01-LEARN/implementer/2": _GOOD_IMPLEMENTATION,
+                    "TOY-01-LEARN/checker_pass1": "RESTATEMENT: full fascicle refuses push",
+                    "TOY-01-LEARN/checker_pass2": "{}",
+                    "TOY-02-FAIL1/test_writer": _whole_file_edit("tests/toy_fail1.rs", _SECOND_TEST_BODY),
+                    "TOY-02-FAIL1/implementer/1": _WRONG_BEHAVIOR_IMPL,
+                    "TOY-02-FAIL1/implementer/2": _BROKEN_COMPILE_IMPL,
+                    "TOY-03-FAIL2/test_writer": _whole_file_edit("tests/toy_fail2.rs", _THIRD_TEST_BODY),
+                    "TOY-03-FAIL2/implementer/1": _WRONG_BEHAVIOR_IMPL,
+                    "TOY-03-FAIL2/implementer/2": _BROKEN_COMPILE_IMPL,
+                }
+            ),
+        )
+
+        run_proc = _run_cli(self.toy.root, "run", "--cards", "3", "--script", str(script_path))
+        self.assertEqual(run_proc.returncode, 0, f"run failed:\n{run_proc.stdout}\n{run_proc.stderr}")
+        run_json = json.loads(run_proc.stdout)
+        o_learn, o_fail1, o_fail2 = run_json["outcomes"]
+        self.assertEqual(o_learn["final_state"], "in-review", o_learn)
+        learned_ids = o_learn["harness_lessons_added"]
+        self.assertTrue(learned_ids)
+
+        self.assertEqual(o_fail1["final_state"], "blocked")
+        self.assertEqual(o_fail2["final_state"], "blocked")
+        self.assertEqual(o_fail2["harness"]["probe_transition"]["action"], "rolled_back")
+        self.assertEqual(o_fail2["harness"]["probe_transition"]["restored_revision"], 0)
+
+        h_status = json.loads(_run_cli(self.toy.root, "harness", "status").stdout)
+        self.assertEqual(h_status["revision"], 0)
+        self.assertEqual(h_status["active_entry_ids"], [])
+
+        entry_json = json.loads(_run_cli(self.toy.root, "harness", "show", learned_ids[0]).stdout)
+        self.assertEqual(entry_json["status"], "demoted")
+        self.assertEqual(entry_json["demote_reason"], "probe_regression")
 
 
 if __name__ == "__main__":
