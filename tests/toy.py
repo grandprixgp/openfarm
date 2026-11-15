@@ -240,6 +240,11 @@ class ToyRepo:
             if path is None:
                 continue
             shutil.rmtree(path, ignore_errors=True)
+        if self.base is not None and self.base.name.startswith("openfarm-toy-"):
+            try:
+                self.base.rmdir()
+            except OSError:
+                pass
 
     @property
     def config(self) -> Path:

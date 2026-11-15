@@ -1009,7 +1009,15 @@ class CardRun:
             self.log(f"{self.card.id}: planner unavailable, running unsplit")
             return
         self.budget.note_tokens(call.tokens_in, call.tokens_out, call.spend)
-        plan = parse_plan(call.content, card=self.card)
+        try:
+            plan = parse_plan(call.content, card=self.card)
+        except Invalid as exc:
+            if getattr(self.cfg, "planner", "auto") == "on":
+                raise GateFailure(StopCode.CANNOT_SPLIT, exc.message) from exc
+            self.planner_used = False
+            self.depth = 1
+            self.log(f"{self.card.id}: planner returned invalid plan ({exc.code}), running unsplit")
+            return
         if plan.cannot_split:
             raise GateFailure(StopCode.CANNOT_SPLIT,
                               "the planner could not split without leaving touches")
@@ -1302,6 +1310,11 @@ class CardRun:
                                 self.pack.commands("list", unit=unit)["argv"],
                                 counted="fixed")
         out, err = self._output(list_result)
+        if list_result.cls == INFRA:
+            raise Infra(
+                "runner-infra",
+                (err or out).strip()[-500:] or "test list command failed on infra",
+            )
         listing = self.pack.parse_list(out)
         write_json(self.card_layout / "gates" / "named-tests-list.json", listing)
 
@@ -2076,6 +2089,11 @@ class CardRun:
             runner_kind("list"),
             self.pack.commands("list", unit=unit)["argv"], counted="fixed")
         list_out, list_err = self._output(final_list_result)
+        if final_list_result.cls == INFRA:
+            raise Infra(
+                "runner-infra",
+                (list_err or list_out).strip()[-500:] or "final test list command failed on infra",
+            )
         final_list = self.pack.parse_list(list_out)
         self.known_failing_excluded = sorted(
             set(self.cfg.known_failing) & {test["name"]
@@ -2282,12 +2300,44 @@ class CardRun:
         return result.cls == PASS
 
     def _extra_gates(self, changed: list[str]) -> None:
+        from .adapters.direct import DirectRunner
+
         for extra in self.cfg.extra_gates:
             if not paths_touched_by_extra_gate(changed, extra.paths):
                 continue
             argv = _split_command(extra.run)
-            result = self._run(runner_kind("extra"), argv, counted="fixed")
-            out, err = self._output(result)
+            if getattr(extra, "via", "runner") == "local":
+                self._check_kill_switch()
+                resolved_unit = self._effective_unit()
+                env = self.cfg.runner_env.get(resolved_unit, {})
+                timeout = max(30.0, self.budget.wall_clock_left_s())
+                local_runner = DirectRunner(
+                    self.worktree,
+                    output_dir=self.card_layout / "gates" / "output",
+                )
+                result = local_runner.exec(
+                    kind=runner_kind("extra"),
+                    argv=argv,
+                    cwd=self.worktree,
+                    target_dir=self.target_dir,
+                    unit=resolved_unit,
+                    env=env,
+                    timeout_s=timeout,
+                )
+                self.runner_seconds += getattr(result, "duration_s", 0.0) or 0.0
+                self.budget.note_fixed_build()
+                self.budget.check_clock()
+                out, err = result.stdout, result.stderr
+            else:
+                result = self._run(runner_kind("extra"), argv, counted="fixed")
+                out, err = self._output(result)
+            if result.cls == INFRA:
+                detail = (
+                    (err or out).strip()[-500:]
+                    or f"extra gate {extra.name!r} failed on infra"
+                )
+                self._record_gate(GateResult(f"extra:{extra.name}", INFRA, detail))
+                raise Infra("runner-infra", detail)
             passed = result.cls == PASS
             gate = self._record_gate(extra_gate_result(
                 extra.name, passed, extra.on_fail,

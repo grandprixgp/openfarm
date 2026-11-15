@@ -346,10 +346,11 @@ class Config:
                                         "[policy] never_touch")
         forbidden = _as_str_list(policy.get("forbidden_files", []),
                                  "[policy] forbidden_files")
-        # The config is forbidden to the farm whatever the file says: a farm that
-        # could edit it could weaken any gate.
-        if ".openfarm/**" not in forbidden:
-            forbidden.append(".openfarm/**")
+        # The config and ACP directories are forbidden to the farm whatever the
+        # file says: a farm that could edit them could weaken any gate or hook.
+        for always_forbidden in (".openfarm/**", ".claude/**"):
+            if always_forbidden not in forbidden:
+                forbidden.append(always_forbidden)
         self.forbidden_files = forbidden
         self.known_failing = _as_str_list(policy.get("known_failing", []),
                                           "[policy] known_failing")

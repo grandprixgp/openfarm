@@ -23,7 +23,7 @@ Openfarm dispatches six protocol-versioned (`PROTOCOL_VERSION = 1`) adapter inte
 | Telemetry sink | `[adapters] telemetry` | `jsonl` | `cmd:<argv>` |
 | Micromanager | `[adapters] micromanager` | `off`, `claude-acp`, `scripted` | `cmd:<argv>` |
 
-External `cmd:<argv>` adapters communicate via newline-delimited JSON over stdio (`op`, `protocol_version`, `ok`, `error`).
+External `cmd:<argv>` adapters communicate via newline-delimited JSON over stdio (`"openfarm": 1`, `adapter`, `op`, `request_id`, `args` / `ok`, `error`).
 
 ## Card Diet & Categories
 
@@ -31,7 +31,7 @@ Eligible cards declare one of nine categories under `[policy] categories`:
 - **Original lesser-model diet**: `test-backfill`, `mechanical`, `pattern`, `pinned-bugfix`, `small-feature`
 - **Expanded v0.4 diet**: `feature`, `refactor`, `integration`, `port`
 
-Core card metadata fields (`category`, `reference`, `tests`, `test_edits`, `frontier_estimate`, `new_symbols`) may be written as `Key: value` lines or inside fenced ` ```openfarm ` / ` ```toml ` blocks (`[cards] fields_block = "toml"`). Optional v0.4 fields:
+Core card metadata fields (`category`, `reference`, `tests`, `test_edits`, `frontier_estimate`, `new_symbols`) live in the `+++` TOML frontmatter header (or inside fenced ` ```openfarm ` / ` ```toml ` blocks when `[cards] fields_block = "toml"`). Optional v0.4 fields:
 - `unit`: explicit package/crate unit when not auto-derived
 - `context_files`: read-only files outside `touches` shown to the model (bounded by `[eligibility] max_context_files`)
 - `type_changes`: boolean enabling cross-file type edits/signatures (gated by `[eligibility] allow_type_changes`)
@@ -48,12 +48,12 @@ Run `python3 -m openfarm_core.cli --help` (or `openfarm` when installed):
 | `openfarm status` | Show card states, queue counts, spend, circuit-breaker status, and harness status |
 | `openfarm pause` / `openfarm resume` | Pause or resume queue scheduling without touching active leases |
 | `openfarm stop` | Trigger the emergency `kill_switch` (`<state_dir>/STOP`) |
-| `openfarm release <card_id>` | Release a blocked/paused card back to eligible state |
+| `openfarm release <card_id> --reason <text>` | Release a blocked/paused card back to eligible state |
 | `openfarm dossier <card_id>` | Print or inspect the card dossier and artifacts |
 | `openfarm check <card_id>` | Run eligibility checks on a single card without running models |
-| `openfarm verdict <card_id> <approve\|reject>` | Record human verdict on a `ready` card |
-| `openfarm escape <card_id>` | Mark an escaped defect for post-mortem tracking |
-| `openfarm supervise (--triage-blocked \| --prepare-queue \| --card <id>) [--apply] [--mm-script <path>]` | Run micromanager triage, queue preparation, or single-card shaping (`--apply` writes card updates or release decisions) |
+| `openfarm verdict <card_id> <clean\|minor-fix\|bounced\|scrapped> --review-tokens <n> [--minutes <m>] [--note <text>]` | Record human review verdict on an `in-review` card |
+| `openfarm escape <card_id> --note <text>` | Mark an escaped defect for post-mortem tracking |
+| `openfarm supervise (--triage-blocked \| --prepare-queue) [--card <id>] [--apply] [--mm-script <path>]` | Run micromanager triage, queue preparation, or single-card shaping (`--apply` writes card updates or release decisions) |
 | `openfarm harness [status\|index\|show\|promote\|demote\|reset] [target] [--reason <text>] [--yes]` | Inspect `<state_dir>/harness/` metrics/entries, manually promote/demote entries or revisions, or reset (`--yes` required) |
 
 Exit codes: `0` success/eligible, `1` refused/ineligible, `2` usage or configuration error, `3` infrastructure/trouble error.
@@ -104,4 +104,4 @@ The following integrations are **untested** against live external binaries/servi
 - **TypeScript language pack**: explicitly unimplemented (`Invalid("no-typescript-pack")`).
 - **External `cmd:` adapters in production**: verified via subprocess test harnesses; real external `cmd:` binaries beyond test harnesses are **untested**.
 
-See [docs/USAGE-AND-FIRST-DEPLOYMENT.md](docs/USAGE-AND-FIRST-DEPLOYMENT.md) for the user-friendly usage & operations guide and executable first-deployment runbook (`tallybox`), [docs/openfarm-internals.md](file:///docs/openfarm-internals.md) for module architecture, and [docs/HANDOFF.md](file:///docs/HANDOFF.md) for engineering handoff notes.
+See [docs/USAGE-AND-FIRST-DEPLOYMENT.md](docs/USAGE-AND-FIRST-DEPLOYMENT.md) for the user-friendly usage & operations guide and executable first-deployment runbook (`tallybox`), [docs/openfarm-internals.md](docs/openfarm-internals.md) for module architecture, and [docs/HANDOFF.md](docs/HANDOFF.md) for engineering handoff notes.

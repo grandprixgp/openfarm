@@ -659,5 +659,230 @@ class V04ReviewFixRegressionTests(unittest.TestCase):
                         "must not archive state when source.release is refused")
 
 
+class FinalAuditPolishTests(unittest.TestCase):
+    """Regressions for Medium-1..2, Low-1, Low-2, and Low-4 audit fixes."""
+
+    def _minimal_config(self, repo: Path, state_dir: Path, **overrides) -> Config:
+        data = {
+            "project": {"name": "ex", "base_branch": "main", "state_dir": str(state_dir)},
+            "adapters": {"cards": "files:cards/", "runner": "direct", "languages": ["rust"]},
+            "model": {"endpoint": "https://x.invalid/v1",
+                      "allowed_endpoints": ["https://x.invalid/v1"]},
+            "policy": {"categories": ["pattern", "pinned-bugfix"]},
+        }
+        for key, value in overrides.items():
+            if isinstance(value, dict) and isinstance(data.get(key), dict):
+                data[key] = {**data[key], **value}
+            else:
+                data[key] = value
+        return Config(data, repo)
+
+    def test_claude_dir_auto_forbidden_and_test_conventions_loading(self) -> None:
+        import shutil
+        from openfarm_core.cli import _load_test_conventions
+
+        tmp = Path(tempfile.mkdtemp(prefix="openfarm-conv-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        repo = tmp / "repo"
+        wt = tmp / "worktree"
+        state_dir = tmp / "state"
+        for root in (repo, wt):
+            (root / ".openfarm").mkdir(parents=True)
+            (root / "secrets").mkdir(parents=True)
+        (wt / ".openfarm" / "test-conventions.md").write_text("Prefer unit tests.\n")
+        (wt / ".openfarm" / "config.toml").write_text("top-secret-config\n")
+        (wt / ".openfarm" / "never.md").write_text("never expose\n")
+        (wt / "secrets" / "guide.md").write_text("secret forbidden guide\n")
+
+        cfg = self._minimal_config(
+            repo, state_dir,
+            brief={"test_conventions": ".openfarm/test-conventions.md"},
+        )
+        self.assertIn(".openfarm/**", cfg.forbidden_files)
+        self.assertIn(".claude/**", cfg.forbidden_files)
+        self.assertTrue(cfg.is_forbidden(".claude/hooks.json"))
+        self.assertEqual(_load_test_conventions(cfg, wt), "Prefer unit tests.\n")
+
+        # Never expose .openfarm/config.toml even if explicitly configured
+        cfg_toml = self._minimal_config(
+            repo, state_dir,
+            brief={"test_conventions": ".openfarm/config.toml"},
+        )
+        self.assertEqual(_load_test_conventions(cfg_toml, wt), "")
+
+        # never_touch takes precedence even under .openfarm/
+        cfg_nt = self._minimal_config(
+            repo, state_dir,
+            policy={"categories": ["pattern"], "never_touch": [".openfarm/never.md"]},
+            brief={"test_conventions": ".openfarm/never.md"},
+        )
+        self.assertEqual(_load_test_conventions(cfg_nt, wt), "")
+
+        # Arbitrary non-.openfarm forbidden_files stay hidden
+        cfg_fb = self._minimal_config(
+            repo, state_dir,
+            policy={"categories": ["pattern"], "forbidden_files": ["secrets/**"]},
+            brief={"test_conventions": "secrets/guide.md"},
+        )
+        self.assertEqual(_load_test_conventions(cfg_fb, wt), "")
+
+    def test_step_plan_invalid_json_never_raises_adapter_error(self) -> None:
+        import shutil
+        from openfarm_core.adapters.jsonl import MemoryTelemetry
+        from openfarm_core.adapters.openai_compat import ScriptedBackend
+        from openfarm_core.briefs import BriefBook
+        from openfarm_core.errors import GateFailure, StopCode
+        from openfarm_core.flow import CardRun
+        from openfarm_core.micromanager import NullMicromanager
+        from openfarm_core.state import StateDir
+
+        tmp = Path(tempfile.mkdtemp(prefix="openfarm-plan-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        repo = tmp / "repo"
+        wt = tmp / "wt"
+        (repo / "src").mkdir(parents=True)
+        (wt / "src").mkdir(parents=True)
+        for name in ("a.rs", "b.rs", "c.rs"):
+            (wt / "src" / name).write_text("pub fn f() {}\n")
+        state = StateDir(tmp / "state")
+        state.create_card("CARD-P1", "run-1")
+
+        card = Card(
+            id="CARD-P1", title="split", state="ready",
+            touches=["src/a.rs", "src/b.rs", "src/c.rs"],
+            fields={
+                "category": "pinned-bugfix",
+                "tests": [
+                    {"name": "t1", "file": "tests/a.rs"},
+                    {"name": "t2", "file": "tests/a.rs"},
+                ],
+            },
+        )
+        backend_bad = ScriptedBackend({"planner": "not json and only gibberish"})
+
+        # planner = "auto" falls back unsplit
+        cfg_auto = self._minimal_config(
+            repo, state.root, gates={"planner": "auto"}, harness={"enabled": False},
+        )
+        run_auto = CardRun(
+            card=card, cfg=cfg_auto, state=state,
+            card_dir=state.card_dir("CARD-P1", "run-1"), worktree=wt,
+            runner=SimpleNamespace(), pack=RustPack(), backend=backend_bad,
+            book=BriefBook(wt, cfg_auto.never_touch, cfg_auto.forbidden_files),
+            run_id="run-1", telemetry=MemoryTelemetry(),
+            micromanager=NullMicromanager(),
+        )
+        run_auto._step_plan()
+        self.assertFalse(run_auto.planner_used)
+        self.assertEqual(run_auto.depth, 1)
+
+        # planner = "on" turns invalid/out-of-bounds plan into CANNOT_SPLIT (not INFRA)
+        backend_oob = ScriptedBackend({
+            "planner": '{"steps":[{"n":1,"does":"a","tests":["wrong"]},{"n":2,"does":"b","tests":["t2"]}]}',
+        })
+        cfg_on = self._minimal_config(
+            repo, state.root, gates={"planner": "on"}, harness={"enabled": False},
+        )
+        run_on = CardRun(
+            card=card, cfg=cfg_on, state=state,
+            card_dir=state.card_dir("CARD-P1", "run-1"), worktree=wt,
+            runner=SimpleNamespace(), pack=RustPack(), backend=backend_oob,
+            book=BriefBook(wt, cfg_on.never_touch, cfg_on.forbidden_files),
+            run_id="run-1", telemetry=MemoryTelemetry(),
+            micromanager=NullMicromanager(),
+        )
+        with self.assertRaises(GateFailure) as caught:
+            run_on._step_plan()
+        self.assertEqual(caught.exception.code, StopCode.CANNOT_SPLIT)
+
+    def test_runner_infra_in_list_and_extra_gates_plus_local_via(self) -> None:
+        import shutil
+        import sys
+        from openfarm_core.adapters.direct import INFRA, PASS, RunResult
+        from openfarm_core.adapters.jsonl import MemoryTelemetry
+        from openfarm_core.adapters.openai_compat import ScriptedBackend
+        from openfarm_core.briefs import BriefBook
+        from openfarm_core.errors import Infra
+        from openfarm_core.flow import CardRun
+        from openfarm_core.micromanager import NullMicromanager
+        from openfarm_core.state import StateDir
+
+        tmp = Path(tempfile.mkdtemp(prefix="openfarm-infra-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        repo = tmp / "repo"
+        wt = tmp / "wt"
+        repo.mkdir(parents=True)
+        wt.mkdir(parents=True)
+        state = StateDir(tmp / "state")
+        state.create_card("CARD-I1", "run-1")
+
+        card = Card(
+            id="CARD-I1", title="infra", state="ready",
+            touches=["src/lib.rs"],
+            fields={
+                "category": "pattern",
+                "tests": [{"name": "t1", "file": "tests/t.rs"}],
+            },
+        )
+
+        class InfraRunner:
+            def exec(self, kind, argv, **kwargs):
+                return RunResult(INFRA, -9, 0.1, "", "oom killer", None, None, argv, kind)
+
+        cfg = self._minimal_config(
+            repo, state.root,
+            gates={"extra": [{"name": "gen", "run": "false", "via": "runner",
+                              "paths": ["src/**"], "on_fail": "block"}]},
+            harness={"enabled": False},
+        )
+        run = CardRun(
+            card=card, cfg=cfg, state=state,
+            card_dir=state.card_dir("CARD-I1", "run-1"), worktree=wt,
+            runner=InfraRunner(), pack=RustPack(), backend=ScriptedBackend({}),
+            book=BriefBook(wt, cfg.never_touch, cfg.forbidden_files),
+            run_id="run-1", telemetry=MemoryTelemetry(),
+            micromanager=NullMicromanager(),
+        )
+        with self.assertRaises(Infra):
+            run._prove_current_tests()
+        with self.assertRaises(Infra):
+            run._extra_gates(["src/lib.rs"])
+
+        # via="local" runs directly without touching configured remote runner
+        cfg_local = self._minimal_config(
+            repo, state.root,
+            gates={"extra": [{"name": "local-ok",
+                              "run": f"{sys.executable} -c 'print(1)'",
+                              "via": "local",
+                              "paths": ["src/**"],
+                              "on_fail": "block"}]},
+            harness={"enabled": False},
+        )
+        run_local = CardRun(
+            card=card, cfg=cfg_local, state=state,
+            card_dir=state.card_dir("CARD-I1", "run-1"), worktree=wt,
+            runner=InfraRunner(), pack=RustPack(), backend=ScriptedBackend({}),
+            book=BriefBook(wt, cfg_local.never_touch, cfg_local.forbidden_files),
+            run_id="run-1", telemetry=MemoryTelemetry(),
+            micromanager=NullMicromanager(),
+        )
+        run_local._extra_gates(["src/lib.rs"])
+        self.assertEqual(run_local.gates[-1].name, "extra:local-ok")
+        self.assertEqual(run_local.gates[-1].result, PASS)
+
+    def test_toy_cleanup_removes_empty_base_dir(self) -> None:
+        from tests.toy import ToyRepo
+
+        base = Path(tempfile.mkdtemp(prefix="openfarm-toy-clean-"))
+        root = base / "repo"
+        state = base / "state"
+        origin = base / "origin.git"
+        for p in (root, state, origin):
+            p.mkdir()
+        toy = ToyRepo(root=root, state_dir=state, origin=origin, base=base)
+        toy.cleanup()
+        self.assertFalse(base.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -36,7 +36,7 @@ from .flow import CardRun
 from .gates.checks import suite_green
 from .gates.eligibility import check_eligibility, derive_cargo_unit
 from .git import Git, GitRefused
-from .globs import matches_any
+from .globs import matches_any, normalise, resolves_within
 from .harness_memory import HarnessLibrary
 from .micromanager import MicromanagerBudget, open_micromanager
 from .packs.base import pack_for
@@ -470,6 +470,28 @@ def _dry_run(ctx: Context, source: FileCardSource, card_id: str) -> dict:
     return payload
 
 
+def _load_test_conventions(cfg, worktree: Path) -> str:
+    """Load `[brief] test_conventions` safely, preferring the card worktree."""
+    if not cfg.test_conventions_path:
+        return ""
+    conv_rel = normalise(str(cfg.test_conventions_path))
+    if conv_rel == ".openfarm/config.toml":
+        return ""
+    allowed_extra = {conv_rel} if conv_rel.startswith(".openfarm/") else set()
+    conv_book = BriefBook(
+        worktree, cfg.never_touch, cfg.forbidden_files,
+        allowed_extra_reads=allowed_extra,
+    )
+    if conv_book.is_hidden(conv_rel):
+        return ""
+    if (worktree / conv_rel).is_file():
+        return conv_book.guarded_read(conv_rel)
+    repo_note = resolves_within(cfg.repo, conv_rel)
+    if repo_note is not None and repo_note.is_file():
+        return repo_note.read_text()
+    return ""
+
+
 def _run_card(ctx: Context, source: FileCardSource, card_id: str, run_id: str,
               telemetry, run_dir: Path, script: Path | None,
               backend=None, mm_script: Path | None = None,
@@ -502,11 +524,7 @@ def _run_card(ctx: Context, source: FileCardSource, card_id: str, run_id: str,
     backend = backend if backend is not None else open_backend(cfg, script)
     runner = ctx.runner(worktree, output_dir=card_dir / "gates" / "output")
     book = BriefBook(worktree, cfg.never_touch, cfg.forbidden_files)
-    conventions = ""
-    if cfg.test_conventions_path:
-        note = cfg.repo / cfg.test_conventions_path
-        if note.exists() and not book.is_hidden(str(cfg.test_conventions_path)):
-            conventions = note.read_text()
+    conventions = _load_test_conventions(cfg, worktree)
 
     owns_mm = micromanager is None
     mm = (micromanager if micromanager is not None else open_micromanager(
