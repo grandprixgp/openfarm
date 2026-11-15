@@ -16,17 +16,22 @@ from .errors import AdapterError, Infra, Invalid, Refused, Unsupported
 
 PROTOCOL_VERSION = 1
 
-#: Ops every adapter must answer.
+#: Ops every adapter must answer. `hash`, `heartbeat` and `stale` are deliberately
+#: absent: the spec gives each a fallback, so an adapter without one still runs.
 REQUIRED_OPS = {
-    "cards": {"hello", "next", "read", "hash", "claim", "move", "release",
-              "finding", "stale"},
+    "cards": {"hello", "next", "read", "claim", "move", "release", "finding"},
     "runner": {"hello", "exec"},
     "pack": {"hello", "commands", "parse_list", "parse_tests", "classify_paths",
-             "signatures", "edit_formats", "apply_edit", "append_stub", "format",
-             "format_check", "patterns", "error_signature", "mutation",
-             "parse_mutation"},
+             "signatures", "edit_formats", "apply_edit",
+             "format", "format_check", "patterns", "error_signature"},
     "model": {"hello", "complete"},
     "telemetry": {"hello", "write", "flush"},
+}
+
+#: Ops an adapter may omit, because the spec names a fallback for each.
+OPTIONAL_OPS = {
+    "cards": {"hash", "heartbeat", "stale"},
+    "pack": {"append_stub", "mutation", "parse_mutation"},
 }
 
 ERROR_KINDS = ("refused", "infra", "invalid", "unsupported")
@@ -87,6 +92,32 @@ def check_hello(result: dict, adapter: str, needed: set[str]) -> None:
     if missing:
         raise Invalid("missing-ops",
                       f"{adapter} adapter does not offer {', '.join(sorted(missing))}")
+
+
+#: Ops a run can do without, and what it falls back to.
+FALLBACKS = {
+    "hash": "SHA-256 of the canonical JSON that `read` returned",
+    "heartbeat": "no lease renewal; the card source's own stale list",
+    "stale": "no stale list; the card source's own",
+}
+
+
+def card_hash(call, card_id: str) -> str:
+    """The card's hash, from the `hash` op or from the canonical `read` payload.
+
+    An adapter that does not offer `hash` is not a reason to refuse the run: the
+    spec names this fallback, and it is the same value for a card source whose
+    `read` is stable.
+    """
+    from .cards import hash_value
+    try:
+        result = call("cards", "hash", {"id": card_id})
+        if isinstance(result, dict) and result.get("hash"):
+            return str(result["hash"])
+    except Unsupported:
+        pass
+    read = call("cards", "read", {"id": card_id})
+    return hash_value((read or {}).get("card", read))
 
 
 class CmdAdapter:

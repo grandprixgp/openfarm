@@ -231,5 +231,63 @@ class CmdAdapterTests(unittest.TestCase):
             adapter.call("cards", "next", {})
 
 
+class FallbackTests(unittest.TestCase):
+    """An adapter may omit the ops the spec gives a fallback for."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.script = self.tmp / "no-hash-adapter.py"
+        self.script.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            "request = json.load(sys.stdin)\n"
+            "op = request['op']\n"
+            "rid = request['request_id']\n"
+            "card = {'id': 'CARD-1', 'title': 'T', 'state': 'ready',\n"
+            "        'done_text': 'returns `Err(Full)`', 'touches': ['src/a.rs'],\n"
+            "        'deps': [], 'fields': {'category': 'pinned-bugfix'}}\n"
+            "if op == 'hello':\n"
+            "    result = {'name': 'no-hash', 'versions': [1],\n"
+            "              'ops': ['hello', 'next', 'read', 'claim', 'move',\n"
+            "                      'release', 'finding']}\n"
+            "elif op == 'read':\n"
+            "    result = {'card': card}\n"
+            "elif op == 'hash':\n"
+            "    print(json.dumps({'openfarm': 1, 'request_id': rid, 'ok': False,\n"
+            "                      'error': {'kind': 'unsupported',\n"
+            "                                'code': 'no-hash', 'message': 'no',\n"
+            "                                'retry_after_s': None}}))\n"
+            "    sys.exit(0)\n"
+            "else:\n"
+            "    result = {}\n"
+            "print(json.dumps({'openfarm': 1, 'request_id': rid, 'ok': True,\n"
+            "                  'result': result}))\n")
+        self.script.chmod(0o755)
+
+    def test_hello_passes_without_the_optional_ops(self) -> None:
+        adapter = CmdAdapter(f"cmd:python3 {self.script}", self.tmp)
+        from openfarm_core.protocol import REQUIRED_OPS
+        hello = adapter.hello("cards", REQUIRED_OPS["cards"])
+        self.assertEqual(hello["name"], "no-hash")
+
+    def test_hash_falls_back_to_the_canonical_read_payload(self) -> None:
+        from openfarm_core.cards import Card, hash_value
+        from openfarm_core.protocol import card_hash
+
+        adapter = CmdAdapter(f"cmd:python3 {self.script}", self.tmp)
+        digest = card_hash(adapter.call, "CARD-1")
+        expected = hash_value(adapter.call("cards", "read", {"id": "CARD-1"})["card"])
+        self.assertEqual(digest, expected)
+
+    def test_the_fallback_matches_the_card_model_hash(self) -> None:
+        from openfarm_core.cards import Card
+        from openfarm_core.protocol import card_hash
+
+        adapter = CmdAdapter(f"cmd:python3 {self.script}", self.tmp)
+        payload = adapter.call("cards", "read", {"id": "CARD-1"})["card"]
+        self.assertEqual(card_hash(adapter.call, "CARD-1"),
+                         Card.from_dict(payload).hash())
+
+
 if __name__ == "__main__":
     unittest.main()
