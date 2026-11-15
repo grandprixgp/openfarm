@@ -234,7 +234,9 @@ class FlowEdgeTests(unittest.TestCase):
         })
         outcome = self.run_card(backend)
         self.assertEqual(outcome["final_state"], "blocked")
-        self.assertEqual(outcome["stop_code"], "tests-unprovable")
+        # A refusal the model cannot fix stops the card: retrying it would only
+        # spend model calls to reach the same answer.
+        self.assertEqual(outcome["stop_code"], "refused")
 
     # -- counter-tests -------------------------------------------------------
 

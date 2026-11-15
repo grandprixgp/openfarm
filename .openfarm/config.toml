@@ -1,0 +1,58 @@
+[project]
+name = "openfarm"
+lane = "farm"
+base_branch = "main"
+state_dir = "~/.openfarm/openfarm"
+
+[adapters]
+cards = "files:cards/"
+runner = "direct"
+languages = ["rust"]
+model = "scripted"
+
+[model]
+endpoint = "https://scripted.invalid/v1"
+allowed_endpoints = ["https://scripted.invalid/v1"]
+test_writer = { model = "stub", temperature = 0.2 }
+implementer = { model = "stub", temperature = 0.3, vary_seed = true }
+checker     = { model = "stub", temperature = 0.4, vary_seed = true }
+
+[policy]
+# The seams here are the parts whose correctness is the whole claim: the git
+# allowlist, the eligibility gate, the Rust pack's parsing, and the shim.
+never_touch = [
+  "openfarm_core/git.py",
+  "openfarm_core/gates/eligibility.py",
+  "openfarm_core/packs/rust.py",
+  "openfarm",
+]
+forbidden_files = [
+  ".openfarm/**",
+  "tests/toy.py",
+  "openfarm spec v0.3.md",
+]
+known_failing = []
+flagged_patterns = []
+# The core's own tests are Python, so the Rust pack exercises nothing here. This
+# config exists to check that the documented file format reads and validates.
+categories = ["mechanical"]
+
+[eligibility]
+max_files = 3
+max_units = 1
+require_reference = ["pattern"]
+rust_tests_in_separate_files = true
+
+[budget]
+implementer_attempts = 3
+test_writer_attempts = 2
+model_build_calls_per_card = 6
+tokens_per_card = 400000
+wall_clock_per_card = "10m"
+spend_per_night = 0.0
+
+[gates]
+mutation = "off"
+coverage = "off"
+workspace_lint = false
+catch_up = "check"

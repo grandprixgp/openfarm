@@ -104,6 +104,16 @@ class OpenAICompatibleBackend:
         self._opener = urllib.request.build_opener(
             _AllowlistRedirectHandler(self.allowed_endpoints))
 
+    @property
+    def prices_spend(self) -> bool:
+        """True when this backend can report a cost per call.
+
+        Without prices every `spend` is zero, so the budget's spend caps cannot
+        fire. That is a property of the configuration, not of a night's luck, and
+        the run record says so.
+        """
+        return self.cost_per_1k_in > 0 or self.cost_per_1k_out > 0
+
     def hello(self) -> dict:
         return {"name": self.name, "versions": [1], "ops": ["hello", "complete"]}
 
@@ -261,4 +271,6 @@ def open_backend(cfg, script_path: Path | None = None):
         endpoint=cfg.endpoint,
         allowed_endpoints=cfg.allowed_endpoints,
         key_file=cfg.key_file,
+        cost_per_1k_in=getattr(cfg, "cost_per_1k_in", 0.0),
+        cost_per_1k_out=getattr(cfg, "cost_per_1k_out", 0.0),
     )

@@ -263,8 +263,11 @@ class GamingTrickTests(unittest.TestCase):
                                        + GOOD_TEST.replace(
                                            "#[test]", "#[test]\n#[ignore]"),
             "CARD-IGNORE/implementer": GOOD_IMPLEMENTATION}))
+        # `#[ignore]` on a named test means it never ran on base, so fail-before
+        # stops the card before an attempt is spent. The banned-pattern gate would
+        # also catch it in the final diff.
         self.assertEqual(outcome["final_state"], "blocked")
-        self.assertEqual(outcome["stop_code"], "attempts")
+        self.assertEqual(outcome["stop_code"], "tests-unprovable")
 
     def test_a_non_unique_search_block_spends_no_attempt(self) -> None:
         """A search block matching more than once is refused before any build."""
@@ -279,8 +282,10 @@ class GamingTrickTests(unittest.TestCase):
                 ">>> REPLACE\n"
                 "self.parts\n")}))
         self.assertEqual(outcome["final_state"], "blocked")
+        # The card stops for attempts once its free retries run out, and the point of
+        # the rule is what it did NOT spend: no build came of a block that never
+        # applied.
         self.assertEqual(outcome["stop_code"], "attempts")
-        # The point of the rule: no attempt and no build were spent on it.
         self.assertEqual(outcome["builds"]["model"], 0)
 
     def test_a_rewrite_of_a_frozen_test_fails_the_freeze(self) -> None:

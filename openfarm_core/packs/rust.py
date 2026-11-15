@@ -274,17 +274,26 @@ class RustPack(Pack):
     # -- files ----------------------------------------------------------------
 
     def classify_paths(self, paths: list[str]) -> dict:
+        """test, production or other.
+
+        A crate can sit at the repository root or under a workspace folder, so the
+        source directory is looked for at any depth. Getting this wrong is not
+        cosmetic: production-only patterns and the mutation gate both key off it, so
+        a workspace crate classified as `other` would silently skip both.
+        """
         out = {}
         for path in paths:
             text = str(path).replace("\\", "/")
-            parts = text.split("/")
-            if text.endswith("_test.rs") or "_tests/" in text or "/tests/" in f"/{text}":
+            parts = [part for part in text.split("/") if part]
+            in_tests = ("/tests/" in f"/{text}" or parts[:1] == ["tests"]
+                        or text.endswith("_test.rs") or "_tests/" in text)
+            in_source = "src" in parts[:-1]
+            if in_tests:
                 out[path] = "test"
-            elif parts[0] == "tests":
-                out[path] = "test"
-            elif parts[0] == "src" and text.endswith(".rs"):
+            elif in_source and text.endswith(".rs"):
                 out[path] = "production"
-            elif parts[0] in ("benches", "examples", "docs") or text.endswith(".md"):
+            elif parts[:1] in (["benches"], ["examples"], ["docs"]) or \
+                    text.endswith(".md"):
                 out[path] = "other"
             else:
                 out[path] = "other"

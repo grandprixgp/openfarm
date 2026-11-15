@@ -15,7 +15,7 @@ import re
 from pathlib import Path
 
 from .errors import Invalid, Refused
-from .globs import matches_any, normalise
+from .globs import escapes, matches_any, normalise
 
 #: An edit the harness may apply.
 FORMAT_SEARCH_REPLACE = "search_replace"
@@ -163,20 +163,32 @@ def apply_edits(worktree: Path, edits: list[Edit], allowed_paths: list[str],
                 never_touch: list[str], forbidden: list[str],
                 additions_only: set[str] | None = None,
                 allow_stubs: bool = False,
-                stub_inserter=None) -> ApplyReport:
+                stub_inserter=None,
+                production_paths: set[str] | None = None,
+                forbid_production: bool = False) -> ApplyReport:
     """Apply edits inside the allowed paths, refusing everything else.
 
     `allowed_paths` is the card's `touches` for that phase. `additions_only` names
     the files where a change must not delete or modify a line (production files the
     test writer may only append a stub to). `allow_stubs` is true only on cards that
     declare new symbols, and only the test writer passes it.
+
+    `production_paths` with `forbid_production` is for the test writer on an ordinary
+    card: production code is not its to write, and without this a whole-file edit
+    there would land in the frozen commit and be invisible to every diff gate.
     """
     worktree = Path(worktree)
     report = ApplyReport()
     additions = set(additions_only or ())
+    production = list(production_paths or ())
 
     for edit in edits:
         path = edit.path
+        if escapes(path):
+            report.refused.append({
+                "path": path, "code": "path-escape",
+                "message": "this path climbs above the repository root"})
+            continue
         if matches_any(path, forbidden):
             report.refused.append({"path": path, "code": "forbidden-file",
                                    "message": "the config forbids this path"})
@@ -191,12 +203,27 @@ def apply_edits(worktree: Path, edits: list[Edit], allowed_paths: list[str],
                 "message": "append_stub is only for cards that declare new symbols, "
                            "and only for the test writer"})
             continue
+        if forbid_production and production and matches_any(path, production):
+            report.refused.append({
+                "path": path, "code": "production-not-writable",
+                "message": "the test writer may not write production code on this "
+                           "card: only its named test files"})
+            continue
         if allowed_paths and not matches_any(path, allowed_paths):
             report.outside_touches.append(path)
             continue
 
-        target = worktree / path
-        if path in additions:
+        target = (worktree / path).resolve()
+        root = worktree.resolve()
+        if root not in target.parents and target != root:
+            report.refused.append({
+                "path": path, "code": "path-escape",
+                "message": "this path resolves outside the worktree"})
+            continue
+        # A glob in `additions_only` still means its files are additions-only.
+        is_addition = path in additions or (
+            additions and matches_any(path, additions))
+        if is_addition:
             existing = target.read_text() if target.exists() else ""
             before = existing
         else:
@@ -221,7 +248,7 @@ def apply_edits(worktree: Path, edits: list[Edit], allowed_paths: list[str],
             continue
 
         after = target.read_text() if target.exists() else ""
-        if path in additions and not _is_additions_only(before or "", after):
+        if is_addition and not _is_additions_only(before or "", after):
             report.not_additions_only.append(path)
         report.added_lines.extend(_added_lines(path, before or "", after))
         report.applied.append(path)

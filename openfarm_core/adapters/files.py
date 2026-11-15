@@ -321,6 +321,19 @@ class FileCardSource:
         header, body, _ = self._read_raw(card_id)
         if lease_id and header.get("lease_id") not in ("", lease_id):
             raise Refused("stale-lease", f"{card_id} is not held on {lease_id}")
+        # A person may free a card whose lease has gone stale, but not one a live run
+        # is holding: the run would keep working and its own move would then fail.
+        if not lease_id:
+            expires = _lease_expiry(header)
+            holder = _holder(header)
+            if holder and expires and expires > utc_now():
+                raise Refused(
+                    "held",
+                    f"{card_id} is held by {holder} on a lease until {expires}; "
+                    f"release it once that has expired")
+        if header.get("state") in ("done", "dropped"):
+            raise Refused("not-held",
+                          f"{card_id} is {header.get('state')}, not in progress")
         header["state"] = READY
         header["holder"] = ""
         header["lease_id"] = ""

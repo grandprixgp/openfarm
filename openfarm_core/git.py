@@ -47,19 +47,47 @@ class GitRefused(Exception):
     """A git call was outside the allowlist. Nothing was run."""
 
 
+#: Options that consume the next argument, so that argument is a value, not a
+#: subcommand. Every other word after a `-`-prefixed token is treated as a candidate
+#: subcommand, because an allowlist that guesses wrong is worse than a strict one.
+_OPTIONS_TAKING_A_VALUE = frozenset({
+    "-C", "--git-dir", "--work-tree", "--namespace", "--exec-path",
+    "--config-env", "-c", "--super-prefix", "--shallow-file",
+})
+
+
 def _check_subcommand(args: list[str]) -> str:
-    for arg in args:
-        if arg.startswith("-"):
+    """Check every word of a git argv, not just the first one.
+
+    A single-token check is not enough: `git --namespace config push` passes
+    `config` to a first-token reader and then runs `push`. Every non-option word is
+    therefore checked against both lists, and the option values that `git` would
+    treat as data are the only ones skipped.
+    """
+    subcommands: list[str] = []
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token in _OPTIONS_TAKING_A_VALUE:
+            index += 2
             continue
-        if arg in FORBIDDEN_SUBCOMMANDS:
+        if token.startswith("-"):
+            index += 1
+            continue
+        subcommands.append(token)
+        index += 1
+
+    if not subcommands:
+        raise GitRefused("git was called with no subcommand")
+    for word in subcommands:
+        if word in FORBIDDEN_SUBCOMMANDS:
             raise GitRefused(
-                f"openfarm never runs git {arg}: the core has no code path that "
+                f"openfarm never runs git {word}: the core has no code path that "
                 f"reaches another repository")
-        if arg not in ALLOWED_SUBCOMMANDS:
-            raise GitRefused(
-                f"git {arg} is not on openfarm's allowlist")
-        return arg
-    raise GitRefused("git was called with no subcommand")
+    for word in subcommands:
+        if word in ALLOWED_SUBCOMMANDS:
+            return word
+    raise GitRefused(f"git {subcommands[0]} is not on openfarm's allowlist")
 
 
 class Git:

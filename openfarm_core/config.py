@@ -28,10 +28,16 @@ _DURATION_UNITS = {"s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0}
 
 
 def parse_duration(value, what: str = "duration") -> float:
-    """Seconds from `45m`, `2h`, `30s`, `1d`, or a plain number of seconds."""
+    """Seconds from `45m`, `2h`, `30s`, `1d`, or a number of seconds.
+
+    A bare string of digits is seconds, so `--for 60` and `--for 60s` agree.
+    """
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return float(value)
-    match = _DURATION_RE.match(str(value))
+    text = str(value).strip()
+    if text.replace(".", "", 1).isdigit():
+        return float(text)
+    match = _DURATION_RE.match(text)
     if not match:
         raise ConfigError(f"{what}: cannot read {value!r} as a duration")
     return float(match.group(1)) * _DURATION_UNITS[match.group(2)]
@@ -160,6 +166,12 @@ class Config:
             model.get("allowed_endpoints", []), "[model] allowed_endpoints")
         key_file = model.get("key_file")
         self.key_file = self._outside_repo(key_file, "[model] key_file") if key_file else None
+        # Prices are what make a spend cap mean anything. Without them every call
+        # reports a zero cost and no spend cap can fire, so the run record says so.
+        self.cost_per_1k_in = _as_float(model.get("cost_per_1k_in"),
+                                        "[model] cost_per_1k_in", 0.0)
+        self.cost_per_1k_out = _as_float(model.get("cost_per_1k_out"),
+                                         "[model] cost_per_1k_out", 0.0)
         self.role_models = {
             role: self._role_model(model.get(role), role)
             for role in ("test_writer", "implementer", "checker", "planner")

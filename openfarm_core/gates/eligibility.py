@@ -45,15 +45,18 @@ class EligibilityResult:
 
 def check_eligibility(card: Card, cfg, deps_done: bool = True,
                       card_count: int | None = None,
-                      known_failing: list[str] | None = None) -> EligibilityResult:
+                      known_failing: list[str] | None = None,
+                      worktree=None) -> EligibilityResult:
     """Every rule, in the order that catches the cheapest thing first."""
     result = EligibilityResult()
     known = list(cfg.known_failing if known_failing is None else known_failing)
 
-    # 1. Seam prefixes in touches. Cheap and certain.
+    # 1. Seam prefixes in touches. Cheap and certain, and normalised first so
+    # `./seam:gestures` cannot slip past a plain startswith.
     for entry in card.touches:
+        candidate = normalise(entry)
         for prefix in cfg.refuse_touches_prefixes:
-            if entry.startswith(prefix):
+            if candidate.startswith(prefix) or entry.startswith(prefix):
                 result.fail("seam-prefix",
                             f"touches entry {entry!r} starts with the refused "
                             f"prefix {prefix!r}")
@@ -75,7 +78,7 @@ def check_eligibility(card: Card, cfg, deps_done: bool = True,
         result.fail("max-files",
                     f"{len(card.touches)} touches entries, over the limit of "
                     f"{cfg.max_files}")
-    units = _units_of(card.touches)
+    units = _units_of(card.touches, worktree)
     if len(units) > cfg.max_units:
         result.fail("max-units",
                     f"touches spans {len(units)} units ({', '.join(sorted(units))}), "
@@ -184,23 +187,49 @@ def _word_present(text: str, word: str) -> bool:
     return bool(re.search(rf"\b{re.escape(word)}\b", text))
 
 
-def _units_of(touches: list[str]) -> set[str]:
-    """The crate, package or view folder each touch belongs to."""
-    units = set()
+def _units_of(touches: list[str], worktree=None) -> set[str]:
+    """The crate, package or view folder each touch belongs to.
+
+    A repository can be flat (one crate at the root) or a workspace (many crates
+    under a folder). The unit is the crate: the directory holding `Cargo.toml`, or
+    the segment before `src`/`tests` when the tree is not readable. Counting the
+    first path segment would make every workspace crate one unit and let a card span
+    three crates at `max_units = 1`.
+    """
+    from pathlib import Path
+
+    units: set[str] = set()
     for entry in touches:
         path = normalise(entry)
-        parts = [p for p in path.split("/") if p and p != "**"]
+        parts = [part for part in path.split("/") if part and part != "**"]
         if not parts:
-            continue
-        stripped = path.rstrip("/")
-        if stripped.endswith("/**"):
-            stripped = stripped[:-3]
-        parts = [p for p in stripped.split("/") if p and p != "**"]
-        if parts and parts[0].endswith(".rs"):
             units.add(".")
             continue
-        if parts:
-            units.add(parts[0])
+
+        # A file in the crate root is that crate; a file under src/ or tests/ belongs
+        # to the crate those directories sit in.
+        directory = parts[:-1]
+        while directory and directory[-1] in ("src", "tests", "benches",
+                                              "examples"):
+            directory = directory[:-1]
+        if not directory:
+            units.add(".")
+            continue
+
+        # Where the tree is readable, walk up to the crate root by its Cargo.toml,
+        # so `crates/a/src/deep/x.rs` and `crates/a/tests/y.rs` are one unit.
+        if worktree is not None:
+            base = Path(worktree)
+            for depth in range(len(directory), 0, -1):
+                candidate = base / "/".join(directory[:depth])
+                if (candidate / "Cargo.toml").exists() or \
+                        (candidate / "package.json").exists():
+                    units.add("/".join(directory[:depth]))
+                    break
+            else:
+                units.add("/".join(directory))
+            continue
+        units.add("/".join(directory))
     return units or {"."}
 
 

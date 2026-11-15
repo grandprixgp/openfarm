@@ -16,11 +16,35 @@ _CACHE: dict[str, re.Pattern[str]] = {}
 
 
 def normalise(path: str) -> str:
-    """Repository-relative, forward slashes, no leading `./` or `/`."""
+    """Repository-relative, forward slashes, no leading `./` or `/`, no `..`.
+
+    Collapsing `..` matters for security, not tidiness: a model's edit names a path,
+    and `a/../../outside.txt` would otherwise pass a glob check against `a/**` and
+    then be written outside the worktree.
+    """
     text = str(path).replace("\\", "/")
-    while text.startswith("./"):
-        text = text[2:]
-    return text.lstrip("/")
+    parts: list[str] = []
+    for part in text.split("/"):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if not parts:
+                # Above the repository root: keep the `..` so the escape stays
+                # visible to the caller instead of being silently absorbed.
+                parts.append("..")
+                continue
+            if parts[-1] == "..":
+                parts.append("..")
+                continue
+            parts.pop()
+            continue
+        parts.append(part)
+    return "/".join(parts)
+
+
+def escapes(path: str) -> bool:
+    """True when a path climbs above the repository root."""
+    return normalise(path).startswith("../") or normalise(path) == ".."
 
 
 def compile_glob(pattern: str) -> re.Pattern[str]:

@@ -14,8 +14,11 @@ Every command takes `--json` and then prints its result as one JSON object on st
 from __future__ import annotations
 
 import argparse
+import datetime as _dt
 import json
+import re
 import sys
+import time as _time
 from pathlib import Path
 
 from .adapters.files import FileCardSource, open_file_source
@@ -25,7 +28,7 @@ from .adapters.direct import open_runner
 from .briefs import BriefBook
 from .budget import NightBudget
 from .cards import Card
-from .config import load_config
+from .config import load_config, parse_duration
 from .dossier import build_dossier, render_markdown
 from .errors import (AdapterError, ConfigError, GateFailure, Infra, Invalid,
                      Refused, StopCode, UsageError)
@@ -86,7 +89,8 @@ def cmd_check(ctx: Context, args) -> int:
         return EXIT_REFUSED
 
     deps_done = _deps_done(source, card)
-    eligibility = check_eligibility(card, ctx.cfg, deps_done=deps_done)
+    eligibility = check_eligibility(card, ctx.cfg, deps_done=deps_done,
+                                    worktree=ctx.repo)
     payload = {"card": card.id, "eligible": eligibility.ok,
                "card_hash": card.hash(),
                "failures": eligibility.failures}
@@ -183,7 +187,14 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
 
     identifiers = [args.card] if args.card else source.next(cfg.lane,
                                                            limit=args.cards)["cards"]
-    night = NightBudget(args.spend or cfg.spend_per_night, cards_cap=args.cards)
+    # `--spend` may lower the night's cap but never raise the config's, because the
+    # config is the operator's standing limit and the flag is one night's.
+    cap = cfg.spend_per_night
+    if args.spend is not None:
+        cap = (min(args.spend, cfg.spend_per_night) if cfg.spend_per_night > 0
+               else args.spend)
+    night = NightBudget(cap, cards_cap=args.cards)
+    deadline = _deadline(args)
     outcomes: list[dict] = []
     consecutive: list[tuple[str, str]] = []
 
@@ -192,6 +203,10 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
             outcomes.append({"card": card_id, "final_state": "blocked",
                              "stop_code": StopCode.KILLED.value})
             break
+        if deadline is not None and _time.time() >= deadline:
+            outcomes.append({"card": card_id,
+                             "skipped": "the run's time ran out"})
+            continue
         reason = night.exhausted()
         if reason:
             outcomes.append({"card": card_id, "skipped": reason})
@@ -212,10 +227,22 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
         night.note_spend(outcome.get("spend", 0.0) or 0.0)
         _update_breaker(ctx, consecutive)
 
+    notes: list[str] = []
+    if not _backend_prices_spend(cfg, args.script):
+        notes.append(
+            "the backend reports no prices, so every spend is zero and the spend "
+            "caps cannot fire: set [model] cost_per_1k_in and cost_per_1k_out")
+    if cfg.concurrent_cards > 1:
+        notes.append(
+            f"concurrent_cards is {cfg.concurrent_cards} but cards run one at a "
+            f"time: the per-card state is ready for a pool, the loop is not")
+
     record = {"run_id": run_id, "started_at": utc_now(),
               "finished_at": utc_now(), "caps": {"spend": night.spend_cap,
                                                 "cards": args.cards},
               "spend": night.spend,
+              "spend_measured": _backend_prices_spend(cfg, args.script),
+              "notes": notes,
               "outcomes": outcomes,
               "dry_run": bool(args.dry_run),
               "telemetry_problems": telemetry.problems}
@@ -234,7 +261,8 @@ def _dry_run(ctx: Context, source: FileCardSource, card_id: str) -> dict:
     except AdapterError as exc:
         return {"card": card_id, "error": exc.message}
     eligibility = check_eligibility(card, ctx.cfg,
-                                    deps_done=_deps_done(source, card))
+                                    deps_done=_deps_done(source, card),
+                                    worktree=ctx.repo)
     return {"card": card_id, "dry_run": True, "eligible": eligibility.ok,
             "failures": eligibility.failures}
 
@@ -290,6 +318,66 @@ def _run_card(ctx: Context, source: FileCardSource, card_id: str, run_id: str,
     record["card_hash"] = card_hash
     record["detail"] = run.detail
     return record
+
+
+def _deadline(args) -> float | None:
+    """When this run must stop claiming, as a `time.monotonic()` deadline.
+
+    Either flag bounds a night. The check runs between cards, not inside one: a card
+    is finished or blocked, never abandoned mid-way, because its partial work and its
+    lease would be left behind.
+    """
+    wall_start = _dt.datetime.now(_dt.timezone.utc)
+    mono_start = _time.monotonic()
+
+    def monotonic_at(target: _dt.datetime) -> float:
+        """A wall-clock moment as a monotonic deadline.
+
+        The two clocks must not be mixed: `time.monotonic()` has an arbitrary epoch,
+        so a wall-clock instant is converted by the offset between them here.
+        """
+        return mono_start + (target - wall_start).total_seconds()
+
+    if getattr(args, "for_duration", None):
+        try:
+            seconds = parse_duration(args.for_duration, "--for")
+        except ConfigError as exc:
+            raise UsageError(str(exc)) from exc
+        return mono_start + seconds
+
+    if getattr(args, "until", None):
+        text = str(args.until).strip()
+        try:
+            # `HH:MM` is a time of day; a date-time carries a date. Checking for `:`
+            # alone would send every `HH:MM` down the ISO branch.
+            is_time_of_day = re.fullmatch(r"\d{1,2}:\d{2}", text) is not None
+            if is_time_of_day:
+                hour, minute = (int(part) for part in text.split(":"))
+                if not (0 <= hour < 24 and 0 <= minute < 60):
+                    raise ValueError(f"{hour}:{minute} is not a time of day")
+                target = wall_start.replace(hour=hour, minute=minute, second=0,
+                                            microsecond=0)
+                # "The next time the clock shows HH:MM": if that instant has already
+                # passed today, it means tomorrow. Comparing to the start of this
+                # minute instead would make the current minute's deadline negative.
+                if target <= wall_start:
+                    target += _dt.timedelta(days=1)
+            else:
+                target = _dt.datetime.fromisoformat(text)
+                if target.tzinfo is None:
+                    target = target.replace(tzinfo=_dt.timezone.utc)
+        except (ValueError, TypeError) as exc:
+            raise UsageError(f"--until: cannot read {text!r} as a time") from exc
+        return monotonic_at(target)
+    return None
+
+
+def _backend_prices_spend(cfg, script: Path | None) -> bool:
+    """Whether this configuration can report a cost at all."""
+    if script is not None or cfg.model_adapter in ("scripted", "stub"):
+        return False
+    return bool(getattr(cfg, "cost_per_1k_in", 0.0)
+                or getattr(cfg, "cost_per_1k_out", 0.0))
 
 
 def _update_breaker(ctx: Context, consecutive: list[tuple[str, str]]) -> None:
