@@ -309,7 +309,13 @@ class GamingTrickTests(unittest.TestCase):
                 "    pub fn len(&self) -> usize {\n"
                 "        let _guard = self.segments.first().unwrap();\n")}))
         self.assertEqual(outcome["final_state"], "blocked")
-        self.assertEqual(outcome["stop_code"], "attempts")
+        # Repeating the exact same banned diff hits the banned gate and then
+        # triggers no-progress on attempt 2 rather than burning remaining budget.
+        self.assertEqual(outcome["stop_code"], "no-progress")
+        banned_files = list(self.toy.state_dir.rglob("gates/*/banned-patterns.json"))
+        self.assertTrue(any(
+            json.loads(p.read_text()).get("result") == "fail"
+            for p in banned_files))
 
     def test_a_leftover_stub_is_banned(self) -> None:
         self.plant("CARD-STUB")
@@ -326,7 +332,11 @@ class GamingTrickTests(unittest.TestCase):
                 "\n"
                 "    pub fn len(&self) -> usize {\n")}))
         self.assertEqual(outcome["final_state"], "blocked")
-        self.assertEqual(outcome["stop_code"], "attempts")
+        self.assertEqual(outcome["stop_code"], "no-progress")
+        banned_files = list(self.toy.state_dir.rglob("gates/*/banned-patterns.json"))
+        self.assertTrue(any(
+            json.loads(p.read_text()).get("result") == "fail"
+            for p in banned_files))
 
     def test_a_deleted_test_is_a_test_loss(self) -> None:
         self.plant("CARD-DELETE")
