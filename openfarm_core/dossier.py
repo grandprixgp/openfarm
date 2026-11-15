@@ -100,9 +100,16 @@ def _line_counts(card_run) -> tuple[int, int]:
 
 
 def _touches_check(card_run, changed: list[str]) -> str:
+    """Every changed path must be in touches, or a test file the card named.
+
+    A card's named test files are answerable by the test writer even when `touches`
+    doesn't list them, so they are not a risk and don't belong in this header.
+    """
     from .globs import matches_any
-    outside = [path for path in changed
-               if not matches_any(path, card_run.card.touches)]
+    answerable = list(card_run.card.touches) + [
+        test.file for test in card_run.card.tests if test.file]
+    answerable += list(card_run.card.test_edits)
+    outside = [path for path in changed if not matches_any(path, answerable)]
     if outside:
         return "outside touches: " + ", ".join(outside)
     return f"{len(changed)} path(s), all inside touches"

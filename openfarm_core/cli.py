@@ -239,7 +239,9 @@ def _dry_run(ctx: Context, source: FileCardSource, card_id: str) -> dict:
 
 
 def _run_card(ctx: Context, source: FileCardSource, card_id: str, run_id: str,
-              telemetry, run_dir: Path, script: Path | None) -> dict:
+              telemetry, run_dir: Path, script: Path | None,
+              backend=None) -> dict:
+    """Claim one card and drive it. `backend` overrides the configured one."""
     cfg = ctx.cfg
     holder = f"openfarm:{run_id}"
     try:
@@ -260,7 +262,7 @@ def _run_card(ctx: Context, source: FileCardSource, card_id: str, run_id: str,
 
     card_dir = ctx.state.create_card(card.id, run_id)
     pack = pack_for(cfg.languages[0])
-    backend = open_backend(cfg, script)
+    backend = backend if backend is not None else open_backend(cfg, script)
     runner = ctx.runner(worktree, output_dir=card_dir / "gates" / "output")
     book = BriefBook(worktree, cfg.never_touch, cfg.forbidden_files)
     conventions = ""

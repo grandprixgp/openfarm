@@ -1043,6 +1043,9 @@ class CardRun:
             self._record_gate(GateResult("catch-up", PASS, "off in this config"))
             return
 
+        # The base as it is now, which is what the frontier lane would merge into.
+        # `base_commit` is where the card's branch started, so the two only differ
+        # when someone landed work while the card ran.
         current_base = self.git.head(self._base_ref())
         if current_base == self.base_commit:
             self.catch_up_result = "skipped: the base has not moved"
@@ -1056,8 +1059,7 @@ class CardRun:
         self.git.worktree_add(trial, self.branch)
         trial_git = Git(trial)
         try:
-            trial_git.checkout("--detach", ) if False else None
-            merged, output = trial_git.merge_no_commit(self._base_ref())
+            merged, output = trial_git.merge_no_commit(current_base)
             if not merged:
                 self.catch_up_result = "conflict with the current base"
                 self._record_gate(GateResult(
