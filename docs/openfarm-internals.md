@@ -155,6 +155,31 @@ core is toy-shaped. That repository's config and cards live in it, not here.
   gates caught all three, which is the system working, but it is the spec's warning
   that a card is harder to cut than it looks.
 
+## Where the implementation is thinner than the spec
+
+Honest gaps, so nobody assumes these work:
+
+- **Only the runner has an external (`cmd:`) transport.** The card source, model
+  backend, telemetry and language pack have protocol classes and a `hello`, but
+  `Context.cards()` only opens the file card source. A repository whose card tool is
+  an external command needs that wiring, which is the Atlas adapter work (spec step
+  3, out of scope for this build).
+- **`coverage` and `findings_per_card` are read and not acted on.** No coverage gate
+  is implemented, so `coverage = "required"` does nothing, and no finding is ever
+  filed, so the per-card cap has nothing to cap. Both are stated in the dossier's
+  "not checked" section rather than silently ignored.
+- **`check --baseline` does not use the baseline cache yet.** It builds base every
+  time, which is correct but slower than the spec intends.
+- **The circuit breaker records placeholder card ids**, not the three cards' real
+  ids, and a `released` card counts toward its three-in-a-row.
+- **`[[gates.extra]] via` is parsed and every extra gate runs through the runner.**
+  `via = "local"` is accepted and not honoured, which is deliberate here: a plain
+  local shell would bypass the runner's build accounting.
+- **The free-space floor is not checked.** `StateDir.free_bytes` has no caller.
+- **The formatter runs before the revert check**, so a touched test file that
+  `rustfmt` rewrites is reported as a frozen-test change. Formatting excludes a file
+  that was not clean at base, which covers the common case but not this one.
+
 ## Adding a language pack
 
 Implement `packs/base.Pack`: the command shapes, `parse_list`, `parse_tests`,

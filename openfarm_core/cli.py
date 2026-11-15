@@ -307,7 +307,11 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
 
 
 def _dry_run(ctx: Context, source: FileCardSource, card_id: str) -> dict:
-    """Eligibility and baselines only: no model calls, no claims."""
+    """Eligibility and baselines only: no model calls, no claims.
+
+    The baseline half is the point of the flag: a dry run exists so an operator can
+    find out that the base is red before a night starts, without spending a card.
+    """
     try:
         card = Card.from_dict(source.read(card_id)["card"])
     except AdapterError as exc:
@@ -315,8 +319,18 @@ def _dry_run(ctx: Context, source: FileCardSource, card_id: str) -> dict:
     eligibility = check_eligibility(card, ctx.cfg,
                                     deps_done=_deps_done(source, card),
                                     worktree=ctx.repo)
-    return {"card": card_id, "dry_run": True, "eligible": eligibility.ok,
-            "failures": eligibility.failures}
+    payload = {"card": card_id, "dry_run": True, "eligible": eligibility.ok,
+               "failures": eligibility.failures}
+    if eligibility.ok:
+        try:
+            payload["baseline"] = _baseline_check(ctx, source, card)
+            if not payload["baseline"].get("ok", False):
+                payload["eligible"] = False
+        except (AdapterError, Infra, OSError) as exc:
+            payload["baseline"] = {"ok": False,
+                                   "error": getattr(exc, "message", str(exc))}
+            payload["eligible"] = False
+    return payload
 
 
 def _run_card(ctx: Context, source: FileCardSource, card_id: str, run_id: str,
@@ -597,7 +611,12 @@ def cmd_release(ctx: Context, args) -> int:
 
 
 def cmd_dossier(ctx: Context, args) -> int:
-    """Read-only: the dossier from the card's latest run, or a named one."""
+    """Read-only: the dossier from the card's latest run, or a named one.
+
+    There is one dossier per run, not one per attempt, so `--attempt` names which
+    attempt's gate results to show rather than choosing a different file. Asking for
+    an attempt the card never reached is a refusal, not a silent fallback.
+    """
     if args.run:
         path = ctx.state.cards / args.card / args.run / "dossier.json"
     else:
@@ -607,6 +626,19 @@ def cmd_dossier(ctx: Context, args) -> int:
         ctx.emit({"card": args.card, "error": "no dossier yet"})
         return EXIT_REFUSED
     payload = read_json(path) or {}
+
+    if args.attempt is not None:
+        gates = [entry for entry in payload.get("2_gates", [])
+                 if entry.get("attempt") == args.attempt]
+        if not gates:
+            ctx.emit({"card": args.card,
+                      "error": f"no gate ran on attempt {args.attempt}",
+                      "attempts_run": sorted({entry.get("attempt")
+                                              for entry in payload.get("2_gates", [])})})
+            return EXIT_REFUSED
+        payload["2_gates"] = gates
+        payload["attempt"] = args.attempt
+
     if args.format == "json" or ctx.json:
         ctx.emit(payload)
     else:

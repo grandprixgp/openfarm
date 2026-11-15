@@ -186,6 +186,28 @@ class NightTests(unittest.TestCase):
         # matters is that the gate answered and did not crash.
         self.assertIn("named", baseline)
 
+    def test_a_dry_run_also_checks_the_base(self) -> None:
+        """A dry run says whether the base is buildable before a night spends a card."""
+        result = cli(self.toy.root, "run", "--dry-run", "--cards", "1")
+        payload = json.loads(result.stdout)
+        outcome = payload["outcomes"][0]
+        self.assertIn("baseline", outcome)
+        self.assertIn("ok", outcome["baseline"])
+
+    def test_dossier_attempt_names_an_attempt_or_refuses(self) -> None:
+        path = script(**good_script("CARD-1"))
+        cli(self.toy.root, "run", "--card", "CARD-1", "--script", str(path),
+            "--cards", "1")
+
+        result = cli(self.toy.root, "dossier", "CARD-1", "--attempt", "1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(json.loads(result.stdout)["2_gates"]) > 0, True)
+
+        missing = cli(self.toy.root, "dossier", "CARD-1", "--attempt", "99")
+        self.assertEqual(missing.returncode, 1)
+        self.assertIn("no gate ran on attempt 99",
+                      json.loads(missing.stdout)["error"])
+
     def test_a_paused_queue_refuses_a_new_run(self) -> None:
         cli(self.toy.root, "pause", "--reason", "a person said so")
         result = cli(self.toy.root, "run", "--cards", "1",
