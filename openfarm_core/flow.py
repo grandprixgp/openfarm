@@ -483,6 +483,7 @@ class CardRun:
             # frozen tests must be in the commit or `reset --hard` would delete them.
             self._freeze()
             self.frozen_commit = self._commit(f"{self.card.id}: freeze the tests")
+            self._record_attempt("test-writer", "passed-gates", role="test_writer")
             return
 
         raise GateFailure(StopCode.TESTS_UNPROVABLE,
@@ -673,6 +674,54 @@ class CardRun:
         return {"diff": text, "paths": changed,
                 "hash": hashlib.sha256(text.encode("utf-8")).hexdigest()}
 
+    def _record_attempt(self, phase: str, outcome: str,
+                        stop_code: StopCode | None = None, *,
+                        diff: dict | None = None, gates: list[GateResult] | None = None,
+                        role: str = "", started: str = "") -> None:
+        """Write one attempt record, in the fields the spec fixes."""
+        from .adapters.jsonl import ATTEMPT_FIELDS, complete_record
+        from .edits import line_counts
+
+        diff = diff or {}
+        added, removed = line_counts(diff.get("diff", "") or "")
+        calls = [call for call in self.roles.calls
+                 if call.role == (role or phase)]
+        record = {
+            "run_id": self.run_id,
+            "card_id": self.card.id,
+            "card_hash": getattr(self, "card_hash_at_claim", ""),
+            "attempt": self.budget.implementer_attempts
+            if phase in ("implement", "fix") else self.budget.test_writer_attempts,
+            "phase": phase,
+            "started_at": started or self.started_at,
+            "ended_at": utc_now(),
+            "model": calls[-1].model if calls else "",
+            "temperature": calls[-1].temperature if calls else 0.0,
+            "seed": calls[-1].seed if calls else 0,
+            "tokens_in": sum(call.tokens_in for call in calls),
+            "tokens_out": sum(call.tokens_out for call in calls),
+            "spend": round(sum(call.spend for call in calls), 6),
+            "edit_format": "search_replace",
+            "files_changed": list(diff.get("paths", [])),
+            "lines_added": added,
+            "lines_removed": removed,
+            "diff_hash": diff.get("hash", ""),
+            "model_builds": self.budget.model_builds,
+            "fixed_builds": self.budget.fixed_builds,
+            "runner_seconds": 0,
+            "gates": [gate.as_dict() for gate in (gates or self.gates)],
+            "named_tests_passing": self.named_passing,
+            "error_signature": (self.error_signatures[-1]
+                                if self.error_signatures else ""),
+            "outcome": outcome,
+            "stop_code": stop_code.value if stop_code else "",
+        }
+        complete = complete_record(record, ATTEMPT_FIELDS)
+        write_json(self.card_layout / "attempts"
+                   / f"{len(self.attempts) + 1:02d}-{phase}.json", complete)
+        self.attempts.append(complete)
+        self.telemetry.write("attempt", complete)
+
     def _judge_attempt(self, attempt_no: int, report) -> str | None:
         """Run the per-attempt gates. Returns a failure detail, or None to move on."""
         diff = self._stash_diff()
@@ -733,13 +782,19 @@ class CardRun:
                             for name in self.card.test_names)
             if all_named:
                 self._commit(f"{self.card.id}: make the frozen tests pass")
+                self._record_attempt("implement", "passed-gates", diff=diff)
                 return None
-            return ("named tests still failing: " + ", ".join(
+            detail = ("named tests still failing: " + ", ".join(
                 name for name in self.card.test_names
                 if _status_of(parsed, name) != "ok"))
+            self._record_attempt("fix", "failed-gates", diff=diff)
+            return detail
 
         self._check_progress()
-        return (suite.detail or "") + (" | " + lint_gate.detail if lint_gate.detail else "")
+        detail = (suite.detail or "") + (
+            " | " + lint_gate.detail if lint_gate.detail else "")
+        self._record_attempt("fix", "failed-gates", diff=diff)
+        return detail
 
     def _check_progress(self) -> None:
         """Any one of three signals stops the card."""
@@ -1019,6 +1074,7 @@ class CardRun:
             f"traceability returned; {len(counters.tests)} counter-test(s), "
             f"{self.counter_summary['failed']} failing",
             {"counter_tests": self.counter_summary}))
+        self._record_attempt("checker", "passed-gates", role="checker_pass2")
 
         if (self.cfg.counter_tests == "reject"
                 and self.counter_summary["failed"] > 0):
