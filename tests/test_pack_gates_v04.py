@@ -95,7 +95,10 @@ def _card(**overrides) -> Card:
 
 class PackForCmdTests(unittest.TestCase):
     def test_falls_back_gracefully_when_cmd_pack_not_wired(self) -> None:
-        pack = pack_for("rust", spec="cmd:python3 fake_pack.py")
+        import openfarm_core.protocol as proto
+
+        with patch.object(proto, "CmdPack", None):
+            pack = pack_for("rust", spec="cmd:python3 fake_pack.py")
         self.assertIsInstance(pack, UnsupportedPack)
         self.assertIn("cmd:python3 fake_pack.py", pack.name)
 
@@ -110,6 +113,9 @@ class PackForCmdTests(unittest.TestCase):
             pack = pack_for("python", spec="cmd:./custom-pack")
         self.assertIsInstance(pack, FakeCmdPack)
         self.assertEqual(pack.name, "fake:cmd:./custom-pack")
+
+        real_pack = pack_for("rust", spec="cmd:python3 fake_pack.py")
+        self.assertIsInstance(real_pack, proto.CmdPack)
 
 
 class RustPackC1ParseTests(unittest.TestCase):
@@ -427,8 +433,7 @@ class EligibilityV04Tests(unittest.TestCase):
             c = _card(category=cat, new_symbols=True)
             self.assertTrue(check_eligibility(c, cfg).ok, cat)
 
-        bad_fe = _card()
-        bad_fe.frontier_estimate_valid = False
+        bad_fe = _card(fields={"frontier_estimate": "not-a-number"})
         self.assertIn("frontier-estimate", [f["rule"] for f in check_eligibility(bad_fe, cfg).failures])
 
         too_many_ctx = _card(fields={"context_files": [f"src/c{i}.rs" for i in range(9)]})

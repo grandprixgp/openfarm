@@ -665,6 +665,8 @@ class Micromanager:
         never_touch: tuple[str, ...] | list[str] = (),
         forbidden_files: tuple[str, ...] | list[str] = (),
         card_dir: Path | str | None = None,
+        mode: str = "active",
+        feature_flags: dict[str, bool] | None = None,
     ) -> None:
         self.backend = backend
         self.budget = budget or MicromanagerBudget()
@@ -673,10 +675,15 @@ class Micromanager:
         if ".openfarm/**" not in self.forbidden_files:
             self.forbidden_files.append(".openfarm/**")
         self.card_dir = Path(card_dir) if card_dir is not None else None
+        self.mode = str(mode or "active").strip().lower()
+        self.feature_flags = dict(feature_flags or {})
 
     @property
     def enabled(self) -> bool:
-        return bool(getattr(self.backend, "enabled", True))
+        return self.mode != "off" and bool(getattr(self.backend, "enabled", True))
+
+    def _feature_enabled(self, name: str) -> bool:
+        return self.enabled and bool(self.feature_flags.get(name, True))
 
     def hello(self) -> dict:
         return self.backend.hello()
@@ -724,7 +731,7 @@ class Micromanager:
         known_tests=None,
         cfg=None,
     ) -> ShapeDecision:
-        if not self.enabled:
+        if not self._feature_enabled("shape_cards"):
             return ShapeDecision(verdict="ready")
 
         nt, fb = self._effective_lists(cfg=cfg)
@@ -818,7 +825,7 @@ class Micromanager:
         never_touch=(),
         forbidden=(),
     ) -> list[Edit]:
-        if not self.enabled:
+        if not self._feature_enabled("scaffold_contracts") or self.mode == "advisory":
             return []
 
         nt, fb = self._effective_lists(never_touch=never_touch, forbidden=forbidden)
@@ -901,7 +908,7 @@ class Micromanager:
                     if edit.format == FORMAT_SEARCH_REPLACE
                     else (edit.content or "")
                 )
-                if "todo!(" not in body and "unimplemented!(" not in body:
+                if not _valid_production_scaffold(body):
                     raise Refused(
                         "scaffold-missing-todo",
                         f"{edit.path}: production scaffold must contain "
@@ -922,7 +929,7 @@ class Micromanager:
         failure_output: str,
         cfg=None,
     ) -> CoachingAdvice:
-        if not self.enabled:
+        if not self._feature_enabled("coach_on_stall"):
             return CoachingAdvice()
 
         nt, fb = self._effective_lists(cfg=cfg)
@@ -951,6 +958,8 @@ class Micromanager:
         guidance = _strip_edit_blocks(str(raw.get("guidance", "")))
         abort = bool(raw.get("abort", False))
         abort_reason = str(raw.get("abort_reason", ""))
+        if self.mode == "advisory":
+            abort = False
         return CoachingAdvice(
             root_cause=root_cause,
             guidance=guidance,
@@ -967,7 +976,7 @@ class Micromanager:
         restatement,
         failing_counters: list,
     ) -> CheckerVerdict:
-        if not self.enabled:
+        if not self._feature_enabled("adjudicate_counter_tests"):
             return CheckerVerdict(verdict="uphold")
 
         restatement_payload = (
@@ -999,8 +1008,10 @@ class Micromanager:
                 "bad-micromanager-verdict",
                 f"adjudicate_checker returned invalid verdict {verdict!r}",
             )
-        if verdict == "dismiss_false_reject":
+        if verdict == "dismiss_false_reject" and self.mode != "advisory":
             self.budget.record_false_reject_dismissed()
+        elif self.mode == "advisory":
+            verdict = "uphold"
 
         return CheckerVerdict(
             verdict=verdict,
@@ -1016,7 +1027,7 @@ class Micromanager:
                 "bad-supervision-op",
                 f"unsupported supervision op {op!r}",
             )
-        if not self.enabled:
+        if not self.enabled or (op == "pre_review" and not self._feature_enabled("pre_review")):
             default_verdict = "approve" if op == "pre_review" else "ok"
             return SupervisionReport(op=op, verdict=default_verdict)
 
@@ -1049,6 +1060,8 @@ class Micromanager:
                         allowed_touches=card_touches,
                         context=f"pre_review {key}",
                     )
+            if self.mode == "advisory":
+                verdict = "approve"
             return SupervisionReport(
                 op=op,
                 verdict=verdict,
@@ -1093,6 +1106,17 @@ class Micromanager:
         )
 
 
+def _valid_production_scaffold(body: str) -> bool:
+    """Allow todo!/unimplemented! stubs or pure type/module declarations without fn bodies."""
+    if "todo!(" in body or "unimplemented!(" in body:
+        return True
+    cleaned = re.sub(r"//.*", "", body)
+    cleaned = re.sub(r"/\*.*?\*/", "", cleaned, flags=re.DOTALL)
+    if re.search(r"\bfn\b", cleaned):
+        return False
+    return bool(re.search(r"\b(?:struct|enum|trait|type|mod|use)\b", cleaned))
+
+
 def _normalise_findings(raw_findings) -> list[dict]:
     out: list[dict] = []
     for entry in raw_findings or []:
@@ -1121,6 +1145,7 @@ def open_micromanager(
     repo: Path | str,
     script: Path | str | dict | None = None,
     worktree: Path | str | None = None,
+    card_dir: Path | str | None = None,
 ) -> Micromanager:
     """Create a configured Micromanager from config (or script override)."""
     repo_path = Path(repo)
@@ -1129,6 +1154,17 @@ def open_micromanager(
 
     never_touch = _cfg_get(cfg, "never_touch", ()) or ()
     forbidden_files = _cfg_get(cfg, "forbidden_files", ()) or ()
+    mode = str(_cfg_get(mm_cfg, "mode", "active") or "active").strip().lower()
+    feature_flags = {
+        key: bool(_cfg_get(mm_cfg, key, True))
+        for key in (
+            "shape_cards",
+            "scaffold_contracts",
+            "coach_on_stall",
+            "adjudicate_counter_tests",
+            "pre_review",
+        )
+    }
 
     max_calls = int(
         _cfg_get(
@@ -1182,6 +1218,9 @@ def open_micromanager(
             budget=budget,
             never_touch=never_touch,
             forbidden_files=forbidden_files,
+            card_dir=card_dir,
+            mode="active" if mode == "off" else mode,
+            feature_flags=feature_flags,
         )
 
     enabled_flag = _cfg_get(mm_cfg, "enabled", None) if mm_cfg is not None else None
@@ -1194,12 +1233,19 @@ def open_micromanager(
         )
     spec_str = str(spec or "off").strip()
 
-    if enabled_flag is False or spec_str.lower() in ("", "off", "none", "null", "disabled"):
+    if (
+        enabled_flag is False
+        or mode == "off"
+        or spec_str.lower() in ("", "off", "none", "null", "disabled")
+    ):
         return Micromanager(
             NullMicromanager(),
             budget=budget,
             never_touch=never_touch,
             forbidden_files=forbidden_files,
+            card_dir=card_dir,
+            mode="off",
+            feature_flags=feature_flags,
         )
 
     timeout_s = float(
@@ -1216,6 +1262,9 @@ def open_micromanager(
             budget=budget,
             never_touch=never_touch,
             forbidden_files=forbidden_files,
+            card_dir=card_dir,
+            mode=mode,
+            feature_flags=feature_flags,
         )
 
     if spec_str.startswith("cmd:"):
@@ -1224,14 +1273,23 @@ def open_micromanager(
             budget=budget,
             never_touch=never_touch,
             forbidden_files=forbidden_files,
+            card_dir=card_dir,
+            mode=mode,
+            feature_flags=feature_flags,
         )
 
     if spec_str.lower() in ("claude-acp", "acp", "claude"):
-        command = _cfg_get(
+        explicit_cmd = _cfg_get(
             mm_cfg,
             "command",
-            _cfg_get(cfg, "micromanager_command", "claude-agent-acp"),
+            _cfg_get(cfg, "micromanager_command", None),
         )
+        if explicit_cmd is not None:
+            command = explicit_cmd
+        else:
+            binary = str(_cfg_get(mm_cfg, "binary", "claude-agent-acp") or "claude-agent-acp")
+            raw_args = _cfg_get(mm_cfg, "args", None) or []
+            command = [binary, *[str(a) for a in raw_args]] if raw_args else binary
         model = str(
             _cfg_get(mm_cfg, "model", _cfg_get(cfg, "micromanager_model", "")) or ""
         )
@@ -1250,7 +1308,7 @@ def open_micromanager(
         auth_file = _cfg_get(
             mm_cfg,
             "auth_file",
-            _cfg_get(cfg, "micromanager_auth_file", _cfg_get(cfg, "key_file", None)),
+            _cfg_get(cfg, "micromanager_auth_file", None),
         )
         cost_in = float(
             _cfg_get(
@@ -1287,6 +1345,9 @@ def open_micromanager(
             budget=budget,
             never_touch=never_touch,
             forbidden_files=forbidden_files,
+            card_dir=card_dir,
+            mode=mode,
+            feature_flags=feature_flags,
         )
 
     raise Invalid(

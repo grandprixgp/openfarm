@@ -113,7 +113,7 @@ class UnsupportedPack(Pack):
 
 
 def pack_for(language: str, cargo_flags: list[str] | None = None,
-             spec: str = "") -> Pack:
+             spec: str = "", cwd: Path | None = None) -> Pack:
     """The pack for a language. `cargo_flags` comes from `[runner] cargo_flags`."""
     cmd_spec = spec if str(spec).startswith("cmd:") else (
         language if str(language).startswith("cmd:") else "")
@@ -123,6 +123,10 @@ def pack_for(language: str, cargo_flags: list[str] | None = None,
         except ImportError:
             CmdPack = None
         if CmdPack is not None:
+            if cwd is not None:
+                return CmdPack(cmd_spec, cwd=cwd, cargo_flags=cargo_flags)
+            if cargo_flags is not None:
+                return CmdPack(cmd_spec, cargo_flags=cargo_flags)
             return CmdPack(cmd_spec)
         return UnsupportedPack(cmd_spec)
     if language == "rust":

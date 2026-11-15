@@ -339,11 +339,12 @@ class CmdPack:
 
     name = "cmd"
 
-    def __init__(self, spec: str, cwd: Path,
+    def __init__(self, spec: str, cwd: Path | None = None,
                  cargo_flags: list[str] | None = None,
                  timeout_s: float = 300.0) -> None:
-        self.adapter = CmdAdapter(spec, cwd, timeout_s=timeout_s)
-        self.cwd = Path(cwd)
+        base_cwd = Path(cwd) if cwd is not None else Path.cwd()
+        self.adapter = CmdAdapter(spec, base_cwd, timeout_s=timeout_s)
+        self.cwd = base_cwd
         self.cargo_flags = list(cargo_flags or [])
         self.notes: list[str] = []
 
