@@ -17,14 +17,16 @@ SECOND = Path.home() / "projects" / "openfarm-second"
 #: Keys the spec's Config section documents, per table.
 SPEC_KEYS = {
     "project": {"name", "lane", "base_branch", "state_dir"},
-    "adapters": {"cards", "runner", "languages", "model"},
+    "adapters": {"cards", "runner", "languages", "model",
+                 "micromanager", "telemetry", "pack"},
     "model": {"endpoint", "allowed_endpoints", "key_file", "test_writer",
               "implementer", "checker", "planner", "cost_per_1k_in",
               "cost_per_1k_out"},
     "policy": {"never_touch", "forbidden_files", "known_failing",
                "flagged_patterns", "categories"},
     "eligibility": {"max_files", "max_units", "require_reference",
-                    "refuse_touches_prefixes", "rust_tests_in_separate_files"},
+                    "refuse_touches_prefixes", "rust_tests_in_separate_files",
+                    "allow_type_changes", "max_context_files"},
     "brief": {"test_conventions"},
     "runner": {"env", "cargo_flags"},
     "budget": {"implementer_attempts", "test_writer_attempts",
@@ -35,8 +37,16 @@ SPEC_KEYS = {
     "gates": {"revert_check", "mutation", "mutation_required_for",
               "mutation_min_kill_rate", "counter_tests", "coverage",
               "workspace_lint", "baseline_cache", "catch_up",
-              "findings_per_card", "circuit_breaker", "extra"},
+              "findings_per_card", "circuit_breaker", "extra", "planner"},
     "cards": {"fields_block", "required_fields"},
+    "micromanager": {"mode", "binary", "args", "model", "effort",
+                     "tool_policy", "timeout_s", "timeout",
+                     "max_calls_per_card", "tokens_per_card",
+                     "spend_per_night", "cost_per_1k_in", "cost_per_1k_out",
+                     "auth_file", "isolate_home", "shape_cards",
+                     "scaffold_contracts", "coach_on_stall",
+                     "adjudicate_counter_tests", "pre_review"},
+    "state": {"min_free_mb"},
 }
 
 

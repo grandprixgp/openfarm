@@ -22,6 +22,7 @@ class StopCode(str, enum.Enum):
     BUDGET = "budget"
     CANNOT_SPLIT = "cannot-split"
     CHECKER_REJECT = "checker-reject"
+    SUPERVISOR_REJECT = "supervisor-reject"
     EXTRA_GATE = "extra-gate"
     CARD_CHANGED = "card-changed"
     STALE_CONFLICT = "stale-conflict"

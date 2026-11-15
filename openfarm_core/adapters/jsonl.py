@@ -87,6 +87,9 @@ CARD_FIELDS = (
     "spend", "files_changed", "lines_added", "lines_removed", "named_tests",
     "known_failing_excluded", "counter_tests", "mutation", "findings_filed",
     "frontier_estimate", "dossier_path",
+    "micromanager_calls", "micromanager_tokens_in",
+    "micromanager_tokens_out", "micromanager_spend",
+    "false_rejects_dismissed",
 )
 
 
@@ -107,9 +110,11 @@ def complete_record(record: dict, fields: tuple[str, ...], schema_version: int =
 def _default_for(field: str):
     if field in ("attempt", "tokens_in", "tokens_out", "lines_added",
                  "lines_removed", "model_builds", "fixed_builds",
-                 "runner_seconds", "depth", "named_tests_passing"):
+                 "runner_seconds", "depth", "named_tests_passing",
+                 "micromanager_calls", "micromanager_tokens_in",
+                 "micromanager_tokens_out", "false_rejects_dismissed"):
         return 0
-    if field in ("spend", "wall_clock_s"):
+    if field in ("spend", "wall_clock_s", "micromanager_spend"):
         return 0.0
     if field == "gates":
         return []
@@ -135,14 +140,34 @@ class TelemetrySink:
         self.inner = inner
         self.problems: list[str] = []
 
+    def _sync_problems(self) -> None:
+        for problem in getattr(self.inner, "problems", ()) or ():
+            if problem not in self.problems:
+                self.problems.append(problem)
+
     def write(self, stream: str, record: dict) -> None:
         try:
             self.inner.write(stream, record)
         except Exception as exc:  # noqa: BLE001 - telemetry must never stop a card
-            self.problems.append(f"{stream}: {exc}")
+            msg = f"{stream}: {exc}"
+            if msg not in self.problems:
+                self.problems.append(msg)
+        self._sync_problems()
 
     def flush(self) -> None:
         try:
             self.inner.flush()
         except Exception as exc:  # noqa: BLE001
-            self.problems.append(f"flush: {exc}")
+            msg = f"flush: {exc}"
+            if msg not in self.problems:
+                self.problems.append(msg)
+        self._sync_problems()
+
+
+def open_telemetry(cfg, run_dir: Path):
+    """Build the telemetry adapter from config (`jsonl` or `cmd:<argv>`)."""
+    spec = getattr(cfg, "telemetry_adapter", "jsonl") or "jsonl"
+    if spec.startswith("cmd:"):
+        from ..protocol import CmdTelemetry
+        return CmdTelemetry(spec, cfg.repo)
+    return JsonlTelemetry(run_dir)

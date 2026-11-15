@@ -8,6 +8,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import re
+import tomllib
+
+from .errors import Invalid
 
 
 def canonical_json(value: object) -> str:
@@ -56,6 +61,42 @@ CARD_FIELDS = (
     "frontier_estimate",
     "new_symbols",
 )
+
+#: Optional field names a card source may also report under `fields`.
+OPTIONAL_CARD_FIELDS = (
+    "unit",
+    "context_files",
+    "type_changes",
+)
+
+_OPENFARM_BLOCK_RE = re.compile(
+    r"^[ \t]*```openfarm[ \t]*\r?\n(.*?)^[ \t]*```[ \t]*(?:\r?\n|$)",
+    re.MULTILINE | re.DOTALL,
+)
+_TOML_BLOCK_RE = re.compile(
+    r"^[ \t]*```toml[ \t]*\r?\n(.*?)^[ \t]*```[ \t]*(?:\r?\n|$)",
+    re.MULTILINE | re.DOTALL,
+)
+
+
+def extract_fenced_fields(done_text: str, block_kind: str = "toml") -> tuple[dict, str]:
+    """Parse a fenced ```openfarm or ```toml metadata block from card body text."""
+    if block_kind != "toml" or not done_text:
+        return {}, done_text
+    match = _OPENFARM_BLOCK_RE.search(done_text) or _TOML_BLOCK_RE.search(done_text)
+    if not match:
+        return {}, done_text
+    try:
+        parsed = tomllib.loads(match.group(1))
+    except tomllib.TOMLDecodeError as exc:
+        raise Invalid("bad-fields-block",
+                      f"fenced fields block is not valid TOML: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise Invalid("bad-fields-block", "fenced fields block must be a TOML table")
+    cleaned = re.sub(
+        r"\n{3,}", "\n\n", done_text[:match.start()] + done_text[match.end():]
+    ).strip()
+    return parsed, cleaned
 
 
 class Card:
@@ -113,9 +154,26 @@ class Card:
     @property
     def frontier_estimate(self) -> float | None:
         value = self.fields.get("frontier_estimate")
-        if value is None or value == "":
+        if value is None or value == "" or isinstance(value, bool):
             return None
-        return float(value)
+        try:
+            num = float(value)
+        except (TypeError, ValueError):
+            return None
+        return num if math.isfinite(num) else None
+
+    @property
+    def frontier_estimate_valid(self) -> bool:
+        value = self.fields.get("frontier_estimate")
+        if value is None or value == "":
+            return True
+        if isinstance(value, bool):
+            return False
+        try:
+            num = float(value)
+        except (TypeError, ValueError):
+            return False
+        return math.isfinite(num)
 
     @property
     def new_symbols(self) -> bool:
@@ -125,6 +183,14 @@ class Card:
     def unit(self) -> str:
         """The one crate, package or view folder the card works in."""
         return str(self.fields.get("unit", "") or "")
+
+    @property
+    def context_files(self) -> list[str]:
+        return [str(p) for p in self.fields.get("context_files", []) or []]
+
+    @property
+    def type_changes(self) -> bool:
+        return bool(self.fields.get("type_changes", False))
 
     # -- serialisation --------------------------------------------------------
 

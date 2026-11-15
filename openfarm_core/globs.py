@@ -11,6 +11,7 @@ relies on:
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 _CACHE: dict[str, re.Pattern[str]] = {}
 
@@ -47,6 +48,25 @@ def escapes(path: str) -> bool:
     return normalise(path).startswith("../") or normalise(path) == ".."
 
 
+def resolves_within(root: Path, rel_path: str) -> Path | None:
+    """Return the resolved path if `rel_path` stays within `root`, else `None`."""
+    if not isinstance(rel_path, str) or "\x00" in rel_path:
+        return None
+    if escapes(rel_path):
+        return None
+    candidate_rel = rel_path.replace("\\", "/")
+    if Path(candidate_rel).is_absolute():
+        return None
+    root_resolved = Path(root).resolve()
+    try:
+        resolved = (root_resolved / candidate_rel).resolve()
+    except (OSError, ValueError):
+        return None
+    if resolved.is_relative_to(root_resolved):
+        return resolved
+    return None
+
+
 def compile_glob(pattern: str) -> re.Pattern[str]:
     """Translate one glob into a regex anchored at both ends."""
     cached = _CACHE.get(pattern)
@@ -80,10 +100,6 @@ def compile_glob(pattern: str) -> re.Pattern[str]:
             continue
         if char == "?":
             out.append("[^/]")
-            index += 1
-            continue
-        if char in "[]":
-            out.append(char)
             index += 1
             continue
         out.append(re.escape(char))
