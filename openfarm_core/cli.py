@@ -38,7 +38,7 @@ from .gates.eligibility import check_eligibility, derive_cargo_unit
 from .git import Git, GitRefused
 from .globs import matches_any
 from .harness_memory import HarnessLibrary
-from .micromanager import open_micromanager
+from .micromanager import MicromanagerBudget, open_micromanager
 from .packs.base import pack_for
 from .state import (StateDir, _safe_id, read_json, utc_now, utc_after,
                     write_json)
@@ -94,8 +94,48 @@ def _open_harness_library(
     if require_enabled and not enabled:
         return None
     hdir_raw = str(getattr(hcfg, "dir", "") or "").strip() if hcfg else ""
-    hdir = Path(hdir_raw).expanduser() if hdir_raw else ctx.state.harness()
+    if hdir_raw:
+        hdir_path = Path(hdir_raw).expanduser()
+        if not hdir_path.is_absolute():
+            hdir_path = (ctx.repo / hdir_path).resolve()
+        hdir = hdir_path
+    else:
+        hdir = ctx.state.harness()
     return HarnessLibrary(hdir, config=ctx.cfg)
+
+
+def _build_night_mm_budget(cfg) -> MicromanagerBudget:
+    mm_cfg = getattr(cfg, "micromanager", None)
+    max_calls = int(
+        getattr(
+            mm_cfg,
+            "max_calls_per_card",
+            getattr(cfg, "micromanager_max_calls_per_card", 8),
+        )
+    )
+    tokens_cap = int(
+        getattr(
+            mm_cfg,
+            "tokens_per_card",
+            getattr(cfg, "micromanager_tokens_per_card", 200_000),
+        )
+    )
+    spend_cap = float(
+        getattr(
+            mm_cfg,
+            "spend_per_night",
+            getattr(
+                cfg,
+                "micromanager_spend_per_night",
+                getattr(cfg, "spend_per_night", 10.0),
+            ),
+        )
+    )
+    return MicromanagerBudget(
+        max_calls_per_card=max_calls,
+        tokens_per_card=tokens_cap,
+        spend_per_night=spend_cap,
+    )
 
 
 # -- commands ------------------------------------------------------------------
@@ -310,6 +350,7 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
         cap = (min(args.spend, cfg.spend_per_night) if cfg.spend_per_night > 0
                else args.spend)
     night = NightBudget(cap, cards_cap=args.cards)
+    night_mm_budget = _build_night_mm_budget(cfg)
     deadline = _deadline(args)
     outcomes: list[dict] = []
     consecutive: list[tuple[str, str, str]] = []
@@ -349,7 +390,8 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
 
         outcome = _run_card(ctx, source, card_id, run_id, telemetry,
                             run_dir, script_path, mm_script=mm_script_path,
-                            harness_library=harness_lib)
+                            harness_library=harness_lib,
+                            mm_budget=night_mm_budget)
         outcomes.append(outcome)
         final_state = outcome.get("final_state")
         if final_state == "blocked":
@@ -432,7 +474,8 @@ def _run_card(ctx: Context, source: FileCardSource, card_id: str, run_id: str,
               telemetry, run_dir: Path, script: Path | None,
               backend=None, mm_script: Path | None = None,
               micromanager=None,
-              harness_library: HarnessLibrary | None = None) -> dict:
+              harness_library: HarnessLibrary | None = None,
+              mm_budget: MicromanagerBudget | None = None) -> dict:
     """Claim one card and drive it. `backend` overrides the configured one."""
     cfg = ctx.cfg
     holder = f"openfarm:{run_id}"
@@ -470,6 +513,8 @@ def _run_card(ctx: Context, source: FileCardSource, card_id: str, run_id: str,
         cfg, card_dir, ctx.repo, script=mm_script,
         worktree=worktree, card_dir=card_dir,
     ))
+    if mm_budget is not None and hasattr(mm, "budget"):
+        mm.budget = mm_budget
     resolved_harness = (
         harness_library
         if harness_library is not None
@@ -863,9 +908,23 @@ def cmd_supervise(ctx: Context, args) -> int:
     source = ctx.cards()
     source.prepare()
     mm_script = Path(args.mm_script) if getattr(args, "mm_script", None) else None
+    supervision_dir = ctx.state.root / "supervision"
+    supervision_dir.mkdir(parents=True, exist_ok=True)
+    base_stamp = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    run_stamp = base_stamp
+    idx = 2
+    while (
+        (supervision_dir / run_stamp).exists()
+        or (supervision_dir / f"{run_stamp}-supervise.json").exists()
+    ):
+        run_stamp = f"{base_stamp}-{idx}"
+        idx += 1
+    sup_card_dir = supervision_dir / run_stamp
+    sup_card_dir.mkdir(parents=True, exist_ok=True)
     mm = open_micromanager(
         ctx.cfg, ctx.state.root, ctx.repo,
         script=mm_script, worktree=ctx.repo,
+        card_dir=sup_card_dir,
     )
     harness_lib = _open_harness_library(ctx, require_enabled=True)
     all_cards = source.all_cards()
@@ -983,6 +1042,9 @@ def cmd_supervise(ctx: Context, args) -> int:
     else:
         payload = {"reports": results, "applied": applied if args.apply else None,
                    "micromanager": mm_budget}
+    report_path = supervision_dir / f"{run_stamp}-supervise.json"
+    write_json(report_path, payload)
+    payload["report_path"] = str(report_path)
     ctx.emit(payload)
     return EXIT_OK
 
@@ -1006,25 +1068,37 @@ def cmd_harness(ctx: Context, args) -> int:
     if action == "show":
         if not target:
             raise UsageError("harness show requires <id>")
-        safe = _check_id(target, "entry id")
-        entry = harness_lib.show_entry(safe)
-        if entry is None:
-            raise Refused("unknown-harness-entry",
-                          f"harness entry {safe!r} does not exist")
+        try:
+            safe = _check_id(target, "entry id")
+            entry = harness_lib.show_entry(safe)
+            if entry is None:
+                raise Refused("unknown-harness-entry",
+                              f"harness entry {safe!r} does not exist")
+        except (Refused, Invalid) as exc:
+            ctx.emit({"error": exc.message, "kind": "refused", "code": exc.code})
+            return EXIT_REFUSED
         ctx.emit(entry)
         return EXIT_OK
 
     if action == "promote":
         if not target:
             raise UsageError("harness promote requires <id>")
-        res = harness_lib.promote_entry(target, reason=reason)
+        try:
+            res = harness_lib.promote_entry(target, reason=reason)
+        except (Refused, Invalid) as exc:
+            ctx.emit({"error": exc.message, "kind": "refused", "code": exc.code})
+            return EXIT_REFUSED
         ctx.emit(res)
         return EXIT_OK
 
     if action == "demote":
         if not target:
             raise UsageError("harness demote requires <id_or_rev>")
-        res = harness_lib.demote_entry_or_revision(target, reason=reason)
+        try:
+            res = harness_lib.demote_entry_or_revision(target, reason=reason)
+        except (Refused, Invalid) as exc:
+            ctx.emit({"error": exc.message, "kind": "refused", "code": exc.code})
+            return EXIT_REFUSED
         ctx.emit(res)
         return EXIT_OK
 

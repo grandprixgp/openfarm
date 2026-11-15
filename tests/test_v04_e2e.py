@@ -349,6 +349,44 @@ class CliSuperviseAndCircuitBreakerFastTests(unittest.TestCase):
         self.assertEqual(payload["micromanager"]["calls"], 1)
         self.assertGreater(payload["micromanager"]["spend"], 0.0)
 
+    def test_acp_l4_supervise_writes_distinct_timestamped_reports_and_artifacts(self) -> None:
+        _write_card_file(
+            self.toy,
+            "CARD-SUP1",
+            title="Ready card",
+            state="ready",
+            category="pinned-bugfix",
+            touches=["src/fascicle.rs"],
+            tests=[{"name": "a_full_fascicle_refuses_a_push", "file": "tests/full.rs",
+                    "asserts": "Err(Full)"}],
+            done_text="Refuse full push.",
+        )
+        self.toy.commit("toy: add CARD-SUP1")
+        mm_script = _write_temp_json(self, "mm_sup_l4.json", {
+            "prepare_queue": {
+                "summary": "Prepared once",
+                "recommendations": [],
+                "findings": [],
+                "_usage": {"tokens_in": 40, "tokens_out": 10, "spend": 0.002},
+            },
+        })
+
+        r1 = _run_cli(self.toy.root, "supervise", "--prepare-queue", "--mm-script", str(mm_script))
+        r2 = _run_cli(self.toy.root, "supervise", "--prepare-queue", "--mm-script", str(mm_script))
+        self.assertEqual(r1.returncode, 0, r1.stderr or r1.stdout)
+        self.assertEqual(r2.returncode, 0, r2.stderr or r2.stdout)
+        p1 = json.loads(r1.stdout)
+        p2 = json.loads(r2.stdout)
+        self.assertTrue(p1.get("report_path"))
+        self.assertTrue(p2.get("report_path"))
+        self.assertNotEqual(p1["report_path"], p2["report_path"])
+        sup_dir = self.toy.state_dir / "supervision"
+        reports = sorted(sup_dir.glob("*-supervise.json"))
+        self.assertEqual(len(reports), 2)
+        artifact_dirs = sorted(p for p in sup_dir.iterdir() if p.is_dir())
+        self.assertEqual(len(artifact_dirs), 2)
+        self.assertNotEqual(artifact_dirs[0].name, artifact_dirs[1].name)
+
 
 @unittest.skipUnless(ENABLED, "set OPENFARM_E2E=1 to run the cargo-backed tests")
 class V04AcpAndOrchestrationE2ETests(unittest.TestCase):
@@ -810,6 +848,112 @@ fn remaining_capacity_tracks_free_slots() {
             capture_output=True, text=True, check=True,
         ).stdout
         self.assertNotIn("revert", wt_list)
+
+    def test_acp_h2c_shared_night_mm_budget_cap_and_per_card_deltas_e2e(self) -> None:
+        turns = _write_temp_json(self, "acp_budget_turns.json", {
+            "turns": [
+                {
+                    "text": json.dumps({
+                        "verdict": "ready",
+                        "clarified_notes": "Card 1 shape ok",
+                        "extra_context_files": [],
+                        "steps": [],
+                        "findings": [],
+                    }),
+                    "usage": {"tokens_in": 100, "tokens_out": 50, "cost": 0.012},
+                },
+                {
+                    "text": json.dumps({
+                        "verdict": "approve",
+                        "reviewer_brief": "Card 1 approved",
+                        "missed_clause": "",
+                        "findings": [],
+                    }),
+                    "usage": {"tokens_in": 80, "tokens_out": 20, "cost": 0.008},
+                },
+                {
+                    "text": json.dumps({
+                        "verdict": "ready",
+                        "clarified_notes": "Card 2 shape hits cap next",
+                        "extra_context_files": [],
+                        "steps": [],
+                        "findings": [],
+                    }),
+                    "usage": {"tokens_in": 90, "tokens_out": 30, "cost": 0.010},
+                },
+                {
+                    "text": json.dumps({
+                        "verdict": "approve",
+                        "reviewer_brief": "Should not run after spend cap",
+                        "missed_clause": "",
+                        "findings": [],
+                    }),
+                    "usage": {"tokens_in": 90, "tokens_out": 30, "cost": 0.050},
+                },
+            ],
+        })
+        _enable_acp_micromanager(self.toy, turns, mode="active", revert_check="off")
+        cfg_path = self.toy.root / ".openfarm" / "config.toml"
+        cfg_text = cfg_path.read_text(encoding="utf-8") + "spend_per_night = 0.025\n"
+        cfg_path.write_text(cfg_text, encoding="utf-8")
+
+        _write_card_file(
+            self.toy,
+            "CARD-B1",
+            title="Budget card 1",
+            category="pinned-bugfix",
+            touches=["src/fascicle.rs"],
+            tests=[{"name": "a_full_fascicle_refuses_a_push", "file": "tests/b1.rs",
+                    "asserts": "Err(Full)"}],
+            done_text="Refuse push when full.",
+        )
+        _write_card_file(
+            self.toy,
+            "CARD-B2",
+            title="Budget card 2 hits shared night mm spend cap",
+            category="pinned-bugfix",
+            touches=["src/fascicle.rs"],
+            tests=[{"name": "a_second_full_fascicle_refuses_a_push", "file": "tests/b2.rs",
+                    "asserts": "Err(Full)"}],
+            done_text="Refuse push when full on card 2.",
+        )
+        self.toy.commit("toy: add CARD-B1, CARD-B2 with mm spend_per_night")
+
+        second_test = GOOD_TEST.replace(
+            "fn a_full_fascicle_refuses_a_push()",
+            "fn a_second_full_fascicle_refuses_a_push()",
+        )
+        script_path = _write_temp_json(self, "budget_script.json", {
+            "CARD-B1/test_writer": "=== whole_file: tests/b1.rs\n" + GOOD_TEST,
+            "CARD-B1/implementer": GOOD_IMPLEMENTATION,
+            "CARD-B1/checker_pass1": "RESTATEMENT: refuse push",
+            "CARD-B1/checker_pass2": "{}",
+            "CARD-B2/test_writer": "=== whole_file: tests/b2.rs\n" + second_test,
+            "CARD-B2/implementer": GOOD_IMPLEMENTATION,
+            "CARD-B2/checker_pass1": "RESTATEMENT: refuse push 2",
+            "CARD-B2/checker_pass2": "{}",
+        })
+
+        res = _run_cli(self.toy.root, "run", "--cards", "2", "--script", str(script_path))
+        self.assertEqual(res.returncode, 0, res.stderr or res.stdout)
+        run_json = json.loads(res.stdout)
+        self.assertEqual(len(run_json["outcomes"]), 2)
+        o1, o2 = run_json["outcomes"]
+        self.assertEqual(o1["final_state"], "in-review", o1)
+        # Card 2 degrades cleanly when shared night micromanager spend cap hits mid-card!
+        self.assertEqual(o2["final_state"], "in-review", o2)
+        self.assertAlmostEqual(o1["micromanager_spend"], 0.020, places=6)
+        self.assertEqual(o1["micromanager_calls"], 2)
+        self.assertAlmostEqual(o2["micromanager_spend"], 0.012, places=6)
+        self.assertEqual(o2["micromanager_calls"], 1)
+        self.assertAlmostEqual(run_json["micromanager_spend"], 0.032, places=6)
+
+        run_dir_2 = list((self.toy.state_dir / "cards" / "CARD-B2").iterdir())[0]
+        pre_gate = next(
+            g for g in read_json(run_dir_2 / "dossier.json")["2_gates"]
+            if g["name"] == "micromanager-pre-review"
+        )
+        self.assertEqual(pre_gate["result"], "fail")
 
 
 if __name__ == "__main__":

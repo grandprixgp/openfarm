@@ -27,7 +27,8 @@ from .gates.eligibility import (check_eligibility, derive_cargo_unit,
                                 file_is_blocked)
 from .git import Git, GitRefused
 from .globs import matches_any, normalise, resolves_within
-from .harness_memory import GuidanceSelection, HarnessLibrary, _classify_failure
+from .harness_memory import (GuidanceSelection, HarnessLibrary, _classify_failure,
+                             _is_unsafe_path)
 from .micromanager import open_micromanager
 from .roles import (Plan, Roles, build_checker_pass1_brief,
                     build_checker_pass2_brief, build_implementer_brief,
@@ -36,7 +37,17 @@ from .roles import (Plan, Roles, build_checker_pass1_brief,
                     wants_planner)
 from .state import append_jsonl, utc_now, utc_after, write_json
 
-#: Sentinel returned by `_judge_attempt` when an intermediate planner step
+_HARNESS_ISOLATED_STOP_CODES = frozenset({
+    StopCode.INFRA,
+    StopCode.KILLED,
+    StopCode.RELEASED,
+    StopCode.PAUSED,
+    StopCode.INELIGIBLE,
+    StopCode.DIRTY_BASELINE,
+    StopCode.STALE_CONFLICT,
+    StopCode.CARD_CHANGED,
+    StopCode.LEASE_EXPIRED,
+})
 #: succeeded and the flow should checkpoint and continue to the next step.
 _STEP_ADVANCED = "__STEP_ADVANCED__"
 
@@ -109,6 +120,16 @@ class CardRun:
                 self.micromanager.card_dir = self.card_layout
         if hasattr(self.micromanager, "harness_context"):
             self.micromanager.harness_context = {}
+        mm_budget = getattr(self.micromanager, "budget", None)
+        self._mm_start = {
+            "calls": int(getattr(mm_budget, "calls", 0) or 0),
+            "tokens_in": int(getattr(mm_budget, "tokens_in", 0) or 0),
+            "tokens_out": int(getattr(mm_budget, "tokens_out", 0) or 0),
+            "spend": float(getattr(mm_budget, "spend", 0.0) or 0.0),
+            "false_rejects_dismissed": int(
+                getattr(mm_budget, "false_rejects_dismissed", 0) or 0
+            ),
+        }
 
         if hasattr(self.book, "allowed_extra_reads") and getattr(self.card, "context_files", None):
             self.book.allowed_extra_reads.update(
@@ -181,11 +202,15 @@ class CardRun:
             self.harness_library = harness_library
         elif harness_enabled:
             hdir_raw = str(getattr(harness_cfg, "dir", "") or "").strip()
-            hdir = (
-                Path(hdir_raw).expanduser()
-                if hdir_raw
-                else self.state.harness()
-            )
+            if hdir_raw:
+                hdir_path = Path(hdir_raw).expanduser()
+                if not hdir_path.is_absolute():
+                    repo_root = getattr(cfg, "repo", None)
+                    base = Path(repo_root) if repo_root else self.worktree
+                    hdir_path = (base / hdir_path).resolve()
+                hdir = hdir_path
+            else:
+                hdir = self.state.harness()
             self.harness_library = HarnessLibrary(hdir, config=cfg)
         else:
             self.harness_library = None
@@ -299,9 +324,80 @@ class CardRun:
         else:
             self.micromanager.harness_context = {}
 
+    def _card_mm_usage(self) -> dict:
+        mm_budget = getattr(self.micromanager, "budget", None)
+        if mm_budget is None:
+            return {
+                "calls": 0,
+                "tokens_in": 0,
+                "tokens_out": 0,
+                "spend": 0.0,
+                "false_rejects_dismissed": 0,
+            }
+        start = getattr(self, "_mm_start", None) or {}
+        return {
+            "calls": max(0, int(getattr(mm_budget, "calls", 0) or 0) - int(start.get("calls", 0))),
+            "tokens_in": max(
+                0, int(getattr(mm_budget, "tokens_in", 0) or 0) - int(start.get("tokens_in", 0))
+            ),
+            "tokens_out": max(
+                0, int(getattr(mm_budget, "tokens_out", 0) or 0) - int(start.get("tokens_out", 0))
+            ),
+            "spend": round(
+                max(0.0, float(getattr(mm_budget, "spend", 0.0) or 0.0) - float(start.get("spend", 0.0))),
+                6,
+            ),
+            "false_rejects_dismissed": max(
+                0,
+                int(getattr(mm_budget, "false_rejects_dismissed", 0) or 0)
+                - int(start.get("false_rejects_dismissed", 0)),
+            ),
+        }
+
+    def _apply_harness_context_hints(self, role: str, *, failure_class: str = "") -> None:
+        if not self._harness_enabled() or self.harness_library is None:
+            return
+        language, kind, tags = self._harness_query_attrs()
+        max_ctx = max(1, int(getattr(self.cfg, "max_context_files", 8) or 8))
+        cue_ids, paths = self.harness_library.select_context_hints(
+            language=language,
+            kind=kind,
+            role=role,
+            failure_class=failure_class,
+            tags=tags,
+            max_files=max_ctx,
+        )
+        applied_any = False
+        for raw_p in paths:
+            if len(self.extra_context_files) >= max_ctx:
+                break
+            if _is_unsafe_path(
+                raw_p,
+                never_touch=getattr(self.cfg, "never_touch", ()) or (),
+                forbidden_files=getattr(self.cfg, "forbidden_files", ()) or (),
+            ):
+                continue
+            norm_p = normalise(raw_p)
+            if not norm_p:
+                continue
+            if not resolves_within(self.worktree, norm_p):
+                continue
+            if not (self.worktree / norm_p).is_file():
+                continue
+            if hasattr(self.book, "is_hidden") and self.book.is_hidden(norm_p):
+                continue
+            if norm_p not in self.extra_context_files:
+                self.extra_context_files.append(norm_p)
+                applied_any = True
+            if hasattr(self.book, "allowed_extra_reads"):
+                self.book.allowed_extra_reads.add(norm_p)
+        if applied_any and cue_ids:
+            self._add_harness_cues(cue_ids)
+
     def _select_harness_guidance(self, role: str, *, failure_class: str = "") -> str:
         if not self._harness_enabled() or self.harness_library is None:
             return ""
+        self._apply_harness_context_hints(role, failure_class=failure_class)
         language, kind, tags = self._harness_query_attrs()
         sel = self.harness_library.select_guidance(
             language=language,
@@ -830,9 +926,12 @@ class CardRun:
                         sigs[norm] = self.book.signatures(norm, self.pack)
                     except (OSError, Refused):
                         pass
+            self._apply_harness_context_hints("planner")
             ctx_contents = {}
             max_ctx = getattr(self.cfg, "max_context_files", 6)
-            for path in (getattr(self.card, "context_files", ()) or ())[:max_ctx]:
+            for path in (
+                self.extra_context_files or getattr(self.card, "context_files", ()) or ()
+            )[:max_ctx]:
                 norm = normalise(path)
                 if resolves_within(self.worktree, norm) and (self.worktree / norm).is_file():
                     try:
@@ -845,43 +944,55 @@ class CardRun:
                 if t.get("name")
             ]
             self._refresh_micromanager_harness_context("planner")
-            decision = self.micromanager.shape_and_plan(
-                self.card, sigs, ctx_contents, known_tests=known_tests, cfg=self.cfg
-            )
-            self._record_gate(GateResult(
-                "micromanager-shape",
-                FAIL if (self.micromanager.mode == "active"
-                         and decision.verdict in ("ineligible", "split")) else PASS,
-                decision.verdict,
-                decision.as_dict(),
-            ))
-            for entry in decision.findings:
-                self._file_finding(entry)
-            self.clarified_notes = decision.clarified_notes
-            for extra_p in decision.extra_context_files:
-                norm_e = normalise(extra_p)
-                if norm_e not in self.extra_context_files:
-                    self.extra_context_files.append(norm_e)
-                if hasattr(self.book, "allowed_extra_reads"):
-                    self.book.allowed_extra_reads.add(norm_e)
-            if self.micromanager.mode == "active":
-                if decision.verdict == "ineligible":
-                    raise GateFailure(
-                        StopCode.INELIGIBLE,
-                        decision.clarified_notes or "micromanager marked card ineligible",
-                    )
-                if decision.verdict == "split":
-                    raise GateFailure(
-                        StopCode.CANNOT_SPLIT,
-                        decision.clarified_notes or "micromanager recommended splitting card",
-                    )
-                if decision.steps:
-                    self.plan = Plan(decision.steps)
-                    self.planner_used = True
-                    self.step_index = 0
-                    self.depth = len(self.plan.steps)
-                    write_json(self.card_layout / "plan.json", self.plan.as_dict())
-                    return
+            try:
+                decision = self.micromanager.shape_and_plan(
+                    self.card, sigs, ctx_contents, known_tests=known_tests, cfg=self.cfg
+                )
+            except (Refused, Invalid, ValueError) as exc:
+                self._record_gate(GateResult(
+                    "micromanager-shape",
+                    FAIL if isinstance(exc, Refused) else INFRA,
+                    f"shape_and_plan degraded ({type(exc).__name__}): "
+                    f"{exc.message if hasattr(exc, 'message') else exc}",
+                    {"error": str(exc)},
+                ))
+                self.log(f"{self.card.id}: micromanager shape_and_plan degraded: {exc}")
+                decision = None
+            if decision is not None:
+                self._record_gate(GateResult(
+                    "micromanager-shape",
+                    FAIL if (self.micromanager.mode == "active"
+                             and decision.verdict in ("ineligible", "split")) else PASS,
+                    decision.verdict,
+                    decision.as_dict(),
+                ))
+                for entry in decision.findings:
+                    self._file_finding(entry)
+                self.clarified_notes = decision.clarified_notes
+                for extra_p in decision.extra_context_files:
+                    norm_e = normalise(extra_p)
+                    if norm_e not in self.extra_context_files:
+                        self.extra_context_files.append(norm_e)
+                    if hasattr(self.book, "allowed_extra_reads"):
+                        self.book.allowed_extra_reads.add(norm_e)
+                if self.micromanager.mode == "active":
+                    if decision.verdict == "ineligible":
+                        raise GateFailure(
+                            StopCode.INELIGIBLE,
+                            decision.clarified_notes or "micromanager marked card ineligible",
+                        )
+                    if decision.verdict == "split":
+                        raise GateFailure(
+                            StopCode.CANNOT_SPLIT,
+                            decision.clarified_notes or "micromanager recommended splitting card",
+                        )
+                    if decision.steps:
+                        self.plan = Plan(decision.steps)
+                        self.planner_used = True
+                        self.step_index = 0
+                        self.depth = len(self.plan.steps)
+                        write_json(self.card_layout / "plan.json", self.plan.as_dict())
+                        return
 
         if not wants_planner(self.card, getattr(self.cfg, "planner", "auto")):
             self.planner_used = False
@@ -1069,9 +1180,20 @@ class CardRun:
                         "test_writer",
                         failure_class=_classify_failure(failure=last_failure),
                     )
-                    advice = self.micromanager.coach(
-                        self.card, "test-writer", attempt,
-                        self._working_test_texts(), "", last_failure, cfg=self.cfg)
+                    try:
+                        advice = self.micromanager.coach(
+                            self.card, "test-writer", attempt,
+                            self._working_test_texts(), "", last_failure, cfg=self.cfg)
+                    except (Refused, Invalid, ValueError) as mm_exc:
+                        self._record_gate(GateResult(
+                            "micromanager-coach",
+                            FAIL if isinstance(mm_exc, Refused) else INFRA,
+                            f"coach degraded ({type(mm_exc).__name__}): "
+                            f"{mm_exc.message if hasattr(mm_exc, 'message') else mm_exc}",
+                            {"error": str(mm_exc)},
+                        ))
+                        self.log(f"{self.card.id}: micromanager coach degraded: {mm_exc}")
+                        continue
                     self._record_gate(GateResult(
                         "micromanager-coach",
                         FAIL if advice.abort else PASS,
@@ -1120,11 +1242,22 @@ class CardRun:
                     sigs[norm] = self.book.signatures(norm, self.pack)
                 except (OSError, Refused):
                     pass
-        scaffold_edits = self.micromanager.scaffold_contract(
-            self.card, base_files, sigs,
-            never_touch=self.cfg.never_touch,
-            forbidden=self.cfg.forbidden_files,
-        )
+        try:
+            scaffold_edits = self.micromanager.scaffold_contract(
+                self.card, base_files, sigs,
+                never_touch=self.cfg.never_touch,
+                forbidden=self.cfg.forbidden_files,
+            )
+        except (Refused, Invalid, ValueError) as exc:
+            self._record_gate(GateResult(
+                "micromanager-scaffold",
+                FAIL if isinstance(exc, Refused) else INFRA,
+                f"scaffold_contract degraded ({type(exc).__name__}): "
+                f"{exc.message if hasattr(exc, 'message') else exc}",
+                {"error": str(exc)},
+            ))
+            self.log(f"{self.card.id}: micromanager scaffold_contract degraded: {exc}")
+            return
         if not scaffold_edits:
             return
         sc_report = apply_edits(
@@ -1763,10 +1896,21 @@ class CardRun:
                         failure=detail,
                     ),
                 )
-                advice = self.micromanager.coach(
-                    self.card, "implementer", attempt_no,
-                    self._frozen_texts(), diff.get("diff", ""), detail,
-                    cfg=self.cfg)
+                try:
+                    advice = self.micromanager.coach(
+                        self.card, "implementer", attempt_no,
+                        self._frozen_texts(), diff.get("diff", ""), detail,
+                        cfg=self.cfg)
+                except (Refused, Invalid, ValueError) as mm_exc:
+                    self._record_gate(GateResult(
+                        "micromanager-coach",
+                        FAIL if isinstance(mm_exc, Refused) else INFRA,
+                        f"coach degraded ({type(mm_exc).__name__}): "
+                        f"{mm_exc.message if hasattr(mm_exc, 'message') else mm_exc}",
+                        {"error": str(mm_exc)},
+                    ))
+                    self.log(f"{self.card.id}: micromanager coach degraded: {mm_exc}")
+                    raise
                 self._record_gate(GateResult(
                     "micromanager-coach",
                     FAIL if advice.abort else PASS,
@@ -2025,48 +2169,60 @@ class CardRun:
 
         if self.micromanager.enabled:
             self._refresh_micromanager_harness_context("micromanager")
-            report = self.micromanager.triage_and_review("pre_review", {
-                "card_id": self.card.id,
-                "card": self.card.as_dict(),
-                "full_diff": full_diff,
-                "gates": [g.as_dict() for g in self.gates],
-                "touches": list(self.card.touches),
-                "counter_tests": dict(self.counter_summary),
-                "mutation": dict(self.mutation_summary),
-            })
-            self._record_gate(GateResult(
-                "micromanager-pre-review",
-                PASS if report.verdict == "approve" else FAIL,
-                report.verdict,
-                report.as_dict(),
-            ))
-            for entry in report.findings:
-                self._file_finding(entry)
-            if report.reviewer_brief:
-                self.reviewer_brief = report.reviewer_brief
-            if report.verdict == "block":
-                raise GateFailure(
-                    StopCode.SUPERVISOR_REJECT,
-                    report.missed_clause or report.summary
-                    or "micromanager blocked pre-review",
-                )
-            if report.verdict == "bounce":
-                if allow_pre_review_bounce:
-                    self.coaching_guidance = (
-                        report.missed_clause or report.reviewer_brief
-                        or report.summary)
-                    return (
-                        "pre_review",
-                        full_diff,
-                        report.missed_clause
-                        or "supervisor requested changes during pre-review",
-                        "",
+            try:
+                report = self.micromanager.triage_and_review("pre_review", {
+                    "card_id": self.card.id,
+                    "card": self.card.as_dict(),
+                    "full_diff": full_diff,
+                    "gates": [g.as_dict() for g in self.gates],
+                    "touches": list(self.card.touches),
+                    "counter_tests": dict(self.counter_summary),
+                    "mutation": dict(self.mutation_summary),
+                })
+            except (Refused, Invalid, ValueError) as exc:
+                self._record_gate(GateResult(
+                    "micromanager-pre-review",
+                    FAIL if isinstance(exc, Refused) else INFRA,
+                    f"pre_review degraded ({type(exc).__name__}): "
+                    f"{exc.message if hasattr(exc, 'message') else exc}",
+                    {"error": str(exc)},
+                ))
+                self.log(f"{self.card.id}: micromanager pre_review degraded: {exc}")
+                report = None
+            if report is not None:
+                self._record_gate(GateResult(
+                    "micromanager-pre-review",
+                    PASS if report.verdict == "approve" else FAIL,
+                    report.verdict,
+                    report.as_dict(),
+                ))
+                for entry in report.findings:
+                    self._file_finding(entry)
+                if report.reviewer_brief:
+                    self.reviewer_brief = report.reviewer_brief
+                if report.verdict == "block":
+                    raise GateFailure(
+                        StopCode.SUPERVISOR_REJECT,
+                        report.missed_clause or report.summary
+                        or "micromanager blocked pre-review",
                     )
-                raise GateFailure(
-                    StopCode.SUPERVISOR_REJECT,
-                    report.missed_clause or report.summary
-                    or "micromanager bounced pre-review with no attempts left",
-                )
+                if report.verdict == "bounce":
+                    if allow_pre_review_bounce:
+                        self.coaching_guidance = (
+                            report.missed_clause or report.reviewer_brief
+                            or report.summary)
+                        return (
+                            "pre_review",
+                            full_diff,
+                            report.missed_clause
+                            or "supervisor requested changes during pre-review",
+                            "",
+                        )
+                    raise GateFailure(
+                        StopCode.SUPERVISOR_REJECT,
+                        report.missed_clause or report.summary
+                        or "micromanager bounced pre-review with no attempts left",
+                    )
 
         self.existing_tests_changed = [
             path for path in changed
@@ -2301,20 +2457,32 @@ class CardRun:
                 self._refresh_micromanager_harness_context(
                     "checker", failure_class="counter-test"
                 )
-                verdict = self.micromanager.adjudicate_checker(
-                    self.card, full_diff, restatement,
-                    self._last_failing_counters,
-                )
-                self.checker_adjudication = verdict.as_dict()
-                self._record_gate(GateResult(
-                    "micromanager-adjudicate",
-                    PASS if verdict.verdict == "dismiss_false_reject" else FAIL,
-                    verdict.verdict,
-                    verdict.as_dict(),
-                ))
-                if verdict.verdict == "dismiss_false_reject":
-                    return None
-                fix_hint = verdict.fix_hint
+                try:
+                    verdict = self.micromanager.adjudicate_checker(
+                        self.card, full_diff, restatement,
+                        self._last_failing_counters,
+                    )
+                except (Refused, Invalid, ValueError) as exc:
+                    self._record_gate(GateResult(
+                        "micromanager-adjudicate",
+                        FAIL if isinstance(exc, Refused) else INFRA,
+                        f"adjudicate_checker degraded ({type(exc).__name__}): "
+                        f"{exc.message if hasattr(exc, 'message') else exc}",
+                        {"error": str(exc)},
+                    ))
+                    self.log(f"{self.card.id}: micromanager adjudicate_checker degraded: {exc}")
+                    verdict = None
+                if verdict is not None:
+                    self.checker_adjudication = verdict.as_dict()
+                    self._record_gate(GateResult(
+                        "micromanager-adjudicate",
+                        PASS if verdict.verdict == "dismiss_false_reject" else FAIL,
+                        verdict.verdict,
+                        verdict.as_dict(),
+                    ))
+                    if verdict.verdict == "dismiss_false_reject":
+                        return None
+                    fix_hint = verdict.fix_hint
             if allow_bounce:
                 if fix_hint:
                     self.coaching_guidance = fix_hint
@@ -2476,77 +2644,114 @@ class CardRun:
     def _record_harness_outcome(self, final_state: str) -> None:
         if not self._harness_enabled() or self.harness_library is None:
             return
-        if self.stop_code in (StopCode.INFRA, StopCode.KILLED) or final_state == "released":
-            status = self.harness_library.status()
-            self.harness_revision = int(status.get("revision", self.harness_revision) or 0)
+        pre_revision = int(self.harness_revision or 0)
+        try:
+            model_calls = len(getattr(self.roles, "calls", ()) or ())
+            isolated = (
+                self.stop_code in _HARNESS_ISOLATED_STOP_CODES
+                or (self.stop_code == StopCode.REFUSED and model_calls == 0)
+                or final_state == "released"
+            )
+            if isolated:
+                status = self.harness_library.status()
+                post_revision = int(status.get("revision", pre_revision) or 0)
+                self.harness_revision = pre_revision
+                self.harness_summary = {
+                    "revision": pre_revision,
+                    "pre_revision": pre_revision,
+                    "post_revision": post_revision,
+                    "state": str(status.get("state", "confirmed")),
+                    "cues_applied": list(self.harness_cues_applied),
+                    "lessons_added": [],
+                    "probe_transition": None,
+                    "metrics": dict(status.get("metrics") or {}),
+                    "skipped_reason": (
+                        self.stop_code.value if self.stop_code else final_state
+                    ),
+                }
+                return
+
+            language, kind, tags = self._harness_query_attrs()
+            attempts_count = (
+                max(1, int(self.budget.implementer_attempts))
+                if self.budget.implementer_attempts > 0
+                else max(1, len(self.attempt_records))
+            )
+            card_meta = {
+                "card_id": self.card.id,
+                "id": self.card.id,
+                "kind": kind,
+                "category": self.card.category,
+                "language": language,
+                "unit": self._effective_unit(),
+                "touches": list(self.card.touches),
+                "tags": list(tags),
+                "final_state": final_state,
+                "stop_code": self.stop_code.value if self.stop_code else "",
+                "passed": final_state == "in-review",
+                "attempts": attempts_count,
+                "tokens_in": self.budget.tokens_in,
+                "tokens_out": self.budget.tokens_out,
+                "spend": round(self.budget.spend, 6),
+                "counter_tests": dict(self.counter_summary),
+                "mutation": dict(self.mutation_summary),
+            }
+            res = self.harness_library.record_card_outcome(
+                card_meta,
+                self.attempt_records,
+                cues_applied=list(self.harness_cues_applied),
+                failure=self.detail,
+                micromanager=self.micromanager,
+                reflect=self._should_reflect_harness(),
+            )
+            post_revision = int(res.get("revision", pre_revision) or 0)
+            self.harness_revision = pre_revision
+            self.harness_lessons_added = list(res.get("lessons_added") or ())
             self.harness_summary = {
-                "revision": self.harness_revision,
-                "state": str(status.get("state", "confirmed")),
+                **res,
+                "revision": pre_revision,
+                "pre_revision": pre_revision,
+                "post_revision": post_revision,
+                "cues_applied": list(self.harness_cues_applied),
+            }
+            metrics = res.get("metrics") or {}
+            eff = float(metrics.get("harness_efficiency", 0.0) or 0.0)
+            self._record_gate(GateResult(
+                "harness-efficiency",
+                PASS,
+                f"rev={pre_revision}->{post_revision} cues={len(self.harness_cues_applied)} "
+                f"lessons={len(self.harness_lessons_added)} eff={eff:.3f}",
+                {
+                    "revision": pre_revision,
+                    "pre_revision": pre_revision,
+                    "post_revision": post_revision,
+                    "state": str(res.get("state", "")),
+                    "cues_applied": list(self.harness_cues_applied),
+                    "lessons_added": list(self.harness_lessons_added),
+                    "probe_transition": res.get("probe_transition"),
+                    "efficiency_score": eff,
+                },
+            ))
+        except Exception as exc:  # noqa: BLE001 — never abort _finish() on harness errors
+            self.harness_revision = pre_revision
+            self.harness_summary = {
+                "revision": pre_revision,
+                "pre_revision": pre_revision,
+                "post_revision": pre_revision,
                 "cues_applied": list(self.harness_cues_applied),
                 "lessons_added": [],
-                "probe_transition": None,
-                "metrics": dict(status.get("metrics") or {}),
-                "skipped_reason": (
-                    self.stop_code.value if self.stop_code else final_state
-                ),
+                "error": f"{type(exc).__name__}: {exc}",
             }
-            return
-
-        language, kind, tags = self._harness_query_attrs()
-        attempts_count = (
-            max(1, int(self.budget.implementer_attempts))
-            if self.budget.implementer_attempts > 0
-            else max(1, len(self.attempt_records))
-        )
-        card_meta = {
-            "card_id": self.card.id,
-            "id": self.card.id,
-            "kind": kind,
-            "category": self.card.category,
-            "language": language,
-            "unit": self._effective_unit(),
-            "touches": list(self.card.touches),
-            "tags": list(tags),
-            "final_state": final_state,
-            "stop_code": self.stop_code.value if self.stop_code else "",
-            "passed": final_state == "in-review",
-            "attempts": attempts_count,
-            "tokens_in": self.budget.tokens_in,
-            "tokens_out": self.budget.tokens_out,
-            "spend": round(self.budget.spend, 6),
-            "counter_tests": dict(self.counter_summary),
-            "mutation": dict(self.mutation_summary),
-        }
-        res = self.harness_library.record_card_outcome(
-            card_meta,
-            self.attempt_records,
-            cues_applied=list(self.harness_cues_applied),
-            failure=self.detail,
-            micromanager=self.micromanager,
-            reflect=self._should_reflect_harness(),
-        )
-        self.harness_revision = int(res.get("revision", self.harness_revision) or 0)
-        self.harness_lessons_added = list(res.get("lessons_added") or ())
-        self.harness_summary = {
-            **res,
-            "cues_applied": list(self.harness_cues_applied),
-        }
-        metrics = res.get("metrics") or {}
-        eff = float(metrics.get("harness_efficiency", 0.0) or 0.0)
-        self._record_gate(GateResult(
-            "harness-efficiency",
-            PASS,
-            f"rev={self.harness_revision} cues={len(self.harness_cues_applied)} "
-            f"lessons={len(self.harness_lessons_added)} eff={eff:.3f}",
-            {
-                "revision": self.harness_revision,
-                "state": str(res.get("state", "")),
-                "cues_applied": list(self.harness_cues_applied),
-                "lessons_added": list(self.harness_lessons_added),
-                "probe_transition": res.get("probe_transition"),
-                "efficiency_score": eff,
-            },
-        ))
+            try:
+                self._record_gate(GateResult(
+                    "harness-efficiency",
+                    INFRA,
+                    f"harness outcome degraded ({type(exc).__name__}): {exc}",
+                    {"error": str(exc)},
+                ))
+            except Exception:  # noqa: BLE001
+                pass
+            self.log(f"{self.card.id}: harness outcome degraded: {exc}")
 
     def _finish(self, final_state: str) -> dict:
         from .dossier import build_dossier, write_dossier
@@ -2554,11 +2759,17 @@ class CardRun:
         self.budget.stop_clock()
         if not self.ended_at:
             self.ended_at = utc_now()
-        self._record_harness_outcome(final_state)
+        try:
+            self._record_harness_outcome(final_state)
+        except Exception as exc:  # noqa: BLE001 — guarantee finish completes cleanly
+            self.log(f"{self.card.id}: harness outcome error ignored in _finish: {exc}")
         mm_budget = getattr(self.micromanager, "budget", None)
+        mm_usage = self._card_mm_usage()
         if mm_budget is not None and hasattr(mm_budget, "as_dict"):
             self.micromanager_summary = {
                 **mm_budget.as_dict(),
+                **mm_usage,
+                "night_totals": mm_budget.as_dict(),
                 "mode": getattr(self.micromanager, "mode", "off"),
                 "reviewer_brief": self.reviewer_brief,
             }
@@ -2631,7 +2842,7 @@ class CardRun:
         except AdapterError:
             hash_at_end = self.card.hash()
 
-        mm_budget = getattr(self.micromanager, "budget", None)
+        mm_usage = self._card_mm_usage()
         record = {
             "run_id": self.run_id,
             "card_id": self.card.id,
@@ -2652,12 +2863,11 @@ class CardRun:
             "tokens_in": self.budget.tokens_in,
             "tokens_out": self.budget.tokens_out,
             "spend": round(self.budget.spend, 6),
-            "micromanager_calls": int(getattr(mm_budget, "calls", 0) or 0),
-            "micromanager_tokens_in": int(getattr(mm_budget, "tokens_in", 0) or 0),
-            "micromanager_tokens_out": int(getattr(mm_budget, "tokens_out", 0) or 0),
-            "micromanager_spend": round(float(getattr(mm_budget, "spend", 0.0) or 0.0), 6),
-            "false_rejects_dismissed": int(
-                getattr(mm_budget, "false_rejects_dismissed", 0) or 0),
+            "micromanager_calls": mm_usage["calls"],
+            "micromanager_tokens_in": mm_usage["tokens_in"],
+            "micromanager_tokens_out": mm_usage["tokens_out"],
+            "micromanager_spend": mm_usage["spend"],
+            "false_rejects_dismissed": mm_usage["false_rejects_dismissed"],
             "files_changed": len(self._changed_since_base()),
             "lines_added": line_counts(self.current_diff or "")[0],
             "lines_removed": line_counts(self.current_diff or "")[1],

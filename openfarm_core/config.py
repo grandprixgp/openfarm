@@ -499,6 +499,9 @@ class Config:
             raise ConfigError("[harness] dir: expected a string")
         if "\x00" in raw_dir:
             raise ConfigError("[harness] dir: invalid null byte")
+        resolved_dir = ""
+        if raw_dir.strip():
+            resolved_dir = str(self._outside_repo(raw_dir.strip(), "[harness].dir"))
 
         if "capture_on" in h and h["capture_on"] is not None:
             raw_capture = _as_str_list(h["capture_on"], "[harness] capture_on")
@@ -549,7 +552,7 @@ class Config:
 
         return HarnessConfig(
             enabled=enabled,
-            dir=raw_dir,
+            dir=resolved_dir,
             capture_on=capture_on,
             max_cues_per_brief=max_cues,
             max_active_adaptations=max_active,

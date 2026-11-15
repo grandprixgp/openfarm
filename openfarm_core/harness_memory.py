@@ -8,16 +8,19 @@ budgets are immutable and cannot be modified or bypassed by any lesson or reflec
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import json
 import math
 import os
 import re
 import tempfile
+import unicodedata
 from pathlib import Path
 from typing import NamedTuple
 
-from .errors import Invalid, Refused, Unsupported
+from .errors import AdapterError, Invalid, Refused, Unsupported
 from .globs import escapes, matches_any, normalise
 from .state import _safe_id, append_jsonl, read_json, utc_now
 
@@ -61,35 +64,211 @@ _ALLOWED_PATCH_SUBKEYS = frozenset(EDITABLE_SURFACES) | frozenset({
     "note", "notes", "tags", "role", "failure_class", "title",
 })
 
+ALLOWED_FAILURE_CLASSES: frozenset[str] = frozenset({
+    "",
+    "type-mismatch",
+    "borrow-checker",
+    "missing-symbol",
+    "trait-bound",
+    "lint-clippy",
+    "format-check",
+    "counter-test",
+    "revert-check",
+    "runtime-assert",
+    "other",
+})
+
+_HOMOGLYPH_MAP = str.maketrans({
+    # Cyrillic lowercase
+    "\u0430": "a",  # а
+    "\u0435": "e",  # е
+    "\u0451": "e",  # ё
+    "\u043e": "o",  # о
+    "\u0440": "p",  # р
+    "\u0441": "c",  # с
+    "\u0445": "x",  # х
+    "\u0456": "i",  # і
+    "\u0458": "j",  # ј
+    "\u043a": "k",  # к
+    "\u043c": "m",  # м
+    "\u0442": "t",  # т
+    "\u0432": "b",  # в
+    "\u043d": "h",  # н
+    "\u0443": "y",  # у
+    "\u0455": "s",  # ѕ
+    "\u0501": "d",  # ԁ
+    "\u0261": "g",  # ɡ
+    "\u04cf": "l",  # ӏ
+    # Cyrillic uppercase
+    "\u0410": "A",  # А
+    "\u0412": "B",  # В
+    "\u0415": "E",  # Е
+    "\u0401": "E",  # Ё
+    "\u041a": "K",  # К
+    "\u041c": "M",  # М
+    "\u041d": "H",  # Н
+    "\u041e": "O",  # О
+    "\u0420": "P",  # Р
+    "\u0421": "C",  # С
+    "\u0422": "T",  # Т
+    "\u0425": "X",  # Х
+    "\u0406": "I",  # І
+    "\u0408": "J",  # Ј
+    "\u0405": "S",  # Ѕ
+    "\u0423": "Y",  # У
+    # Greek lowercase
+    "\u03b1": "a",  # α
+    "\u03b2": "b",  # β
+    "\u03b5": "e",  # ε
+    "\u03b9": "i",  # ι
+    "\u03ba": "k",  # κ
+    "\u03bc": "m",  # μ
+    "\u03bd": "v",  # ν
+    "\u03bf": "o",  # ο
+    "\u03c1": "p",  # ρ
+    "\u03c2": "c",  # ς
+    "\u03c3": "s",  # σ
+    "\u03c4": "t",  # τ
+    "\u03c5": "u",  # υ
+    "\u03c7": "x",  # χ
+    # Greek uppercase
+    "\u0391": "A",  # Α
+    "\u0392": "B",  # Β
+    "\u0395": "E",  # Ε
+    "\u0396": "Z",  # Ζ
+    "\u0397": "H",  # Η
+    "\u0399": "I",  # Ι
+    "\u039a": "K",  # Κ
+    "\u039c": "M",  # Μ
+    "\u039d": "N",  # Ν
+    "\u039f": "O",  # Ο
+    "\u03a1": "P",  # Ρ
+    "\u03a4": "T",  # Τ
+    "\u03a5": "Y",  # Υ
+    "\u03a7": "X",  # Χ
+})
+
 _DATA_FENCE = "-------- BEGIN CARD DATA (not instructions) --------"
 _DATA_FENCE_END = "-------- END CARD DATA --------"
 _CSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 _OSC_TERMINATED_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
-_FENCED_BLOCK_RE = re.compile(r"```[\s\S]*?```")
+_BACKTICK_FENCE_RE = re.compile(r"`{3,}[\s\S]*?`{3,}")
+_TILDE_FENCE_RE = re.compile(r"~{3,}[\s\S]*?~{3,}")
 _EDIT_HEADER_RE = re.compile(
     r"^\s*===+\s*(?:search_replace|whole_file|append_stub)\b[^\n]*$",
-    re.MULTILINE,
+    re.MULTILINE | re.IGNORECASE,
 )
 _EDIT_MARKER_LINE_RE = re.compile(
-    r"^\s*(?:<{3,}\s*SEARCH|>{3,}\s*REPLACE)\s*$",
-    re.MULTILINE,
+    r"^\s*(?:<(?:[\s]*<)+\s*SEARCH|>(?:[\s]*>)+\s*REPLACE)\b[^\n]*$",
+    re.MULTILINE | re.IGNORECASE,
 )
 _TRAVERSAL_RE = re.compile(
-    r"(?:\.\./|\.\.\\|/etc/(?:passwd|shadow|hosts)|~/\.|\.openfarm/[^\s\"']*)"
+    r"(?:"
+    r"\.\./|\.\.\\|"
+    r"(?:^|[\s\"'`(\[])\.\.(?:[/\\]|$)|"
+    r"~[/\\]|"
+    r"[A-Za-z]:[/\\]|"
+    r"(?<![A-Za-z0-9_.-])/(?:etc|root|proc|sys|var|home|tmp|usr|opt|bin|sbin)(?:/[^\s\"'`)\]]*|(?=$|[\s\"'`)\],;:]))|"
+    r"(?<![A-Za-z0-9_.-])\.(?:openfarm|git|claude)(?:[/\\][^\s\"'`)\]]*)?(?=$|[\s\"'`)\],;:])"
+    r")",
+    re.IGNORECASE,
+)
+
+_BYPASS_VERB_PAT = (
+    r"(?:"
+    r"d-?i-?s-?a-?b-?l-?e(?:d|s)?|dis\s+able(?:d|s)?|"
+    r"b-?y-?p-?a-?s-?s(?:ed|es|ing)?|by\s+pass(?:ed|es|ing)?|"
+    r"s-?k-?i-?p(?:ped|ping|s)?|"
+    r"i-?g-?n-?o-?r-?(?:e[ds]?|ing)|"
+    r"w-?e-?a-?k-?e-?n(?:ed|s|ing)?|"
+    r"turn\s+off|"
+    r"o-?v-?e-?r-?r-?i-?d-?(?:e[ns]?|ing)|"
+    r"r-?e-?m-?o-?v-?(?:e[ds]?|ing)|"
+    r"d-?e-?l-?e-?t-?(?:e[ds]?|ing)|"
+    r"m-?o-?d-?i-?f-?(?:y|ied|ies|ying)|"
+    r"r-?e-?w-?r-?i-?t-?(?:e[ns]?|ing)|"
+    r"e-?d-?i-?t(?:ed|s|ing)?|"
+    r"n-?e-?u-?t-?r-?a-?l-?i-?z-?(?:e[ds]?|ing)|"
+    r"s-?u-?p-?p-?r-?e-?s-?s(?:ed|es|ing)?"
+    r")"
+)
+_PASSIVE_VERB_PAT = (
+    r"(?:"
+    r"d-?i-?s-?a-?b-?l-?e-?d|dis\s+abled|"
+    r"b-?y-?p-?a-?s-?s-?e-?d|by\s+passed|"
+    r"s-?k-?i-?p-?p-?e-?d|"
+    r"i-?g-?n-?o-?r-?e-?d|"
+    r"w-?e-?a-?k-?e-?n-?e-?d|"
+    r"turned\s+off|"
+    r"o-?v-?e-?r-?r-?i-?d-?d-?e-?n|"
+    r"r-?e-?m-?o-?v-?e-?d|"
+    r"d-?e-?l-?e-?t-?e-?d|"
+    r"m-?o-?d-?i-?f-?i-?e-?d|"
+    r"r-?e-?w-?r-?i-?t-?t-?e-?n|"
+    r"e-?d-?i-?t-?e-?d|"
+    r"n-?e-?u-?t-?r-?a-?l-?i-?z-?e-?d|"
+    r"s-?u-?p-?p-?r-?e-?s-?s-?e-?d"
+    r")"
+)
+_BYPASS_TARGET_PAT = (
+    r"(?:"
+    r"cargo\s+test|"
+    r"(?:the\s+|all\s+|existing\s+|frozen\s+)?tests?(?:\s+files?)?|"
+    r"frozen(?:\s+tests?)?|"
+    r"clippy|mutants?|mutation|"
+    r"diff_check|diff\s+check|revert_check|revert\s+check|revert|"
+    r"counter_tests?|counter-tests?|forbidden_files|never_touch|"
+    r"eligibility|budget|scope|touches|gates?|thresholds?|"
+    r"\.openfarm(?:/config\.toml)?|\.claude(?:/[^\s]*)?|\.git(?:/[^\s]*)?|openfarm_core/"
+    r")"
 )
 _BYPASS_DIRECTIVE_RE = re.compile(
-    r"\b(?:disable|bypass|skip|ignore|weaken|turn\s+off|override|remove|delete|modify|rewrite|edit)\b"
-    r"[^.\n;]{0,60}\b(?:"
-    r"cargo\s+test|clippy|mutants?|mutation|diff_check|diff\s+check|revert_check|revert\s+check|"
-    r"counter_tests?|counter-tests?|forbidden_files|never_touch|eligibility|budget|scope|"
-    r"gates?|thresholds?|\.openfarm(?:/config\.toml)?|openfarm_core/"
-    r")\b",
+    rf"(?:"
+    rf"\b{_BYPASS_VERB_PAT}\b[^.\n;]{{0,60}}\b{_BYPASS_TARGET_PAT}(?:\b|(?<=/))|"
+    rf"\b{_BYPASS_TARGET_PAT}(?:\b|(?<=/))[^.\n;]{{0,60}}\b(?:should|can|could|may|might|must|need\s+to|ought\s+to|will|would|is|are|was|were|be|been|being|get|gets|getting)\s+(?:be\s+|been\s+|being\s+)?(?:easily\s+|safely\s+|temporarily\s+)?{_PASSIVE_VERB_PAT}\b|"
+    rf"#!?\[\s*(?:allow|ignore)\b"
+    rf")",
     re.IGNORECASE,
 )
 _ASSERT_LEAK_RE = re.compile(
-    r"(?:assertion\s+(?:failed|`[^`]+`\s+failed)|left\s*:\s*[^\n]+|right\s*:\s*[^\n]+)",
+    r"(?:"
+    r"assertion\s+(?:failed|`[^`]+`\s+failed)|"
+    r"left\s*:[\s\S]{0,120}\bright\s*:|"
+    r"\bassert_(?:eq|ne)!\s*\(|"
+    r"\bexpected\b[^\n]{0,80}\bgot\b|"
+    r"==\s*(?:Err|Ok)\s*\(|"
+    r"\basserts?\b[^\n]{0,120}=="
+    r")",
     re.IGNORECASE,
 )
+
+_MULTI_EDIT_ANGLE_RE = re.compile(r"<{2,}|>{2,}")
+_FENCE_MARKER_RE = re.compile(r"`{3,}|~{3,}")
+_UNIX_ABS_PREFIXES = (
+    "/etc/",
+    "/root/",
+    "/proc/",
+    "/sys/",
+    "/var/",
+    "/home/",
+    "/tmp/",
+    "/usr/",
+    "/opt/",
+    "/bin/",
+    "/sbin/",
+)
+_PROTECTED_DOTDIRS = frozenset({".openfarm", ".git", ".claude"})
+
+
+def _strip_unicode_noise(text: str) -> str:
+    """Apply NFKC normalization and drop Unicode format/zero-width (Cf) characters."""
+    normalized = unicodedata.normalize("NFKC", str(text or ""))
+    return "".join(ch for ch in normalized if unicodedata.category(ch) != "Cf")
+
+
+def _normalize_for_scan(text: str) -> str:
+    """Normalize text and fold Cyrillic/Greek homoglyphs before security scanning."""
+    return _strip_unicode_noise(text).translate(_HOMOGLYPH_MAP)
 
 
 def _atomic_write_text(path: Path, text: str) -> Path:
@@ -120,15 +299,23 @@ def sanitize_lesson_text(text: str, *, max_len: int = 600) -> str:
     cleaned = _OSC_TERMINATED_RE.sub("", str(text or ""))
     cleaned = _CSI_RE.sub("", cleaned)
     cleaned = cleaned.replace("\x1b", "")
+    cleaned = _strip_unicode_noise(cleaned)
     cleaned = cleaned.replace(_DATA_FENCE, "")
     cleaned = cleaned.replace(_DATA_FENCE_END, "")
-    cleaned = _FENCED_BLOCK_RE.sub("", cleaned)
-    cleaned = cleaned.replace("```", "")
+    cleaned = _BACKTICK_FENCE_RE.sub("", cleaned)
+    cleaned = _TILDE_FENCE_RE.sub("", cleaned)
+    cleaned = _FENCE_MARKER_RE.sub("", cleaned)
     cleaned = _EDIT_HEADER_RE.sub("", cleaned)
     cleaned = _EDIT_MARKER_LINE_RE.sub("", cleaned)
-    cleaned = cleaned.replace("<<<", "").replace(">>>", "")
-    cleaned = _BYPASS_DIRECTIVE_RE.sub("[removed-directive]", cleaned)
-    cleaned = _TRAVERSAL_RE.sub("[removed-path]", cleaned)
+    cleaned = _MULTI_EDIT_ANGLE_RE.sub("", cleaned)
+    if _BYPASS_DIRECTIVE_RE.search(_normalize_for_scan(cleaned)):
+        if not _BYPASS_DIRECTIVE_RE.search(cleaned):
+            cleaned = _normalize_for_scan(cleaned)
+        cleaned = _BYPASS_DIRECTIVE_RE.sub("[removed-directive]", cleaned)
+    if _TRAVERSAL_RE.search(_normalize_for_scan(cleaned)):
+        if not _TRAVERSAL_RE.search(cleaned):
+            cleaned = _normalize_for_scan(cleaned)
+        cleaned = _TRAVERSAL_RE.sub("[removed-path]", cleaned)
     cleaned = re.sub(r"[ \t]+", " ", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     cleaned = cleaned.strip()
@@ -139,8 +326,14 @@ def sanitize_lesson_text(text: str, *, max_len: int = 600) -> str:
 
 def is_gate_bypass_directive(text: str) -> bool:
     """True when text instructs disabling, bypassing, or modifying deterministic gates/scope."""
-    raw = str(text or "")
-    return bool(_BYPASS_DIRECTIVE_RE.search(raw))
+    scanned = _normalize_for_scan(text)
+    return bool(_BYPASS_DIRECTIVE_RE.search(scanned))
+
+
+def is_assertion_leak(text: str) -> bool:
+    """True when text contains exact assertion or hidden-grader comparison leaks."""
+    scanned = _normalize_for_scan(text)
+    return bool(_ASSERT_LEAK_RE.search(scanned))
 
 
 def _is_unsafe_path(
@@ -149,22 +342,33 @@ def _is_unsafe_path(
     never_touch: tuple[str, ...] | list[str] = (),
     forbidden_files: tuple[str, ...] | list[str] = (),
 ) -> bool:
-    text = str(raw_path or "").strip()
+    text = _normalize_for_scan(raw_path).strip()
     if not text or "\x00" in text:
         return True
     if text.startswith("/") or text.startswith("\\") or text.startswith("~"):
         return True
     if len(text) >= 2 and text[1] == ":" and text[0].isalpha():
         return True
+    text_lower = text.lower().replace("\\", "/")
+    if any(text_lower.startswith(prefix) or text_lower == prefix.rstrip("/") for prefix in _UNIX_ABS_PREFIXES):
+        return True
+    parts = [p for p in text_lower.split("/") if p and p != "."]
+    if ".." in parts or any(p in _PROTECTED_DOTDIRS for p in parts):
+        return True
     if escapes(text):
         return True
     norm = normalise(text)
     if not norm:
         return True
-    fb = list(forbidden_files or ())
-    if ".openfarm/**" not in fb:
-        fb.append(".openfarm/**")
-    if matches_any(norm, fb) or matches_any(norm, never_touch or ()):
+    norm_lower = norm.lower()
+    if ".." in norm_lower.split("/") or any(p in _PROTECTED_DOTDIRS for p in norm_lower.split("/")):
+        return True
+    fb = [str(p).lower() for p in (forbidden_files or ())]
+    for default_fb in (".openfarm/**", ".git/**", ".claude/**"):
+        if default_fb not in fb:
+            fb.append(default_fb)
+    nt = [str(p).lower() for p in (never_touch or ())]
+    if matches_any(norm_lower, fb) or matches_any(norm_lower, nt):
         return True
     return False
 
@@ -179,12 +383,19 @@ def _sanitize_patch_value(
     if isinstance(value, str):
         if is_gate_bypass_directive(value):
             return None, f"gate-bypass directive in {key_name or 'proposed_patch'}"
-        if _TRAVERSAL_RE.search(value):
+        if _TRAVERSAL_RE.search(_normalize_for_scan(value)):
             return None, f"unsafe path reference in {key_name or 'proposed_patch'}"
+        if is_assertion_leak(value):
+            return None, f"assertion leak rejected in {key_name or 'proposed_patch'}"
+        if key_name == "failure_class":
+            fc = value.strip().lower()
+            if fc not in ALLOWED_FAILURE_CLASSES:
+                return None, f"disallowed failure_class {value!r} in proposed_patch"
+            return fc, ""
         if key_name in ("path", "file"):
             if _is_unsafe_path(value, never_touch=never_touch, forbidden_files=forbidden_files):
                 return None, f"unsafe path {value!r} in {key_name}"
-            return normalise(value), ""
+            return normalise(_strip_unicode_noise(value)), ""
         return sanitize_lesson_text(value), ""
     if isinstance(value, list):
         out = []
@@ -192,7 +403,7 @@ def _sanitize_patch_value(
             if isinstance(item, str) and key_name in ("context_files", "paths", "files"):
                 if _is_unsafe_path(item, never_touch=never_touch, forbidden_files=forbidden_files):
                     return None, f"unsafe path {item!r} in {key_name}"
-                out.append(normalise(item))
+                out.append(normalise(_strip_unicode_noise(item)))
             else:
                 cleaned, err = _sanitize_patch_value(
                     item,
@@ -223,7 +434,10 @@ def _sanitize_patch_value(
         return out_dict, ""
     if isinstance(value, (int, float, bool)) or value is None:
         return value, ""
-    return sanitize_lesson_text(str(value)), ""
+    text_val = str(value)
+    if is_assertion_leak(text_val):
+        return None, f"assertion leak rejected in {key_name or 'proposed_patch'}"
+    return sanitize_lesson_text(text_val), ""
 
 
 def validate_harness_proposal(
@@ -275,10 +489,13 @@ def validate_harness_proposal(
         val = raw.get(field_name, "")
         if val is None:
             val = ""
-        if field_name in ("title", "cue", "lesson") and is_gate_bypass_directive(str(val)):
+        val_str = str(val)
+        if is_gate_bypass_directive(val_str):
             return None, f"gate-bypass directive rejected in {field_name}"
-        if field_name in ("cue", "lesson") and _TRAVERSAL_RE.search(str(val)):
+        if _TRAVERSAL_RE.search(_normalize_for_scan(val_str)):
             return None, f"unsafe path directive rejected in {field_name}"
+        if is_assertion_leak(val_str):
+            return None, f"assertion leak rejected in {field_name}"
 
     title = sanitize_lesson_text(str(raw.get("title", "")), max_len=140)
     cue = sanitize_lesson_text(str(raw.get("cue", "")), max_len=400)
@@ -303,6 +520,8 @@ def validate_harness_proposal(
         role = _DEFAULT_ROLE_FOR_SURFACE[surface]
 
     raw_conf = raw.get("confidence", 0.65)
+    if isinstance(raw_conf, bool):
+        return None, f"invalid confidence {raw_conf!r}"
     try:
         conf = float(raw_conf)
     except (TypeError, ValueError):
@@ -317,9 +536,17 @@ def validate_harness_proposal(
     kind = sanitize_lesson_text(
         str(raw.get("kind", default_kind) or default_kind), max_len=60
     ) or "*"
-    failure_class = sanitize_lesson_text(
-        str(raw.get("failure_class", "") or ""), max_len=60
-    )
+    raw_fc = raw.get("failure_class", "")
+    if raw_fc is None:
+        raw_fc = ""
+    if not isinstance(raw_fc, str):
+        return None, f"invalid failure_class {raw_fc!r}"
+    stripped_fc = _strip_unicode_noise(raw_fc).strip()
+    if any(ch.isspace() for ch in stripped_fc):
+        return None, f"invalid failure_class {raw_fc!r}"
+    failure_class = stripped_fc.lower()
+    if failure_class not in ALLOWED_FAILURE_CLASSES:
+        return None, f"disallowed failure_class {raw_fc!r}"
 
     raw_tags = raw.get("tags") or []
     tags: list[str] = []
@@ -369,18 +596,17 @@ def _classify_failure(error_signature: str = "", stop_code: str = "", failure: s
     if any(k in combined for k in ("rustfmt", "format_check", "format check")):
         return "format-check"
     if any(k in combined for k in ("no-progress", "identical error")):
-        return "no-progress"
+        return "other"
     if any(k in combined for k in ("error[e", "could not compile", "compile")):
-        return "compile-error"
+        return "other"
     if any(k in combined for k in ("assert", "panicked at", "test failed", "fail-before", "tests-unprovable")):
-        return "test-assertion"
-    if stop_code:
-        return sanitize_lesson_text(stop_code, max_len=48).lower().replace(" ", "-")
-    return "unknown-failure"
+        return "runtime-assert"
+    return "other"
 
 
 def _scrub_test_leaks(text: str) -> str:
-    cleaned = _ASSERT_LEAK_RE.sub("[redacted-assertion-detail]", str(text or ""))
+    scanned = _normalize_for_scan(text)
+    cleaned = _ASSERT_LEAK_RE.sub("[redacted-assertion-detail]", scanned)
     return sanitize_lesson_text(cleaned, max_len=240)
 
 
@@ -700,6 +926,7 @@ class HarnessLedger:
         *,
         source: str = "deterministic",
         card_id: str = "",
+        status: str = "probing",
     ) -> dict:
         return self.append_event(
             "lesson_added",
@@ -710,6 +937,7 @@ class HarnessLedger:
                 "revision": int(revision),
                 "source": source,
                 "card_id": card_id,
+                "status": status,
             },
         )
 
@@ -897,11 +1125,33 @@ class HarnessLibrary:
         self.index_path = self.harness_dir / "INDEX.md"
         self.revisions_dir = self.harness_dir / "revisions"
         self.entries_dir = self.harness_dir / "entries"
+        self._lock_path = self.harness_dir / ".lock"
+        self._lock_depth = 0
         self.ledger = HarnessLedger(
             self.harness_dir,
             window_size=max(3, int(self.harness_cfg.probe_window) * 2),
         )
         self._ensure_initialized()
+
+    @contextlib.contextmanager
+    def _locked(self):
+        """Acquire an advisory flock around read-modify-write harness mutations (reentrant)."""
+        if self._lock_depth > 0:
+            self._lock_depth += 1
+            try:
+                yield
+            finally:
+                self._lock_depth -= 1
+            return
+        self.harness_dir.mkdir(parents=True, exist_ok=True)
+        with open(self._lock_path, "a+", encoding="utf-8") as lock_handle:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+            self._lock_depth += 1
+            try:
+                yield
+            finally:
+                self._lock_depth -= 1
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
 
     @staticmethod
     def _resolve_harness_cfg(config):
@@ -936,17 +1186,22 @@ class HarnessLibrary:
         }
 
     def _ensure_initialized(self) -> None:
-        self.harness_dir.mkdir(parents=True, exist_ok=True)
-        self.revisions_dir.mkdir(parents=True, exist_ok=True)
-        self.entries_dir.mkdir(parents=True, exist_ok=True)
-        if not self.overlay_path.exists():
-            overlay = self._empty_overlay(revision=0, parent_revision=0)
-            _atomic_write_json(self.overlay_path, overlay)
-            _atomic_write_json(self.revisions_dir / "rev-0000.json", overlay)
-        if not self.ledger.metrics_path.exists():
-            self.ledger.refresh_metrics()
-        if not self.index_path.exists():
-            self._rebuild_index()
+        with self._locked():
+            self.harness_dir.mkdir(parents=True, exist_ok=True)
+            self.revisions_dir.mkdir(parents=True, exist_ok=True)
+            self.entries_dir.mkdir(parents=True, exist_ok=True)
+            if not self.overlay_path.exists():
+                overlay = self._empty_overlay(revision=0, parent_revision=0)
+                _atomic_write_json(self.overlay_path, overlay)
+            if not (self.revisions_dir / "rev-0000.json").exists():
+                _atomic_write_json(
+                    self.revisions_dir / "rev-0000.json",
+                    self._empty_overlay(revision=0, parent_revision=0),
+                )
+            if not self.ledger.metrics_path.exists():
+                self.ledger.refresh_metrics()
+            if not self.index_path.exists():
+                self._rebuild_index()
 
     def _load_overlay(self) -> dict:
         data = read_json(self.overlay_path)
@@ -1140,6 +1395,7 @@ class HarnessLibrary:
             "active_entry_ids": list(overlay.get("active_entry_ids") or ()),
             "active_count": counts["active"],
             "probing_count": counts["probing"],
+            "candidate_count": counts["candidate"],
             "demoted_count": counts["demoted"],
             "total_entries": len(entries),
             "surfaces": dict(overlay.get("surfaces") or {}),
@@ -1238,8 +1494,12 @@ class HarnessLibrary:
         cue_ids = [str(e["id"]) for e in selected]
         brief_lines = []
         for e in selected:
-            fc_label = f", {e['failure_class']}" if e.get("failure_class") else ""
-            brief_lines.append(f"- [{e['id']}] ({e['surface']}{fc_label}): {e['cue']}")
+            safe_id = re.sub(r"\s+", " ", str(e["id"])).strip()
+            safe_surf = re.sub(r"\s+", " ", str(e["surface"])).strip()
+            safe_fc = re.sub(r"\s+", " ", str(e.get("failure_class") or "")).strip()
+            safe_cue = re.sub(r"\s+", " ", str(e.get("cue") or "")).strip()
+            fc_label = f", {safe_fc}" if safe_fc else ""
+            brief_lines.append(f"- [{safe_id}] ({safe_surf}{fc_label}): {safe_cue}")
         brief_text = "\n".join(brief_lines)
 
         mm_candidates.sort(key=lambda item: item[0], reverse=True)
@@ -1260,8 +1520,8 @@ class HarnessLibrary:
                 "id": eid,
                 "surface": e["surface"],
                 "role": e.get("role", "*"),
-                "failure_class": e.get("failure_class", ""),
-                "cue": e["cue"],
+                "failure_class": re.sub(r"\s+", " ", str(e.get("failure_class") or "")).strip(),
+                "cue": re.sub(r"\s+", " ", str(e.get("cue") or "")).strip(),
                 "confidence": e["confidence"],
             })
             if limit > 0 and len(mm_cues) >= limit:
@@ -1277,6 +1537,118 @@ class HarnessLibrary:
             else {}
         )
         return GuidanceSelection(cue_ids=cue_ids, brief_text=brief_text, micromanager_context=mm_context)
+
+    def select_context_hints(
+        self,
+        language: str,
+        kind: str,
+        role: str,
+        *,
+        failure_class: str = "",
+        tags: list[str] | tuple[str, ...] = (),
+        max_files: int | None = None,
+        min_confidence: float | None = None,
+    ) -> tuple[list[str], list[str]]:
+        """Return ``(cue_ids, relative_file_paths)`` from active/probing ``context_hints`` entries."""
+        if not self.harness_cfg.enabled:
+            return [], []
+
+        cap = (
+            int(getattr(self._cfg, "max_context_files", 8) or 8)
+            if max_files is None
+            else max(0, int(max_files))
+        )
+        if cap <= 0:
+            return [], []
+        min_conf = self.harness_cfg.min_confidence if min_confidence is None else float(min_confidence)
+        tag_set = {str(t).strip().lower() for t in (tags or ()) if str(t).strip()}
+
+        overlay = self._load_overlay()
+        active_ids = list(overlay.get("active_entry_ids") or ())
+        ranked: list[tuple[tuple, dict]] = []
+
+        for eid in active_ids:
+            entry = self._load_entry(eid)
+            if not entry or entry.get("status") not in ("active", "probing"):
+                continue
+            if entry.get("surface") != "context_hints":
+                continue
+            entry_role = str(entry.get("role", "*") or "*")
+            if entry_role not in ("", "*", role):
+                continue
+            conf = float(entry.get("confidence", 0.0) or 0.0)
+            if conf < min_conf:
+                continue
+            entry_lang = str(entry.get("language", "*") or "*")
+            entry_kind = str(entry.get("kind", "*") or "*")
+            if entry_lang not in ("*", language):
+                continue
+            if entry_kind not in ("*", kind):
+                continue
+            entry_fc = str(entry.get("failure_class", "") or "")
+            if failure_class and entry_fc and entry_fc != failure_class:
+                continue
+
+            entry_tags = {str(t).strip().lower() for t in (entry.get("tags") or ()) if str(t).strip()}
+            specificity = 0
+            if failure_class and entry_fc == failure_class:
+                specificity += 4
+            if entry_lang == language:
+                specificity += 2
+            if entry_kind == kind:
+                specificity += 2
+            if entry_role == role:
+                specificity += 1
+            specificity += len(tag_set & entry_tags)
+
+            stats = entry.get("stats") or {}
+            helpfulness = int(stats.get("helped", 0) or 0) - int(stats.get("hurt", 0) or 0)
+            score = (
+                specificity,
+                helpfulness,
+                conf,
+                int(entry.get("revision", 0) or 0),
+                str(entry.get("id", "")),
+            )
+            ranked.append((score, entry))
+
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        cue_ids: list[str] = []
+        paths: list[str] = []
+        seen_paths: set[str] = set()
+
+        for _, entry in ranked:
+            patch = entry.get("proposed_patch") or {}
+            if not isinstance(patch, dict):
+                continue
+            raw_paths: list[str] = []
+            for list_key in ("context_files", "paths", "files"):
+                vals = patch.get(list_key)
+                if isinstance(vals, (list, tuple)):
+                    raw_paths.extend(str(v) for v in vals if isinstance(v, str))
+            for single_key in ("path", "file"):
+                val = patch.get(single_key)
+                if isinstance(val, str) and val.strip():
+                    raw_paths.append(val)
+
+            added_from_entry = False
+            for raw_p in raw_paths:
+                if _is_unsafe_path(raw_p, never_touch=self.never_touch, forbidden_files=self.forbidden_files):
+                    continue
+                norm_p = normalise(_strip_unicode_noise(raw_p))
+                if not norm_p or norm_p in seen_paths:
+                    continue
+                seen_paths.add(norm_p)
+                paths.append(norm_p)
+                added_from_entry = True
+                if len(paths) >= cap:
+                    break
+            if added_from_entry:
+                cue_ids.append(str(entry["id"]))
+            if len(paths) >= cap:
+                break
+
+        return cue_ids, paths
 
     # -- deterministic capture & outcome recording ----------------------------
 
@@ -1464,15 +1836,19 @@ class HarnessLibrary:
                 entry_ids=demoted_ids,
                 reason="probe_regression",
             )
-            return {
+            promoted = self._promote_buffered_candidates(overlay, self.ledger.compute_metrics())
+            transition = {
                 "action": "rolled_back",
                 "failed_revision": current_rev,
                 "restored_revision": parent_rev,
                 "demoted_entry_ids": demoted_ids,
                 "probe_summary": probe_summary,
             }
+            if promoted is not None:
+                transition["promoted_candidates"] = promoted
+            return transition
 
-        # Confirm probing revision (held or auto_demote disabled)
+        # Confirm probing revision (held or auto_demote disabled); keep rev-XXXX.json immutable.
         for eid in list(overlay.get("active_entry_ids") or ()):
             entry = self._load_entry(eid)
             if entry and entry.get("status") == "probing":
@@ -1483,12 +1859,85 @@ class HarnessLibrary:
         overlay["probe_outcomes"] = []
         overlay["surfaces"] = self._rebuild_surfaces(overlay["active_entry_ids"])
         self._save_overlay(overlay)
-        _atomic_write_json(self.revisions_dir / f"rev-{current_rev:04d}.json", overlay)
         self.ledger.record_revision_confirmed(current_rev)
-        return {
+        promoted = self._promote_buffered_candidates(overlay, self.ledger.compute_metrics())
+        transition = {
             "action": "confirmed",
             "revision": current_rev,
             "probe_summary": probe_summary,
+        }
+        if promoted is not None:
+            transition["promoted_candidates"] = promoted
+        return transition
+
+    def _promote_buffered_candidates(self, overlay: dict, baseline_metrics: dict) -> dict | None:
+        if not self.harness_cfg.enabled or self.harness_cfg.max_active_adaptations <= 0:
+            return None
+        if overlay.get("state") == "probing":
+            return None
+
+        active_set = set(overlay.get("active_entry_ids") or ())
+        eligible = [
+            e
+            for e in self.list_entries(status="candidate")
+            if str(e.get("id", "")) not in active_set
+            and float(e.get("confidence", 0.0) or 0.0) >= self.harness_cfg.min_confidence
+            and str(e.get("surface", "")) in self.harness_cfg.editable_surfaces
+        ]
+        if not eligible:
+            return None
+
+        prev_rev = int(overlay.get("revision", 0))
+        next_rev = self._next_revision_number(overlay)
+        cand_ids: list[str] = []
+        for entry in eligible:
+            entry["status"] = "probing"
+            entry["revision"] = next_rev
+            self._save_entry(entry)
+            cand_ids.append(str(entry["id"]))
+
+        combined_ids = list(dict.fromkeys(list(overlay.get("active_entry_ids") or ()) + cand_ids))
+        kept_ids, evicted_ids = self._enforce_active_cap(
+            combined_ids, self.harness_cfg.max_active_adaptations
+        )
+        if evicted_ids:
+            self.ledger.record_demotion(
+                target="cap",
+                revision=next_rev,
+                entry_ids=evicted_ids,
+                reason="evicted_by_cap",
+            )
+        surviving = [eid for eid in cand_ids if eid in kept_ids]
+        if not surviving:
+            overlay["active_entry_ids"] = kept_ids
+            overlay["surfaces"] = self._rebuild_surfaces(kept_ids)
+            self._save_overlay(overlay)
+            return None
+
+        overlay["parent_revision"] = prev_rev
+        overlay["revision"] = next_rev
+        overlay["state"] = "probing"
+        overlay["probe_remaining"] = int(self.harness_cfg.probe_window)
+        overlay["probe_baseline"] = {
+            "cards_total": int(baseline_metrics.get("cards_total", 0)),
+            "pass_rate": float(baseline_metrics.get("pass_rate", 0.0)),
+            "harness_efficiency": float(baseline_metrics.get("harness_efficiency", 0.0)),
+        }
+        overlay["probe_outcomes"] = []
+        overlay["active_entry_ids"] = kept_ids
+        overlay["surfaces"] = self._rebuild_surfaces(kept_ids)
+        self._save_overlay(overlay)
+        _atomic_write_json(self.revisions_dir / f"rev-{next_rev:04d}.json", overlay)
+        self.ledger.record_revision_promoted(
+            revision=next_rev,
+            parent_revision=prev_rev,
+            entry_ids=surviving,
+            reason="buffered_candidates",
+        )
+        return {
+            "revision": next_rev,
+            "parent_revision": prev_rev,
+            "entry_ids": surviving,
         }
 
     def _enforce_active_cap(
@@ -1532,353 +1981,408 @@ class HarnessLibrary:
         reflect: bool = True,
     ) -> dict:
         """Record a card run outcome, update probe state, capture adaptations, and refresh metrics."""
-        contrast = extract_contrast(card_meta, attempt_records, failure=failure)
-        overlay = self._load_overlay()
-        cues_list = list(cues_applied or ())
+        with self._locked():
+            contrast = extract_contrast(card_meta, attempt_records, failure=failure)
+            overlay = self._load_overlay()
+            cues_list = list(cues_applied or ())
 
-        surfaces_applied = self._update_applied_stats(cues_list, contrast)
-        self.ledger.record_card_outcome(
-            contrast,
-            revision=int(overlay.get("revision", 0)),
-            cues_applied=cues_list,
-            surfaces_applied=surfaces_applied,
-        )
+            # Snapshot pre-card metrics before appending this card's outcome so
+            # probe_baseline captures true pre-card performance.
+            metrics_before_capture = self.ledger.compute_metrics()
 
-        probe_transition = self._check_probe_window(overlay, contrast)
-        overlay = self._load_overlay()
-        metrics_before_capture = self.ledger.compute_metrics()
+            surfaces_applied = self._update_applied_stats(cues_list, contrast)
+            self.ledger.record_card_outcome(
+                contrast,
+                revision=int(overlay.get("revision", 0)),
+                cues_applied=cues_list,
+                surfaces_applied=surfaces_applied,
+            )
 
-        lessons_added: list[str] = []
-        rejected_proposals: list[dict] = []
+            probe_transition = self._check_probe_window(overlay, contrast)
+            overlay = self._load_overlay()
 
-        if self.harness_cfg.enabled and contrast["outcome_kind"] in self.harness_cfg.capture_on:
-            candidates: list[dict] = []
-            if (
-                reflect
-                and self.harness_cfg.allow_micromanager_reflection
-                and micromanager is not None
-                and getattr(micromanager, "enabled", False)
-            ):
-                try:
-                    refl = micromanager.reflect_harness(
-                        card_meta,
-                        contrast,
-                        overlay,
-                        self.format_index(),
-                        metrics_before_capture,
-                        cfg=self._cfg,
-                    )
-                except Unsupported:
-                    refl = {}
-                if isinstance(refl, dict):
-                    for item in refl.get("lessons") or ():
-                        if isinstance(item, dict):
-                            candidates.append({**item, "source": item.get("source") or "micromanager"})
-                    for rej in refl.get("rejected") or ():
-                        if isinstance(rej, dict):
-                            rejected_proposals.append(rej)
+            lessons_added: list[str] = []
+            buffered_candidates: list[str] = []
+            rejected_proposals: list[dict] = []
 
-            if not candidates:
-                candidates = self._deterministic_extract(card_meta, contrast, failure)
-
-            existing_entries = self.list_entries()
-            existing_ids = {str(e["id"]) for e in existing_entries}
-            existing_by_fp: dict[tuple, dict] = {
-                self._cue_fingerprint(e): e for e in existing_entries
-            }
-
-            new_entry_ids: list[str] = []
-            next_rev = None
-
-            for raw_cand in candidates:
-                cleaned, reason = validate_harness_proposal(
-                    raw_cand,
-                    allowed_surfaces=self.harness_cfg.editable_surfaces,
-                    never_touch=self.never_touch,
-                    forbidden_files=self.forbidden_files,
-                    default_language=contrast["language"],
-                    default_kind=contrast["kind"],
-                )
-                if cleaned is None:
-                    rejected_proposals.append({"reason": reason, "raw": raw_cand})
-                    continue
-                if cleaned["confidence"] < self.harness_cfg.min_confidence:
-                    rejected_proposals.append({
-                        "reason": f"confidence {cleaned['confidence']} below min_confidence {self.harness_cfg.min_confidence}",
-                        "raw": raw_cand,
-                    })
-                    continue
-
-                fp = self._cue_fingerprint(cleaned)
-                prior = existing_by_fp.get(fp)
-                if prior is not None:
-                    if prior.get("status") == "demoted":
+            if self.harness_cfg.enabled and contrast["outcome_kind"] in self.harness_cfg.capture_on:
+                candidates: list[dict] = []
+                if (
+                    reflect
+                    and self.harness_cfg.allow_micromanager_reflection
+                    and micromanager is not None
+                    and getattr(micromanager, "enabled", False)
+                ):
+                    try:
+                        refl = micromanager.reflect_harness(
+                            card_meta,
+                            contrast,
+                            overlay,
+                            self.format_index(),
+                            metrics_before_capture,
+                            cfg=self._cfg,
+                        )
+                    except (AdapterError, ValueError) as exc:
+                        refl = {}
                         rejected_proposals.append({
-                            "reason": f"matches demoted entry {prior['id']}",
+                            "reason": f"reflect_harness error ({type(exc).__name__}): {exc}",
+                            "raw": {},
+                        })
+                    if isinstance(refl, dict):
+                        for item in refl.get("lessons") or ():
+                            if isinstance(item, dict):
+                                candidates.append({**item, "source": item.get("source") or "micromanager"})
+                        for rej in refl.get("rejected") or ():
+                            if isinstance(rej, dict):
+                                rejected_proposals.append(rej)
+
+                if not candidates:
+                    candidates = self._deterministic_extract(card_meta, contrast, failure)
+
+                existing_entries = self.list_entries()
+                existing_ids = {str(e["id"]) for e in existing_entries}
+                existing_by_fp: dict[tuple, dict] = {
+                    self._cue_fingerprint(e): e for e in existing_entries
+                }
+
+                is_probing = overlay.get("state") == "probing"
+                new_entry_ids: list[str] = []
+                next_rev = None
+
+                for raw_cand in candidates:
+                    cleaned, reason = validate_harness_proposal(
+                        raw_cand,
+                        allowed_surfaces=self.harness_cfg.editable_surfaces,
+                        never_touch=self.never_touch,
+                        forbidden_files=self.forbidden_files,
+                        default_language=contrast["language"],
+                        default_kind=contrast["kind"],
+                    )
+                    if cleaned is None:
+                        rejected_proposals.append({"reason": reason, "raw": raw_cand})
+                        continue
+                    if cleaned["confidence"] < self.harness_cfg.min_confidence:
+                        rejected_proposals.append({
+                            "reason": f"confidence {cleaned['confidence']} below min_confidence {self.harness_cfg.min_confidence}",
                             "raw": raw_cand,
                         })
                         continue
-                    # Reinforce existing active/probing entry rather than duplicating.
-                    prior["confidence"] = round(
-                        min(1.0, max(float(prior.get("confidence", 0.0)), cleaned["confidence"]) + 0.02),
-                        4,
-                    )
-                    if cleaned["evidence"] and cleaned["evidence"] not in str(prior.get("evidence", "")):
-                        prior["evidence"] = sanitize_lesson_text(
-                            f"{prior.get('evidence', '')}\n{cleaned['evidence']}".strip(),
-                            max_len=400,
+
+                    fp = self._cue_fingerprint(cleaned)
+                    prior = existing_by_fp.get(fp)
+                    if prior is not None:
+                        if prior.get("status") == "demoted":
+                            rejected_proposals.append({
+                                "reason": f"matches demoted entry {prior['id']}",
+                                "raw": raw_cand,
+                            })
+                            continue
+                        # Reinforce existing entry rather than duplicating.
+                        prior["confidence"] = round(
+                            min(1.0, max(float(prior.get("confidence", 0.0)), cleaned["confidence"]) + 0.02),
+                            4,
                         )
-                    self._save_entry(prior)
-                    continue
+                        if cleaned["evidence"] and cleaned["evidence"] not in str(prior.get("evidence", "")):
+                            prior["evidence"] = sanitize_lesson_text(
+                                f"{prior.get('evidence', '')}\n{cleaned['evidence']}".strip(),
+                                max_len=400,
+                            )
+                        self._save_entry(prior)
+                        continue
 
-                if next_rev is None:
-                    next_rev = self._next_revision_number(overlay)
+                    entry_id = self._make_entry_id(cleaned, existing_ids)
+                    existing_ids.add(entry_id)
+                    now = utc_now()
 
-                entry_id = self._make_entry_id(cleaned, existing_ids)
-                existing_ids.add(entry_id)
-                now = utc_now()
-                entry_record = {
-                    "id": entry_id,
-                    "title": cleaned["title"],
-                    "surface": cleaned["surface"],
-                    "role": cleaned["role"],
-                    "language": cleaned["language"],
-                    "kind": cleaned["kind"],
-                    "failure_class": cleaned["failure_class"],
-                    "tags": cleaned["tags"],
-                    "cue": cleaned["cue"],
-                    "lesson": cleaned["lesson"],
-                    "evidence": cleaned["evidence"],
-                    "proposed_patch": cleaned["proposed_patch"],
-                    "confidence": cleaned["confidence"],
-                    "status": "probing",
-                    "source": cleaned["source"],
-                    "card_id": contrast["card_id"],
-                    "revision": next_rev,
-                    "created_at": now,
-                    "updated_at": now,
-                    "stats": {"applied": 0, "helped": 0, "hurt": 0, "neutral": 0},
-                }
-                self._save_entry(entry_record)
-                existing_by_fp[fp] = entry_record
-                new_entry_ids.append(entry_id)
-                lessons_added.append(entry_id)
-                self.ledger.record_lesson_added(
-                    entry_id=entry_id,
-                    surface=entry_record["surface"],
-                    confidence=entry_record["confidence"],
-                    revision=next_rev,
-                    source=entry_record["source"],
-                    card_id=contrast["card_id"],
-                )
+                    if is_probing:
+                        # Buffer as candidate without stacking or overwriting the active probing revision.
+                        entry_record = {
+                            "id": entry_id,
+                            "title": cleaned["title"],
+                            "surface": cleaned["surface"],
+                            "role": cleaned["role"],
+                            "language": cleaned["language"],
+                            "kind": cleaned["kind"],
+                            "failure_class": cleaned["failure_class"],
+                            "tags": cleaned["tags"],
+                            "cue": cleaned["cue"],
+                            "lesson": cleaned["lesson"],
+                            "evidence": cleaned["evidence"],
+                            "proposed_patch": cleaned["proposed_patch"],
+                            "confidence": cleaned["confidence"],
+                            "status": "candidate",
+                            "source": cleaned["source"],
+                            "card_id": contrast["card_id"],
+                            "revision": 0,
+                            "created_at": now,
+                            "updated_at": now,
+                            "stats": {"applied": 0, "helped": 0, "hurt": 0, "neutral": 0},
+                        }
+                        self._save_entry(entry_record)
+                        existing_by_fp[fp] = entry_record
+                        buffered_candidates.append(entry_id)
+                        lessons_added.append(entry_id)
+                        self.ledger.record_lesson_added(
+                            entry_id=entry_id,
+                            surface=entry_record["surface"],
+                            confidence=entry_record["confidence"],
+                            revision=0,
+                            source=entry_record["source"],
+                            card_id=contrast["card_id"],
+                            status="candidate",
+                        )
+                    else:
+                        if next_rev is None:
+                            next_rev = self._next_revision_number(overlay)
+                        entry_record = {
+                            "id": entry_id,
+                            "title": cleaned["title"],
+                            "surface": cleaned["surface"],
+                            "role": cleaned["role"],
+                            "language": cleaned["language"],
+                            "kind": cleaned["kind"],
+                            "failure_class": cleaned["failure_class"],
+                            "tags": cleaned["tags"],
+                            "cue": cleaned["cue"],
+                            "lesson": cleaned["lesson"],
+                            "evidence": cleaned["evidence"],
+                            "proposed_patch": cleaned["proposed_patch"],
+                            "confidence": cleaned["confidence"],
+                            "status": "probing",
+                            "source": cleaned["source"],
+                            "card_id": contrast["card_id"],
+                            "revision": next_rev,
+                            "created_at": now,
+                            "updated_at": now,
+                            "stats": {"applied": 0, "helped": 0, "hurt": 0, "neutral": 0},
+                        }
+                        self._save_entry(entry_record)
+                        existing_by_fp[fp] = entry_record
+                        new_entry_ids.append(entry_id)
+                        lessons_added.append(entry_id)
+                        self.ledger.record_lesson_added(
+                            entry_id=entry_id,
+                            surface=entry_record["surface"],
+                            confidence=entry_record["confidence"],
+                            revision=next_rev,
+                            source=entry_record["source"],
+                            card_id=contrast["card_id"],
+                            status="probing",
+                        )
 
-            if new_entry_ids and next_rev is not None:
-                prev_rev = int(overlay.get("revision", 0))
-                combined_ids = list(dict.fromkeys(list(overlay.get("active_entry_ids") or ()) + new_entry_ids))
-                kept_ids, evicted_ids = self._enforce_active_cap(
-                    combined_ids, self.harness_cfg.max_active_adaptations
-                )
-                if evicted_ids:
-                    self.ledger.record_demotion(
-                        target="cap",
+                if not is_probing and new_entry_ids and next_rev is not None:
+                    prev_rev = int(overlay.get("revision", 0))
+                    combined_ids = list(dict.fromkeys(list(overlay.get("active_entry_ids") or ()) + new_entry_ids))
+                    kept_ids, evicted_ids = self._enforce_active_cap(
+                        combined_ids, self.harness_cfg.max_active_adaptations
+                    )
+                    if evicted_ids:
+                        self.ledger.record_demotion(
+                            target="cap",
+                            revision=next_rev,
+                            entry_ids=evicted_ids,
+                            reason="evicted_by_cap",
+                        )
+
+                    overlay["parent_revision"] = prev_rev
+                    overlay["revision"] = next_rev
+                    overlay["state"] = "probing"
+                    overlay["probe_remaining"] = int(self.harness_cfg.probe_window)
+                    overlay["probe_baseline"] = {
+                        "cards_total": int(metrics_before_capture.get("cards_total", 0)),
+                        "pass_rate": float(metrics_before_capture.get("pass_rate", 0.0)),
+                        "harness_efficiency": float(metrics_before_capture.get("harness_efficiency", 0.0)),
+                    }
+                    overlay["probe_outcomes"] = []
+                    overlay["active_entry_ids"] = kept_ids
+                    overlay["surfaces"] = self._rebuild_surfaces(kept_ids)
+                    self._save_overlay(overlay)
+                    _atomic_write_json(self.revisions_dir / f"rev-{next_rev:04d}.json", overlay)
+                    self.ledger.record_revision_promoted(
                         revision=next_rev,
-                        entry_ids=evicted_ids,
-                        reason="evicted_by_cap",
+                        parent_revision=prev_rev,
+                        entry_ids=new_entry_ids,
+                        reason=contrast["outcome_kind"],
                     )
 
-                overlay["parent_revision"] = prev_rev
-                overlay["revision"] = next_rev
-                overlay["state"] = "probing"
-                overlay["probe_remaining"] = int(self.harness_cfg.probe_window)
-                overlay["probe_baseline"] = {
-                    "cards_total": int(metrics_before_capture.get("cards_total", 0)),
-                    "pass_rate": float(metrics_before_capture.get("pass_rate", 0.0)),
-                    "harness_efficiency": float(metrics_before_capture.get("harness_efficiency", 0.0)),
-                }
-                overlay["probe_outcomes"] = []
-                overlay["active_entry_ids"] = kept_ids
-                overlay["surfaces"] = self._rebuild_surfaces(kept_ids)
-                self._save_overlay(overlay)
-                _atomic_write_json(self.revisions_dir / f"rev-{next_rev:04d}.json", overlay)
-                self.ledger.record_revision_promoted(
-                    revision=next_rev,
-                    parent_revision=prev_rev,
-                    entry_ids=new_entry_ids,
-                    reason=contrast["outcome_kind"],
-                )
-
-        metrics = self.ledger.refresh_metrics()
-        self._rebuild_index()
-        return {
-            "contrast": contrast,
-            "revision": int(self._load_overlay().get("revision", 0)),
-            "state": str(self._load_overlay().get("state", "confirmed")),
-            "lessons_added": lessons_added,
-            "rejected": rejected_proposals,
-            "probe_transition": probe_transition,
-            "metrics": metrics,
-        }
+            metrics = self.ledger.refresh_metrics()
+            self._rebuild_index()
+            final_overlay = self._load_overlay()
+            return {
+                "contrast": contrast,
+                "revision": int(final_overlay.get("revision", 0)),
+                "state": str(final_overlay.get("state", "confirmed")),
+                "lessons_added": lessons_added,
+                "buffered_candidates": buffered_candidates,
+                "rejected": rejected_proposals,
+                "probe_transition": probe_transition,
+                "metrics": metrics,
+            }
 
     # -- management / CLI control APIs ----------------------------------------
 
     def promote_entry(self, entry_id: str, reason: str = "manual") -> dict:
-        safe = _safe_id(entry_id, "entry_id")
-        entry = self._load_entry(safe)
-        if entry is None:
-            raise Invalid("unknown-harness-entry", f"harness entry {safe!r} does not exist")
+        with self._locked():
+            safe = _safe_id(entry_id, "entry_id")
+            entry = self._load_entry(safe)
+            if entry is None:
+                raise Invalid("unknown-harness-entry", f"harness entry {safe!r} does not exist")
 
-        cleaned, err = validate_harness_proposal(
-            entry,
-            allowed_surfaces=self.harness_cfg.editable_surfaces,
-            never_touch=self.never_touch,
-            forbidden_files=self.forbidden_files,
-        )
-        if cleaned is None:
-            raise Refused("unsafe-harness-entry", f"cannot promote {safe!r}: {err}")
+            cleaned, err = validate_harness_proposal(
+                entry,
+                allowed_surfaces=self.harness_cfg.editable_surfaces,
+                never_touch=self.never_touch,
+                forbidden_files=self.forbidden_files,
+            )
+            if cleaned is None:
+                raise Refused("unsafe-harness-entry", f"cannot promote {safe!r}: {err}")
 
-        overlay = self._load_overlay()
-        prev_rev = int(overlay.get("revision", 0))
-        new_rev = self._next_revision_number(overlay)
+            overlay = self._load_overlay()
+            prev_rev = int(overlay.get("revision", 0))
+            new_rev = self._next_revision_number(overlay)
 
-        entry["status"] = "active"
-        entry.pop("demote_reason", None)
-        entry["revision"] = new_rev
-        self._save_entry(entry)
+            entry["status"] = "active"
+            entry.pop("demote_reason", None)
+            entry["revision"] = new_rev
+            self._save_entry(entry)
 
-        combined = list(dict.fromkeys(list(overlay.get("active_entry_ids") or ()) + [safe]))
-        kept, evicted = self._enforce_active_cap(
-            combined,
-            self.harness_cfg.max_active_adaptations,
-            protected_ids={safe} if self.harness_cfg.max_active_adaptations > 0 else frozenset(),
-        )
+            combined = list(dict.fromkeys(list(overlay.get("active_entry_ids") or ()) + [safe]))
+            kept, evicted = self._enforce_active_cap(
+                combined,
+                self.harness_cfg.max_active_adaptations,
+                protected_ids={safe} if self.harness_cfg.max_active_adaptations > 0 else frozenset(),
+            )
 
-        overlay["parent_revision"] = prev_rev
-        overlay["revision"] = new_rev
-        overlay["state"] = "confirmed"
-        overlay["probe_remaining"] = 0
-        overlay["probe_outcomes"] = []
-        overlay["active_entry_ids"] = kept
-        overlay["surfaces"] = self._rebuild_surfaces(kept)
-        self._save_overlay(overlay)
-        _atomic_write_json(self.revisions_dir / f"rev-{new_rev:04d}.json", overlay)
-        self.ledger.record_revision_promoted(new_rev, prev_rev, [safe], reason=reason)
-        if evicted:
-            self.ledger.record_demotion("cap", new_rev, evicted, reason="evicted_by_cap")
-        metrics = self.ledger.refresh_metrics()
-        self._rebuild_index()
-        return {"revision": new_rev, "entry_id": safe, "evicted": evicted, "metrics": metrics}
+            overlay["parent_revision"] = prev_rev
+            overlay["revision"] = new_rev
+            overlay["state"] = "confirmed"
+            overlay["probe_remaining"] = 0
+            overlay["probe_outcomes"] = []
+            overlay["active_entry_ids"] = kept
+            overlay["surfaces"] = self._rebuild_surfaces(kept)
+            self._save_overlay(overlay)
+            _atomic_write_json(self.revisions_dir / f"rev-{new_rev:04d}.json", overlay)
+            self.ledger.record_revision_promoted(new_rev, prev_rev, [safe], reason=reason)
+            if evicted:
+                self.ledger.record_demotion("cap", new_rev, evicted, reason="evicted_by_cap")
+            metrics = self.ledger.refresh_metrics()
+            self._rebuild_index()
+            return {"revision": new_rev, "entry_id": safe, "evicted": evicted, "metrics": metrics}
 
     def demote_entry_or_revision(self, target: str, reason: str = "manual") -> dict:
-        text = str(target or "").strip()
-        if not text:
-            raise Invalid("bad-demote-target", "demote target must not be empty")
+        with self._locked():
+            text = str(target or "").strip()
+            if not text:
+                raise Invalid("bad-demote-target", "demote target must not be empty")
 
-        overlay = self._load_overlay()
-        demoted_ids: list[str] = []
+            overlay = self._load_overlay()
+            demoted_ids: list[str] = []
 
-        rev_num: int | None = None
-        if text.startswith("rev-") and text[4:].isdigit():
-            rev_num = int(text[4:])
-        elif text.isdigit():
-            rev_num = int(text)
+            rev_num: int | None = None
+            if text.startswith("rev-") and text[4:].isdigit():
+                rev_num = int(text[4:])
+            elif text.isdigit():
+                rev_num = int(text)
 
-        if rev_num is not None:
-            rev_path = self.revisions_dir / f"rev-{rev_num:04d}.json"
-            rev_snap = read_json(rev_path)
-            if rev_num == 0 and rev_snap is None:
-                raise Invalid("unknown-harness-revision", "revision 0 snapshot missing")
-            if rev_snap is None:
-                raise Invalid("unknown-harness-revision", f"revision {text!r} does not exist")
+            if rev_num is not None:
+                rev_path = self.revisions_dir / f"rev-{rev_num:04d}.json"
+                rev_snap = read_json(rev_path)
+                if rev_num == 0 and rev_snap is None:
+                    raise Invalid("unknown-harness-revision", "revision 0 snapshot missing")
+                if rev_snap is None:
+                    raise Invalid("unknown-harness-revision", f"revision {text!r} does not exist")
 
-            for e in self.list_entries():
-                if int(e.get("revision", -1)) == rev_num and e.get("status") != "demoted":
-                    e["status"] = "demoted"
-                    e["demote_reason"] = reason
-                    self._save_entry(e)
-                    demoted_ids.append(str(e["id"]))
+                for e in self.list_entries():
+                    if int(e.get("revision", -1)) == rev_num and e.get("status") not in ("demoted", "candidate"):
+                        e["status"] = "demoted"
+                        e["demote_reason"] = reason
+                        self._save_entry(e)
+                        demoted_ids.append(str(e["id"]))
 
-            active_ids = [
-                eid for eid in (overlay.get("active_entry_ids") or ())
-                if eid not in demoted_ids
-            ]
-            if int(overlay.get("revision", 0)) == rev_num:
-                parent_rev = int(rev_snap.get("parent_revision", 0))
-                parent_snap = read_json(self.revisions_dir / f"rev-{parent_rev:04d}.json") or {}
-                parent_ids = [
-                    eid for eid in (parent_snap.get("active_entry_ids") or ())
+                active_ids = [
+                    eid for eid in (overlay.get("active_entry_ids") or ())
                     if eid not in demoted_ids
                 ]
-                overlay["revision"] = parent_rev
-                overlay["parent_revision"] = int(parent_snap.get("parent_revision", 0))
+                if int(overlay.get("revision", 0)) == rev_num:
+                    parent_rev = int(rev_snap.get("parent_revision", 0))
+                    parent_snap = read_json(self.revisions_dir / f"rev-{parent_rev:04d}.json") or {}
+                    parent_ids = [
+                        eid for eid in (parent_snap.get("active_entry_ids") or ())
+                        if eid not in demoted_ids
+                    ]
+                    overlay["revision"] = parent_rev
+                    overlay["parent_revision"] = int(parent_snap.get("parent_revision", 0))
+                    overlay["state"] = "confirmed"
+                    overlay["probe_remaining"] = 0
+                    overlay["probe_outcomes"] = []
+                    overlay["active_entry_ids"] = parent_ids
+                    overlay["surfaces"] = self._rebuild_surfaces(parent_ids)
+                else:
+                    overlay["active_entry_ids"] = active_ids
+                    overlay["surfaces"] = self._rebuild_surfaces(active_ids)
+
+                self._save_overlay(overlay)
+                self.ledger.record_demotion(f"rev-{rev_num:04d}", rev_num, demoted_ids, reason=reason)
+                metrics = self.ledger.refresh_metrics()
+                self._rebuild_index()
+                return {
+                    "target": f"rev-{rev_num:04d}",
+                    "demoted_entry_ids": demoted_ids,
+                    "revision": int(overlay["revision"]),
+                    "metrics": metrics,
+                }
+
+            safe = _safe_id(text, "entry_id")
+            entry = self._load_entry(safe)
+            if entry is None:
+                raise Invalid("unknown-harness-entry", f"harness entry {safe!r} does not exist")
+
+            entry["status"] = "demoted"
+            entry["demote_reason"] = reason
+            self._save_entry(entry)
+            demoted_ids.append(safe)
+
+            active_ids = [eid for eid in (overlay.get("active_entry_ids") or ()) if eid != safe]
+            overlay["active_entry_ids"] = active_ids
+            overlay["surfaces"] = self._rebuild_surfaces(active_ids)
+            if overlay.get("state") == "probing" and not any(
+                (self._load_entry(eid) or {}).get("status") == "probing" for eid in active_ids
+            ):
                 overlay["state"] = "confirmed"
                 overlay["probe_remaining"] = 0
                 overlay["probe_outcomes"] = []
-                overlay["active_entry_ids"] = parent_ids
-                overlay["surfaces"] = self._rebuild_surfaces(parent_ids)
-            else:
-                overlay["active_entry_ids"] = active_ids
-                overlay["surfaces"] = self._rebuild_surfaces(active_ids)
-
             self._save_overlay(overlay)
-            self.ledger.record_demotion(f"rev-{rev_num:04d}", rev_num, demoted_ids, reason=reason)
+            self.ledger.record_demotion(
+                safe, int(overlay.get("revision", 0)), demoted_ids, reason=reason
+            )
             metrics = self.ledger.refresh_metrics()
             self._rebuild_index()
             return {
-                "target": f"rev-{rev_num:04d}",
+                "target": safe,
                 "demoted_entry_ids": demoted_ids,
                 "revision": int(overlay["revision"]),
                 "metrics": metrics,
             }
 
-        safe = _safe_id(text, "entry_id")
-        entry = self._load_entry(safe)
-        if entry is None:
-            raise Invalid("unknown-harness-entry", f"harness entry {safe!r} does not exist")
-
-        entry["status"] = "demoted"
-        entry["demote_reason"] = reason
-        self._save_entry(entry)
-        demoted_ids.append(safe)
-
-        active_ids = [eid for eid in (overlay.get("active_entry_ids") or ()) if eid != safe]
-        overlay["active_entry_ids"] = active_ids
-        overlay["surfaces"] = self._rebuild_surfaces(active_ids)
-        if overlay.get("state") == "probing" and not any(
-            (self._load_entry(eid) or {}).get("status") == "probing" for eid in active_ids
-        ):
-            overlay["state"] = "confirmed"
-            overlay["probe_remaining"] = 0
-            overlay["probe_outcomes"] = []
-        self._save_overlay(overlay)
-        self.ledger.record_demotion(
-            safe, int(overlay.get("revision", 0)), demoted_ids, reason=reason
-        )
-        metrics = self.ledger.refresh_metrics()
-        self._rebuild_index()
-        return {
-            "target": safe,
-            "demoted_entry_ids": demoted_ids,
-            "revision": int(overlay["revision"]),
-            "metrics": metrics,
-        }
-
     def reset(self) -> dict:
-        """Clear active overlay back to revision 0 and deactivate active/probing entries."""
-        demoted_ids: list[str] = []
-        for e in self.list_entries():
-            if e.get("status") in ("active", "probing"):
-                e["status"] = "demoted"
-                e["demote_reason"] = "reset"
-                self._save_entry(e)
-                demoted_ids.append(str(e["id"]))
+        """Clear active overlay back to revision 0 and deactivate active/probing/candidate entries."""
+        with self._locked():
+            demoted_ids: list[str] = []
+            for e in self.list_entries():
+                if e.get("status") in ("active", "probing", "candidate"):
+                    e["status"] = "demoted"
+                    e["demote_reason"] = "reset"
+                    self._save_entry(e)
+                    demoted_ids.append(str(e["id"]))
 
-        overlay = self._load_overlay()
-        next_rev_counter = int(overlay.get("next_revision", 1))
-        reset_overlay = self._empty_overlay(revision=0, parent_revision=0)
-        reset_overlay["next_revision"] = next_rev_counter
-        self._save_overlay(reset_overlay)
-        _atomic_write_json(self.revisions_dir / "rev-0000.json", reset_overlay)
-        self.ledger.append_event("reset", {"demoted_entry_ids": demoted_ids})
-        metrics = self.ledger.refresh_metrics()
-        self._rebuild_index()
-        return {"revision": 0, "demoted_entry_ids": demoted_ids, "metrics": metrics}
+            overlay = self._load_overlay()
+            next_rev_counter = int(overlay.get("next_revision", 1))
+            reset_overlay = self._empty_overlay(revision=0, parent_revision=0)
+            reset_overlay["next_revision"] = next_rev_counter
+            self._save_overlay(reset_overlay)
+            if not (self.revisions_dir / "rev-0000.json").exists():
+                _atomic_write_json(self.revisions_dir / "rev-0000.json", reset_overlay)
+            self.ledger.append_event("reset", {"demoted_entry_ids": demoted_ids})
+            metrics = self.ledger.refresh_metrics()
+            self._rebuild_index()
+            return {"revision": 0, "demoted_entry_ids": demoted_ids, "metrics": metrics}

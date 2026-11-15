@@ -25,12 +25,17 @@ from openfarm_core.briefs import (
 from openfarm_core.cards import Card
 from openfarm_core.cli import Context, _run_card
 from openfarm_core.config import Config, ConfigError, HarnessConfig, load_config
-from openfarm_core.errors import Infra, Invalid, Refused, Unsupported
+from openfarm_core.errors import Infra, Invalid, Refused, StopCode, Unsupported
+from openfarm_core.flow import CardRun
 from openfarm_core.harness_memory import (
+    ALLOWED_FAILURE_CLASSES,
     EDITABLE_SURFACES,
     HarnessLedger,
     HarnessLibrary,
+    _classify_failure,
+    _is_unsafe_path,
     extract_contrast,
+    is_gate_bypass_directive,
     sanitize_lesson_text,
     validate_harness_proposal,
 )
@@ -126,7 +131,7 @@ class ConfigAndContractsTests(unittest.TestCase):
             '[policy]\ncategories = ["pinned-bugfix"]\n'
             '[harness]\n'
             'enabled = true\n'
-            'dir = "custom-harness"\n'
+            'dir = "../custom-harness"\n'
             'capture_on = ["retry_recovery", "counter_fail"]\n'
             'max_cues_per_brief = 2\n'
             'max_active_adaptations = 5\n'
@@ -138,7 +143,10 @@ class ConfigAndContractsTests(unittest.TestCase):
             encoding="utf-8",
         )
         cfg = load_config(self.repo)
-        self.assertEqual(cfg.harness.dir, "custom-harness")
+        self.assertEqual(
+            Path(cfg.harness.dir),
+            (self.repo.parent / "custom-harness").resolve(),
+        )
         self.assertEqual(cfg.harness.capture_on, ("retry_recovery", "counter_fail"))
         self.assertEqual(cfg.harness.max_cues_per_brief, 2)
         self.assertEqual(cfg.harness.max_active_adaptations, 5)
@@ -150,6 +158,13 @@ class ConfigAndContractsTests(unittest.TestCase):
             cfg.harness.editable_surfaces,
             ("implementer_guidance", "micromanager_context"),
         )
+
+        # Reject [harness].dir inside the repo
+        for inside in ("custom-harness", ".", str(self.repo / "inside")):
+            bad_dir = _base_config_data(self.state_dir)
+            bad_dir["harness"] = {"dir": inside}
+            with self.assertRaises(ConfigError, msg=f"inside-repo dir {inside!r}"):
+                Config(bad_dir, self.repo)
 
         # Reject unknown key
         bad = _base_config_data(self.state_dir)
@@ -1326,7 +1341,8 @@ class HarnessIntegrationE2ETests(unittest.TestCase):
         o1, o2 = run1_json["outcomes"]
         self.assertEqual(o1["card_id"], "TOY-01")
         self.assertEqual(o1["final_state"], "in-review")
-        self.assertGreaterEqual(o1["harness_revision"], 1)
+        self.assertEqual(o1["harness_revision"], 0)
+        self.assertGreaterEqual(o1["harness"]["post_revision"], 1)
         self.assertTrue(o1["harness_lessons_added"])
 
         self.assertEqual(o2["card_id"], "TOY-02")
@@ -1481,6 +1497,614 @@ class HarnessIntegrationE2ETests(unittest.TestCase):
         entry_json = json.loads(_run_cli(self.toy.root, "harness", "show", learned_ids[0]).stdout)
         self.assertEqual(entry_json["status"], "demoted")
         self.assertEqual(entry_json["demote_reason"], "probe_regression")
+
+
+class Wave35HardeningTests(unittest.TestCase):
+    """Targeted regression tests for Wave 3.5 security, probe-stacking, flow, and CLI hardening."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="of-wave35-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.repo = self.tmp / "repo"
+        self.repo.mkdir()
+        self.state_dir = self.tmp / "state"
+        self.state_dir.mkdir()
+        self.harness_dir = self.state_dir / "harness"
+        self.cfg = Config(_base_config_data(self.state_dir), self.repo)
+        self._toys = []
+        self._temp_dirs = []
+        self.addCleanup(_cleanup_case_toys, self)
+
+    def _make_lib(self, **harness_overrides) -> HarnessLibrary:
+        data = _base_config_data(self.state_dir)
+        data["harness"] = {
+            "enabled": True,
+            "probe_window": 2,
+            "min_confidence": 0.5,
+            "auto_demote": True,
+            **harness_overrides,
+        }
+        cfg = Config(data, self.repo)
+        return HarnessLibrary(self.harness_dir, config=cfg)
+
+    def test_reflect_harness_catches_all_adapter_errors_and_falls_back(self) -> None:
+        class _ExplodingBackend:
+            def __init__(self, exc_factory):
+                self._exc_factory = exc_factory
+
+            def assist(self, op: str, payload: dict) -> dict:
+                raise self._exc_factory()
+
+        for label, factory in (
+            ("refused", lambda: Refused("mm-cap", "night budget exhausted")),
+            ("infra", lambda: Infra("acp-down", "connection reset")),
+            ("invalid", lambda: Invalid("bad-json", "malformed output")),
+            ("value", lambda: ValueError("bad float token")),
+        ):
+            sub_dir = self.tmp / f"harness-{label}"
+            lib = HarnessLibrary(sub_dir, config=self.cfg)
+            mm = Micromanager(_ExplodingBackend(factory))
+            res = lib.record_card_outcome(
+                {
+                    "card_id": f"ERR-{label}",
+                    "category": "pinned-bugfix",
+                    "language": "rust",
+                    "final_state": "in-review",
+                    "attempts": 2,
+                },
+                [
+                    {"attempt": 1, "phase": "implementer", "outcome": "fail", "error_signature": "E0308 type mismatch"},
+                    {"attempt": 2, "phase": "implementer", "outcome": "pass"},
+                ],
+                micromanager=mm,
+            )
+            self.assertTrue(res["lessons_added"], f"{label} should fall back to deterministic extract")
+            self.assertTrue(
+                any("reflect_harness error" in r["reason"] for r in res["rejected"]),
+                f"{label} should record reflect error note: {res['rejected']}",
+            )
+
+    def test_probe_stacking_buffers_candidates_and_promotes_after_probe_window(self) -> None:
+        lib = self._make_lib(probe_window=2, auto_demote=True)
+        mm_rev1 = Micromanager(ScriptedMicromanager({
+            "reflect_harness": {
+                "lessons": [
+                    {
+                        "title": "Cue rev 1",
+                        "surface": "implementer_guidance",
+                        "role": "implementer",
+                        "cue": "Always validate input bounds before slicing.",
+                        "confidence": 0.9,
+                    }
+                ]
+            }
+        }))
+        r1 = lib.record_card_outcome(
+            {"card_id": "C1", "category": "pinned-bugfix", "language": "rust", "final_state": "in-review", "attempts": 2},
+            [{"attempt": 1, "outcome": "fail", "error_signature": "E0308"}, {"attempt": 2, "outcome": "pass"}],
+            micromanager=mm_rev1,
+        )
+        self.assertEqual(r1["revision"], 1)
+        self.assertEqual(r1["state"], "probing")
+        rev1_snap_before = (lib.revisions_dir / "rev-0001.json").read_bytes()
+
+        # Card 2 runs while rev 1 is probing (probe_remaining 2 -> 1) and produces another lesson:
+        # must buffer as candidate without overwriting/stacking onto rev 1!
+        mm_cand = Micromanager(ScriptedMicromanager({
+            "reflect_harness": {
+                "lessons": [
+                    {
+                        "title": "Buffered cue 2",
+                        "surface": "implementer_guidance",
+                        "role": "implementer",
+                        "cue": "Check capacity saturation arithmetic cleanly.",
+                        "confidence": 0.85,
+                    }
+                ]
+            }
+        }))
+        r2 = lib.record_card_outcome(
+            {"card_id": "C2", "category": "pinned-bugfix", "language": "rust", "final_state": "in-review", "attempts": 2},
+            [{"attempt": 1, "outcome": "fail", "error_signature": "E0382"}, {"attempt": 2, "outcome": "pass"}],
+            micromanager=mm_cand,
+        )
+        self.assertEqual(r2["revision"], 1)
+        self.assertEqual(r2["state"], "probing")
+        self.assertTrue(r2["buffered_candidates"])
+        cand_id = r2["buffered_candidates"][0]
+        cand_entry = lib.show_entry(cand_id)
+        self.assertEqual(cand_entry["status"], "candidate")
+        self.assertEqual(cand_entry["revision"], 0)
+        self.assertNotIn(cand_id, lib.status()["active_entry_ids"])
+        self.assertEqual(lib.status()["candidate_count"], 1)
+        self.assertFalse((lib.revisions_dir / "rev-0002.json").exists())
+
+        # Card 3 finishes probe_window for rev 1 cleanly -> rev 1 confirmed AND buffered candidate promoted to rev 2!
+        r3 = lib.record_card_outcome(
+            {"card_id": "C3", "category": "pinned-bugfix", "language": "rust", "final_state": "in-review", "attempts": 1},
+            [{"attempt": 1, "outcome": "pass"}],
+        )
+        self.assertEqual(r3["probe_transition"]["action"], "confirmed")
+        self.assertEqual(r3["probe_transition"]["revision"], 1)
+        self.assertEqual(r3["probe_transition"]["promoted_candidates"]["revision"], 2)
+        self.assertEqual(r3["revision"], 2)
+        self.assertEqual(r3["state"], "probing")
+        self.assertEqual(lib.show_entry(cand_id)["status"], "probing")
+        self.assertEqual(lib.show_entry(cand_id)["revision"], 2)
+        self.assertEqual(lib.show_entry(r1["lessons_added"][0])["status"], "active")
+        # Confirmed rev-0001.json stayed immutable!
+        self.assertEqual((lib.revisions_dir / "rev-0001.json").read_bytes(), rev1_snap_before)
+
+    def test_probe_rollback_still_promotes_buffered_candidate(self) -> None:
+        lib = self._make_lib(probe_window=2, auto_demote=True)
+        # Seed baseline pass so base_cards > 0 -> pass_rate = 1.0
+        lib.record_card_outcome(
+            {"card_id": "BASE-PASS", "category": "pinned-bugfix", "language": "rust", "final_state": "in-review", "attempts": 1},
+            [{"attempt": 1, "outcome": "pass"}],
+        )
+        mm_rev1 = Micromanager(ScriptedMicromanager({
+            "reflect_harness": {
+                "lessons": [
+                    {
+                        "title": "Bad probing cue",
+                        "surface": "implementer_guidance",
+                        "role": "implementer",
+                        "cue": "Try risky shortcut A.",
+                        "confidence": 0.9,
+                    }
+                ]
+            }
+        }))
+        r1 = lib.record_card_outcome(
+            {"card_id": "C-LEARN", "category": "pinned-bugfix", "language": "rust", "final_state": "in-review", "attempts": 2},
+            [{"attempt": 1, "outcome": "fail", "error_signature": "E0308"}, {"attempt": 2, "outcome": "pass"}],
+            micromanager=mm_rev1,
+        )
+        rev1_id = r1["lessons_added"][0]
+
+        mm_cand = Micromanager(ScriptedMicromanager({
+            "reflect_harness": {
+                "lessons": [
+                    {
+                        "title": "Buffered cue during failing probe",
+                        "surface": "implementer_guidance",
+                        "role": "implementer",
+                        "cue": "Preserve exact return variants.",
+                        "confidence": 0.85,
+                    }
+                ]
+            }
+        }))
+        r2 = lib.record_card_outcome(
+            {"card_id": "C-FAIL1", "category": "pinned-bugfix", "language": "rust", "final_state": "blocked", "attempts": 2},
+            [{"attempt": 1, "outcome": "fail"}, {"attempt": 2, "outcome": "fail"}],
+            micromanager=mm_cand,
+        )
+        cand_id = r2["buffered_candidates"][0]
+
+        # Second failing card triggers rollback of rev 1, then buffered candidate promotes to rev 2 (parent=0)
+        r3 = lib.record_card_outcome(
+            {"card_id": "C-FAIL2", "category": "pinned-bugfix", "language": "rust", "final_state": "blocked", "attempts": 2},
+            [{"attempt": 1, "outcome": "fail"}, {"attempt": 2, "outcome": "fail"}],
+            reflect=False,
+        )
+        self.assertEqual(r3["probe_transition"]["action"], "rolled_back")
+        self.assertEqual(lib.show_entry(rev1_id)["status"], "demoted")
+        promoted = r3["probe_transition"]["promoted_candidates"]
+        self.assertEqual(promoted["revision"], 2)
+        self.assertEqual(promoted["parent_revision"], 0)
+        self.assertIn(cand_id, promoted["entry_ids"])
+        self.assertEqual(lib.show_entry(cand_id)["status"], "probing")
+
+    def test_unicode_passive_attributes_fences_and_unsafe_paths_hardening(self) -> None:
+        # Unicode zero-width, Cyrillic homoglyph, NFKC fullwidth
+        for obfuscated in (
+            "dis\u200bable clippy now",
+            "dis\u0430ble clippy cleanly",  # Cyrillic 'а'
+            "\uff42\uff59\uff50\uff41\uff53\uff53 revert_check",  # fullwidth "bypass"
+            "clippy should be disabled here",
+            "the existing tests can be temporarily skipped",
+            "dis-able clippy before push",
+            "by-pass diff_check carefully",
+            "#[allow(clippy::all)]",
+            "#![allow(warnings)]",
+            "#[ignore] broken test",
+            "skip the tests when iterating",
+            "neutralize revert check",
+            "edit touches in manifest",
+            "rewrite the test files to pass",
+            "modify frozen test assertions",
+        ):
+            self.assertTrue(
+                is_gate_bypass_directive(obfuscated),
+                f"expected bypass detection for {obfuscated!r}",
+            )
+            cleaned, reason = validate_harness_proposal({
+                "surface": "implementer_guidance",
+                "cue": obfuscated,
+                "confidence": 0.8,
+            })
+            self.assertIsNone(cleaned, f"expected proposal rejection for {obfuscated!r}")
+            self.assertIn("gate-bypass", reason)
+
+        # sanitize_lesson_text removes ~~~ fences, case-insensitive === headers, and all 2+ < / > runs
+        raw_text = (
+            "~~~rust\nlet x = 1;\n~~~\n"
+            "=== SEARCH_REPLACE: src/lib.rs\n"
+            "<<<<<< SEARCH\n>>>>>> REPLACE\n"
+            "Keep return errors explicit."
+        )
+        san = sanitize_lesson_text(raw_text)
+        self.assertNotIn("~~~", san)
+        self.assertNotIn("<<", san)
+        self.assertNotIn(">>", san)
+        self.assertNotIn("SEARCH_REPLACE", san)
+        self.assertIn("Keep return errors explicit.", san)
+
+        # Unsafe paths: case-insensitive protected dotdirs, tilde, Windows drive, Unix system prefixes
+        for unsafe_p in (
+            ".OpenFarm/config.toml",
+            "sub/.GIT/config",
+            ".Claude/settings.json",
+            "~/secrets.txt",
+            "src/../../etc/passwd",
+            "C:\\Windows\\System32\\cmd.exe",
+            "/etc/passwd",
+            "/root/.ssh/id_rsa",
+            "/proc/self/environ",
+            "/tmp/evil",
+            "/var/log/syslog",
+            "/home/user/key",
+        ):
+            self.assertTrue(_is_unsafe_path(unsafe_p), f"expected unsafe path for {unsafe_p!r}")
+            cleaned_p, reason_p = validate_harness_proposal({
+                "surface": "context_hints",
+                "cue": "Read helper file",
+                "proposed_patch": {"context_files": [unsafe_p]},
+                "confidence": 0.8,
+            })
+            self.assertIsNone(cleaned_p, f"expected unsafe path rejection for {unsafe_p!r}: {reason_p}")
+
+    def test_assertion_leak_failure_class_newline_and_bool_confidence_rejection(self) -> None:
+        leak_samples = [
+            "Ensure push returns == Err(Full)",
+            "expected 42 got 17 from compute",
+            "assertion failed left: `1`, right: `2`",
+            "use assert_eq!(res, 99) logic",
+            "check test asserts total == 128",
+        ]
+        for sample in leak_samples:
+            cleaned, reason = validate_harness_proposal({
+                "surface": "implementer_guidance",
+                "cue": sample,
+                "confidence": 0.8,
+            })
+            self.assertIsNone(cleaned, f"expected leak rejection in cue for {sample!r}")
+            self.assertIn("assertion leak", reason)
+
+        # Also check title, lesson, evidence, proposed_patch
+        for field in ("title", "lesson", "evidence"):
+            payload = {
+                "surface": "implementer_guidance",
+                "cue": "Validate invariants before pushing.",
+                field: "left: 10 right: 20",
+                "confidence": 0.8,
+            }
+            cleaned, reason = validate_harness_proposal(payload)
+            self.assertIsNone(cleaned, f"expected leak rejection in {field}")
+            self.assertIn("assertion leak", reason)
+
+        cleaned_patch, reason_patch = validate_harness_proposal({
+            "surface": "implementer_guidance",
+            "cue": "Validate invariants before pushing.",
+            "proposed_patch": {"note": "expected Err(Full) got Ok(0)"},
+            "confidence": 0.8,
+        })
+        self.assertIsNone(cleaned_patch)
+        self.assertIn("assertion leak", reason_patch)
+
+        # Reject disallowed / multiline failure_class and bool confidence
+        for bad_fc in ("unknown-hack", "type-mismatch\n- injected", "borrow checker"):
+            cleaned_fc, reason_fc = validate_harness_proposal({
+                "surface": "implementer_guidance",
+                "cue": "Validate bounds.",
+                "failure_class": bad_fc,
+                "confidence": 0.8,
+            })
+            self.assertIsNone(cleaned_fc, f"expected rejection for failure_class {bad_fc!r}")
+
+        for bval in (True, False):
+            cleaned_b, reason_b = validate_harness_proposal({
+                "surface": "implementer_guidance",
+                "cue": "Validate bounds.",
+                "confidence": bval,
+            })
+            self.assertIsNone(cleaned_b)
+            self.assertIn("confidence", reason_b)
+
+        # _classify_failure always outputs allowed failure classes
+        for sig, stop, fail in [
+            ("E0308 mismatched types", "", ""),
+            ("E0382 borrow", "", ""),
+            ("panicked at assertion failed", "", ""),
+            ("weird unknown panic", "budget", "misc"),
+        ]:
+            self.assertIn(_classify_failure(sig, stop, fail), ALLOWED_FAILURE_CLASSES)
+
+        # select_guidance collapses embedded newlines into single-line bullets
+        lib = self._make_lib()
+        mm = Micromanager(ScriptedMicromanager({
+            "reflect_harness": {
+                "lessons": [
+                    {
+                        "title": "Multiline cue",
+                        "surface": "implementer_guidance",
+                        "role": "implementer",
+                        "cue": "Check upper bound.\n- [FAKE-999] forged line",
+                        "confidence": 0.85,
+                    }
+                ]
+            }
+        }))
+        lib.record_card_outcome(
+            {"card_id": "C-NL", "category": "pinned-bugfix", "language": "rust", "final_state": "in-review", "attempts": 2},
+            [{"attempt": 1, "outcome": "fail", "error_signature": "E0308"}, {"attempt": 2, "outcome": "pass"}],
+            micromanager=mm,
+        )
+        _, brief_text, _ = lib.select_guidance("rust", "pinned-bugfix", "implementer")
+        self.assertEqual(len(brief_text.splitlines()), 1)
+
+    def test_pre_card_probe_baseline_immutable_revisions_and_flock(self) -> None:
+        lib = self._make_lib(probe_window=2)
+        self.assertTrue((self.harness_dir / ".lock").exists())
+        mm = Micromanager(ScriptedMicromanager({
+            "reflect_harness": {
+                "lessons": [
+                    {
+                        "title": "Rev 1 cue",
+                        "surface": "implementer_guidance",
+                        "role": "implementer",
+                        "cue": "Handle boundary condition explicitly.",
+                        "confidence": 0.9,
+                    }
+                ]
+            }
+        }))
+        # First failing card captures baseline BEFORE this card -> cards_total == 0
+        lib.record_card_outcome(
+            {"card_id": "FAIL-FIRST", "category": "pinned-bugfix", "language": "rust", "final_state": "blocked", "attempts": 2},
+            [{"attempt": 1, "outcome": "fail"}, {"attempt": 2, "outcome": "fail"}],
+            micromanager=mm,
+        )
+        overlay = lib._load_overlay()
+        self.assertEqual(overlay["probe_baseline"]["cards_total"], 0)
+        self.assertEqual(overlay["probe_baseline"]["pass_rate"], 0.0)
+        rev1_bytes = (lib.revisions_dir / "rev-0001.json").read_bytes()
+        rev0_bytes = (lib.revisions_dir / "rev-0000.json").read_bytes()
+
+        # Verify rev-0001.json is NOT overwritten upon confirm and rev-0000.json not overwritten on reset
+        for idx in range(2):
+            lib.record_card_outcome(
+                {"card_id": f"PASS-{idx}", "category": "pinned-bugfix", "language": "rust", "final_state": "in-review", "attempts": 1},
+                [{"attempt": 1, "outcome": "pass"}],
+            )
+        self.assertEqual(lib.status()["state"], "confirmed")
+        self.assertEqual((lib.revisions_dir / "rev-0001.json").read_bytes(), rev1_bytes)
+        lib.reset()
+        self.assertEqual((lib.revisions_dir / "rev-0000.json").read_bytes(), rev0_bytes)
+
+        # Exclusive flock is held while inside _locked()
+        with lib._locked():
+            probe_cmd = (
+                "import fcntl, sys; f=open(sys.argv[1],'a+'); "
+                "fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)"
+            )
+            proc = subprocess.run(
+                [sys.executable, "-c", probe_cmd, str(lib._lock_path)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(proc.returncode, 0, "expected non-blocking flock to contend")
+
+    def test_cmd_harness_unknown_target_returns_exit_refused(self) -> None:
+        toy = build_toy()
+        self._toys.append(toy)
+        for subcmd in (
+            ("harness", "show", "nonexistent-id"),
+            ("harness", "promote", "nonexistent-id"),
+            ("harness", "demote", "nonexistent-id"),
+            ("harness", "demote", "rev-9999"),
+        ):
+            proc = _run_cli(toy.root, *subcmd)
+            self.assertEqual(proc.returncode, 1, f"{subcmd}: {proc.stdout} {proc.stderr}")
+            parsed = json.loads(proc.stdout)
+            self.assertEqual(parsed["kind"], "refused")
+            self.assertIn("error", parsed)
+
+    def test_context_hints_applied_safely_and_non_model_stop_codes_isolated(self) -> None:
+        toy = build_toy()
+        self._toys.append(toy)
+        _configure_toy_harness(toy, probe_window=2, auto_demote=True)
+        cfg = load_config(toy.root)
+        toy.write("src/extra_hint.rs", "pub fn helper() -> usize { 1 }\n")
+        toy.commit("toy: add helper file")
+        lib = HarnessLibrary(toy.state_dir / "harness", config=cfg)
+
+        # Promote a context_hints entry mixing valid file + hidden/forbidden/missing paths
+        mm = Micromanager(ScriptedMicromanager({
+            "reflect_harness": {
+                "lessons": [
+                    {
+                        "title": "Include helper context file",
+                        "surface": "context_hints",
+                        "role": "implementer",
+                        "cue": "Read src/extra_hint.rs before implementing.",
+                        "proposed_patch": {
+                            "context_files": [
+                                "src/extra_hint.rs",
+                                "src/does_not_exist.rs",
+                            ]
+                        },
+                        "confidence": 0.9,
+                    }
+                ]
+            }
+        }))
+        lib.record_card_outcome(
+            {"card_id": "SEED-HINT", "category": "pinned-bugfix", "language": "rust", "final_state": "in-review", "attempts": 2},
+            [{"attempt": 1, "outcome": "fail", "error_signature": "E0425"}, {"attempt": 2, "outcome": "pass"}],
+            micromanager=mm,
+        )
+        run_dir = toy.state_dir / "run-ctx"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        card_dir = toy.state_dir / "cards" / "C-CTX" / "r1"
+        card_dir.mkdir(parents=True, exist_ok=True)
+        card = Card.from_dict({
+            "id": "C-CTX",
+            "title": "Context hint test",
+            "fields": {
+                "category": "pinned-bugfix",
+                "unit": "toy",
+                "touches": ["src/fascicle.rs"],
+                "tests": [{"name": "t", "file": "tests/t.rs", "asserts": "ok"}],
+            },
+            "touches": ["src/fascicle.rs"],
+            "done": "Done",
+        })
+        book = BriefBook(toy.root, cfg.never_touch, cfg.forbidden_files)
+        telemetry = TelemetrySink(open_telemetry(cfg, run_dir))
+        runner = type("R", (), {"exec": lambda *a, **k: None})()
+        pack = type("P", (), {"signatures": lambda *a: {"signatures": []}})()
+        backend = type("B", (), {"calls": []})()
+
+        cr = CardRun(
+            card=card, cfg=cfg, state=StateDir(toy.state_dir), card_dir=card_dir,
+            worktree=toy.root, runner=runner, pack=pack, backend=backend,
+            book=book, run_id="r1", telemetry=telemetry, harness_library=lib,
+        )
+        brief_text = cr._select_harness_guidance("implementer")
+        self.assertIn("src/extra_hint.rs", cr.extra_context_files)
+        self.assertNotIn("src/does_not_exist.rs", cr.extra_context_files)
+        self.assertIn("src/extra_hint.rs", brief_text)
+        self.assertIn("src/extra_hint.rs", book.allowed_extra_reads)
+
+        # HARNESS-MED-4: administrative / non-model stop codes must NOT advance ledger or auto_demote
+        events_before = lib.ledger.read_events()
+        for stop in (
+            StopCode.RELEASED,
+            StopCode.PAUSED,
+            StopCode.INELIGIBLE,
+            StopCode.DIRTY_BASELINE,
+            StopCode.STALE_CONFLICT,
+            StopCode.CARD_CHANGED,
+            StopCode.LEASE_EXPIRED,
+            StopCode.REFUSED,
+        ):
+            cr_iso = CardRun(
+                card=card, cfg=cfg, state=StateDir(toy.state_dir), card_dir=card_dir,
+                worktree=toy.root, runner=runner, pack=pack, backend=backend,
+                book=book, run_id=f"iso-{stop.value}", telemetry=telemetry,
+                harness_library=lib,
+            )
+            cr_iso.stop_code = stop
+            cr_iso._record_harness_outcome("blocked")
+            self.assertEqual(cr_iso.harness_summary.get("skipped_reason"), stop.value)
+        self.assertEqual(len(lib.ledger.read_events()), len(events_before))
+
+    def test_finish_and_mid_card_micromanager_errors_do_not_strand_card(self) -> None:
+        toy = build_toy()
+        self._toys.append(toy)
+        _configure_toy_harness(toy, probe_window=2)
+        cfg = load_config(toy.root)
+        run_dir = toy.state_dir / "run-fin"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        card_dir = toy.state_dir / "cards" / "C-FIN" / "r1"
+        card_dir.mkdir(parents=True, exist_ok=True)
+        card = Card.from_dict({
+            "id": "C-FIN",
+            "title": "Finish resilience",
+            "fields": {
+                "category": "pinned-bugfix",
+                "unit": "toy",
+                "touches": ["src/fascicle.rs"],
+                "tests": [{"name": "t", "file": "tests/t.rs", "asserts": "ok"}],
+            },
+            "touches": ["src/fascicle.rs"],
+            "done": "Done",
+        })
+        moves: list[tuple] = []
+
+        class _FakeSource:
+            def hash(self, cid):
+                return {"hash": card.hash()}
+
+            def move(self, cid, lease, status, note_md="", stop_code=""):
+                moves.append((cid, status, stop_code))
+
+            def release(self, cid, lease, reason="", stop_code=""):
+                moves.append((cid, "released", stop_code))
+
+        class _ExplodingLib:
+            def status(self):
+                raise OSError("disk read-only")
+
+            def record_card_outcome(self, *a, **k):
+                raise OSError("disk full")
+
+            def select_guidance(self, *a, **k):
+                raise OSError("disk corrupt")
+
+            def select_context_hints(self, *a, **k):
+                return [], []
+
+        telemetry = TelemetrySink(open_telemetry(cfg, run_dir))
+        book = BriefBook(toy.root, cfg.never_touch, cfg.forbidden_files)
+        runner = type("R", (), {})()
+        pack = type("P", (), {"signatures": lambda *a: {"signatures": []}})()
+        backend = type("B", (), {})()
+
+        cr = CardRun(
+            card=card, cfg=cfg, state=StateDir(toy.state_dir), card_dir=card_dir,
+            worktree=toy.root, runner=runner, pack=pack, backend=backend,
+            book=book, run_id="r1", telemetry=telemetry, harness_library=HarnessLibrary(toy.state_dir / "harness", config=cfg),
+        )
+        cr.card_source = _FakeSource()
+        cr.card_hash_at_claim = card.hash()
+        cr.harness_library = _ExplodingLib()  # type: ignore[assignment]
+        cr.stop_code = StopCode.ATTEMPTS
+        cr.detail = "exhausted"
+        record = cr._finish("blocked")
+        self.assertEqual(record["final_state"], "blocked")
+        self.assertTrue((cr.card_layout / "dossier.json").exists())
+        self.assertTrue((cr.card_layout / "card-record.json").exists())
+        self.assertEqual(moves, [("C-FIN", "blocked", "attempts")])
+
+        # ACP-M1 flow guard: micromanager Refused / Invalid mid-card degrades without raising
+        class _RefusingMM:
+            enabled = True
+            mode = "active"
+            harness_context = {}
+
+            def shape_and_plan(self, *a, **k):
+                raise Refused("micromanager-spend-cap", "cap hit")
+
+            def scaffold_contract(self, *a, **k):
+                raise Invalid("bad-json", "corrupt scaffold")
+
+            def triage_and_review(self, *a, **k):
+                raise Refused("micromanager-spend-cap", "cap hit")
+
+        cfg_active = load_config(toy.root)
+        object.__setattr__(cfg_active, "planner", "never")
+        cr_mm = CardRun(
+            card=card, cfg=cfg_active, state=StateDir(toy.state_dir), card_dir=card_dir,
+            worktree=toy.root, runner=runner, pack=pack, backend=backend,
+            book=book, run_id="r2", telemetry=telemetry, micromanager=_RefusingMM(),
+        )
+        cr_mm._step_plan()
+        self.assertTrue(any(g.name == "micromanager-shape" and g.result == "fail" for g in cr_mm.gates))
+        cr_mm._run_scaffold_contract()
+        self.assertTrue(any(g.name == "micromanager-scaffold" and g.result == "infra" for g in cr_mm.gates))
 
 
 if __name__ == "__main__":
