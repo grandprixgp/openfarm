@@ -126,9 +126,25 @@ class CardRun:
     # -- helpers --------------------------------------------------------------
 
     def _record_gate(self, gate: GateResult) -> GateResult:
+        """Write one gate's result where the spec puts it: `gates/<attempt>/<gate>`.
+
+        A gate can run on more than one attempt, and the same gate can run twice in
+        one card (the end-of-run scan and the per-attempt scan), so a numbered file
+        inside the attempt folder keeps every result rather than overwriting one.
+        """
         self.gates.append(gate)
-        write_json(self.card_layout / "gates" / f"{len(self.gates):02d}-{gate.name}.json",
-                   gate.as_dict())
+        attempt = max(1, self.attempt)
+        folder = self.card_layout / "gates" / str(attempt)
+        folder.mkdir(parents=True, exist_ok=True)
+        stem = gate.name.replace(":", "-")
+        path = folder / f"{stem}.json"
+        if path.exists():
+            index = 2
+            while (folder / f"{stem}-{index}.json").exists():
+                index += 1
+            path = folder / f"{stem}-{index}.json"
+        gate.detail_path = path
+        write_json(path, gate.as_dict())
         self.log(f"{self.card.id}: {gate.name} {gate.result}"
                  + (f" — {gate.detail}" if gate.detail else ""))
         return gate
@@ -549,6 +565,8 @@ class CardRun:
         out, err = self._output(list_result)
         listing = self.pack.parse_list(out)
         write_json(self.card_layout / "gates" / "named-tests-list.json", listing)
+        # Kept at the top of `gates/` as well, because it is evidence for every
+        # attempt rather than for one.
 
         listed = {t["name"] for t in listing.get("tests", [])}
         if not self.card.test_names:

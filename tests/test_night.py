@@ -174,6 +174,18 @@ class NightTests(unittest.TestCase):
         card_file = self.toy.state_dir / "cards-source" / "cards" / "CARD-SEAM.md"
         self.assertIn('state = "ready"', card_file.read_text())
 
+    def test_check_baseline_does_not_crash_and_reports_the_base(self) -> None:
+        """`check --baseline` builds base and says what the named tests did there."""
+        result = cli(self.toy.root, "check", "CARD-1", "--baseline")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["eligible"])
+        baseline = payload["baseline"]
+        self.assertIn("ok", baseline)
+        # The named test file does not exist on base, so it is not run there. What
+        # matters is that the gate answered and did not crash.
+        self.assertIn("named", baseline)
+
     def test_a_paused_queue_refuses_a_new_run(self) -> None:
         cli(self.toy.root, "pause", "--reason", "a person said so")
         result = cli(self.toy.root, "run", "--cards", "1",

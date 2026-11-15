@@ -119,9 +119,12 @@ def _deps_done(source: FileCardSource, card: Card) -> bool:
 
 
 def _baseline_check(ctx: Context, source: FileCardSource, card: Card) -> dict:
-    """Build base and confirm the named tests fail at runtime."""
-    pack = pack_for(ctx.cfg.languages[0], ctx.cfg.cargo_flags)
-    pack.configure(worktree)
+    """Build base and confirm the named tests fail at runtime.
+
+    The spec's `check --baseline`: "it also builds base and confirms the named tests
+    fail at runtime, through the baseline cache". A compile error is not a runtime
+    failure, so it is reported separately.
+    """
     worktree = ctx.state.root / "checks" / "worktree" / card.id
     git = Git(ctx.repo)
     base = (f"refs/heads/{ctx.cfg.base_branch}"
@@ -130,16 +133,40 @@ def _baseline_check(ctx: Context, source: FileCardSource, card: Card) -> dict:
         git.worktree_remove(worktree)
     git.worktree_add(worktree, base)
     try:
+        pack = pack_for(ctx.cfg.languages[0], ctx.cfg.cargo_flags)
+        pack.configure(worktree)
         runner = ctx.runner(worktree)
         target = ctx.state.check_dir(card.id) / "target"
+        env = ctx.cfg.runner_env.get(card.unit, {})
+        argv = pack.commands("test", unit=card.unit)["argv"]
+        if card.test_names:
+            argv = argv + ["--", *card.test_names]
         result = runner.exec(
-            kind="test", argv=pack.commands("test", unit=card.unit)["argv"],
-            cwd=worktree, target_dir=target, unit=card.unit,
-            env=ctx.cfg.runner_env.get(card.unit, {}))
+            kind="test", argv=argv, cwd=worktree, target_dir=target,
+            unit=card.unit, env=env)
         parsed = pack.parse_tests(result.stdout, result.stderr)
-        return {"ok": not parsed.get("compile_errors"),
-                "compile_errors": parsed.get("compile_errors", []),
-                "class": result.cls}
+
+        if result.cls == "infra" or parsed.get("missing_footers"):
+            return {"ok": False, "class": result.cls,
+                    "error": "the base run did not finish"}
+        if parsed.get("compile_errors"):
+            return {"ok": False, "class": result.cls,
+                    "error": "the frozen tests do not compile on base, so a failure "
+                             "would prove nothing",
+                    "compile_errors": parsed.get("compile_errors", [])}
+
+        statuses = {entry["name"]: entry["status"]
+                    for entry in parsed.get("results", [])}
+        named = {name: statuses.get(name, "not-run") for name in card.test_names}
+        passing = [name for name, status in named.items() if status == "ok"]
+        return {
+            "ok": not passing,
+            "class": result.cls,
+            "named": named,
+            "failed_on_base": [name for name, status in named.items()
+                               if status == "FAILED"],
+            "passing_on_base": passing,
+        }
     finally:
         git.worktree_remove(worktree)
 
