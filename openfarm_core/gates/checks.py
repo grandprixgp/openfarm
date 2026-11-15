@@ -247,7 +247,13 @@ def ignored_or_filtered(parsed: dict, named: list[str]) -> GateResult:
 
 
 def suite_green(parsed: dict, known_failing: list[str]) -> GateResult:
-    """Every failure must be on `known_failing`, by exact name; no footer is infra."""
+    """Every failure must be on `known_failing`, by exact name.
+
+    A missing footer is infra **only when nothing compiled**. A test binary that
+    failed to compile has a compile error and no footer, and that is the model's
+    edit being wrong, not the machine: the card must go back to the implementer with
+    the compiler output, which is the single most useful thing it can be told.
+    """
     known = set(known_failing)
     unexpected: list[str] = []
     known_red: list[str] = []
@@ -260,7 +266,18 @@ def suite_green(parsed: dict, known_failing: list[str]) -> GateResult:
         else:
             unexpected.append(name)
 
+    compile_errors = parsed.get("compile_errors", [])
     missing_footers = parsed.get("missing_footers", [])
+
+    if compile_errors:
+        targets = sorted({_compile_name(entry) for entry in compile_errors})
+        return GateResult(
+            "suite", FAIL,
+            f"the code did not compile ({len(targets)} target(s)): "
+            + ", ".join(targets[:8]),
+            {"compile_errors": compile_errors, "unexpected": unexpected,
+             "known-red": known_red})
+
     if missing_footers:
         return GateResult(
             "suite", INFRA,
@@ -278,6 +295,10 @@ def suite_green(parsed: dict, known_failing: list[str]) -> GateResult:
         detail += f"; {len(known_red)} known red left out"
     return GateResult("suite", PASS, detail,
                       {"known-red": known_red})
+
+
+def _compile_name(entry: dict) -> str:
+    return str(entry.get("target") or entry.get("pkg") or entry.get("binary") or "?")
 
 
 def frozen_check(expected: dict[str, str], actual: dict[str, str]) -> GateResult:

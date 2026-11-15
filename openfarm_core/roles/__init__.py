@@ -53,7 +53,12 @@ class Roles:
         self.calls: list[RoleCall] = []
 
     def _settings(self, role: str):
-        role_model = self.cfg.role_models.get(role)
+        # The config names a `checker`, but the flow calls the two passes by their
+        # own names. Without this the checker would silently run on the implementer's
+        # model and temperature, which is the one thing the spec is explicit about.
+        aliases = {"checker_pass1": "checker", "checker_pass2": "checker"}
+        role_model = self.cfg.role_models.get(
+            aliases.get(role, role))
         if role_model is None:
             role_model = self.cfg.role_models.get("implementer")
         model = role_model.model if role_model else ""

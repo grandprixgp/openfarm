@@ -204,6 +204,12 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
     telemetry = TelemetrySink(JsonlTelemetry(run_dir))
 
     cfg = ctx.cfg
+    handshake = _handshake(ctx, source, args)
+    if handshake["refused"]:
+        ctx.emit({"refused": True, "reason": handshake["reason"],
+                  "adapters": handshake["adapters"]})
+        return EXIT_REFUSED
+
     if cfg.state_dir.exists():
         try:
             (ctx.state.config_lock).write_text(
@@ -235,9 +241,18 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
 
     for card_id in identifiers:
         if ctx.state.kill_requested(cfg.kill_switch):
-            outcomes.append({"card": card_id, "final_state": "blocked",
-                             "stop_code": StopCode.KILLED.value})
+            # Cards in flight were stopped by CardRun itself, which blocks them with
+            # `killed`. A card not yet claimed is simply left alone.
+            outcomes.append({"card": card_id,
+                             "skipped": "the kill switch was set"})
             break
+        # A pause stops new claims, and cards already in flight finish their attempt:
+        # that is the spec's rule, and it is checked here rather than only at entry so
+        # `openfarm pause` means something during a night.
+        if ctx.state.is_paused():
+            outcomes.append({"card": card_id,
+                             "skipped": "the queue was paused"})
+            continue
         # `_deadline` answers in `time.monotonic()`, so it must be compared to the
         # same clock. Comparing it to `time.time()` would skip every card at once.
         if deadline is not None and _time.monotonic() >= deadline:
@@ -407,6 +422,55 @@ def _deadline(args) -> float | None:
             raise UsageError(f"--until: cannot read {text!r} as a time") from exc
         return monotonic_at(target)
     return None
+
+
+def _handshake(ctx: Context, source, args) -> dict:
+    """Ask every adapter `hello`, and refuse to start if one is incompatible.
+
+    The spec is explicit: "A run refuses to start if no version is shared or an op it
+    needs is missing." Doing it here, before any card is claimed, turns version skew
+    into an honest refusal instead of a mid-run adapter failure.
+    """
+    from .protocol import OPTIONAL_OPS, REQUIRED_OPS, check_hello
+
+    names = {}
+    try:
+        hello = source.hello() if hasattr(source, "hello") else {"versions": [1],
+                                                                "ops": []}
+        check_hello(hello, "cards", set(REQUIRED_OPS["cards"]))
+        names["cards"] = hello.get("name", "")
+    except Invalid as exc:
+        return {"refused": True,
+                "reason": f"card source: {exc.message}",
+                "adapters": names}
+
+    runner = ctx.runner(ctx.repo)
+    try:
+        hello = runner.hello()
+        check_hello(hello, "runner", set(REQUIRED_OPS["runner"]))
+        names["runner"] = hello.get("name", "")
+    except Invalid as exc:
+        return {"refused": True,
+                "reason": f"runner: {exc.message}",
+                "adapters": names}
+
+    try:
+        pack = pack_for(ctx.cfg.languages[0], ctx.cfg.cargo_flags)
+        hello = pack.hello()
+        needed = set(REQUIRED_OPS["pack"])
+        offered = set(hello.get("ops") or [])
+        missing = needed - offered
+        if missing:
+            return {"refused": True,
+                    "reason": f"language pack: it does not offer "
+                              f"{', '.join(sorted(missing))}",
+                    "adapters": names}
+        names["pack"] = hello.get("name", "")
+    except Invalid as exc:
+        return {"refused": True, "reason": f"language pack: {exc.message}",
+                "adapters": names}
+
+    return {"refused": False, "reason": "", "adapters": names}
 
 
 def _backend_prices_spend(cfg, script: Path | None) -> bool:

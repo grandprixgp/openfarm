@@ -108,16 +108,23 @@ class CardRun:
         #: One entry per judged attempt: how many named tests passed then.
         self.named_history: list[int] = []
         self.planner_used = False
+        self.plan = None
+        self.step_index = 0
+        self.step_failures = 0
         self.depth = 1
         self.counter_summary = {"written": 0, "dropped_uncompiled": 0,
                                 "passed": 0, "failed": 0}
-        self.mutation_summary = {"killed": 0, "total": 0, "capped": False}
+        self.mutation_summary = {"killed": 0, "survived": 0, "total": 0,
+                                 "capped": False}
         self.known_failing_excluded: list[str] = []
         self.findings_filed: list[str] = []
         self.dossier_path = ""
+        self.dossier_payload: dict | None = None
         self.current_diff = ""
         self.started_at = utc_now()
         self.checker_restatement = None
+        #: Sum of every runner call's own duration, which the pilot measures.
+        self.runner_seconds = 0.0
         self.catch_up_result = ""
         self.unformatted: list[str] = []
         self.existing_tests_changed: list[str] = []
@@ -149,8 +156,50 @@ class CardRun:
                  + (f" — {gate.detail}" if gate.detail else ""))
         return gate
 
+    def _current_step(self) -> dict | None:
+        """The planner step the implementer is on, or None when there is no plan.
+
+        The planner exists to split phase B into sequential steps, each checkpointed
+        by the harness. A step is done when its named tests pass; until then the
+        implementer sees that step alone, which is the point of splitting a card the
+        model would otherwise lose track of.
+        """
+        if self.plan is None or not self.plan.steps:
+            return None
+        if self.step_index >= len(self.plan.steps):
+            return self.plan.steps[-1]
+        return self.plan.steps[self.step_index]
+
+    def _advance_step(self, parsed: dict) -> None:
+        """Move to the next planner step once its tests pass."""
+        if self.plan is None or not self.plan.steps:
+            return
+        step = self._current_step()
+        if not step:
+            return
+        wanted = step.get("tests") or []
+        if wanted and all(_status_of(parsed, name) == "ok" for name in wanted):
+            self.step_index = min(self.step_index + 1, len(self.plan.steps))
+            self.step_failures = 0
+            self.log(f"{self.card.id}: planner step done, now on "
+                     f"{self.step_index + 1} of {len(self.plan.steps)}")
+
+    def _check_kill_switch(self) -> None:
+        """A kill switch stops the card after the call or build in progress.
+
+        The spec: "The live run stops after the model call or build in progress,
+        archives partial work, and moves every card it holds to blocked with stop
+        code `killed`." The check runs between a gate's steps, never inside one, so
+        nothing is torn mid-build.
+        """
+        if self.state.kill_requested(self.cfg.kill_switch):
+            raise GateFailure(
+                StopCode.KILLED,
+                "the kill switch was set while this card was in progress")
+
     def _run(self, kind: str, argv: list[str], counted: str = "model",
              unit: str = "", timeout_s: float | None = None):
+        self._check_kill_switch()
         env = self.cfg.runner_env.get(unit or self.card.unit, {})
         timeout = timeout_s
         if timeout is None:
@@ -160,6 +209,7 @@ class CardRun:
             kind=kind, argv=argv, cwd=self.worktree,
             target_dir=self.target_dir, unit=unit or self.card.unit,
             env=env, timeout_s=timeout)
+        self.runner_seconds += getattr(result, "duration_s", 0.0) or 0.0
         if counted == "model":
             self.budget.note_model_build()
         elif counted == "fixed":
@@ -460,6 +510,8 @@ class CardRun:
             raise GateFailure(StopCode.CANNOT_SPLIT,
                               "the planner could not split without leaving touches")
         self.planner_used = True
+        self.plan = plan
+        self.step_index = 0
         write_json(self.card_layout / "plan.json", plan.as_dict())
 
     # -- step 5: phase A, the test writer ------------------------------------
@@ -479,7 +531,13 @@ class CardRun:
             return
 
         last_failure = ""
-        for attempt in range(1, self.cfg.test_writer_attempts + 1):
+        # Bounded the same way phase B is: a refused answer gives its attempt back,
+        # so the loop is bounded by free sends rather than by the config number.
+        free_sends = self.cfg.test_writer_attempts
+        attempt = 0
+        while free_sends > 0:
+            free_sends -= 1
+            attempt += 1
             # Every test-writer attempt starts from the frozen base, so a refused or
             # partial answer cannot leave an edit behind that the next attempt then
             # gets committed.
@@ -540,6 +598,9 @@ class CardRun:
                         StopCode.REFUSED,
                         "the test writer's answer was refused: "
                         + _report_detail(report))
+                # A refused search block spends no attempt and no build.
+                free_sends += 1
+                self.budget.test_writer_attempts -= 1
                 continue
 
             # Freeze, then commit: an attempt starts from a clean tree, so the
@@ -680,11 +741,13 @@ class CardRun:
             # A retry with no edits to show would leave the model with nothing, so
             # the first attempt's shape is used whenever the tree is clean.
             showing_diff = bool(stashed["diff"])
+            step = self._current_step()
             brief = build_implementer_brief(
                 self.card, self.book, self._frozen_texts(),
                 attempt=attempt_no if showing_diff else 1,
                 diff=stashed["diff"],
-                failure=last_failure, counter_tests=counter_tests)
+                failure=last_failure, counter_tests=counter_tests,
+                step=step)
             write_json(self.card_layout / "briefs" / f"{attempt_no}-implementer.md",
                        {"brief": brief.body})
 
@@ -744,6 +807,14 @@ class CardRun:
             if outcome is None:
                 return
             last_failure = outcome
+            if self.plan is not None:
+                # A step that fails twice is the spec's second `cannot-split`
+                # condition: the split was wrong, and retrying it cannot help.
+                self.step_failures += 1
+                if self.step_failures >= 2:
+                    raise GateFailure(
+                        StopCode.CANNOT_SPLIT,
+                        f"planner step {self.step_index + 1} failed twice")
 
         raise GateFailure(StopCode.ATTEMPTS,
                           f"{self.cfg.implementer_attempts} implementer attempts used")
@@ -863,7 +934,7 @@ class CardRun:
             "diff_hash": diff.get("hash", ""),
             "model_builds": self.budget.model_builds,
             "fixed_builds": self.budget.fixed_builds,
-            "runner_seconds": 0,
+            "runner_seconds": round(self.runner_seconds, 2),
             "gates": [gate.as_dict() for gate in (gates or self.gates)],
             "named_tests_passing": self.named_passing,
             "error_signature": (self.error_signatures[-1]
@@ -944,6 +1015,7 @@ class CardRun:
             all_named = all(_status_of(parsed, name) == "ok"
                             for name in self.card.test_names)
             if all_named:
+                self._advance_step(parsed)
                 self._commit(f"{self.card.id}: make the frozen tests pass")
                 self._record_attempt("implement", "passed-gates", diff=diff,
                                          attempt=attempt_no)
@@ -959,8 +1031,16 @@ class CardRun:
             return detail
 
         self._check_progress()
+        # The model gets the compiler's own words. A summary like "the code did not
+        # compile" is far less useful than the error and its location, and a compile
+        # error is the most common weak-model failure.
+        compile_output = ""
+        if suite.evidence.get("compile_errors"):
+            compile_output = (err or out).strip()
         detail = (suite.detail or "") + (
             " | " + lint_gate.detail if lint_gate.detail else "")
+        if compile_output:
+            detail += "\n\n" + compile_output[-6000:]
         self._record_attempt("fix", "failed-gates", diff=diff,
                                          attempt=attempt_no)
         return detail
@@ -1273,7 +1353,9 @@ class CardRun:
         # is recorded rather than raised, because the run already happened.
         self.budget.mutation_builds += max(1, int(parsed.get("total", 1) or 1))
         self.mutation_summary = {
-            "killed": parsed.get("killed", 0), "total": parsed.get("total", 0),
+            "killed": parsed.get("killed", 0),
+            "survived": parsed.get("survived", 0),
+            "total": parsed.get("total", 0),
             "capped": parsed.get("capped", False) or self.budget.mutation_capped()}
         gate = self._record_gate(mutation_gate(
             parsed, self.cfg.mutation_min_kill_rate, mode, self.card.category))
@@ -1490,22 +1572,35 @@ class CardRun:
                    stop_code=self.stop_code.value if self.stop_code else "")
 
     def _note(self, final_state: str) -> str:
+        """The card's in-review note: the dossier itself, not a path to it.
+
+        The spec: "the dossier goes into the card's in-review note through the card
+        adapter". The reviewing lane works from the card, not from this machine's
+        state folder, so a file path there would be useless to it.
+        """
+        from .dossier import render_markdown
+
         counts = {gate.name: gate.result for gate in self.gates}
-        if final_state == "blocked" or final_state == "released":
+        if final_state in ("blocked", "released"):
             return (f"{self.card.id}: {self.stop_code.value if self.stop_code else 'blocked'}"
                     f" — {self.detail}\n\nGates: {_gate_line(counts)}")
-        return (f"{self.card.id}: in review\n\n"
-                f"{len(self.gates)} gates, all passed. "
-                f"Attempts: {self.budget.implementer_attempts}. "
-                f"Named tests: {self.named_passing}. "
-                f"Builds: {self.budget.model_builds} model, "
-                f"{self.budget.fixed_builds} fixed, "
-                f"{self.budget.mutation_builds} mutation.\n\n"
-                f"Full dossier: {self.dossier_path}")
+
+        header = (f"{self.card.id}: in review\n\n"
+                  f"{len(self.gates)} gates, all passed. "
+                  f"Attempts: {self.budget.implementer_attempts}. "
+                  f"Named tests: {self.named_passing}. "
+                  f"Builds: {self.budget.model_builds} model, "
+                  f"{self.budget.fixed_builds} fixed, "
+                  f"{self.budget.mutation_builds} mutation.\n\n")
+        if self.dossier_payload is None:
+            return header + f"Full dossier: {self.dossier_path}"
+        # The Markdown dossier is one page and is meant to be read here.
+        return header + render_markdown(self.dossier_payload)
 
     def _write_dossier(self, final_state: str) -> None:
         from .dossier import build_dossier, write_dossier
         payload = build_dossier(self, final_state)
+        self.dossier_payload = payload
         md_path, json_path = write_dossier(self.card_layout, payload)
         self.dossier_path = str(md_path)
 
@@ -1532,14 +1627,14 @@ class CardRun:
             "depth": self.depth,
             "planner_used": self.planner_used,
             "builds": self.budget.builds(),
-            "runner_seconds": 0.0,
+            "runner_seconds": round(self.runner_seconds, 2),
             "wall_clock_s": round(self.budget.wall_clock_s, 2),
             "tokens_in": self.budget.tokens_in,
             "tokens_out": self.budget.tokens_out,
             "spend": round(self.budget.spend, 6),
             "files_changed": len(self._changed_since_base()),
-            "lines_added": 0,
-            "lines_removed": 0,
+            "lines_added": line_counts(self.current_diff or "")[0],
+            "lines_removed": line_counts(self.current_diff or "")[1],
             "named_tests": self.card.test_names,
             "known_failing_excluded": self.known_failing_excluded,
             "counter_tests": dict(self.counter_summary),

@@ -64,7 +64,9 @@ def build_dossier(card_run, final_state: str) -> dict:
             "touches_check": touches_check,
             "existing_tests_changed": list(card_run.existing_tests_changed),
             "banned_patterns": len(banned.get("banned", [])),
+            "banned_lines": banned.get("banned", []),
             "flagged_patterns": banned.get("flagged", []),
+            "flagged_lines": banned.get("flagged", []),
             "unformatted": list(card_run.unformatted),
             "catch_up": card_run.catch_up_result,
         },
@@ -201,20 +203,33 @@ def render_markdown(payload: dict) -> str:
         f"- Touches check: {risk['touches_check']}",
         f"- Existing tests changed: "
         + (", ".join(risk["existing_tests_changed"]) or "no"),
-        f"- Banned patterns: {risk['banned_patterns']}; "
-        f"flagged: {len(risk['flagged_patterns'])}",
+        f"- Banned patterns: {risk['banned_patterns']}",
+        f"- Flagged: {len(risk['flagged_patterns'])}",
         f"- Files left unformatted: " + (", ".join(risk["unformatted"]) or "none"),
         f"- Catch-up: {risk['catch_up'] or 'not run'}",
         "",
         "## 2. Gate results",
         "",
-        "| Gate | Result | Attempt | Detail |",
-        "| --- | --- | --- | --- |",
+        "| Gate | Result | Attempt | Detail | Output |",
+        "| --- | --- | --- | --- | --- |",
     ]
     for gate in payload["2_gates"]:
         detail = (gate["detail"] or "").replace("|", "\\|")[:200]
+        output = (gate.get("output") or "").replace("|", "\\|")
         lines.append(f"| {gate['name']} | {gate['result']} | {gate['attempt']} "
-                     f"| {detail} |")
+                     f"| {detail} | {output} |")
+
+    banned = risk.get("banned_lines") or []
+    flagged = risk.get("flagged_lines") or []
+    if banned or flagged:
+        lines += ["", "### Patterns, with their lines", ""]
+        for entry in banned:
+            lines.append(f"- **{entry.get('pattern')}** "
+                         f"{entry.get('file')}:{entry.get('line')} "
+                         f"`{(entry.get('text') or '').strip()[:160]}`")
+        for entry in flagged:
+            lines.append(f"- flagged `{entry.get('pattern')}` "
+                         f"{entry.get('file')}:{entry.get('line')}")
 
     lines += ["", "## 3. Known-failing tests left out", ""]
     excluded = payload["3_known_failing"]["excluded"]
@@ -251,7 +266,8 @@ def render_markdown(payload: dict) -> str:
     lines += ["", "## 7. Mutation and coverage", "",
               f"- Killed {mutation.get('killed', 0)} of {mutation.get('total', 0)}"
               f"{'; hit its cap' if mutation.get('capped') else ''}",
-              f"- Coverage: {'not measured' if 'coverage is off' in payload['8_not_checked'] else 'measured'}"]
+              f"- Survived: {mutation.get('survived', 0)}",
+              "- Coverage: not measured (no coverage gate is implemented)"]
 
     lines += ["", "## 8. Not checked", ""]
     lines += [f"- {item}" for item in payload["8_not_checked"]]

@@ -33,7 +33,25 @@ from ..errors import Infra, Invalid, Refused, Unsupported
 from ..git import Git
 from ..state import utc_after, utc_now
 
-HEADER_RE = re.compile(r"^\+\+\+\s*\n(.*?)\n\+\+\+\s*\n?", re.DOTALL)
+#: The header is a TOML block between two `+++` lines. Delimiters must be alone on
+#: their line, so a note or a dossier's diff containing `+++ b/some/file.rs` is safe.
+#: A note line that is *only* `+++` would still end the header early, and `_write`
+#: refuses a card it cannot read back rather than write one.
+HEADER_RE = re.compile(r"\A\+\+\+[ \t]*\n(.*?)\n\+\+\+[ \t]*(?:\n|\Z)", re.DOTALL)
+
+
+def parse_card_file(text: str) -> tuple[dict, str]:
+    """The TOML header and the Markdown body of a card file."""
+    match = HEADER_RE.match(text)
+    if not match:
+        raise Invalid("no-header", "a card file needs a +++ TOML header")
+    try:
+        header = tomllib.loads(match.group(1))
+    except tomllib.TOMLDecodeError as exc:
+        raise Invalid("bad-header", f"card header is not TOML: {exc}") from exc
+    if not isinstance(header, dict):
+        raise Invalid("bad-header", "card header must be a table")
+    return header, text[match.end():]
 
 #: States a card can be in.
 STATES = ("backlog", "ready", "in_progress", "in_review", "blocked", "done", "dropped")
@@ -76,10 +94,13 @@ def _toml_value(value) -> str:
     if isinstance(value, list):
         return "[" + ", ".join(_toml_value(v) for v in value) + "]"
     text = str(value)
-    # TOML basic strings have no `\n` escape, so text with newlines (a note, a done
-    # text) goes in a multi-line literal string instead.
+    # A note carries the whole Markdown dossier, which contains diffs, quotes and
+    # backslashes. Only a multi-line *basic* string can hold that: it allows escapes,
+    # while a literal string has none and ends at the first `'''`.
     if "\n" in text:
-        return "'''\n" + text.replace("'''", "''\\'") + "'''"
+        escaped = (text.replace("\\", "\\\\").replace('"""', '\\"\\"\\"')
+                   .replace("\t", "\\t").replace("\r", "\\r"))
+        return '"""\n' + escaped + '"""'
     return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
@@ -254,7 +275,19 @@ class FileCardSource:
 
     def _write(self, card_id: str, header: dict, body: str, message: str) -> str:
         path = self._path(card_id)
-        path.write_text(render_card_file(header, body))
+        text = render_card_file(header, body)
+        # Read the card back before committing it. A card whose header does not parse
+        # is unrecoverable through the adapter: every later `read`, `release` and
+        # `move` fails on it, and the only way out is a person editing the branch. A
+        # note carrying a Markdown dossier once did exactly that.
+        try:
+            parse_card_file(text)
+        except Invalid as exc:
+            raise Invalid(
+                "unwritable-card",
+                f"the card {card_id} would not read back ({exc.message}); nothing "
+                f"was written") from exc
+        path.write_text(text)
         git = Git(self.worktree)
         git.commit_all(message)
         return git.head()

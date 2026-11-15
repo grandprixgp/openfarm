@@ -118,7 +118,7 @@ def _default_for(field: str):
     if field == "counter_tests":
         return {"written": 0, "dropped_uncompiled": 0, "passed": 0, "failed": 0}
     if field == "mutation":
-        return {"killed": 0, "total": 0, "capped": False}
+        return {"killed": 0, "survived": 0, "total": 0, "capped": False}
     if field == "planner_used":
         return False
     if field in ("findings_filed", "known_failing_excluded", "named_tests"):

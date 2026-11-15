@@ -290,6 +290,82 @@ class SeamPrefixTests(unittest.TestCase):
                           [f["rule"] for f in result.failures], touch)
 
 
+class CardFileRoundTripTests(unittest.TestCase):
+    """A card the adapter writes must read back, or the card is unrecoverable."""
+
+    def setUp(self) -> None:
+        from openfarm_core.adapters.files import parse_card_file, render_card_file
+        self.render = render_card_file
+        self.parse = parse_card_file
+
+    def _round_trip(self, header: dict) -> dict:
+        text = self.render(header, "the body")
+        parsed, _body = self.parse(text)
+        return parsed
+
+    def test_a_note_with_a_diff_round_trips(self) -> None:
+        """A dossier's diff has `+++ b/path` lines, which must not end the header."""
+        note = "MECH-1: in review\n\n```diff\n--- a/f.rs\n+++ b/f.rs\n-old\n+new\n```\n"
+        parsed = self._round_trip({"id": "C", "note": note})
+        self.assertEqual(parsed["note"], note)
+
+    def test_a_note_with_backslashes_and_quotes_round_trips(self) -> None:
+        note = 'a """quoted""" line\npath C:\\temp\\x\na tab\there\n'
+        parsed = self._round_trip({"id": "C", "note": note})
+        self.assertEqual(parsed["note"], note)
+
+    def test_structured_test_fields_survive(self) -> None:
+        parsed = self._round_trip({
+            "id": "C",
+            "tests": [{"name": "a_b", "file": "tests/a.rs", "asserts": "== 1"}],
+        })
+        self.assertEqual(parsed["tests"][0]["file"], "tests/a.rs")
+        self.assertEqual(parsed["tests"][0]["asserts"], "== 1")
+
+    def test_a_write_that_would_not_read_back_is_refused(self) -> None:
+        """A note line that is only `+++` ends the header, so the write is refused.
+
+        This is not hypothetical: a card's note carries the Markdown dossier, and a
+        card written in a form its own parser cannot read is unrecoverable through
+        the adapter. Nothing is written and the card stays as it was.
+        """
+        from openfarm_core.adapters.files import FileCardSource
+        from openfarm_core.errors import Invalid
+        import subprocess, tempfile
+        from pathlib import Path as P
+
+        root = P(tempfile.mkdtemp())
+        subprocess.run(["git", "init", "-q", "-b", "main", str(root)], check=True)
+        (root / "cards").mkdir()
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t",
+                        "commit", "-q", "--allow-empty", "-m", "one"],
+                       cwd=str(root), check=True)
+        source = FileCardSource(root, "cards", worktree=root)
+
+        with self.assertRaises(Invalid) as caught:
+            source._write("CARD-1", {"id": "CARD-1", "note": "a\n+++\nb"},
+                          "body", "CARD-1: add")
+        self.assertEqual(caught.exception.code, "unwritable-card")
+        self.assertFalse((root / "cards" / "CARD-1.md").exists(),
+                         "nothing may be written")
+
+    def test_a_perfectly_ordinary_card_still_writes(self) -> None:
+        from openfarm_core.adapters.files import FileCardSource
+        import subprocess, tempfile
+        from pathlib import Path as P
+
+        root = P(tempfile.mkdtemp())
+        subprocess.run(["git", "init", "-q", "-b", "main", str(root)], check=True)
+        (root / "cards").mkdir()
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t",
+                        "commit", "-q", "--allow-empty", "-m", "one"],
+                       cwd=str(root), check=True)
+        source = FileCardSource(root, "cards", worktree=root)
+        source._write("CARD-1", {"id": "CARD-1", "state": "ready"},
+                      "A body.", "CARD-1: add")
+        self.assertTrue((root / "cards" / "CARD-1.md").exists())
+
+
 class PreExistingPatternTests(unittest.TestCase):
     """A pattern the file already had is flagged, not blamed on the card."""
 
