@@ -106,21 +106,60 @@ class FileCardSource:
                         "move", "release", "finding", "stale"]}
 
     def prepare(self) -> Path:
-        """Check the cards branch out in its own worktree, creating it if needed."""
+        """Check the cards branch out in its own worktree, creating it if needed.
+
+        When the branch is new, any card files already on the base branch are copied
+        in, so a repository can commit its cards beside its code and let the farm's
+        branch take over from there.
+        """
         if self.worktree is None:
             raise Invalid("no-worktree", "the file card source needs a worktree path")
+        created = False
         if not self.git.branch_exists(self.branch):
             start = (self.base_branch if self.git.ref_exists(
                 f"refs/heads/{self.base_branch}") else "HEAD")
             self.git.create_branch(self.branch, start)
+            created = True
         if not self.worktree.exists():
             self.git.worktree_add(self.worktree, self.branch)
         else:
             checker = Git(self.worktree)
             if checker.current_branch() != self.branch:
-                checker.checkout(self.branch)
+                # A worktree on the wrong branch may be holding an old head of the
+                # cards branch, and git will not move a branch a worktree has out.
+                self.git.worktree_remove(self.worktree)
+                self.git.worktree_add(self.worktree, self.branch)
+            else:
+                # The cards branch may have moved since this worktree was made,
+                # because another lane or a person edits cards. A stale worktree
+                # would show a card as missing, so it is fast-forwarded first.
+                head = checker.head()
+                target = self.git.head(f"refs/heads/{self.branch}")
+                if head != target:
+                    checker.reset_hard(target)
+
         (self.worktree / self.folder).mkdir(parents=True, exist_ok=True)
+        if created:
+            self._seed_from_base()
         return self.worktree
+
+    def _seed_from_base(self) -> None:
+        """Copy card files the base branch already holds onto the cards branch."""
+        if self.worktree is None:
+            return
+        source = self.repo / self.folder
+        if not source.is_dir():
+            return
+        copied = 0
+        for path in sorted(source.glob("*.md")):
+            target = self.worktree / self.folder / path.name
+            if target.exists():
+                continue
+            shutil.copy2(path, target)
+            copied += 1
+        if copied:
+            Git(self.worktree).commit_all(
+                f"openfarm: seed {copied} card(s) from the base branch")
 
     @property
     def cards_dir(self) -> Path:

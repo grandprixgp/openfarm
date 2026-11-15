@@ -177,7 +177,21 @@ class Git:
         self._run(args)
 
     def create_branch(self, name: str, start: str) -> None:
-        self._run(["branch", name, start])
+        """Make or move a branch to `start`.
+
+        `start` is resolved to a commit first, because passing a ref name straight
+        to `git branch` can pick up a different worktree's idea of it. Git refuses
+        to move a branch that a worktree has checked out, so any worktree holding it
+        is removed first rather than leaving the branch silently on an old commit.
+        """
+        commit = self.head(start)
+        result = self._run(["branch", "--force", name, commit], check=False)
+        if result.returncode == 0:
+            return
+        holder = self._worktree_holding(name)
+        if holder is not None:
+            self.worktree_remove(holder)
+            self._run(["branch", "--force", name, commit])
 
     def worktree_add(self, path: Path, ref: str) -> None:
         path = Path(path)
@@ -189,9 +203,23 @@ class Git:
         self._run(["worktree", "prune"], check=False)
 
     def worktree_list(self) -> list[str]:
-        return [line for line in
+        return [line[len("worktree "):] for line in
                 self._run(["worktree", "list", "--porcelain"]).stdout.splitlines()
                 if line.startswith("worktree ")]
+
+    def _worktree_holding(self, branch: str) -> Path | None:
+        """The worktree that has `branch` checked out, if any."""
+        out = self._run(["worktree", "list", "--porcelain"]).stdout
+        current = None
+        for line in out.splitlines():
+            if line.startswith("worktree "):
+                current = line[len("worktree "):]
+            elif line.startswith("branch ") and current:
+                if line[len("branch "):] == f"refs/heads/{branch}":
+                    return Path(current)
+            elif not line.strip():
+                current = None
+        return None
 
     def merge_no_commit(self, ref: str) -> tuple[bool, str]:
         """Trial merge: stops before committing. Never leaves a merge commit."""

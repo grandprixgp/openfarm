@@ -428,6 +428,18 @@ class CardRun:
 
     def _step_phase_a(self) -> None:
         self.phase = "test-writer"
+        if not self.card.test_names and self.card.category == "mechanical":
+            # A mechanical card is a compiler-guided edit: there is no new test to
+            # write, and the existing suite is the judge. Freeze the tests as they
+            # are, so the freeze and revert checks still mean what they say.
+            self._freeze()
+            self.frozen_commit = self._commit(
+                f"{self.card.id}: freeze the existing tests")
+            self._record_gate(GateResult(
+                "test-writer", PASS,
+                "skipped: a mechanical card names no new tests"))
+            return
+
         last_failure = ""
         for attempt in range(1, self.cfg.test_writer_attempts + 1):
             self.budget.take_test_writer_attempt()
@@ -491,6 +503,11 @@ class CardRun:
         write_json(self.card_layout / "gates" / "named-tests-list.json", listing)
 
         listed = {t["name"] for t in listing.get("tests", [])}
+        if not self.card.test_names:
+            self._record_gate(GateResult(
+                "named-tests-exist", PASS,
+                f"skipped: a {self.card.category} card names no new tests"))
+            return
         missing = [name for name in self.card.test_names if name not in listed]
         if missing:
             self._record_gate(GateResult(
@@ -510,6 +527,16 @@ class CardRun:
             self._record_gate(GateResult(
                 "fail-before", PASS,
                 "skipped for test-backfill: the new tests pass on base by design"))
+            return
+
+        if not self.card.test_names:
+            # A mechanical card is judged by the existing suite, which the baseline
+            # and no-test-loss gates already cover. There is nothing new to prove
+            # red, and running the whole suite again here would only spend a build.
+            self._record_gate(GateResult(
+                "fail-before", PASS,
+                f"skipped: a {self.card.category} card names no new tests, so the "
+                f"existing suite is the judge"))
             return
 
         base = self._base_ref()
@@ -749,19 +776,28 @@ class CardRun:
         self.current_diff = full_diff
         added, removed = line_counts(full_diff)
 
-        # pass-after: the named tests, twice, per the spec's flakiness rule.
+        # pass-after: the named tests, twice, per the spec's flakiness rule. A card
+        # that names no tests has nothing to pass here; the suite gate below is its
+        # judge.
         named_ok = True
-        for index in (1, 2):
-            result = self._run(runner_kind("test"),
-                               self.pack.commands("test", unit=unit)["argv"]
-                               + ["--", *self.card.test_names], counted="fixed")
-            out, err = self._output(result)
-            parsed = self.pack.parse_tests(out, err)
-            gate = self._record_gate(ignored_or_filtered(parsed, self.card.test_names))
-            named_ok = named_ok and gate.ok
-            if not gate.ok:
-                raise GateFailure(StopCode.ATTEMPTS,
-                                  f"named tests not passing at the end: {gate.detail}")
+        if self.card.test_names:
+            for index in (1, 2):
+                result = self._run(runner_kind("test"),
+                                   self.pack.commands("test", unit=unit)["argv"]
+                                   + ["--", *self.card.test_names], counted="fixed")
+                out, err = self._output(result)
+                parsed = self.pack.parse_tests(out, err)
+                gate = self._record_gate(
+                    ignored_or_filtered(parsed, self.card.test_names))
+                named_ok = named_ok and gate.ok
+                if not gate.ok:
+                    raise GateFailure(
+                        StopCode.ATTEMPTS,
+                        f"named tests not passing at the end: {gate.detail}")
+        else:
+            self._record_gate(GateResult(
+                "pass-after", PASS,
+                "skipped: the card names no tests, so the suite gate is the judge"))
 
         # Suite and lint, then workspace lint.
         suite_result = self._run(runner_kind("test"),

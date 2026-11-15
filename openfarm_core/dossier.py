@@ -153,6 +153,10 @@ def _not_checked(card_run) -> list[str]:
         out.append("mutation is report-only for this category in the pilot")
     if card_run.cfg.counter_tests == "report":
         out.append("counter-tests are report-only in the first pilot batch")
+    # A language pack may have had to drop something. Say so rather than let a
+    # reader assume the gate ran the way it would elsewhere.
+    for note in getattr(card_run.pack, "notes", []) or []:
+        out.append(note)
     out.append("visual layout and behaviour across crates are not checked by any gate")
     return out
 

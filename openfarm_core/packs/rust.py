@@ -88,6 +88,26 @@ class RustPack(Pack):
     def __init__(self, cargo_flags: list[str] | None = None) -> None:
         #: Always placed on cargo commands, always before the `--` separator.
         self.cargo_flags = list(cargo_flags if cargo_flags is not None else ["--locked"])
+        #: Cleared when the worktree has no lock file, because `--locked` means
+        #: "use the lock as it is" and cargo refuses to make one under it.
+        self.has_lockfile = True
+        self.notes: list[str] = []
+
+    def configure(self, worktree: Path) -> None:
+        """Adapt the flags to this worktree.
+
+        A library often commits no lock file, and Atlas-style repositories always
+        do. Dropping `--locked` where there is no lock is the only honest choice:
+        keeping it would fail every command, and pretending the lock existed would
+        hide that the resolution was free.
+        """
+        lockfile = Path(worktree) / "Cargo.lock"
+        if "--locked" in self.cargo_flags and not lockfile.exists():
+            self.has_lockfile = False
+            self.cargo_flags = [flag for flag in self.cargo_flags if flag != "--locked"]
+            self.notes.append(
+                "Cargo.lock is not committed, so --locked is not passed: the "
+                "dependency resolution is not pinned")
 
     # -- commands -------------------------------------------------------------
 

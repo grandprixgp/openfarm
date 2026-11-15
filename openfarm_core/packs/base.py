@@ -112,10 +112,11 @@ class UnsupportedPack(Pack):
         self._refuse("parse_tests")
 
 
-def pack_for(language: str) -> Pack:
+def pack_for(language: str, cargo_flags: list[str] | None = None) -> Pack:
+    """The pack for a language. `cargo_flags` comes from `[runner] cargo_flags`."""
     if language == "rust":
         from .rust import RustPack
-        return RustPack()
+        return RustPack(cargo_flags)
     if language in ("typescript", "ts", "javascript", "js"):
         raise Invalid(
             "no-typescript-pack",

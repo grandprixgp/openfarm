@@ -188,7 +188,10 @@ class NightBudget:
         self.spend += amount
 
     def exhausted(self) -> str | None:
-        if self.spend >= self.spend_cap:
+        # A zero cap means "do not spend", which a scripted backend satisfies
+        # without being refused outright. It is enforced on the first real spend,
+        # in `note_spend`, not by refusing every card up front.
+        if self.spend_cap > 0 and self.spend >= self.spend_cap:
             return f"night spend {self.spend:.4f} reached its cap of {self.spend_cap:.4f}"
         if self.cards_cap is not None and self.cards_claimed >= self.cards_cap:
             return f"{self.cards_claimed} cards claimed, the run's cap"

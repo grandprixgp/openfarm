@@ -116,7 +116,8 @@ def _deps_done(source: FileCardSource, card: Card) -> bool:
 
 def _baseline_check(ctx: Context, source: FileCardSource, card: Card) -> dict:
     """Build base and confirm the named tests fail at runtime."""
-    pack = pack_for(ctx.cfg.languages[0])
+    pack = pack_for(ctx.cfg.languages[0], ctx.cfg.cargo_flags)
+    pack.configure(worktree)
     worktree = ctx.state.root / "checks" / "worktree" / card.id
     git = Git(ctx.repo)
     base = (f"refs/heads/{ctx.cfg.base_branch}"
@@ -261,7 +262,8 @@ def _run_card(ctx: Context, source: FileCardSource, card_id: str, run_id: str,
     Git(ctx.repo).worktree_add(worktree, base_ref)
 
     card_dir = ctx.state.create_card(card.id, run_id)
-    pack = pack_for(cfg.languages[0])
+    pack = pack_for(cfg.languages[0], cfg.cargo_flags)
+    pack.configure(worktree)
     backend = backend if backend is not None else open_backend(cfg, script)
     runner = ctx.runner(worktree, output_dir=card_dir / "gates" / "output")
     book = BriefBook(worktree, cfg.never_touch, cfg.forbidden_files)

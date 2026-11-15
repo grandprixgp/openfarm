@@ -106,7 +106,8 @@ def check_eligibility(card: Card, cfg, deps_done: bool = True,
         result.fail("reference-required",
                     f"a {card.category} card needs a reference example")
 
-    # 6. Named tests.
+    # 6. Named tests. A mechanical card is a compiler-guided edit, and the existing
+    # suite judging it is the point; every other category must name its tests.
     if card.category != "mechanical" and not card.tests:
         result.fail("named-tests",
                     "the card names no tests, so nothing can judge it")

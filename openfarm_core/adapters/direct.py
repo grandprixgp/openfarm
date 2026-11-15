@@ -24,7 +24,9 @@ PASS = "pass"
 FAIL = "fail"
 INFRA = "infra"
 
-#: Output that means the machine, not the code, went wrong.
+#: Output that means the machine, not the code, went wrong. Every pattern here is
+#: about the machine: a missing toolchain, a full disk, a lost build box. A compile
+#: error is deliberately absent, because that is the model's edit being wrong.
 INFRA_PATTERNS = (
     r"error: could not compile `[^`]+` \(signal",
     r"No space left on device",
@@ -35,17 +37,14 @@ INFRA_PATTERNS = (
     r"Blocking waiting for file lock",
     r"linker command failed",
     r"internal compiler error",
-    r"error\[E0460\]",  # a crate the machine can't find
-    r"couldn't read .*Cargo\.lock",
-    r"the lock file .* needs to be updated",
     r"network failure",
-    r"Timeout",
-    r"timed out",
     r"connection refused",
-    r"Permission denied \(os error 13\)",
     r"Text file busy",
     r"cannot execute binary file",
-    r"No such file or directory \(os error 2\)",
+    r"error: no such command",
+    r"error: could not find `cargo`",
+    r"error: toolchain .* is not installed",
+    r"Permission denied \(os error 13\).*cargo",
 )
 
 
@@ -144,7 +143,11 @@ class DirectRunner:
 
     def classify(self, exit_code: int, stdout: str, stderr: str,
                  kind: str = "") -> str:
-        """pass, fail or infra. Infra wins, because a broken machine looks red."""
+        """pass, fail or infra. Infra wins, because a broken machine looks red.
+
+        A compile error is a code failure, not an infra one: `error[E0449]` says the
+        edit was wrong. Only the machine-shaped failures below are infra.
+        """
         if exit_code == 0:
             return PASS
         combined = f"{stdout}\n{stderr}"
