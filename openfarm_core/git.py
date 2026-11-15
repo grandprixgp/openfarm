@@ -67,6 +67,31 @@ _LEAF_SUBCOMMANDS = frozenset({
 })
 
 
+_FORBIDDEN_CONFIG_PREFIXES = (
+    "alias.",
+    "core.hookspath",
+    "core.sshcommand",
+    "core.fsmonitor",
+    "core.pager",
+)
+
+
+def _check_config_args(args: list[str]) -> None:
+    """Reject global/system/executable-hook git config invocations."""
+    after_double_dash = False
+    for token in args:
+        if token == "--" and not after_double_dash:
+            after_double_dash = True
+            continue
+        if not after_double_dash and token in {"--global", "--system"}:
+            raise GitRefused(f"git config flag {token!r} is refused")
+        if after_double_dash or not token.startswith("-"):
+            low = token.lower()
+            for prefix in _FORBIDDEN_CONFIG_PREFIXES:
+                if low.startswith(prefix):
+                    raise GitRefused(f"git config key {token!r} is refused")
+
+
 def _check_subcommand(args: list[str]) -> str:
     """Check the words git will read as a subcommand, and only those.
 
@@ -80,11 +105,20 @@ def _check_subcommand(args: list[str]) -> str:
     - Skip option values, because a commit message can be any word at all.
     """
     subcommands: list[str] = []
+    subcommand_end = len(args)
     index = 0
     while index < len(args):
         token = args[index]
         if token == "--":
             break
+        if not subcommands:
+            if (token == "-c" or token.startswith("-c")
+                    or token == "--config-env" or token.startswith("--config-env=")
+                    or token == "--exec-path" or token.startswith("--exec-path=")):
+                raise GitRefused(f"git global option {token!r} is refused")
+            if token.startswith("-C") and len(token) > 2:
+                index += 1
+                continue
         if token in _OPTIONS_TAKING_A_VALUE:
             index += 2
             continue
@@ -95,6 +129,7 @@ def _check_subcommand(args: list[str]) -> str:
         index += 1
         # A leaf subcommand's remaining words are its arguments, not subcommands.
         if token in _LEAF_SUBCOMMANDS:
+            subcommand_end = index
             break
 
     if not subcommands:
@@ -106,6 +141,8 @@ def _check_subcommand(args: list[str]) -> str:
                 f"reaches another repository")
     for word in subcommands:
         if word in ALLOWED_SUBCOMMANDS:
+            if word == "config":
+                _check_config_args(args[subcommand_end:])
             return word
     raise GitRefused(f"git {subcommands[0]} is not on openfarm's allowlist")
 

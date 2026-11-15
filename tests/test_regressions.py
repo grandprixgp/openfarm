@@ -6,10 +6,12 @@ noticed. They are the cheapest possible insurance against those bugs coming back
 
 from __future__ import annotations
 
+import json
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from openfarm_core.cards import Card
 from openfarm_core.config import Config
@@ -421,6 +423,240 @@ class PreExistingPatternTests(unittest.TestCase):
                              base_counts=base, head_counts=head)
         self.assertEqual(base, {"src/a.rs": {"production-unwrap": 2}},
                          "the base counts must survive the gate")
+
+
+class V04ReviewFixRegressionTests(unittest.TestCase):
+    """Regressions for M2, M8, M11, M12, H4, H6, L1, L2, and dossier accuracy."""
+
+    def test_git_allowlist_blocks_global_config_flags_and_dangerous_config_keys(self) -> None:
+        from openfarm_core.git import GitRefused, _check_subcommand
+
+        for bad in (
+            ["-c", "user.name=x", "status"],
+            ["-calias.st=!sh", "status"],
+            ["--config-env", "FOO=BAR", "status"],
+            ["--config-env=FOO=BAR", "status"],
+            ["--exec-path", "/tmp", "status"],
+            ["--exec-path=/tmp", "status"],
+            ["config", "--global", "user.name", "x"],
+            ["config", "--system", "user.name", "x"],
+            ["config", "alias.co", "checkout"],
+            ["config", "Core.HooksPath", "/tmp/h"],
+            ["config", "core.sshCommand", "evil"],
+            ["config", "core.fsmonitor", "true"],
+            ["config", "core.pager", "cat"],
+            ["-C/tmp/repo", "push"],
+        ):
+            with self.assertRaises(GitRefused, msg=f"should refuse {bad!r}"):
+                _check_subcommand(bad)
+
+        self.assertEqual(_check_subcommand(["-C/tmp/repo", "status"]), "status")
+        self.assertEqual(_check_subcommand(["config", "user.name"]), "config")
+
+    def test_night_budget_tracks_micromanager_spend(self) -> None:
+        from openfarm_core.budget import NightBudget
+
+        night = NightBudget(1.00)
+        night.note_spend(0.60)
+        self.assertIsNone(night.exhausted())
+        night.note_micromanager(0.45)
+        self.assertAlmostEqual(night.total_spend(), 1.05, places=6)
+        self.assertIsNotNone(night.exhausted())
+
+    def test_roles_vary_seed_unpredictable_and_parse_plan_validations(self) -> None:
+        from openfarm_core.cards import Card
+        from openfarm_core.errors import Invalid
+        from openfarm_core.roles import (Roles, build_implementer_brief,
+                                         build_test_writer_brief, parse_plan,
+                                         wants_planner)
+        from openfarm_core.briefs import BriefBook
+        from openfarm_core.packs.rust import RustPack
+        from types import SimpleNamespace
+        import tempfile, shutil
+
+        cfg = Config({
+            "project": {"name": "t", "state_dir": "/tmp/openfarm-seed-state"},
+            "adapters": {"languages": ["rust"]},
+            "policy": {"categories": ["pinned-bugfix"]},
+            "model": {"implementer": {"model": "m", "temperature": 0.3,
+                                      "vary_seed": True}},
+        }, Path("/tmp/none"))
+
+        class DummyBackend:
+            def complete(self, **kwargs):
+                return SimpleNamespace(content="ok", tokens_in=1, tokens_out=1, cost=0.0)
+
+        seeds_a = [Roles(cfg, DummyBackend(), "C1")._settings("implementer")[2]
+                   for _ in range(4)]
+        seeds_b = [Roles(cfg, DummyBackend(), "C1")._settings("implementer")[2]
+                   for _ in range(4)]
+        self.assertNotEqual(seeds_a, seeds_b)
+        self.assertEqual(
+            Roles(cfg, DummyBackend(), "C1", rng_seed=99)._settings("implementer")[2],
+            Roles(cfg, DummyBackend(), "C1", rng_seed=99)._settings("implementer")[2],
+        )
+
+        card = Card(
+            id="C-1", title="t", state="ready",
+            touches=["src/a.rs", "src/b.rs", "src/c.rs"],
+            fields={
+                "category": "pinned-bugfix",
+                "tests": [
+                    {"name": "t1", "file": "tests/a.rs"},
+                    {"name": "t2", "file": "tests/a.rs"},
+                ],
+                "context_files": ["src/ctx.rs"],
+            },
+        )
+        # JSON step containing the string CANNOT_SPLIT is not treated as CANNOT_SPLIT
+        plan = parse_plan(
+            '{"steps":[{"n":1,"does":"note CANNOT_SPLIT","tests":["t1"],"touches":["src/a.rs"]},'
+            '{"n":2,"does":"second","tests":["t2"]}]}',
+            card=card,
+        )
+        self.assertFalse(plan.cannot_split)
+        self.assertEqual(plan.steps[0]["touches"], ["src/a.rs"])
+
+        with self.assertRaises(Invalid):
+            parse_plan(
+                '{"steps":[{"n":1,"does":"a","tests":["unknown_test"]},'
+                '{"n":2,"does":"b","tests":["t2"]}]}',
+                card=card,
+            )
+        with self.assertRaises(Invalid):
+            parse_plan(
+                '{"steps":[{"n":1,"does":"a","tests":["t1"],"touches":["src/outside.rs"]},'
+                '{"n":2,"does":"b","tests":["t2"]}]}',
+                card=card,
+            )
+
+        self.assertFalse(wants_planner(card, "off"))
+        self.assertTrue(wants_planner(card, "on"))
+        self.assertTrue(wants_planner(card, "auto"))
+
+        tmp = Path(tempfile.mkdtemp(prefix="openfarm-brief-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        (tmp / "src").mkdir()
+        (tmp / "src" / "a.rs").write_text("pub fn a() {}\n")
+        (tmp / "src" / "b.rs").write_text("pub fn b() {}\n")
+        (tmp / "src" / "c.rs").write_text("pub fn c() {}\n")
+        (tmp / "src" / "ctx.rs").write_text("pub fn helper() {}\n")
+        book = BriefBook(tmp, [], [], allowed_extra_reads={"src/ctx.rs"})
+        tw = build_test_writer_brief(card, book, RustPack(), guidance="use strict asserts",
+                                     context_files=["src/ctx.rs"])
+        self.assertIn("use strict asserts", tw.body)
+        self.assertIn("pub fn helper()", tw.body)
+        imp = build_implementer_brief(card, book, {}, guidance="fix guard",
+                                      step_context="Step 1 done",
+                                      context_files=["src/ctx.rs"])
+        self.assertIn("fix guard", imp.body)
+        self.assertIn("Step 1 done", imp.body)
+
+    def test_dossier_uses_gate_attempt_test_maps_and_mutation_required_for(self) -> None:
+        from openfarm_core.cards import Card
+        from openfarm_core.dossier import build_dossier, render_markdown
+        from openfarm_core.gates.checks import GateResult
+        import tempfile, shutil
+
+        tmp = Path(tempfile.mkdtemp(prefix="openfarm-dos-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        g1 = GateResult("suite", "fail", "red")
+        g1.attempt = 1
+        g2 = GateResult("suite", "pass", "green")
+        g2.attempt = 2
+        cfg = Config({
+            "project": {"name": "t", "state_dir": str(tmp / "state")},
+            "adapters": {"languages": ["rust"]},
+            "policy": {"categories": ["pinned-bugfix", "test-backfill"]},
+            "gates": {"mutation": "report", "mutation_required_for": ["test-backfill"]},
+        }, Path("/tmp/none"))
+        card = Card(
+            id="C-DOS", title="t", state="ready",
+            fields={"category": "test-backfill",
+                    "tests": [{"name": "t_one", "file": "tests/a.rs"},
+                              {"name": "t_two", "file": "tests/a.rs"}]},
+        )
+        run = SimpleNamespace(
+            card=card, cfg=cfg, pack=SimpleNamespace(notes=[]),
+            card_layout=tmp, run_id="r1", attempt=2, stop_code=None,
+            gates=[g1, g2],
+            counter_summary={"written": 1, "dropped_uncompiled": 0,
+                             "passed": 0, "failed": 0, "not_run": 1},
+            mutation_summary={"killed": 1, "survived": 0, "total": 1, "capped": False},
+            checker_restatement=None,
+            checker_adjudication={"verdict": "dismiss_false_reject",
+                                  "rationale": "out of scope"},
+            micromanager_summary={"mode": "active", "calls": 2, "spend": 0.05,
+                                  "false_rejects_dismissed": 1,
+                                  "reviewer_brief": "clean fix"},
+            existing_tests_changed=[], unformatted=[], catch_up_result="skipped",
+            known_failing_excluded=[], current_diff="",
+            frozen_hash="abcdef1234567890",
+            failed_on_base_by_test={"t_one": "ok"},
+            head_status_by_test={"t_one": "ok"},
+            budget=SimpleNamespace(implementer_attempts=2, test_writer_attempts=1),
+            planner_used=False,
+        )
+        dos = build_dossier(run, "in-review")
+        self.assertEqual([g["attempt"] for g in dos["2_gates"]], [1, 2])
+        self.assertEqual(dos["4_red_green"][0]["status_at_head"], "pass")
+        self.assertEqual(dos["4_red_green"][1]["status_at_head"], "unknown")
+        self.assertNotIn("mutation is report-only for this category",
+                         dos["8_not_checked"])
+        md = render_markdown(dos)
+        self.assertIn("1 not-run", md)
+        self.assertIn("dismiss_false_reject", md)
+        self.assertIn("clean fix", md)
+
+    def test_cli_normalise_argv_and_json_errors_and_release_order(self) -> None:
+        from openfarm_core.cli import _normalise_argv, cmd_release, main
+        from openfarm_core.errors import Refused, UsageError
+        import io, contextlib, tempfile, shutil
+
+        self.assertEqual(
+            _normalise_argv(["check", "C-1", "--", "--repo", "other"]),
+            ["check", "C-1", "--", "--repo", "other"],
+        )
+        with self.assertRaises(UsageError):
+            _normalise_argv(["status", "--repo"])
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = main(["status", "--repo", "--json"])
+        self.assertEqual(code, 2)
+        err = json.loads(buf.getvalue())
+        self.assertIn("error", err)
+        self.assertEqual(err["kind"], "usage error")
+
+        buf2 = io.StringIO()
+        with contextlib.redirect_stdout(buf2):
+            code2 = main(["--config", "/tmp/does-not-exist-openfarm.toml",
+                          "status", "--json"])
+        self.assertEqual(code2, 2)
+        self.assertEqual(json.loads(buf2.getvalue())["kind"], "config error")
+
+        tmp = Path(tempfile.mkdtemp(prefix="openfarm-rel-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        card_state = tmp / "cards" / "CARD-1" / "run-1"
+        card_state.mkdir(parents=True)
+        (card_state / "note.txt").write_text("keep me")
+
+        class RefuseSource:
+            def prepare(self):
+                pass
+
+            def release(self, card_id, reason="", stop_code=""):
+                raise Refused("cannot-release", "still active")
+
+        fake_ctx = SimpleNamespace(
+            cards=lambda: RefuseSource(),
+            state=SimpleNamespace(cards=tmp / "cards"),
+            emit=lambda payload: None,
+        )
+        rc = cmd_release(fake_ctx, SimpleNamespace(card="CARD-1", reason="test"))
+        self.assertEqual(rc, 1)
+        self.assertTrue((card_state / "note.txt").exists(),
+                        "must not archive state when source.release is refused")
 
 
 if __name__ == "__main__":

@@ -35,16 +35,27 @@ def build_dossier(card_run, final_state: str) -> dict:
 
     gates = [
         {"name": gate.name, "result": gate.result,
-         "attempt": card_run.attempt,
+         "attempt": getattr(gate, "attempt", card_run.attempt),
          "detail": gate.detail,
          "output": str(gate.detail_path or "")}
         for gate in card_run.gates
     ]
 
     counter = dict(card_run.counter_summary)
+    counter.setdefault("not_run", 0)
     mutation = dict(card_run.mutation_summary)
     restatement = (card_run.checker_restatement.as_dict()
                    if card_run.checker_restatement else {})
+    adjudication = dict(getattr(card_run, "checker_adjudication", {}) or {})
+    mm_summary = dict(getattr(card_run, "micromanager_summary", {}) or {})
+    if not mm_summary and getattr(card_run, "micromanager", None) is not None:
+        mm_budget = getattr(card_run.micromanager, "budget", None)
+        if mm_budget is not None and hasattr(mm_budget, "as_dict"):
+            mm_summary = {
+                **mm_budget.as_dict(),
+                "mode": getattr(card_run.micromanager, "mode", "off"),
+                "reviewer_brief": getattr(card_run, "reviewer_brief", ""),
+            }
 
     return {
         "schema_version": 1,
@@ -86,6 +97,8 @@ def build_dossier(card_run, final_state: str) -> dict:
             "restatement": restatement,
             "restatement_mismatch": bool(restatement.get("mismatch")),
             "counter_tests": counter,
+            "checker_adjudication": adjudication,
+            "micromanager": mm_summary,
         },
         "7_mutation": mutation,
         "8_not_checked": _not_checked(card_run),
@@ -125,15 +138,30 @@ def _evidence(card_run, name: str) -> dict:
 
 
 def _red_green(card_run) -> list[dict]:
+    failed_map = getattr(card_run, "failed_on_base_by_test", {}) or {}
+    head_map = getattr(card_run, "head_status_by_test", {}) or {}
     rows = []
     for test in card_run.card.tests:
+        if card_run.card.category == "test-backfill":
+            failed_on_base = "n/a (backfill)"
+        elif test.name in failed_map:
+            status = failed_map[test.name]
+            failed_on_base = "yes" if status == "FAILED" else f"no ({status})"
+        else:
+            failed_on_base = "unknown"
+
+        if test.name in head_map:
+            head_status = head_map[test.name]
+            status_at_head = "pass" if head_status == "ok" else head_status
+        else:
+            status_at_head = "unknown"
+
         rows.append({
             "name": test.name,
             "file": test.file,
             "asserts": test.asserts,
-            "failed_on_base": "yes" if card_run.card.category != "test-backfill" else
-                              "n/a (backfill)",
-            "status_at_head": "pass" if card_run.named_passing else "unknown",
+            "failed_on_base": failed_on_base,
+            "status_at_head": status_at_head,
             "frozen_hash": card_run.frozen_hash,
         })
     return rows
@@ -151,10 +179,15 @@ def _not_checked(card_run) -> list[str]:
     out = ["doc-tests were not run: the suite uses --lib --bins --tests"]
     if card_run.cfg.coverage == "off":
         out.append("coverage is off")
-    if card_run.cfg.mutation == "report":
-        out.append("mutation is report-only for this category in the pilot")
+    required_for = getattr(card_run.cfg, "mutation_required_for",
+                           ("test-backfill",))
+    if card_run.cfg.mutation == "off":
+        out.append("mutation testing is off")
+    elif (card_run.cfg.mutation == "report"
+          and card_run.card.category not in required_for):
+        out.append("mutation is report-only for this category")
     if card_run.cfg.counter_tests == "report":
-        out.append("counter-tests are report-only in the first pilot batch")
+        out.append("counter-tests are report-only")
     # A language pack may have had to drop something. Say so rather than let a
     # reader assume the gate ran the way it would elsewhere.
     for note in getattr(card_run.pack, "notes", []) or []:
@@ -260,7 +293,22 @@ def render_markdown(payload: dict) -> str:
     counters = checker["counter_tests"]
     lines.append(f"- Counter-tests: {counters['written']} written, "
                  f"{counters['dropped_uncompiled']} dropped (did not compile), "
-                 f"{counters['passed']} passed, {counters['failed']} failed")
+                 f"{counters['passed']} passed, {counters['failed']} failed, "
+                 f"{counters.get('not_run', 0)} not-run")
+    adj = checker.get("checker_adjudication") or {}
+    if adj:
+        lines.append(f"- Checker adjudication: {adj.get('verdict', '')} — "
+                     f"{adj.get('rationale', '')[:200]}")
+    mm = checker.get("micromanager") or {}
+    if mm and (mm.get("calls", 0) or mm.get("reviewer_brief")):
+        lines.append(
+            f"- Micromanager: mode={mm.get('mode', 'off')}, "
+            f"calls={mm.get('calls', 0)}, "
+            f"spend={mm.get('spend', 0.0):.4f}, "
+            f"false_rejects_dismissed={mm.get('false_rejects_dismissed', 0)}"
+        )
+        if mm.get("reviewer_brief"):
+            lines.append(f"  > {mm['reviewer_brief'][:400]}")
 
     mutation = payload["7_mutation"]
     lines += ["", "## 7. Mutation and coverage", "",
