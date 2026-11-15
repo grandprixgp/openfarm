@@ -1,81 +1,90 @@
-# openfarm
+# Openfarm (v0.4)
 
-A plain-code orchestrator that runs a cheap, non-frontier coding model on narrowly
-scoped cards and hands back a branch for a frontier lane to review.
+Openfarm is a standalone, fail-closed pipeline that turns eligible work cards in a git repository into verified branches ready for human review. It isolates a lesser code-writing model in a disposable git worktree, enforces strict write boundaries and deterministic verification gates, and pairs the runner with a bounded supervisory micromanager (`claude-acp` over Agent Client Protocol v1, or `off` / `scripted` / `cmd:<argv>`).
 
-Every gate is a command the harness runs and parses. No model ever reports its own
-result. The core holds no project's assumptions: it is one config file per repository
-and five adapters.
+## Core Workflow
 
-Built from `openfarm spec v0.3.md`, which is in this folder and is the authority on
-what the tool is for. `docs/openfarm-internals.md` is about the code.
-**`docs/HANDOFF.md` is the place to start:** what is proven, what is not, and what
-comes next.
+1. **Eligibility & shaping**: Cards are validated against policy, file/unit bounds, and category rules. When enabled, the micromanager shapes ambiguous cards, validates `context_files`, and proposes step plans (`plan.steps`) or `todo!()` / `unimplemented!()` type-contract scaffolds (`scaffold_contracts`).
+2. **Test-first Phase A (and fail-before loop)**: Within `test_writer_attempts`, a `test_writer` role writes or updates tests inside `test_edits` against frozen `touches` (and optional `scaffold_commit`). Tests must fail on the pre-implementation tree before implementation begins.
+3. **Frozen-test Phase B (checkpointed)**: `tests` and `test_edits` are frozen read-only while an `implementer` role edits `touches` (optionally step-by-step across `plan.steps` checkpoints, with `coach` assistance if stalled). Every edit batch runs through the language pack formatter, unit tests, lints, `revert-check` against `base + frozen-tests`, and optional `mutation` / `coverage` / `extra` gates.
+4. **Adversarial & supervisory review**: Independent `checker` runs generate counter-tests (`--test <stem>`) and structured findings (`findings_per_card`). When counter-tests fail or review finishes, `adjudicate_checker` and `triage_and_review` classify bounce-backs, stale conflicts, or `pre_review` status (`supervisor-reject` if unshippable).
+5. **Dossier & human landing**: Every card writes a self-contained dossier (card, plan, diffs, gate logs, checker findings, micromanager transcripts/verdicts, and cost breakdown) under `state_dir`. Branches are never pushed or auto-merged without human review.
 
-## Run it
+## Six Adapters
 
-Python 3.11 or later, standard library only. No install.
+Openfarm dispatches six protocol-versioned (`PROTOCOL_VERSION = 1`) adapter interfaces configured in `.openfarm/config.toml`:
 
-```
-./openfarm --repo /path/to/repo check CARD-1 --json   # 0 eligible, 1 ineligible
-./openfarm --repo /path/to/repo run --cards 3         # a night
-./openfarm --repo /path/to/repo status --json
-./openfarm --repo /path/to/repo dossier CARD-1
-```
+| Adapter | Config key | Built-in options | External option |
+| --- | --- | --- | --- |
+| Card source | `[adapters] cards` | `files:<dir>` (default `files:cards/`) | `cmd:<argv>` |
+| Build/test runner | `[adapters] runner` | `direct` | `cmd:<argv>` |
+| Language pack | `[adapters] languages` / `pack` | `rust` (`typescript` unimplemented: `Invalid("no-typescript-pack")`) | `cmd:<argv>` |
+| Model backend | `[adapters] model` | `openai-compatible`, `scripted` | `cmd:<argv>` |
+| Telemetry sink | `[adapters] telemetry` | `jsonl` | `cmd:<argv>` |
+| Micromanager | `[adapters] micromanager` | `off`, `claude-acp`, `scripted` | `cmd:<argv>` |
 
-`openfarm --help` lists all ten commands. Exit codes are the same everywhere: `0`
-done, `1` refused, `2` usage or config, `3` trouble.
+External `cmd:<argv>` adapters communicate via newline-delimited JSON over stdio (`op`, `protocol_version`, `ok`, `error`).
 
-## Configure it
+## Card Diet & Categories
 
-One file, `.openfarm/config.toml`, on the repository's base branch. The spec's
-Config section is the reference; `~/projects/openfarm-second/.openfarm/config.toml`
-is a worked example for a real crate.
+Eligible cards declare one of nine categories under `[policy] categories`:
+- **Original lesser-model diet**: `test-backfill`, `mechanical`, `pattern`, `pinned-bugfix`, `small-feature`
+- **Expanded v0.4 diet**: `feature`, `refactor`, `integration`, `port`
 
-A repository supplies at most:
+Core card metadata fields (`category`, `reference`, `tests`, `test_edits`, `frontier_estimate`, `new_symbols`) may be written as `Key: value` lines or inside fenced ` ```openfarm ` / ` ```toml ` blocks (`[cards] fields_block = "toml"`). Optional v0.4 fields:
+- `unit`: explicit package/crate unit when not auto-derived
+- `context_files`: read-only files outside `touches` shown to the model (bounded by `[eligibility] max_context_files`)
+- `type_changes`: boolean enabling cross-file type edits/signatures (gated by `[eligibility] allow_type_changes`)
 
-- a **card source** — the default is card files under `cards/`, with state kept on a
-  branch of its own so concurrent cards can't conflict;
-- a **runner** — the default runs `cargo` or `npm` directly;
-- a **language pack** — Rust ships; TypeScript does not yet;
-- a **model backend** — any OpenAI-compatible endpoint, with an allowlist and a key
-  read from a file outside the repository;
-- a **telemetry sink** — JSONL by default.
+Multi-file `new_symbols` declarations are allowed when `type_changes = true` or `[micromanager] scaffold_contracts = true`.
 
-Anything odd about a repository goes through three hooks, never into the core:
-`[[gates.extra]]`, `[runner.env]`, and `brief.test_conventions`.
+## CLI Commands (11 Subcommands)
 
-## What it will not do
+Run `python3 -m openfarm_core.cli --help` (or `openfarm` when installed):
 
-- **Merge, rebase or push.** The core has no code path that runs `git push`, and a
-  test checks a bare remote stays empty after a full run.
-- **Design or decompose work.** Cards come in fully specified and must pass
-  eligibility before any model call.
-- **Touch a seam.** Never-touch is file globs, checked against the card's touches and
-  against every attempt's diff.
-- **Run a model with tools or a shell.** Models return edits; the harness applies
-  only those inside the allowed paths, and runs every command itself.
-- **Let a model report a gate result.** Every gate is code.
+| Command | Purpose |
+| --- | --- |
+| `openfarm run [--script <path>] [--mm-script <path>] [--dry-run]` | Run the card queue once (or with scripted model/micromanager harnesses) |
+| `openfarm status` | Show card states, queue counts, spend, and circuit-breaker status |
+| `openfarm pause` / `openfarm resume` | Pause or resume queue scheduling without touching active leases |
+| `openfarm stop` | Trigger the emergency `kill_switch` (`<state_dir>/STOP`) |
+| `openfarm release <card_id>` | Release a blocked/paused card back to eligible state |
+| `openfarm dossier <card_id>` | Print or inspect the card dossier and artifacts |
+| `openfarm check <card_id>` | Run eligibility checks on a single card without running models |
+| `openfarm verdict <card_id> <approve\|reject>` | Record human verdict on a `ready` card |
+| `openfarm escape <card_id>` | Mark an escaped defect for post-mortem tracking |
+| `openfarm supervise (--triage-blocked \| --prepare-queue \| --card <id>) [--apply] [--mm-script <path>]` | Run micromanager triage, queue preparation, or single-card shaping (`--apply` writes card updates or release decisions) |
 
-## Test it
+Exit codes: `0` success/eligible, `1` refused/ineligible, `2` usage or configuration error, `3` infrastructure/trouble error.
 
-```
-python3 -m unittest discover -s tests -t . -p 'test_*.py'            # fast
-OPENFARM_E2E=1 python3 -m unittest discover -s tests -t . -p 'test_*.py'
-```
+## Configuration (`.openfarm/config.toml`)
 
-The end-to-end suite builds a real toy repository with real git and a real cargo
-crate, and plays each gaming trick against the gates: a test that asserts nothing, a
-test that never compiled, a frozen test rewritten, an ignored test, a production
-`.unwrap()`, a leftover stub, an edit outside touches, and more.
+Twelve strict TOML tables are recognized (unknown tables or keys fail closed with `ConfigError`):
+`[project]`, `[adapters]`, `[model]`, `[policy]`, `[eligibility]`, `[brief]`, `[runner]`, `[budget]`, `[gates]`, `[cards]`, `[micromanager]`, `[state]`.
 
-## Status
+Key v0.4 settings include:
+- `[adapters]`: `micromanager`, `telemetry`, `pack`
+- `[eligibility]`: `allow_type_changes` (default `true`), `max_context_files` (default `8`)
+- `[gates]`: `planner` (`"off"` | `"auto"` | `"on"`, default `"auto"`), `mutation_required_for` (default `["test-backfill"]`)
+- `[cards]`: `fields_block` (`""` | `"toml"`), `required_fields`
+- `[state]`: `min_free_mb` (default `256`)
+- `[micromanager]`: `mode` (`"off"` | `"advisory"` | `"active"`), `binary` (`"claude-agent-acp"`), `args`, `model`, `effort`, `tool_policy` (`"none"` | `"read-only"`), `timeout_s`/`timeout`, `max_calls_per_card`, `tokens_per_card`, `spend_per_night`, `cost_per_1k_in`, `cost_per_1k_out`, `auth_file`, `isolate_home`, `shape_cards`, `scaffold_contracts`, `coach_on_stall`, `adjudicate_counter_tests`, `pre_review`
 
-The core and adapters, with the Rust pack, running cards to `in-review` on a real toy
-repository and on a real public crate (`dtolnay/anyhow`), whose branch passes
-`clippy -D warnings` when checked by hand.
+## Security & Trust Boundaries
 
-**Unproven:** no real model has run through it (every gate is proven against scripted
-answers), mutation testing is not installed on this machine, cards run one at a time,
-and spend caps need prices in the config to mean anything. `docs/openfarm-internals.md`
-lists the rest, with the tests that back each claim.
+- **Fail-closed ACP client (`openfarm_core/adapters/acp.py`)**: Advertises `clientCapabilities: {}`; rejects `fs/write_text_file` and `terminal/*` RPC calls (`-32601`); `session/request_permission` denies all writes/executions and restricts read-only tools strictly inside the card worktree excluding `never_touch` and `forbidden_files`.
+- **Credential & environment isolation**: `isolate_home = true` runs the ACP subprocess under an isolated `$HOME` with optional `[micromanager] auth_file`. The OpenAI-compatible `[model] key_file` is never passed to the ACP subprocess.
+- **Prompt & output hygiene**: Untrusted repo files and test output are fenced and stripped of ANSI/OSC control sequences (`strip_control_sequences`). Production `scaffold_contract` `fn` stubs require `todo!()` or `unimplemented!()`. The micromanager can block (`supervisor-reject`) or annotate, but never waives deterministic gates.
+
+## Verification & Untested Boundaries
+
+The core Python implementation and deterministic test harnesses (`tests/test_project_config.py`, `tests/test_protocol.py`, `tests/test_acp_micromanager.py`, `tests/test_core_io_v04.py`, `tests/test_pack_gates_v04.py`, `tests/acp_stand_in.py`) verify config validation, protocol dispatch, ACP JSON-RPC security boundaries, git/worktree safety, Cargo diagnostics, and gate checks locally.
+
+The following integrations are **untested** against live external binaries/services in this repository:
+- **Live `claude-agent-acp` binary with real Anthropic credentials**: verified only against `tests/acp_stand_in.py` over real stdio NDJSON-RPC pipes; live `claude-agent-acp` execution is **untested**.
+- **Live hosted ZDR OpenAI-compatible model endpoints**: verified against local HTTP test servers and `ScriptedBackend`; live hosted endpoints are **untested**.
+- **Live `cargo-mutants` binary runs**: output parsing and mutation gates are tested with synthetic outputs; live `cargo-mutants` execution is **untested**.
+- **TypeScript language pack**: explicitly unimplemented (`Invalid("no-typescript-pack")`).
+- **External `cmd:` adapters in production**: verified via subprocess test harnesses; real external `cmd:` binaries beyond test harnesses are **untested**.
+
+See [docs/openfarm-internals.md](file:///docs/openfarm-internals.md) for module architecture and [docs/HANDOFF.md](file:///docs/HANDOFF.md) for engineering handoff notes.

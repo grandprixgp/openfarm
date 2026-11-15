@@ -1,197 +1,81 @@
-# openfarm internals
+# Openfarm v0.4 Internals
 
-How the core is put together, for whoever works on it next. The specification is
-`openfarm spec v0.3.md` in this folder; this page is about the code.
+Technical reference for `openfarm_core`, its six protocol-versioned adapters, configuration schema, execution flow, security boundaries, and gate hardening.
 
-## What this is
+## Module Layout (`openfarm_core/`)
 
-`openfarm` runs a cheap model on narrowly scoped cards and hands back a branch for a
-frontier lane to review. A plain-code orchestrator drives every step and runs every
-gate itself, so no model ever reports its own result.
+- `config.py`: Strict TOML loader (`KNOWN_TABLES`, `_TABLE_KEYS`) with fail-closed rejection (`ConfigError`) on unknown tables, unknown keys, conflicting keys (e.g. `timeout` vs `timeout_s`), invalid policy/globs, or paths escaping the repo root.
+- `cards.py`: Card parser (`parse_card`), `Card` / `TestRef` models, `CARD_FIELDS` and `OPTIONAL_CARD_FIELDS` (`unit`, `context_files`, `type_changes`), and fenced TOML block extractor (`extract_fenced_fields` supporting ` ```openfarm ` and ` ```toml `).
+- `errors.py`: `StopCode` enum (17 per-card stop codes including `supervisor-reject`, plus `killed`, `released`, `paused`), `RELEASING_CODES`, and typed exception hierarchy (`AdapterError`, `Refused`, `Infra`, `Invalid`, `Unsupported`, `ConfigError`, `UsageError`, `GateFailure`).
+- `protocol.py`: `PROTOCOL_VERSION = 1`, `REQUIRED_OPS` / `OPTIONAL_OPS` for all 6 adapters (`cards`, `runner`, `pack`, `model`, `telemetry`, `micromanager`), and JSON-over-stdio `CmdAdapter` wrappers (`CmdCardSource`, `CmdModelBackend`, `CmdTelemetry`, `CmdPack`). `CmdRunner` lives in `adapters/direct.py` and `CmdMicromanager` lives in `micromanager.py`.
+- `globs.py`: Repo-relative glob normalization, `resolves_within` path-traversal guard, and matchers for `never_touch` / `forbidden_files`.
+- `git.py`: Git worktree lifecycle (`worktree_add`, `worktree_remove`, baseline reset), commit helpers, safe flag/config allowlisting (rejecting arbitrary `-c` / unsafe options), and repo lock coordination.
+- `state.py`: On-disk state under `state_dir` (`cards/<safe_id>/`, `leases/`, `breaker.json`, `STOP`), card ID path sanitization (`_safe_id` preventing path traversal), atomic writes, and disk-space floor enforcement (`[state] min_free_mb`).
+- `budget.py`: Per-card and nightly token/spend/build/wall-clock accounting (`BudgetTracker`), frontier cost ratio checks, and lease TTL checks.
+- `edits.py`: Structured search/replace/create/delete edit parser and atomic multi-file `apply_edits` (rolling back all files in a batch if any edit fails or touches a forbidden path).
+- `briefs.py`: Prompt assembly for `test_writer`, `implementer`, `checker`, and `planner`, incorporating `reference`, `context_files`, rich Rust `signatures()`, `flagged_patterns`, and sanitized failure logs.
+- `roles/__init__.py`: Role dispatch and response parsing for `test_writer`, `implementer`, `checker`, and `planner` (`plan.steps` multi-step output).
+- `micromanager.py`: Supervisory orchestration (`Micromanager`, `NullMicromanager`, `ScriptedMicromanager`, `CmdMicromanager`, `ClaudeAcpMicromanager`, `open_micromanager`) implementing 5 ops: `shape_and_plan`, `scaffold_contract`, `coach`, `adjudicate_checker`, `triage_and_review` (`pre_review`, `triage_blocked`, `prepare_queue`). Enforces `MicromanagerBudget` (`max_calls_per_card`, `tokens_per_card`, `spend_per_night`), strips/blocks edit blocks outside contracts (`_strip_edit_blocks`), validates production `todo!()`/`unimplemented!()` stubs (`_valid_production_scaffold`), and sanitizes paths (`_validate_safe_path`).
+- `adapters/`:
+  - `files.py`: `FileCardSource` reading markdown cards and applying safe card/checkbox updates.
+  - `direct.py`: `DirectRunner` & `CmdRunner` executing build/test subprocesses with safe env scoping (`[runner.env]`) and timeout/signal reporting.
+  - `openai_compat.py`: `OpenAICompatibleBackend` & `ScriptedBackend` with endpoint allowlist validation (`allowed_endpoints`), key-file loading, retry handling for HTTP `429` and `5xx` responses, and token/cost accounting.
+  - `jsonl.py`: `JsonlTelemetry` writing structured JSONL telemetry events.
+  - `acp.py`: `ClaudeAcpAdapter` speaking Agent Client Protocol v1 (NDJSON JSON-RPC 2.0 over stdio) with strict capability denial and read-only path mediation.
+- `packs/`:
+  - `base.py`: `LanguagePack` abstract contract (`unit_for`, `signatures`, `format`, `check`, `test`, `lint`, `mutate`, `coverage`, `parse_counter_tests`, etc.) and `pack_for` factory. TypeScript raises `Invalid("no-typescript-pack")`.
+  - `rust.py`: `RustPack` implementing rich `signatures()` (structs, enums, traits, type aliases, consts, statics, unions, `mod`, `impl` blocks), `cargo fmt`, split stdout/stderr Cargo error & crash signal parsing, `--test <stem>` execution for counter-tests, and `cargo-mutants` output parsing.
+- `gates/`:
+  - `eligibility.py`: `check_eligibility` enforcing 9 `KNOWN_CATEGORIES`, `max_files`, `max_units`, `require_reference`, `context_files` bounds (`max_context_files`), `type_changes` (`allow_type_changes`), multi-file `new_symbols` rules (permitted when `type_changes = true` or `scaffold_contracts = true`), `never_touch`/`forbidden_files` intersections, and card hash checks.
+  - `checks.py`: Deterministic gate helpers including `revert-check` against `base + frozen-tests` (after formatting), mutation kill-rate enforcement (`mutation_required_for`), counter-test bounce-back handling, `workspace_lint`, `baseline_cache`, `catch_up`, `extra` custom gates, and circuit breaker tracking keyed by real card IDs in `breaker.json`.
+- `dossier.py`: Structured per-card artifact and Markdown/JSON dossier writer (including micromanager calls, scaffolds, coaching hints, and verdicts).
+- `flow.py`: End-to-end card scheduler, worktree manager, Phase A fail-before loop, `scaffold_commit`, checkpointed Phase B step execution, checker/adjudicator loop, pre-review, and dossier finalization.
+- `cli.py`: 11-subcommand CLI (`run`, `status`, `pause`, `resume`, `stop`, `release`, `dossier`, `check`, `verdict`, `escape`, `supervise`).
 
-Run it from a repository root with no install:
+## Configuration Schema (12 Tables)
 
-```
-./openfarm --repo /path/to/repo check CARD-1 --json
-./openfarm --repo /path/to/repo run --cards 3
-```
+Exact table/key validation lives in `openfarm_core/config.py` and is verified by `tests/test_project_config.py`:
 
-`openfarm` is a shim that puts its own folder on `sys.path` and calls
-`openfarm_core.cli:main`. Python 3.11 or later, standard library only.
+- `[project]`: `name`, `lane`, `base_branch`, `state_dir`
+- `[adapters]`: `cards`, `runner`, `languages`, `model`, `micromanager`, `telemetry`, `pack`
+- `[model]`: `endpoint`, `allowed_endpoints`, `key_file`, `test_writer`, `implementer`, `checker`, `planner`, `cost_per_1k_in`, `cost_per_1k_out` (`RoleModel`: `model`, `temperature`, `vary_seed`; `checker` defaults `temperature=0.35`, `vary_seed=True`)
+- `[policy]`: `never_touch`, `forbidden_files` (always includes `.openfarm/**`), `known_failing`, `flagged_patterns`, `categories`
+- `[eligibility]`: `max_files` (`6`), `max_units` (`1` or `len(languages)`), `require_reference` (`["pattern", "small-feature"]`), `refuse_touches_prefixes`, `rust_tests_in_separate_files` (`True`), `allow_type_changes` (`True`), `max_context_files` (`8`)
+- `[brief]`: `test_conventions`
+- `[runner]`: `env` (`[runner.env]` per-unit env), `cargo_flags`
+- `[budget]`: `implementer_attempts` (`3`), `test_writer_attempts` (`2`), `model_build_calls_per_card` (`10`), `mutation_build_calls_per_card` (`40`), `tokens_per_card` (`400_000`), `wall_clock_per_card` (`"45m"`), `frontier_cost_ratio`, `spend_per_night` (`20.0`), `concurrent_builds` (`2`), `concurrent_cards` (`3`), `lease_ttl` (`"20m"`), `kill_switch` (`<state_dir>/STOP`)
+- `[gates]`: `revert_check` (`"required"` | `"off"`), `mutation` (`"off"` | `"report"` | `"required"`, default `"report"`), `mutation_required_for` (`["test-backfill"]`), `mutation_min_kill_rate` (`0.8`), `counter_tests` (`"report"` | `"reject"`), `coverage` (`"off"` | `"report"` | `"required"`), `workspace_lint` (`True`), `baseline_cache` (`True`), `catch_up` (`"off"` | `"check"`), `findings_per_card` (`2`), `circuit_breaker` (`3`), `extra` (`name`, `run`, `via`, `paths`, `on_fail`), `planner` (`"off"` | `"auto"` | `"on"`, default `"auto"`)
+- `[cards]`: `fields_block` (`""` | `"toml"`), `required_fields` (`[]`)
+- `[micromanager]`: `mode` (`"off"` | `"advisory"` | `"active"`, default `"active"`), `binary` (`"claude-agent-acp"`), `args`, `model`, `effort` (`"low"` | `"medium"` | `"high"`), `tool_policy` (`"none"` | `"read-only"`), `timeout_s` / `timeout` (`180.0`, mutually exclusive), `max_calls_per_card` (`4`), `tokens_per_card` (`120_000`), `spend_per_night` (`10.0`), `cost_per_1k_in`, `cost_per_1k_out`, `auth_file`, `isolate_home` (`True`), `shape_cards` (`True`), `scaffold_contracts` (`True`), `coach_on_stall` (`True`), `adjudicate_counter_tests` (`True`), `pre_review` (`True`)
+- `[state]`: `min_free_mb` (`256`)
 
-## The one rule the core keeps
+## Key v0.4 Pipeline & Gate Hardening
 
-**No project's assumptions in the core.** A repository is known to openfarm only
-through `.openfarm/config.toml` and the adapters that file names. If a change needs a
-project's name or path in `openfarm_core/`, it belongs in a config hook or an adapter
-instead. The three hooks are `[[gates.extra]]`, `[runner.env]` and
-`brief.test_conventions`.
+1. **ACP Micromanager & Security Isolation (`adapters/acp.py`, `micromanager.py`)**:
+   - `initialize` sends `clientCapabilities: {}` so write (`fs/write_text_file`) and `terminal/*` capabilities are never advertised, and incoming write/terminal JSON-RPC requests return `-32601`.
+   - `session/request_permission` denies write/execute tools and enforces `[micromanager] tool_policy` (`"none"` denies all tools; `"read-only"` permits read-only inspections strictly inside the worktree via `resolves_within`, excluding `never_touch` and `forbidden_files`).
+   - `_sanitised_env` strips sensitive host env vars and, when `isolate_home = true`, points `$HOME` to a scratch directory populated only from `[micromanager] auth_file` when provided. `[model] key_file` is never passed to ACP.
+   - `strip_control_sequences` removes ANSI/OSC escape sequences and fences untrusted test/repo excerpts in prompts.
+   - `scaffold_contract` may emit type stubs only; any production `fn` body must be `todo!()` or `unimplemented!()`.
+   - Modes: `"off"` disables all calls; `"advisory"` logs decisions/recommendations without blocking or writing scaffolds/plans; `"active"` applies shaping/plans/scaffolds and can reject via `supervisor-reject` (`StopCode.SUPERVISOR_REJECT`).
+2. **Phase A Fail-Before Retry Loop & Scaffolds**:
+   - `test_writer` runs inside `test_writer_attempts` until generated tests compile against optional `scaffold_commit` (when `scaffold_contracts = true`) and fail for the right reason on the unimplemented codebase before entering Phase B.
+3. **Checkpointed Phase B Execution**:
+   - When `planner` (`"auto"` / `"on"`) or `shape_and_plan` emits `plan.steps`, Phase B commits intermediate checkpoints per step via atomic `apply_edits` while keeping `tests` and `test_edits` frozen.
+4. **Gate Hardening**:
+   - Formatting runs before `full_diff` capture and before `revert-check`.
+   - `revert-check` compares cleanly against `base + frozen-tests` so frozen test changes do not pass falsely.
+   - Cargo parser consumes split stdout/stderr streams and surfaces crash signals (`SIGSEGV`, `SIGABRT`, etc.).
+   - Counter-tests run with `--test <stem>`, supporting bounce-back (`adjudicate_checker` or Phase A/B feedback) when counter-tests fail.
+   - `breaker.json` keys circuit-breaker strikes by real sanitized card IDs (`_safe_id`).
+   - `[state] min_free_mb` aborts before spawning worktrees on low disk space (`infra`).
+   - `OpenAICompatibleBackend` retries transient HTTP `429` and `5xx` errors with backoff while enforcing `allowed_endpoints`.
 
-## The modules
+## Verification Status
 
-| Module | What it owns |
-| --- | --- |
-| `cli.py` | The ten commands, the shared exit codes, `--json`, and one `Context` per command |
-| `config.py` | Reading and validating `.openfarm/config.toml`; unknown tables are an error |
-| `cards.py` | The `Card` model, its canonical JSON, its hash |
-| `protocol.py` | The adapter envelope, the five adapters' required ops, and the spec's fallbacks |
-| `git.py` | **The only place the core runs git.** A subcommand allowlist that has no `push` |
-| `globs.py` | Never-touch, forbidden and touch matching |
-| `edits.py` | Applying edits; exactly-once search/replace, whole files, additions-only |
-| `briefs.py` | Building briefs; card text fenced as data, never-touch files never loaded |
-| `budget.py` | Model builds, fixed builds, mutation builds, tokens, spend, wall clock |
-| `flow.py` | The per-card flow: nine steps, every gate, every stop code |
-| `dossier.py` | The nine-section dossier, as Markdown and as JSON |
-| `state.py` | The state folder layout, the run lock, pause, the kill switch, the breaker |
-| `roles/` | The four model roles' calls, and parsing what they return |
-| `gates/` | Eligibility, and the gate functions that don't need a worktree |
-| `packs/` | The language pack interface, and the Rust pack |
-| `adapters/` | Card source, runner, model backend, telemetry, and the `cmd:` transport |
-
-## The per-card flow
-
-`flow.CardRun.run()` is the whole card. Nine steps, and each gate is a command the
-harness runs and parses:
-
-1. **Claim and eligibility** — read, hash, and every eligibility rule, before any
-   model call. A rejected card is *released*, because the card was wrong.
-2. **Branch, worktree, target** — one of each per card, so a stale shared build can't
-   pass.
-3. **Baseline green** — the unit suite twice, with fail-fast off. Both must agree,
-   and only then is the result cached.
-4. **Planner** — off by default. It runs when the done text names two groups.
-5. **Phase A, the test writer** — write the named tests, freeze their hashes, commit.
-   The commit matters: an attempt starts from a clean tree.
-6. **Named tests exist, and fail-before is a runtime failure** — a compile error
-   proves nothing, so a card needs `new_symbols` and a stub to prove itself.
-7. **Phase B, the implementer** — per attempt: diff within touches, banned patterns,
-   frozen tests, suite, lint. Any failed gate goes back with only the diff and the
-   failure output.
-8. **The end gates** — pass-after twice, suite, formatting, workspace lint, extra
-   gates, no test loss, revert check, mutation, checker pass 1 and 2.
-9. **Catch-up** — a trial merge in a throwaway worktree, building the merged result,
-   committing nothing.
-
-## Rules worth knowing before you change something
-
-- **Never judge a run by its exit code.** A `known_failing` test still makes cargo
-  exit 101. The Rust pack parses per-test lines plus one footer per test binary, and
-  a binary with no footer means the run died partway.
-- **The model-build cap and the fixed-build cap are separate.** A healthy card needs
-  more than ten builds if the gates count against it. Fixed gates sit outside.
-- **A refused edit spends no attempt and no build.** If you add a refusal path, keep
-  that property, or cards will die on a wrong search block.
-- **`known_failing` matches exact full names**, never substrings, and the config
-  holds it because `.openfarm/**` is forbidden to the farm.
-- **The test writer writes the card's named test files**, even when `touches` doesn't
-  list them. The implementer may not touch a test at all.
-- **A card that names no tests is a `mechanical` card.** Eligibility allows it, the
-  test writer is skipped, and the existing suite is the judge.
-- **Text with newlines cannot go in a TOML basic string.** The card file writer uses
-  a multi-line literal string, because TOML has no `\n` escape.
-
-## Testing
-
-```
-python3 -m unittest discover -s tests -t . -p 'test_*.py'          # fast, no cargo
-OPENFARM_E2E=1 python3 -m unittest discover -s tests -t . -p 'test_*.py'
-```
-
-The fast suite covers config, globs, the card model, the Rust pack's parsing against
-captured cargo output, edits and stubs, eligibility, every gate on synthetic input,
-the protocol and its fallbacks, and the no-push guarantee.
-
-The end-to-end suite builds a real toy repository (`tests/toy.py`) with real git and a
-real cargo crate, and drives cards through it with a scripted model backend. Each
-planted card asserts one gaming trick is caught. Every toy is removed by its case's
-`tearDown`, because each one carries a build target and `/tmp` on the development VM
-is a small tmpfs with a per-user quota.
-
-`tests/test_portability.py` points the core at a second, real public crate
-(`dtolnay/anyhow`, cloned to `~/projects/openfarm-second`) to show nothing about the
-core is toy-shaped. That repository's config and cards live in it, not here.
-
-## What is proven, and what is not
-
-**Proven**, with tests in this repository:
-
-- The per-card flow reaches `in-review` on a real toy repository and on a real public
-  crate (`dtolnay/anyhow`), with the branch carrying exactly the intended edit and the
-  base left alone.
-- Every gaming trick in the matrix is caught: a test that passes on base, a test that
-  never compiled, an ignored test, a frozen test rewritten, a production `.unwrap()`,
-  a leftover stub, an edit outside touches, a non-unique search block, a deleted test.
-- The no-push guarantee: the bare remote is empty after a full run, and the git
-  allowlist refuses `push` in every argv shape.
-- The catch-up trial merge: skipped when the base is still, merged green when it moved
-  harmlessly, blocked on a real conflict, and it commits nothing.
-- The circuit breaker, the kill switch, the pause, one run at a time, a dry run that
-  touches nothing, and an ineligible card released rather than blocked.
-- The adapter protocol, its four error kinds, and the `hash` fallback.
-
-**Not proven:**
-
-- **No real model has run.** Every gate is proven against scripted answers. Whether a
-  cheap model can clear them is the pilot's question.
-- **Mutation is unverified end to end.** The gate and its parser are implemented and
-  tested against a fake tool, but `cargo-mutants` is not installed on this machine and
-  installing it is a system change. On Atlas it must also build through `tools/heavy`.
-- **Concurrency is sequential.** `concurrent_cards` and `concurrent_builds` are parsed
-  and a run records a note that they are inert. The per-card state is isolated enough
-  for a pool; the loop in `cli._do_run` is what would change.
-- **Leases are implemented and dormant.** The file card source keeps and renews a
-  lease; a card source without one falls back to its own stale list.
-- **Spend caps cannot fire without prices.** `[model] cost_per_1k_in` and
-  `cost_per_1k_out` are what make a spend cap mean anything; with both at zero the run
-  record says `spend_measured: false` rather than pretending.
-- **The two diagrams in the spec are missing** from the file, so the flow's step order
-  was reconstructed from the prose in *Per-card flow*, *Roles*, *Gates* and the
-  stop-code table.
-- **The TypeScript pack does not exist.** It comes after the pilot, and `pack_for`
-  refuses it plainly rather than pretending.
-- **Cutting cards is real work.** Four cards were written for the second repository;
-  one was eligible and correct. The other three were a bad premise about the API, an
-  illegal edit to a trait item, and a production `.unwrap()` the file already had. The
-  gates caught all three, which is the system working, but it is the spec's warning
-  that a card is harder to cut than it looks.
-
-## Where the implementation is thinner than the spec
-
-Honest gaps, so nobody assumes these work:
-
-- **Only the runner has an external (`cmd:`) transport.** The card source, model
-  backend, telemetry and language pack have protocol classes and a `hello`, but
-  `Context.cards()` only opens the file card source. A repository whose card tool is
-  an external command needs that wiring, which is the Atlas adapter work (spec step
-  3, out of scope for this build).
-- **`coverage` and `findings_per_card` are read and not acted on.** No coverage gate
-  is implemented, so `coverage = "required"` does nothing, and no finding is ever
-  filed, so the per-card cap has nothing to cap. Both are stated in the dossier's
-  "not checked" section rather than silently ignored.
-- **`check --baseline` does not use the baseline cache yet.** It builds base every
-  time, which is correct but slower than the spec intends.
-- **The circuit breaker records placeholder card ids**, not the three cards' real
-  ids, and a `released` card counts toward its three-in-a-row.
-- **`[[gates.extra]] via` is parsed and every extra gate runs through the runner.**
-  `via = "local"` is accepted and not honoured, which is deliberate here: a plain
-  local shell would bypass the runner's build accounting.
-- **The free-space floor is not checked.** `StateDir.free_bytes` has no caller.
-- **The formatter runs before the revert check**, so a touched test file that
-  `rustfmt` rewrites is reported as a frozen-test change. Formatting excludes a file
-  that was not clean at base, which covers the common case but not this one.
-
-## Adding a language pack
-
-Implement `packs/base.Pack`: the command shapes, `parse_list`, `parse_tests`,
-`classify_paths`, `signatures`, `apply_edit`, `format`, `patterns`, `error_signature`
-and, where the language has them, `append_stub` and mutation. Two properties matter
-more than the rest: `parse_tests` must report a run that died partway, and
-`apply_edit` must refuse a match that isn't unique. Register it in `pack_for`.
-
-## Adding an adapter
-
-An adapter is a small module or an external command speaking JSON on stdin and
-stdout. `protocol.CmdAdapter` is the transport; `protocol.REQUIRED_OPS` says which ops
-each kind must answer, and `protocol.OPTIONAL_OPS` which the spec gives a fallback
-for. A project tool that doesn't speak the protocol is wrapped in a shim, and the
-shim is kept where the farm can't edit it.
+Verified locally on deterministic suites (config schema, protocol v1 dispatch, ACP security & micromanager orchestration via `tests/acp_stand_in.py`, core git/state/edits/retry I/O, and Rust pack/gate logic). Explicitly **untested** against live external targets on this machine:
+- Live `claude-agent-acp` binary with real Anthropic credentials (**untested**).
+- Live hosted ZDR OpenAI-compatible endpoints (**untested**).
+- Live `cargo-mutants` binary runs (**untested**).
+- TypeScript language pack (explicitly unimplemented; raises `Invalid("no-typescript-pack")`).
+- External `cmd:` adapter binaries outside subprocess test harnesses (**untested**).
