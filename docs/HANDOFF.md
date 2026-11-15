@@ -2,6 +2,8 @@
 
 Concise entry point for engineers reviewing, testing, or extending Openfarm v0.4.
 
+For step-by-step operator instructions, 13-table config reference, card authoring rules, and the executable `tallybox` first-deployment runbook, see [docs/USAGE-AND-FIRST-DEPLOYMENT.md](USAGE-AND-FIRST-DEPLOYMENT.md).
+
 ## What Changed in v0.4
 
 1. **Expanded Card Diet & Authoring (`cards.py`, `eligibility.py`, `packs/rust.py`, `edits.py`)**:

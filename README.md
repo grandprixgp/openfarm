@@ -104,4 +104,4 @@ The following integrations are **untested** against live external binaries/servi
 - **TypeScript language pack**: explicitly unimplemented (`Invalid("no-typescript-pack")`).
 - **External `cmd:` adapters in production**: verified via subprocess test harnesses; real external `cmd:` binaries beyond test harnesses are **untested**.
 
-See [docs/openfarm-internals.md](file:///docs/openfarm-internals.md) for module architecture and [docs/HANDOFF.md](file:///docs/HANDOFF.md) for engineering handoff notes.
+See [docs/USAGE-AND-FIRST-DEPLOYMENT.md](docs/USAGE-AND-FIRST-DEPLOYMENT.md) for the user-friendly usage & operations guide and executable first-deployment runbook (`tallybox`), [docs/openfarm-internals.md](file:///docs/openfarm-internals.md) for module architecture, and [docs/HANDOFF.md](file:///docs/HANDOFF.md) for engineering handoff notes.
