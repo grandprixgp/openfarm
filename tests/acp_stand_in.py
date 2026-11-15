@@ -59,7 +59,11 @@ def _send_chunk(session_id: str, text: str, *, as_list: bool = False) -> None:
 
 
 def _send_usage(
-    session_id: str, tokens_in: int, tokens_out: int, cost_amount: float
+    session_id: str,
+    used: int,
+    cost_amount: float,
+    *,
+    size: int = 200_000,
 ) -> None:
     _send(
         {
@@ -69,13 +73,34 @@ def _send_usage(
                 "sessionId": session_id,
                 "update": {
                     "sessionUpdate": "usage_update",
-                    "inputTokens": tokens_in,
-                    "outputTokens": tokens_out,
+                    "used": used,
+                    "size": size,
                     "cost": {"amount": cost_amount, "currency": "USD"},
                 },
             },
         }
     )
+
+
+def _send_prompt_result(
+    req_id: object,
+    *,
+    stop_reason: str = "end_turn",
+    tokens_in: int = 0,
+    tokens_out: int = 0,
+    omit_usage: bool = False,
+    usage_override: object = None,
+) -> None:
+    result: dict = {"stopReason": stop_reason}
+    if not omit_usage:
+        if usage_override is not None:
+            result["usage"] = usage_override
+        else:
+            result["usage"] = {
+                "inputTokens": tokens_in,
+                "outputTokens": tokens_out,
+            }
+    _send({"jsonrpc": "2.0", "id": req_id, "result": result})
 
 
 def _rpc_roundtrip(req: dict) -> dict | None:
@@ -104,6 +129,7 @@ def main() -> int:
             "replay",
             "unterminated-osc",
             "hang",
+            "block-stdin-prompt",
             "oversized",
             "script",
         ),
@@ -130,6 +156,8 @@ def main() -> int:
     replay_rejection_code = None
     last_session_meta: dict = {}
     turn_count = 0
+    session_used_tokens = 0
+    session_cost = 0.0
 
     while True:
         msg = _read_msg()
@@ -171,6 +199,8 @@ def main() -> int:
 
         if method == "session/new":
             last_session_meta = params.get("_meta") or {}
+            session_used_tokens = 0
+            session_cost = 0.0
             _send(
                 {
                     "jsonrpc": "2.0",
@@ -178,10 +208,16 @@ def main() -> int:
                     "result": {"sessionId": "sess-standin-1"},
                 }
             )
+            if args.mode == "block-stdin-prompt":
+                # Stop reading stdin completely so large prompt writes block on pipe.
+                time.sleep(args.hang_seconds)
+                return 0
             continue
 
         if method == "session/load":
             sid = str(params.get("sessionId") or "sess-standin-1")
+            session_used_tokens = 0
+            session_cost = 0.0
             if args.mode == "replay":
                 _send_chunk(sid, "REPLAYED_HISTORY_NOISE")
                 resp = _rpc_roundtrip(
@@ -355,13 +391,14 @@ def main() -> int:
                 mid = max(1, len(payload_text) // 2)
                 _send_chunk(sid, payload_text[:mid], as_list=False)
                 _send_chunk(sid, payload_text[mid:], as_list=True)
-                _send_usage(sid, args.tokens_in, args.tokens_out, args.cost)
-                _send(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": req_id,
-                        "result": {"stopReason": "end_turn"},
-                    }
+                session_used_tokens += args.tokens_in + args.tokens_out
+                session_cost += args.cost
+                _send_usage(sid, session_used_tokens, round(session_cost, 10))
+                _send_prompt_result(
+                    req_id,
+                    stop_reason="end_turn",
+                    tokens_in=args.tokens_in,
+                    tokens_out=args.tokens_out,
                 )
                 continue
 
@@ -403,13 +440,14 @@ def main() -> int:
                     }
                 )
                 _send_chunk(sid, json.dumps({"perm_response": perm_resp}))
-                _send_usage(sid, args.tokens_in, args.tokens_out, args.cost)
-                _send(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": req_id,
-                        "result": {"stopReason": "end_turn"},
-                    }
+                session_used_tokens += args.tokens_in + args.tokens_out
+                session_cost += args.cost
+                _send_usage(sid, session_used_tokens, round(session_cost, 10))
+                _send_prompt_result(
+                    req_id,
+                    stop_reason="end_turn",
+                    tokens_in=args.tokens_in,
+                    tokens_out=args.tokens_out,
                 )
                 continue
 
@@ -429,13 +467,14 @@ def main() -> int:
                     )
                     results[mname] = resp
                 _send_chunk(sid, json.dumps({"fs_responses": results}))
-                _send_usage(sid, args.tokens_in, args.tokens_out, args.cost)
-                _send(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": req_id,
-                        "result": {"stopReason": "end_turn"},
-                    }
+                session_used_tokens += args.tokens_in + args.tokens_out
+                session_cost += args.cost
+                _send_usage(sid, session_used_tokens, round(session_cost, 10))
+                _send_prompt_result(
+                    req_id,
+                    stop_reason="end_turn",
+                    tokens_in=args.tokens_in,
+                    tokens_out=args.tokens_out,
                 )
                 continue
 
@@ -515,13 +554,13 @@ def main() -> int:
                     }
                 )
                 _send_chunk(sid, "\x1b]8;;http://x\x1b[31m" + payload)
-                _send_usage(sid, args.tokens_in, args.tokens_out, 0.0)
-                _send(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": req_id,
-                        "result": {"stopReason": "end_turn"},
-                    }
+                session_used_tokens += args.tokens_in + args.tokens_out
+                _send_usage(sid, session_used_tokens, round(session_cost, 10))
+                _send_prompt_result(
+                    req_id,
+                    stop_reason="end_turn",
+                    tokens_in=args.tokens_in,
+                    tokens_out=args.tokens_out,
                 )
                 continue
 
@@ -556,23 +595,47 @@ def main() -> int:
             if args.mode == "script":
                 turns = script_data.get("turns") or []
                 entry = turns[min(turn_count - 1, len(turns) - 1)] if turns else {}
+                for raw_line in entry.get("raw_lines") or []:
+                    sys.stdout.write(str(raw_line) + "\n")
+                    sys.stdout.flush()
                 for req in entry.get("requests") or []:
                     _rpc_roundtrip(req)
-                for chunk in entry.get("chunks") or [entry.get("text", "{}")]:
-                    _send_chunk(sid, str(chunk))
+                if "chunks" in entry:
+                    for chunk in entry["chunks"]:
+                        _send_chunk(sid, str(chunk))
+                elif "text" in entry:
+                    _send_chunk(sid, str(entry["text"]))
+
                 usage = entry.get("usage") or {}
-                _send_usage(
-                    sid,
-                    int(usage.get("tokens_in", args.tokens_in)),
-                    int(usage.get("tokens_out", args.tokens_out)),
-                    float(usage.get("cost", args.cost)),
-                )
-                _send(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": req_id,
-                        "result": {"stopReason": str(entry.get("stop_reason", "end_turn"))},
-                    }
+                turn_in = int(usage.get("tokens_in", args.tokens_in))
+                turn_out = int(usage.get("tokens_out", args.tokens_out))
+                turn_cost = float(usage.get("cost", args.cost))
+                if "usage_updates" in entry:
+                    for upd in entry["usage_updates"]:
+                        upd_obj = dict(upd)
+                        upd_obj.setdefault("sessionUpdate", "usage_update")
+                        _send(
+                            {
+                                "jsonrpc": "2.0",
+                                "method": "session/update",
+                                "params": {"sessionId": sid, "update": upd_obj},
+                            }
+                        )
+                else:
+                    session_used_tokens += turn_in + turn_out
+                    session_cost += turn_cost
+                    _send_usage(sid, session_used_tokens, round(session_cost, 10))
+
+                if entry.get("eof_before_response"):
+                    return 0
+
+                _send_prompt_result(
+                    req_id,
+                    stop_reason=str(entry.get("stop_reason", "end_turn")),
+                    tokens_in=turn_in,
+                    tokens_out=turn_out,
+                    omit_usage=bool(entry.get("omit_result_usage", False)),
+                    usage_override=entry.get("result_usage"),
                 )
                 continue
 

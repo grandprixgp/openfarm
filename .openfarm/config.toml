@@ -31,6 +31,7 @@ never_touch = [
 ]
 forbidden_files = [
   ".openfarm/**",
+  ".claude/**",
   "tests/toy.py",
   "openfarm spec v0.3.md",
   "openfarm spec v0.4.md",

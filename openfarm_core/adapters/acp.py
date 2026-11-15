@@ -18,12 +18,17 @@ Implements the Agent Client Protocol (ACP) v1 stdio transport for Claude ACP
 
 from __future__ import annotations
 
+import atexit
 import collections
 import dataclasses
+import errno
+import io
 import json
+import math
 import os
 import queue
 import re
+import select
 import shlex
 import shutil
 import signal
@@ -34,7 +39,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from ..errors import Infra, Invalid, Refused
+from ..errors import AdapterError, Infra, Invalid, Refused
 from ..globs import escapes, matches_any, normalise
 
 PROTOCOL_VERSION = 1
@@ -50,6 +55,13 @@ _DISALLOWED_NONE = (
     "NotebookEdit",
     "WebFetch",
     "WebSearch",
+    "Read",
+    "Glob",
+    "Grep",
+    "LS",
+    "Task",
+    "TodoWrite",
+    "NotebookRead",
 )
 _DISALLOWED_READ_ONLY = (
     "Bash",
@@ -57,7 +69,36 @@ _DISALLOWED_READ_ONLY = (
     "Write",
     "MultiEdit",
     "NotebookEdit",
+    "WebFetch",
+    "WebSearch",
+    "Task",
+    "TodoWrite",
+    "NotebookRead",
 )
+
+_ISOLATED_HOMES_LOCK = threading.Lock()
+_ACTIVE_ISOLATED_HOMES: set[Path] = set()
+
+
+def _register_isolated_home(path: Path) -> None:
+    with _ISOLATED_HOMES_LOCK:
+        _ACTIVE_ISOLATED_HOMES.add(path)
+
+
+def _unregister_isolated_home(path: Path) -> None:
+    with _ISOLATED_HOMES_LOCK:
+        _ACTIVE_ISOLATED_HOMES.discard(path)
+
+
+def _cleanup_all_isolated_homes() -> None:
+    with _ISOLATED_HOMES_LOCK:
+        paths = list(_ACTIVE_ISOLATED_HOMES)
+        _ACTIVE_ISOLATED_HOMES.clear()
+    for path in paths:
+        shutil.rmtree(path, ignore_errors=True)
+
+
+atexit.register(_cleanup_all_isolated_homes)
 
 # Control sequence strippers. Order matters: complete sequences first, then
 # lone unclosed prefixes so subsequent printable text is never truncated.
@@ -99,6 +140,8 @@ def _sanitised_env(
     extra_env: dict[str, str] | None = None,
     isolate_home: bool = True,
     auth_file: Path | str | None = None,
+    never_touch: list[str] | tuple[str, ...] = (),
+    forbidden_files: list[str] | tuple[str, ...] = (),
 ) -> tuple[dict[str, str], Path | None]:
     """Build a sanitised subprocess environment and optional isolated HOME dir."""
     source = os.environ if base_env is None else base_env
@@ -120,12 +163,33 @@ def _sanitised_env(
     if isolate_home:
         isolated_home = Path(tempfile.mkdtemp(prefix="openfarm-acp-home-"))
         os.chmod(isolated_home, 0o700)
+        _register_isolated_home(isolated_home)
         try:
             claude_dir = isolated_home / ".claude"
             claude_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
             os.chmod(claude_dir, 0o700)
 
-            settings: dict[str, object] = {"hooks": {}}
+            deny_patterns: list[str] = []
+            for raw_pat in (
+                ".openfarm/**",
+                ".claude/**",
+                *(forbidden_files or ()),
+                *(never_touch or ()),
+            ):
+                norm_pat = normalise(str(raw_pat or ""))
+                if norm_pat and norm_pat not in deny_patterns:
+                    deny_patterns.append(norm_pat)
+            deny_rules = [
+                f"{tool}({pat})"
+                for pat in deny_patterns
+                for tool in ("Read", "Edit", "Write")
+            ]
+
+            settings: dict[str, object] = {
+                "disableAllHooks": True,
+                "hooks": {},
+                "permissions": {"deny": deny_rules},
+            }
             if auth_file is not None:
                 auth_path = Path(auth_file).expanduser().resolve()
                 helper_path = claude_dir / "api-key-helper.sh"
@@ -154,6 +218,7 @@ def _sanitised_env(
             env["HOME"] = str(isolated_home)
         except Exception:
             shutil.rmtree(isolated_home, ignore_errors=True)
+            _unregister_isolated_home(isolated_home)
             raise
 
     return env, isolated_home
@@ -274,13 +339,21 @@ def _extract_paths_from_tool_call(tool_call: dict) -> list[str]:
             if key in _PATH_INPUT_KEYS:
                 continue
             if isinstance(val, str) and (
-                val.startswith("/")
+                "\x00" in val
+                or val.startswith("/")
                 or val.startswith("~")
                 or ".." in val.replace("\\", "/").split("/")
             ):
                 _add(val)
     elif isinstance(raw_input, str) and raw_input.strip():
-        if raw_input.startswith("/") or "/" in raw_input or "\\" in raw_input or ".." in raw_input:
+        if (
+            "\x00" in raw_input
+            or raw_input.startswith("/")
+            or raw_input.startswith("~")
+            or "/" in raw_input
+            or "\\" in raw_input
+            or ".." in raw_input
+        ):
             _add(raw_input)
 
     return paths
@@ -319,8 +392,9 @@ class ClaudeAcpAdapter:
         self.extra_env = dict(env) if env is not None else None
         self.never_touch = list(never_touch or ())
         self.forbidden_files = list(forbidden_files or ())
-        if ".openfarm/**" not in self.forbidden_files:
-            self.forbidden_files.append(".openfarm/**")
+        for default_forbidden in (".openfarm/**", ".claude/**"):
+            if default_forbidden not in self.forbidden_files:
+                self.forbidden_files.append(default_forbidden)
         self.max_line_bytes = int(max_line_bytes)
 
         self._proc: subprocess.Popen[bytes] | None = None
@@ -341,6 +415,8 @@ class ClaudeAcpAdapter:
         self._session_policies: dict[str, str] = {}
         self._seen_request_ids: dict[str, set[tuple[type, object]]] = {}
         self._session_ids: list[str] = []
+        self._session_cost_usd: float = 0.0
+        self.last_usage: AcpUsage = AcpUsage()
 
     def __enter__(self) -> "ClaudeAcpAdapter":
         return self
@@ -381,6 +457,8 @@ class ClaudeAcpAdapter:
             extra_env=self.extra_env,
             isolate_home=self.isolate_home,
             auth_file=self.auth_file,
+            never_touch=self.never_touch,
+            forbidden_files=self.forbidden_files,
         )
         self._isolated_home = isolated_home
         try:
@@ -434,12 +512,12 @@ class ClaudeAcpAdapter:
                 continue
             try:
                 msg = json.loads(line)
-            except ValueError:
+            except (ValueError, RecursionError):
                 self._msg_queue.put(("_bad_json", line))
-                continue
+                break
             if not isinstance(msg, dict):
                 self._msg_queue.put(("_bad_json", line))
-                continue
+                break
             self._msg_queue.put(("_json", msg))
 
     def _read_stderr(self, proc: subprocess.Popen[bytes]) -> None:
@@ -462,7 +540,13 @@ class ClaudeAcpAdapter:
             return ""
         return " | ".join(list(self._stderr_tail)[-10:])[:600]
 
-    def _send_json(self, payload: dict) -> None:
+    def _send_json(
+        self,
+        payload: dict,
+        *,
+        timeout_s: float = 30.0,
+        cancel_check: Callable[[], bool] | None = None,
+    ) -> None:
         proc = self._proc
         if proc is None or proc.stdin is None or proc.poll() is not None:
             raise Infra("acp-not-running", "ACP subprocess is not running")
@@ -472,14 +556,64 @@ class ClaudeAcpAdapter:
             )
             + b"\n"
         )
+        effective_timeout = max(0.0, float(timeout_s))
+        deadline = time.monotonic() + effective_timeout
         with self._write_lock:
+            stdin = proc.stdin
+            if stdin is None:
+                self._terminate_process_group()
+                raise Infra("acp-pipe-closed", "ACP subprocess stdin is closed")
             try:
-                proc.stdin.write(data)
-                proc.stdin.flush()
-            except OSError as exc:
+                fd = stdin.fileno()
+                os.set_blocking(fd, False)
+            except (OSError, ValueError, io.UnsupportedOperation) as exc:
+                self._terminate_process_group()
                 raise Infra(
-                    "acp-pipe-closed", f"failed writing to ACP stdin: {exc}"
+                    "acp-pipe-closed", f"failed preparing ACP stdin: {exc}"
                 ) from exc
+
+            view = memoryview(data)
+            offset = 0
+            total = len(data)
+            while offset < total:
+                if cancel_check is not None and cancel_check():
+                    self._terminate_process_group()
+                    raise Refused("acp-cancelled", "ACP stdin write was cancelled")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self._terminate_process_group()
+                    raise Infra(
+                        "acp-stdin-timeout",
+                        f"ACP stdin write timed out after {effective_timeout:.2f}s "
+                        f"({offset}/{total} bytes written)",
+                    )
+                wait_s = min(_POLL_INTERVAL_S, remaining)
+                try:
+                    _, writable, _ = select.select([], [fd], [], wait_s)
+                except (OSError, ValueError) as exc:
+                    self._terminate_process_group()
+                    raise Infra(
+                        "acp-pipe-closed", f"failed waiting for ACP stdin: {exc}"
+                    ) from exc
+                if not writable:
+                    continue
+                try:
+                    written = os.write(fd, view[offset:])
+                except BlockingIOError:
+                    continue
+                except OSError as exc:
+                    if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                        continue
+                    self._terminate_process_group()
+                    raise Infra(
+                        "acp-pipe-closed", f"failed writing to ACP stdin: {exc}"
+                    ) from exc
+                if written <= 0:
+                    self._terminate_process_group()
+                    raise Infra(
+                        "acp-pipe-closed", "ACP stdin write returned 0 bytes"
+                    )
+                offset += written
 
     def _terminate_process_group(self) -> None:
         proc = self._proc
@@ -533,8 +667,10 @@ class ClaudeAcpAdapter:
 
     def _cleanup_isolated_home(self) -> None:
         if self._isolated_home is not None:
-            shutil.rmtree(self._isolated_home, ignore_errors=True)
+            path = self._isolated_home
             self._isolated_home = None
+            shutil.rmtree(path, ignore_errors=True)
+            _unregister_isolated_home(path)
 
     def close(self) -> None:
         """Close active ACP session, terminate child process, and clean temp HOME."""
@@ -548,9 +684,10 @@ class ClaudeAcpAdapter:
                                 "jsonrpc": "2.0",
                                 "method": "session/close",
                                 "params": {"sessionId": sid},
-                            }
+                            },
+                            timeout_s=1.0,
                         )
-                    except (Infra, OSError):
+                    except (AdapterError, OSError):
                         break
                 if proc.stdin is not None:
                     try:
@@ -565,6 +702,7 @@ class ClaudeAcpAdapter:
         finally:
             self._initialized = False
             self._session_ids.clear()
+            self._session_cost_usd = 0.0
             self._cleanup_isolated_home()
 
     # -- ACP RPC methods ------------------------------------------------------
@@ -605,6 +743,7 @@ class ClaudeAcpAdapter:
                     f"ACP message exceeded {self.max_line_bytes} bytes ({item})",
                 )
             if kind == "_bad_json":
+                self._terminate_process_group()
                 raise Infra("acp-bad-json", f"ACP emitted invalid JSON: {str(item)[:200]}")
 
             msg = item
@@ -622,7 +761,8 @@ class ClaudeAcpAdapter:
                                 "code": -32600,
                                 "message": "Requests rejected during session replay",
                             },
-                        }
+                        },
+                        timeout_s=max(0.05, remaining),
                     )
                 else:
                     self._send_json(
@@ -633,7 +773,8 @@ class ClaudeAcpAdapter:
                                 "code": -32601,
                                 "message": f"Method not found: {msg.get('method')}",
                             },
-                        }
+                        },
+                        timeout_s=max(0.05, remaining),
                     )
                 continue
 
@@ -659,6 +800,7 @@ class ClaudeAcpAdapter:
     def initialize(self, timeout_s: float = 30.0) -> dict:
         self._ensure_started()
         req_id = self._next_id()
+        deadline = time.monotonic() + float(timeout_s)
         self._send_json(
             {
                 "jsonrpc": "2.0",
@@ -668,9 +810,12 @@ class ClaudeAcpAdapter:
                     "protocolVersion": PROTOCOL_VERSION,
                     "clientCapabilities": {},
                 },
-            }
+            },
+            timeout_s=timeout_s,
         )
-        result = self._wait_simple_response(req_id, timeout_s=timeout_s)
+        result = self._wait_simple_response(
+            req_id, timeout_s=max(0.05, deadline - time.monotonic())
+        )
         if result.get("protocolVersion") != PROTOCOL_VERSION:
             raise Invalid(
                 "acp-protocol-version",
@@ -714,6 +859,7 @@ class ClaudeAcpAdapter:
 
         session_cwd = str(Path(cwd) if cwd is not None else self.cwd)
         req_id = self._next_id()
+        deadline = time.monotonic() + float(timeout_s)
         self._send_json(
             {
                 "jsonrpc": "2.0",
@@ -724,12 +870,16 @@ class ClaudeAcpAdapter:
                     "mcpServers": [],
                     "_meta": meta,
                 },
-            }
+            },
+            timeout_s=timeout_s,
         )
-        result = self._wait_simple_response(req_id, timeout_s=timeout_s)
+        result = self._wait_simple_response(
+            req_id, timeout_s=max(0.05, deadline - time.monotonic())
+        )
         session_id = str(result.get("sessionId") or "")
         if not session_id:
             raise Invalid("acp-no-session-id", "session/new returned no sessionId")
+        self._session_cost_usd = 0.0
         self._session_policies[session_id] = tool_policy
         self._seen_request_ids.setdefault(session_id, set())
         if session_id not in self._session_ids:
@@ -753,6 +903,7 @@ class ClaudeAcpAdapter:
 
         session_cwd = str(Path(cwd) if cwd is not None else self.cwd)
         req_id = self._next_id()
+        deadline = time.monotonic() + float(timeout_s)
         self._replaying_history = True
         try:
             self._send_json(
@@ -765,17 +916,19 @@ class ClaudeAcpAdapter:
                         "cwd": session_cwd,
                         "mcpServers": [],
                     },
-                }
+                },
+                timeout_s=timeout_s,
             )
             result = self._wait_simple_response(
                 req_id,
-                timeout_s=timeout_s,
+                timeout_s=max(0.05, deadline - time.monotonic()),
                 reject_requests=True,
                 ignore_updates=True,
             )
         finally:
             self._replaying_history = False
 
+        self._session_cost_usd = 0.0
         self._session_policies[session_id] = tool_policy
         self._seen_request_ids.setdefault(session_id, set())
         if session_id not in self._session_ids:
@@ -796,36 +949,44 @@ class ClaudeAcpAdapter:
     # -- permission & request enforcement -------------------------------------
 
     def _is_path_allowed_readonly(self, raw_path: str) -> tuple[bool, str]:
-        text = str(raw_path).strip()
+        raw_str = str(raw_path)
+        if "\x00" in raw_str:
+            return False, "nul-path"
+        text = raw_str.strip()
         if not text:
             return False, "empty-path"
+        if text.startswith("~"):
+            return False, "tilde-path"
 
-        candidate = Path(text)
-        if not candidate.is_absolute():
-            lexical_norm = normalise(text)
-            if escapes(lexical_norm):
-                return False, "path-escape"
-            if matches_any(lexical_norm, self.forbidden_files):
+        try:
+            candidate = Path(text)
+            if not candidate.is_absolute():
+                lexical_norm = normalise(text)
+                if escapes(lexical_norm):
+                    return False, "path-escape"
+                if matches_any(lexical_norm, self.forbidden_files):
+                    return False, "forbidden-file"
+                if matches_any(lexical_norm, self.never_touch):
+                    return False, "never-touch"
+                resolved = (self.allowed_root / lexical_norm).resolve()
+            else:
+                resolved = candidate.resolve()
+
+            root = self.allowed_root.resolve()
+            if resolved != root and root not in resolved.parents:
+                return False, "outside-allowed-root"
+
+            rel = (
+                "."
+                if resolved == root
+                else resolved.relative_to(root).as_posix()
+            )
+            if matches_any(rel, self.forbidden_files):
                 return False, "forbidden-file"
-            if matches_any(lexical_norm, self.never_touch):
+            if matches_any(rel, self.never_touch):
                 return False, "never-touch"
-            resolved = (self.allowed_root / lexical_norm).resolve()
-        else:
-            resolved = candidate.resolve()
-
-        root = self.allowed_root.resolve()
-        if resolved != root and root not in resolved.parents:
-            return False, "outside-allowed-root"
-
-        rel = (
-            "."
-            if resolved == root
-            else resolved.relative_to(root).as_posix()
-        )
-        if matches_any(rel, self.forbidden_files):
-            return False, "forbidden-file"
-        if matches_any(rel, self.never_touch):
-            return False, "never-touch"
+        except (OSError, ValueError, RuntimeError):
+            return False, "invalid-path"
         return True, "ok"
 
     def _handle_permission(
@@ -834,6 +995,9 @@ class ClaudeAcpAdapter:
         params: dict,
         tool_policy: str,
         permission_events: list[dict],
+        *,
+        timeout_s: float = 30.0,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> None:
         options = params.get("options")
         if not isinstance(options, list):
@@ -851,9 +1015,9 @@ class ClaudeAcpAdapter:
             if tool_kind not in ("read", "search"):
                 allow = False
                 reason = f"tool-kind-{tool_kind or 'unknown'}-disallowed"
-            elif tool_kind == "read" and not extracted_paths:
+            elif not extracted_paths:
                 allow = False
-                reason = "read-missing-path"
+                reason = f"{tool_kind}-missing-path"
             else:
                 all_ok = True
                 for p in extracted_paths:
@@ -906,7 +1070,9 @@ class ClaudeAcpAdapter:
             }
         )
         self._send_json(
-            {"jsonrpc": "2.0", "id": in_id, "result": {"outcome": outcome}}
+            {"jsonrpc": "2.0", "id": in_id, "result": {"outcome": outcome}},
+            timeout_s=timeout_s,
+            cancel_check=cancel_check,
         )
 
     def _cancel_and_terminate(self, session_id: str, req_id: int) -> None:
@@ -916,9 +1082,10 @@ class ClaudeAcpAdapter:
                     "jsonrpc": "2.0",
                     "method": "session/cancel",
                     "params": {"sessionId": session_id},
-                }
+                },
+                timeout_s=1.0,
             )
-        except (Infra, OSError):
+        except (AdapterError, OSError):
             pass
 
         drain_deadline = time.monotonic() + _CANCEL_DRAIN_S
@@ -969,6 +1136,7 @@ class ClaudeAcpAdapter:
         timeout_s: float,
         cancel_check: Callable[[], bool] | None,
     ) -> AcpResult:
+        self.last_usage = AcpUsage()
         if self._proc is None or self._proc.poll() is not None:
             raise Infra("acp-not-running", "ACP subprocess is not running")
 
@@ -987,209 +1155,314 @@ class ClaudeAcpAdapter:
                     "sessionId": session_id,
                     "prompt": [{"type": "text", "text": text}],
                 },
-            }
+            },
+            timeout_s=timeout_s,
+            cancel_check=cancel_check,
         )
 
         chunks: list[str] = []
-        tokens_in = 0
-        tokens_out = 0
-        vendor_cost_usd = 0.0
+        update_tokens_in: int | None = None
+        update_tokens_out: int | None = None
+        latest_cum_cost: float | None = None
         permission_events: list[dict] = []
         rejected_methods: list[dict] = []
+        turn_completed = False
 
-        while True:
-            if cancel_check is not None and cancel_check():
-                self._cancel_and_terminate(session_id, req_id)
-                raise Refused("acp-cancelled", "ACP prompt turn was cancelled")
+        try:
+            while True:
+                if cancel_check is not None and cancel_check():
+                    self._cancel_and_terminate(session_id, req_id)
+                    raise Refused("acp-cancelled", "ACP prompt turn was cancelled")
 
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                self._cancel_and_terminate(session_id, req_id)
-                raise Infra(
-                    "acp-timeout",
-                    f"ACP prompt turn timed out after {timeout_s:.1f}s",
-                )
-
-            try:
-                kind, item = self._msg_queue.get(
-                    timeout=min(_POLL_INTERVAL_S, remaining)
-                )
-            except queue.Empty:
-                continue
-
-            if kind == "_eof":
-                raise Infra(
-                    "acp-eof",
-                    f"ACP subprocess exited before PromptResponse: {self._stderr_summary()}",
-                )
-            if kind == "_oversized":
-                self._terminate_process_group()
-                raise Infra(
-                    "acp-oversized",
-                    f"ACP line exceeded {self.max_line_bytes} bytes ({item})",
-                )
-            if kind == "_bad_json":
-                raise Infra("acp-bad-json", f"ACP emitted invalid JSON: {str(item)[:200]}")
-
-            msg = item
-            assert isinstance(msg, dict)
-
-            # Agent -> Client request (has both method and non-null id).
-            if "method" in msg and "id" in msg and msg["id"] is not None:
-                in_id = msg["id"]
-                method = str(msg.get("method") or "")
-                params = msg.get("params")
-                if not isinstance(params, dict):
-                    params = {}
-
-                if self._replaying_history:
-                    self._send_json(
-                        {
-                            "jsonrpc": "2.0",
-                            "id": in_id,
-                            "error": {
-                                "code": -32600,
-                                "message": "Requests rejected during history replay",
-                            },
-                        }
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self._cancel_and_terminate(session_id, req_id)
+                    raise Infra(
+                        "acp-timeout",
+                        f"ACP prompt turn timed out after {timeout_s:.1f}s",
                     )
-                    rejected_methods.append(
-                        {"id": in_id, "method": method, "code": -32600, "reason": "replay"}
+
+                try:
+                    kind, item = self._msg_queue.get(
+                        timeout=min(_POLL_INTERVAL_S, remaining)
                     )
+                except queue.Empty:
                     continue
 
-                id_key = (type(in_id), in_id)
-                if id_key in seen_ids:
-                    self._send_json(
-                        {
-                            "jsonrpc": "2.0",
-                            "id": in_id,
-                            "error": {
-                                "code": -32600,
-                                "message": "Duplicate request id",
-                            },
-                        }
+                if kind == "_eof":
+                    raise Infra(
+                        "acp-eof",
+                        f"ACP subprocess exited before PromptResponse: {self._stderr_summary()}",
                     )
-                    rejected_methods.append(
-                        {
-                            "id": in_id,
-                            "method": method,
-                            "code": -32600,
-                            "reason": "duplicate-id",
-                        }
+                if kind == "_oversized":
+                    self._terminate_process_group()
+                    raise Infra(
+                        "acp-oversized",
+                        f"ACP line exceeded {self.max_line_bytes} bytes ({item})",
                     )
-                    continue
-                seen_ids.add(id_key)
+                if kind == "_bad_json":
+                    self._terminate_process_group()
+                    raise Infra("acp-bad-json", f"ACP emitted invalid JSON: {str(item)[:200]}")
 
-                if method == "session/request_permission":
-                    self._handle_permission(
-                        in_id, params, tool_policy, permission_events
-                    )
-                elif method == "elicitation/create":
-                    permission_events.append(
-                        {"id": in_id, "method": method, "decision": "decline"}
-                    )
-                    self._send_json(
-                        {
-                            "jsonrpc": "2.0",
-                            "id": in_id,
-                            "result": {"action": "decline"},
-                        }
-                    )
-                else:
-                    rejected_methods.append(
-                        {
-                            "id": in_id,
-                            "method": method,
-                            "code": -32601,
-                            "reason": "method-not-found",
-                        }
-                    )
-                    self._send_json(
-                        {
-                            "jsonrpc": "2.0",
-                            "id": in_id,
-                            "error": {
-                                "code": -32601,
-                                "message": f"Method not found: {method}",
-                            },
-                        }
-                    )
-                continue
+                msg = item
+                assert isinstance(msg, dict)
 
-            # Notification (method without id).
-            if "method" in msg:
-                if self._replaying_history:
-                    continue
-                if msg.get("method") == "session/update":
+                # Agent -> Client request (has both method and non-null id).
+                if "method" in msg and "id" in msg and msg["id"] is not None:
+                    in_id = msg["id"]
+                    method = str(msg.get("method") or "")
                     params = msg.get("params")
                     if not isinstance(params, dict):
-                        continue
-                    msg_sid = params.get("sessionId")
-                    if msg_sid is not None and str(msg_sid) != session_id:
-                        continue
-                    update = params.get("update")
-                    if not isinstance(update, dict):
-                        update = params
-                    upd_kind = update.get("sessionUpdate")
-                    if upd_kind == "agent_message_chunk":
-                        chunk = strip_control_sequences(
-                            _extract_chunk_text(update.get("content"))
-                        )
-                        if chunk:
-                            chunks.append(chunk)
-                    elif upd_kind == "usage_update":
-                        in_tok = _first_present(
-                            update, ("inputTokens", "tokensIn", "promptTokens")
-                        )
-                        out_tok = _first_present(
-                            update,
-                            ("outputTokens", "tokensOut", "completionTokens"),
-                        )
-                        if in_tok is not None:
-                            tokens_in += int(in_tok)
-                        if out_tok is not None:
-                            tokens_out += int(out_tok)
-                        cost_val = update.get("cost")
-                        if isinstance(cost_val, dict):
-                            amt = cost_val.get("amount")
-                            if amt is not None:
-                                vendor_cost_usd += float(amt)
-                        elif isinstance(cost_val, (int, float)) and not isinstance(
-                            cost_val, bool
-                        ):
-                            vendor_cost_usd += float(cost_val)
-                continue
+                        params = {}
+                    resp_timeout = max(0.05, deadline - time.monotonic())
 
-            # JSON-RPC Response to our session/prompt request.
-            if msg.get("id") == req_id:
-                if msg.get("error") is not None:
-                    err = msg["error"]
-                    if isinstance(err, dict):
-                        code = err.get("code", -1)
-                        message = str(err.get("message", "ACP prompt error"))
-                        data = err.get("data")
-                        if isinstance(data, dict) and data.get("kind") == "refused":
-                            raise Refused(str(data.get("code", "acp-refused")), message)
+                    if self._replaying_history:
+                        self._send_json(
+                            {
+                                "jsonrpc": "2.0",
+                                "id": in_id,
+                                "error": {
+                                    "code": -32600,
+                                    "message": "Requests rejected during history replay",
+                                },
+                            },
+                            timeout_s=resp_timeout,
+                            cancel_check=cancel_check,
+                        )
+                        rejected_methods.append(
+                            {"id": in_id, "method": method, "code": -32600, "reason": "replay"}
+                        )
+                        continue
+
+                    id_key = (type(in_id), in_id)
+                    if id_key in seen_ids:
+                        self._send_json(
+                            {
+                                "jsonrpc": "2.0",
+                                "id": in_id,
+                                "error": {
+                                    "code": -32600,
+                                    "message": "Duplicate request id",
+                                },
+                            },
+                            timeout_s=resp_timeout,
+                            cancel_check=cancel_check,
+                        )
+                        rejected_methods.append(
+                            {
+                                "id": in_id,
+                                "method": method,
+                                "code": -32600,
+                                "reason": "duplicate-id",
+                            }
+                        )
+                        continue
+                    seen_ids.add(id_key)
+
+                    if method == "session/request_permission":
+                        self._handle_permission(
+                            in_id,
+                            params,
+                            tool_policy,
+                            permission_events,
+                            timeout_s=resp_timeout,
+                            cancel_check=cancel_check,
+                        )
+                    elif method == "elicitation/create":
+                        permission_events.append(
+                            {"id": in_id, "method": method, "decision": "decline"}
+                        )
+                        self._send_json(
+                            {
+                                "jsonrpc": "2.0",
+                                "id": in_id,
+                                "result": {"action": "decline"},
+                            },
+                            timeout_s=resp_timeout,
+                            cancel_check=cancel_check,
+                        )
                     else:
-                        code = -1
-                        message = str(err)
-                    raise Infra(f"acp-rpc-{code}", message)
+                        rejected_methods.append(
+                            {
+                                "id": in_id,
+                                "method": method,
+                                "code": -32601,
+                                "reason": "method-not-found",
+                            }
+                        )
+                        self._send_json(
+                            {
+                                "jsonrpc": "2.0",
+                                "id": in_id,
+                                "error": {
+                                    "code": -32601,
+                                    "message": f"Method not found: {method}",
+                                },
+                            },
+                            timeout_s=resp_timeout,
+                            cancel_check=cancel_check,
+                        )
+                    continue
 
-                result = msg.get("result")
-                if not isinstance(result, dict):
-                    result = {}
-                stop_reason = str(result.get("stopReason", ""))
-                return AcpResult(
-                    text="".join(chunks),
-                    stop_reason=stop_reason,
-                    session_id=session_id,
-                    tokens_in=tokens_in,
-                    tokens_out=tokens_out,
-                    vendor_cost_usd=vendor_cost_usd,
-                    latency_s=time.monotonic() - started,
-                    permission_events=permission_events,
-                    rejected_methods=rejected_methods,
+                # Notification (method without id).
+                if "method" in msg:
+                    if self._replaying_history:
+                        continue
+                    if msg.get("method") == "session/update":
+                        params = msg.get("params")
+                        if not isinstance(params, dict):
+                            continue
+                        msg_sid = params.get("sessionId")
+                        if msg_sid is not None and str(msg_sid) != session_id:
+                            continue
+                        update = params.get("update")
+                        if not isinstance(update, dict):
+                            update = params
+                        upd_kind = update.get("sessionUpdate")
+                        if upd_kind == "agent_message_chunk":
+                            chunk = strip_control_sequences(
+                                _extract_chunk_text(update.get("content"))
+                            )
+                            if chunk:
+                                chunks.append(chunk)
+                        elif upd_kind == "usage_update":
+                            in_tok = _first_present(
+                                update, ("inputTokens", "tokensIn", "promptTokens")
+                            )
+                            out_tok = _first_present(
+                                update,
+                                ("outputTokens", "tokensOut", "completionTokens"),
+                            )
+                            try:
+                                if in_tok is not None:
+                                    update_tokens_in = _parse_int_usage(
+                                        in_tok, "usage_update.inputTokens"
+                                    )
+                                if out_tok is not None:
+                                    update_tokens_out = _parse_int_usage(
+                                        out_tok, "usage_update.outputTokens"
+                                    )
+                                if "cost" in update and update["cost"] is not None:
+                                    cost_val = update["cost"]
+                                    if isinstance(cost_val, dict):
+                                        amt = cost_val.get("amount")
+                                        if amt is not None:
+                                            latest_cum_cost = _parse_float_usage(
+                                                amt, "usage_update.cost.amount"
+                                            )
+                                    else:
+                                        latest_cum_cost = _parse_float_usage(
+                                            cost_val, "usage_update.cost"
+                                        )
+                            except Invalid:
+                                self._terminate_process_group()
+                                raise
+                    continue
+
+                # JSON-RPC Response to our session/prompt request.
+                if msg.get("id") == req_id:
+                    if msg.get("error") is not None:
+                        err = msg["error"]
+                        if isinstance(err, dict):
+                            code = err.get("code", -1)
+                            message = str(err.get("message", "ACP prompt error"))
+                            data = err.get("data")
+                            if isinstance(data, dict) and data.get("kind") == "refused":
+                                raise Refused(str(data.get("code", "acp-refused")), message)
+                        else:
+                            code = -1
+                            message = str(err)
+                        raise Infra(f"acp-rpc-{code}", message)
+
+                    result = msg.get("result")
+                    if not isinstance(result, dict):
+                        result = {}
+                    stop_reason = str(result.get("stopReason", ""))
+
+                    resp_usage = result.get("usage")
+                    if resp_usage is not None and not isinstance(resp_usage, dict):
+                        self._terminate_process_group()
+                        raise Invalid(
+                            "acp-bad-usage",
+                            f"PromptResponse.result.usage must be an object, got {type(resp_usage).__name__}",
+                        )
+                    resp_in_raw = (
+                        _first_present(
+                            resp_usage, ("inputTokens", "promptTokens", "tokensIn")
+                        )
+                        if isinstance(resp_usage, dict)
+                        else None
+                    )
+                    resp_out_raw = (
+                        _first_present(
+                            resp_usage,
+                            ("outputTokens", "completionTokens", "tokensOut"),
+                        )
+                        if isinstance(resp_usage, dict)
+                        else None
+                    )
+                    try:
+                        if resp_in_raw is not None:
+                            tokens_in = _parse_int_usage(
+                                resp_in_raw, "PromptResponse.usage.inputTokens"
+                            )
+                        elif update_tokens_in is not None:
+                            tokens_in = update_tokens_in
+                        else:
+                            tokens_in = 0
+
+                        if resp_out_raw is not None:
+                            tokens_out = _parse_int_usage(
+                                resp_out_raw, "PromptResponse.usage.outputTokens"
+                            )
+                        elif update_tokens_out is not None:
+                            tokens_out = update_tokens_out
+                        else:
+                            tokens_out = 0
+                    except Invalid:
+                        self._terminate_process_group()
+                        raise
+
+                    if latest_cum_cost is not None:
+                        turn_vendor_cost = max(0.0, latest_cum_cost - self._session_cost_usd)
+                        self._session_cost_usd = max(
+                            self._session_cost_usd, latest_cum_cost
+                        )
+                    else:
+                        turn_vendor_cost = 0.0
+
+                    self.last_usage = AcpUsage(
+                        tokens_in=tokens_in,
+                        tokens_out=tokens_out,
+                        vendor_cost_usd=turn_vendor_cost,
+                    )
+                    turn_completed = True
+                    return AcpResult(
+                        text="".join(chunks),
+                        stop_reason=stop_reason,
+                        session_id=session_id,
+                        tokens_in=tokens_in,
+                        tokens_out=tokens_out,
+                        vendor_cost_usd=turn_vendor_cost,
+                        latency_s=time.monotonic() - started,
+                        permission_events=permission_events,
+                        rejected_methods=rejected_methods,
+                    )
+        finally:
+            if not turn_completed:
+                partial_cost = (
+                    max(0.0, latest_cum_cost - self._session_cost_usd)
+                    if latest_cum_cost is not None
+                    else 0.0
+                )
+                if latest_cum_cost is not None:
+                    self._session_cost_usd = max(
+                        self._session_cost_usd, latest_cum_cost
+                    )
+                self.last_usage = AcpUsage(
+                    tokens_in=update_tokens_in or 0,
+                    tokens_out=update_tokens_out or 0,
+                    vendor_cost_usd=partial_cost,
                 )
 
 
@@ -1198,3 +1471,49 @@ def _first_present(mapping: dict, keys: tuple[str, ...]):
         if key in mapping and mapping[key] is not None:
             return mapping[key]
     return None
+
+
+def _parse_int_usage(val: object, field: str) -> int:
+    if isinstance(val, bool):
+        raise Invalid("acp-bad-usage", f"boolean not allowed for {field}: {val!r}")
+    if isinstance(val, int):
+        parsed = val
+    elif isinstance(val, float):
+        if not math.isfinite(val) or not val.is_integer():
+            raise Invalid("acp-bad-usage", f"invalid integer for {field}: {val!r}")
+        try:
+            parsed = int(val)
+        except (ValueError, TypeError, OverflowError) as exc:
+            raise Invalid("acp-bad-usage", f"invalid integer for {field}: {val!r}") from exc
+    elif isinstance(val, str):
+        try:
+            parsed = int(val.strip())
+        except (ValueError, TypeError, OverflowError) as exc:
+            raise Invalid("acp-bad-usage", f"invalid integer for {field}: {val!r}") from exc
+    else:
+        raise Invalid("acp-bad-usage", f"invalid integer for {field}: {val!r}")
+    if parsed < 0:
+        raise Invalid("acp-bad-usage", f"negative value for {field}: {parsed!r}")
+    return parsed
+
+
+def _parse_float_usage(val: object, field: str) -> float:
+    if isinstance(val, bool):
+        raise Invalid("acp-bad-usage", f"boolean not allowed for {field}: {val!r}")
+    if isinstance(val, (int, float)):
+        try:
+            parsed = float(val)
+        except (ValueError, TypeError, OverflowError) as exc:
+            raise Invalid("acp-bad-usage", f"invalid float for {field}: {val!r}") from exc
+    elif isinstance(val, str):
+        try:
+            parsed = float(val.strip())
+        except (ValueError, TypeError, OverflowError) as exc:
+            raise Invalid("acp-bad-usage", f"invalid float for {field}: {val!r}") from exc
+    else:
+        raise Invalid("acp-bad-usage", f"invalid float for {field}: {val!r}")
+    if not math.isfinite(parsed) or parsed < 0.0:
+        raise Invalid(
+            "acp-bad-usage", f"invalid non-negative finite float for {field}: {val!r}"
+        )
+    return parsed

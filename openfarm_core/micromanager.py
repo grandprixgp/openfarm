@@ -78,7 +78,7 @@ def parse_json_answer(text: str) -> dict:
             parsed = json.loads(candidate)
             if isinstance(parsed, dict):
                 return parsed
-        except ValueError:
+        except (ValueError, RecursionError):
             pass
 
     # Also handle fences embedded inside surrounding prose.
@@ -89,7 +89,7 @@ def parse_json_answer(text: str) -> dict:
             parsed = json.loads(match.group(1).strip())
             if isinstance(parsed, dict):
                 return parsed
-        except ValueError:
+        except (ValueError, RecursionError):
             continue
 
     # Fall back to scanning for the outermost JSON object.
@@ -100,7 +100,7 @@ def parse_json_answer(text: str) -> dict:
             parsed, _end = decoder.raw_decode(stripped, idx)
             if isinstance(parsed, dict):
                 return parsed
-        except ValueError:
+        except (ValueError, RecursionError):
             pass
         idx = stripped.find("{", idx + 1)
 
@@ -111,7 +111,7 @@ def parse_json_answer(text: str) -> dict:
             parsed = json.loads(stripped[start : end + 1])
             if isinstance(parsed, dict):
                 return parsed
-        except ValueError:
+        except (ValueError, RecursionError):
             pass
 
     raise Invalid(
@@ -155,8 +155,9 @@ def _validate_safe_path(
     if not norm:
         raise Refused("path-escape", f"{context}: empty path is not allowed")
     forbidden = list(forbidden_files)
-    if ".openfarm/**" not in forbidden:
-        forbidden.append(".openfarm/**")
+    for default_forbidden in (".openfarm/**", ".claude/**"):
+        if default_forbidden not in forbidden:
+            forbidden.append(default_forbidden)
     if matches_any(norm, forbidden):
         raise Refused(
             "forbidden-file",
@@ -381,6 +382,7 @@ class ScriptedMicromanager:
         return {"name": self.name, "versions": [1], "ops": ["hello", "assist"]}
 
     def assist(self, op: str, payload: dict) -> dict:
+        self.last_usage = {"tokens_in": 0, "tokens_out": 0, "spend": 0.0}
         clean_payload = {k: v for k, v in payload.items() if k != "_card_dir"}
         self.calls.append({"op": op, "payload": clean_payload})
         card_id = str(
@@ -410,12 +412,21 @@ class ScriptedMicromanager:
             entry = entry(op, clean_payload)
 
         if isinstance(entry, str):
+            usage = self.last_usage
             parsed = parse_json_answer(entry)
-            self.last_usage = {"tokens_in": 0, "tokens_out": 0, "spend": 0.0}
+            self.last_usage = usage
             return parsed
 
         if not isinstance(entry, dict):
             raise Invalid("bad-micromanager-script", f"invalid script entry {entry!r}")
+
+        usage = entry.get("_usage") if isinstance(entry.get("_usage"), dict) else {}
+        if usage or any(k in entry for k in ("tokens_in", "tokens_out", "spend")):
+            self.last_usage = {
+                "tokens_in": int(usage.get("tokens_in", entry.get("tokens_in", 0))),
+                "tokens_out": int(usage.get("tokens_out", entry.get("tokens_out", 0))),
+                "spend": float(usage.get("spend", entry.get("spend", 0.0))),
+            }
 
         if entry.get("fail"):
             kind = str(entry.get("kind", "infra"))
@@ -427,12 +438,6 @@ class ScriptedMicromanager:
                 str(entry.get("message", f"scripted {kind} for {op}")),
             )
 
-        usage = entry.get("_usage") if isinstance(entry.get("_usage"), dict) else {}
-        self.last_usage = {
-            "tokens_in": int(usage.get("tokens_in", entry.get("tokens_in", 0))),
-            "tokens_out": int(usage.get("tokens_out", entry.get("tokens_out", 0))),
-            "spend": float(usage.get("spend", entry.get("spend", 0.0))),
-        }
         return {k: v for k, v in entry.items() if k != "_usage"}
 
     def close(self) -> None:
@@ -453,6 +458,7 @@ class CmdMicromanager:
         return self._adapter.hello("micromanager", {"hello", "assist"})
 
     def assist(self, op: str, payload: dict) -> dict:
+        self.last_usage = {"tokens_in": 0, "tokens_out": 0, "spend": 0.0}
         clean_payload = {k: v for k, v in payload.items() if k != "_card_dir"}
         result = self._adapter.call(
             "micromanager", "assist", {"op": op, "payload": clean_payload}
@@ -598,6 +604,7 @@ class ClaudeAcpMicromanager:
         return self._adapter, self._session_id
 
     def assist(self, op: str, payload: dict) -> dict:
+        self.last_usage = {"tokens_in": 0, "tokens_out": 0, "spend": 0.0}
         raw_card_dir = payload.get("_card_dir")
         artifact_root = (
             Path(raw_card_dir)
@@ -608,12 +615,33 @@ class ClaudeAcpMicromanager:
 
         adapter, session_id = self._ensure_session()
         prompt_text = _build_op_prompt(op, clean_payload)
-        res = adapter.prompt(
-            session_id,
-            prompt_text,
-            timeout_s=self.timeout_s,
-            cancel_check=self.cancel_check,
-        )
+        try:
+            res = adapter.prompt(
+                session_id,
+                prompt_text,
+                timeout_s=self.timeout_s,
+                cancel_check=self.cancel_check,
+            )
+        except Exception:
+            partial = getattr(adapter, "last_usage", None)
+            if partial is not None:
+                p_in = int(getattr(partial, "tokens_in", 0) or 0)
+                p_out = int(getattr(partial, "tokens_out", 0) or 0)
+                p_vcost = float(getattr(partial, "vendor_cost_usd", 0.0) or 0.0)
+                if p_vcost > 0:
+                    p_spend = p_vcost
+                else:
+                    p_spend = (
+                        p_in / 1000.0 * self.cost_per_1k_in
+                        + p_out / 1000.0 * self.cost_per_1k_out
+                    )
+                self.last_usage = {
+                    "tokens_in": p_in,
+                    "tokens_out": p_out,
+                    "spend": p_spend,
+                    "vendor_cost_usd": p_vcost,
+                }
+            raise
 
         if res.vendor_cost_usd > 0:
             spend = float(res.vendor_cost_usd)
@@ -686,8 +714,9 @@ class Micromanager:
         self.budget = budget or MicromanagerBudget()
         self.never_touch = list(never_touch or ())
         self.forbidden_files = list(forbidden_files or ())
-        if ".openfarm/**" not in self.forbidden_files:
-            self.forbidden_files.append(".openfarm/**")
+        for default_forbidden in (".openfarm/**", ".claude/**"):
+            if default_forbidden not in self.forbidden_files:
+                self.forbidden_files.append(default_forbidden)
         self.card_dir = Path(card_dir) if card_dir is not None else None
         self.mode = str(mode or "active").strip().lower()
         self.feature_flags = dict(feature_flags or {})
@@ -718,22 +747,25 @@ class Micromanager:
         if cfg is not None:
             nt.extend(getattr(cfg, "never_touch", ()) or ())
             fb.extend(getattr(cfg, "forbidden_files", ()) or ())
-        if ".openfarm/**" not in fb:
-            fb.append(".openfarm/**")
+        for default_forbidden in (".openfarm/**", ".claude/**"):
+            if default_forbidden not in fb:
+                fb.append(default_forbidden)
         return nt, fb
 
     def _call_backend(self, op: str, card_id: str, payload: dict) -> dict:
         self.budget.check(card_id)
         if self.card_dir is not None and "_card_dir" not in payload:
             payload = {**payload, "_card_dir": str(self.card_dir)}
-        answer = self.backend.assist(op, payload)
-        usage = getattr(self.backend, "last_usage", None) or {}
-        self.budget.record(
-            card_id=card_id,
-            tokens_in=int(usage.get("tokens_in", 0)),
-            tokens_out=int(usage.get("tokens_out", 0)),
-            spend=float(usage.get("spend", 0.0)),
-        )
+        try:
+            answer = self.backend.assist(op, payload)
+        finally:
+            usage = getattr(self.backend, "last_usage", None) or {}
+            self.budget.record(
+                card_id=card_id,
+                tokens_in=int(usage.get("tokens_in", 0) or 0),
+                tokens_out=int(usage.get("tokens_out", 0) or 0),
+                spend=float(usage.get("spend", 0.0) or 0.0),
+            )
         return answer if isinstance(answer, dict) else {}
 
     # -- 1. shape_and_plan ----------------------------------------------------
@@ -768,7 +800,7 @@ class Micromanager:
                 f"shape_and_plan returned invalid verdict {verdict!r}",
             )
 
-        clarified_notes = str(raw.get("clarified_notes", ""))
+        clarified_notes = _strip_edit_blocks(str(raw.get("clarified_notes", "")))
 
         # Filter extra_context_files strictly in Python to exclude escapes,
         # absolute paths, never_touch, and forbidden_files.
@@ -817,7 +849,7 @@ class Micromanager:
             cleaned_steps.append(
                 {
                     "n": int(step.get("n", idx)),
-                    "does": str(step.get("does", "")),
+                    "does": _strip_edit_blocks(str(step.get("does", ""))),
                     "tests": step_tests,
                     "touches": step_touches,
                 }
@@ -912,25 +944,25 @@ class Micromanager:
             )
 
         for edit in parsed_edits:
-            _validate_safe_path(
+            norm_path = _validate_safe_path(
                 edit.path,
                 never_touch=nt,
                 forbidden_files=fb,
                 allowed_touches=card.touches,
                 context="scaffold_contract edit",
             )
-            if not _is_test_path(edit.path, card):
-                body = (
-                    edit.replace
-                    if edit.format == FORMAT_SEARCH_REPLACE
-                    else (edit.content or "")
+            if _is_test_path(norm_path, card):
+                raise Refused(
+                    "scaffold-test-path",
+                    f"{edit.path}: scaffold_contract may only target production paths in card.touches",
                 )
-                if not _valid_production_scaffold(body):
-                    raise Refused(
-                        "scaffold-missing-todo",
-                        f"{edit.path}: production scaffold must contain "
-                        f"`todo!(` or `unimplemented!(`",
-                    )
+            body = _scaffold_body_to_validate(edit)
+            if not _valid_production_scaffold(body):
+                raise Refused(
+                    "scaffold-missing-todo",
+                    f"{edit.path}: production scaffold must contain "
+                    f"`todo!(` or `unimplemented!(` stubs only",
+                )
 
         return parsed_edits
 
@@ -976,7 +1008,7 @@ class Micromanager:
         root_cause = _strip_edit_blocks(str(raw.get("root_cause", "")))
         guidance = _strip_edit_blocks(str(raw.get("guidance", "")))
         abort = bool(raw.get("abort", False))
-        abort_reason = str(raw.get("abort_reason", ""))
+        abort_reason = _strip_edit_blocks(str(raw.get("abort_reason", "")))
         if self.mode == "advisory":
             abort = False
         return CoachingAdvice(
@@ -1034,7 +1066,7 @@ class Micromanager:
 
         return CheckerVerdict(
             verdict=verdict,
-            rationale=str(raw.get("rationale", "")),
+            rationale=_strip_edit_blocks(str(raw.get("rationale", ""))),
             fix_hint=_strip_edit_blocks(str(raw.get("fix_hint", ""))),
         )
 
@@ -1087,8 +1119,8 @@ class Micromanager:
             return SupervisionReport(
                 op=op,
                 verdict=verdict,
-                reviewer_brief=str(raw.get("reviewer_brief", "")),
-                missed_clause=str(raw.get("missed_clause", "")),
+                reviewer_brief=_strip_edit_blocks(str(raw.get("reviewer_brief", ""))),
+                missed_clause=_strip_edit_blocks(str(raw.get("missed_clause", ""))),
                 findings=_normalise_findings(raw.get("findings")),
             )
 
@@ -1099,7 +1131,7 @@ class Micromanager:
         cleaned_recs: list[dict] = []
         for entry in raw_recs:
             if not isinstance(entry, dict):
-                cleaned_recs.append({"action": str(entry)})
+                cleaned_recs.append({"action": _strip_edit_blocks(str(entry))})
                 continue
             for key in ("path", "file"):
                 if entry.get(key):
@@ -1117,12 +1149,12 @@ class Micromanager:
                         forbidden_files=fb,
                         context=f"{op} recommendation {key}",
                     )
-            cleaned_recs.append(dict(entry))
+            cleaned_recs.append(_strip_edit_blocks_recursive(dict(entry)))
 
         return SupervisionReport(
             op=op,
             verdict=str(raw.get("verdict", "ok") or "ok"),
-            summary=str(raw.get("summary", "")),
+            summary=_strip_edit_blocks(str(raw.get("summary", ""))),
             recommendations=cleaned_recs,
             findings=_normalise_findings(raw.get("findings")),
         )
@@ -1236,14 +1268,199 @@ class Micromanager:
         }
 
 
+_RUST_CHAR_RE = re.compile(
+    r"b?'(?:[^'\\\n]|\\(?:.|x[0-9a-fA-F]{2}|u\{[0-9a-fA-F_]+\}))'"
+)
+_RUST_RAW_STR_RE = re.compile(r"(?:[bc])?r(#*)\"")
+_FN_DEF_RE = re.compile(r"\bfn\s+(?:r#)?[A-Za-z_][A-Za-z0-9_]*\b")
+_TODO_ONLY_RE = re.compile(
+    r"^(?:todo|unimplemented)!\s*\(\s*(?:\"\"\s*(?:,\s*\"\")*\s*)?\)\s*;?$"
+)
+
+
+def _strip_rust_comments_and_strings(src: str) -> str:
+    """Strip Rust // and nested /* */ comments plus string/char literal contents."""
+    out: list[str] = []
+    n = len(src)
+    i = 0
+    while i < n:
+        ch = src[i]
+        # Line comment
+        if ch == "/" and i + 1 < n and src[i + 1] == "/":
+            i += 2
+            while i < n and src[i] != "\n":
+                i += 1
+            out.append(" ")
+            continue
+        # Nested block comment
+        if ch == "/" and i + 1 < n and src[i + 1] == "*":
+            depth = 1
+            i += 2
+            while i < n and depth > 0:
+                if src[i] == "/" and i + 1 < n and src[i + 1] == "*":
+                    depth += 1
+                    i += 2
+                elif src[i] == "*" and i + 1 < n and src[i + 1] == "/":
+                    depth -= 1
+                    i += 2
+                else:
+                    if src[i] == "\n":
+                        out.append("\n")
+                    i += 1
+            out.append(" ")
+            continue
+        # Raw string literal: r"...", r#"..."#, br#"..."#, cr#"..."#
+        if ch in ("r", "b", "c") and (i == 0 or not (src[i - 1].isalnum() or src[i - 1] == "_")):
+            raw_m = _RUST_RAW_STR_RE.match(src, i)
+            if raw_m:
+                closing = '"' + raw_m.group(1)
+                end_idx = src.find(closing, raw_m.end())
+                if end_idx == -1:
+                    out.append('""')
+                    break
+                out.append('""')
+                i = end_idx + len(closing)
+                continue
+        # Normal / byte string literal: "..." or b"..."
+        if ch == '"' or (
+            ch in ("b", "c")
+            and i + 1 < n
+            and src[i + 1] == '"'
+            and (i == 0 or not (src[i - 1].isalnum() or src[i - 1] == "_"))
+        ):
+            if ch != '"':
+                i += 1
+            i += 1
+            while i < n:
+                if src[i] == "\\":
+                    i += 2
+                    continue
+                if src[i] == '"':
+                    i += 1
+                    break
+                i += 1
+            out.append('""')
+            continue
+        # Char / byte char literal (distinct from lifetimes like 'a)
+        if ch == "'" or (
+            ch == "b"
+            and i + 1 < n
+            and src[i + 1] == "'"
+            and (i == 0 or not (src[i - 1].isalnum() or src[i - 1] == "_"))
+        ):
+            char_m = _RUST_CHAR_RE.match(src, i)
+            if char_m:
+                out.append("' '")
+                i = char_m.end()
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _scaffold_body_to_validate(edit: Edit) -> str:
+    if edit.format != FORMAT_SEARCH_REPLACE:
+        return edit.content or ""
+    replace = edit.replace or ""
+    search = edit.search or ""
+    if search:
+        s_stripped = search.strip("\n")
+        if s_stripped and s_stripped.count("{") == s_stripped.count("}"):
+            if replace.startswith(search) and (
+                len(replace) == len(search)
+                or replace[len(search)] == "\n"
+                or search.endswith("\n")
+            ):
+                delta = replace[len(search) :].strip()
+                if delta:
+                    return delta
+            if replace.endswith(search) and (
+                len(replace) == len(search)
+                or replace[-len(search) - 1] == "\n"
+                or search.startswith("\n")
+            ):
+                delta = replace[: len(replace) - len(search)].strip()
+                if delta:
+                    return delta
+    return replace
+
+
 def _valid_production_scaffold(body: str) -> bool:
-    """Allow todo!/unimplemented! stubs or pure type/module declarations without fn bodies."""
-    if "todo!(" in body or "unimplemented!(" in body:
-        return True
-    cleaned = re.sub(r"//.*", "", body)
-    cleaned = re.sub(r"/\*.*?\*/", "", cleaned, flags=re.DOTALL)
-    if re.search(r"\bfn\b", cleaned):
+    """Allow todo!/unimplemented! fn stubs, brace-free signatures, or pure declarations."""
+    cleaned = _strip_rust_comments_and_strings(str(body or ""))
+    if not cleaned.strip():
         return False
+
+    n = len(cleaned)
+    pos = 0
+    found_fn = False
+    while True:
+        fn_m = _FN_DEF_RE.search(cleaned, pos)
+        if not fn_m:
+            break
+        found_fn = True
+        idx = cleaned.find("(", fn_m.end())
+        if idx == -1:
+            return False
+        paren_depth = 1
+        idx += 1
+        while idx < n and paren_depth > 0:
+            if cleaned[idx] == "(":
+                paren_depth += 1
+            elif cleaned[idx] == ")":
+                paren_depth -= 1
+            idx += 1
+        if paren_depth != 0:
+            return False
+
+        bracket_depth = 0
+        body_start = -1
+        is_sig_only = False
+        while idx < n:
+            ch = cleaned[idx]
+            if ch == "(":
+                paren_depth += 1
+            elif ch == ")":
+                paren_depth = max(0, paren_depth - 1)
+            elif ch == "[":
+                bracket_depth += 1
+            elif ch == "]":
+                bracket_depth = max(0, bracket_depth - 1)
+            elif paren_depth == 0 and bracket_depth == 0:
+                if ch == ";":
+                    is_sig_only = True
+                    pos = idx + 1
+                    break
+                if ch == "{":
+                    body_start = idx
+                    break
+            idx += 1
+
+        if is_sig_only:
+            continue
+        if body_start == -1:
+            return False
+
+        brace_depth = 1
+        idx = body_start + 1
+        while idx < n and brace_depth > 0:
+            if cleaned[idx] == "{":
+                brace_depth += 1
+            elif cleaned[idx] == "}":
+                brace_depth -= 1
+            idx += 1
+        if brace_depth != 0:
+            return False
+
+        fn_body = cleaned[body_start + 1 : idx - 1].strip()
+        if not _TODO_ONLY_RE.match(fn_body):
+            return False
+        pos = idx
+
+    if found_fn:
+        return True
+    if _TODO_ONLY_RE.match(cleaned.strip()):
+        return True
     return bool(re.search(r"\b(?:struct|enum|trait|type|mod|use)\b", cleaned))
 
 
@@ -1261,8 +1478,8 @@ def _normalise_findings(raw_findings) -> list[dict]:
     out: list[dict] = []
     for entry in raw_findings or []:
         if isinstance(entry, dict):
-            title = str(entry.get("title", "")).strip()
-            body = str(entry.get("body", "")).strip()
+            title = _strip_edit_blocks(str(entry.get("title", ""))).strip()
+            body = _strip_edit_blocks(str(entry.get("body", ""))).strip()
             if title or body:
                 out.append({"title": title or "Finding", "body": body})
     return out
@@ -1286,6 +1503,7 @@ def open_micromanager(
     script: Path | str | dict | None = None,
     worktree: Path | str | None = None,
     card_dir: Path | str | None = None,
+    budget: MicromanagerBudget | None = None,
 ) -> Micromanager:
     """Create a configured Micromanager from config (or script override)."""
     repo_path = Path(repo)
@@ -1306,36 +1524,37 @@ def open_micromanager(
         )
     }
 
-    max_calls = int(
-        _cfg_get(
-            mm_cfg,
-            "max_calls_per_card",
-            _cfg_get(cfg, "micromanager_max_calls_per_card", 8),
-        )
-    )
-    tokens_cap = int(
-        _cfg_get(
-            mm_cfg,
-            "tokens_per_card",
-            _cfg_get(cfg, "micromanager_tokens_per_card", 200_000),
-        )
-    )
-    spend_cap = float(
-        _cfg_get(
-            mm_cfg,
-            "spend_per_night",
+    if budget is None:
+        max_calls = int(
             _cfg_get(
-                cfg,
-                "micromanager_spend_per_night",
-                _cfg_get(cfg, "spend_per_night", 10.0),
-            ),
+                mm_cfg,
+                "max_calls_per_card",
+                _cfg_get(cfg, "micromanager_max_calls_per_card", 8),
+            )
         )
-    )
-    budget = MicromanagerBudget(
-        max_calls_per_card=max_calls,
-        tokens_per_card=tokens_cap,
-        spend_per_night=spend_cap,
-    )
+        tokens_cap = int(
+            _cfg_get(
+                mm_cfg,
+                "tokens_per_card",
+                _cfg_get(cfg, "micromanager_tokens_per_card", 200_000),
+            )
+        )
+        spend_cap = float(
+            _cfg_get(
+                mm_cfg,
+                "spend_per_night",
+                _cfg_get(
+                    cfg,
+                    "micromanager_spend_per_night",
+                    _cfg_get(cfg, "spend_per_night", 10.0),
+                ),
+            )
+        )
+        budget = MicromanagerBudget(
+            max_calls_per_card=max_calls,
+            tokens_per_card=tokens_cap,
+            spend_per_night=spend_cap,
+        )
 
     if script is not None:
         if isinstance(script, dict):

@@ -17,14 +17,19 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from openfarm_core.adapters.acp import (
+    _ACTIVE_ISOLATED_HOMES,
+    _DISALLOWED_NONE,
+    _DISALLOWED_READ_ONLY,
     AcpResult,
     ClaudeAcpAdapter,
+    _cleanup_all_isolated_homes,
     _sanitised_env,
     strip_control_sequences,
 )
 from openfarm_core.cards import Card
+from openfarm_core.config import load_config
 from openfarm_core.edits import FORMAT_SEARCH_REPLACE, FORMAT_WHOLE_FILE, parse_edits
-from openfarm_core.errors import Infra, Invalid, Refused
+from openfarm_core.errors import AdapterError, Infra, Invalid, Refused
 from openfarm_core.micromanager import (
     ClaudeAcpMicromanager,
     CmdMicromanager,
@@ -112,7 +117,13 @@ class SanitisedEnvAndHomeTests(unittest.TestCase):
 
             self.assertEqual(stat.S_IMODE(iso.stat().st_mode), 0o700)
             settings = json.loads((iso / ".claude" / "settings.json").read_text())
-            self.assertEqual(settings, {"hooks": {}})
+            self.assertEqual(settings["hooks"], {})
+            self.assertTrue(settings["disableAllHooks"])
+            deny = settings["permissions"]["deny"]
+            self.assertIn("Read(.openfarm/**)", deny)
+            self.assertIn("Write(.openfarm/**)", deny)
+            self.assertIn("Read(.claude/**)", deny)
+            self.assertIn("Edit(.claude/**)", deny)
             copied = iso / ".claude" / ".credentials.json"
             self.assertTrue(copied.exists())
             self.assertEqual(stat.S_IMODE(copied.stat().st_mode), 0o600)
@@ -164,6 +175,26 @@ class SanitisedEnvAndHomeTests(unittest.TestCase):
                 os.environ.pop("CLAUDE_CODE_TEST_VAR", None)
             else:
                 os.environ["CLAUDE_CODE_TEST_VAR"] = orig_cc_test
+
+    def test_isolated_home_atexit_registry_and_custom_deny_rules(self) -> None:
+        env, iso = _sanitised_env(
+            base_env={"HOME": str(self.tmp)},
+            isolate_home=True,
+            never_touch=["secrets/**"],
+            forbidden_files=["private/**"],
+        )
+        self.assertIsNotNone(iso)
+        assert iso is not None
+        self.assertIn(iso, _ACTIVE_ISOLATED_HOMES)
+        settings = json.loads((iso / ".claude" / "settings.json").read_text())
+        self.assertTrue(settings["disableAllHooks"])
+        deny = settings["permissions"]["deny"]
+        self.assertIn("Read(secrets/**)", deny)
+        self.assertIn("Edit(private/**)", deny)
+        _cleanup_all_isolated_homes()
+        self.assertFalse(iso.exists())
+        self.assertNotIn(iso, _ACTIVE_ISOLATED_HOMES)
+        self.assertEqual(env["HOME"], str(iso))
 
 
 class AcpProtocolAndSecurityTests(unittest.TestCase):
@@ -308,10 +339,18 @@ class AcpProtocolAndSecurityTests(unittest.TestCase):
             sid = acp.new_session(cwd=self.tmp, tool_policy="read-only")
             res = acp.prompt(sid, "hello")
             opts = json.loads(res.text)["meta"]["claudeCode"]["options"]
-            self.assertEqual(
-                opts["disallowedTools"],
-                ["Bash", "Edit", "Write", "MultiEdit", "NotebookEdit"],
-            )
+            self.assertEqual(opts["disallowedTools"], list(_DISALLOWED_READ_ONLY))
+            for tool in ("WebFetch", "WebSearch", "Task", "TodoWrite", "NotebookRead"):
+                self.assertIn(tool, opts["disallowedTools"])
+
+    def test_none_new_session_disallows_read_glob_grep_and_task(self) -> None:
+        with ClaudeAcpAdapter(_stand_in_cmd("--mode", "normal"), cwd=self.tmp) as acp:
+            sid = acp.new_session(cwd=self.tmp, tool_policy="none")
+            res = acp.prompt(sid, "hello")
+            opts = json.loads(res.text)["meta"]["claudeCode"]["options"]
+            self.assertEqual(opts["disallowedTools"], list(_DISALLOWED_NONE))
+            for tool in ("Read", "Glob", "Grep", "LS", "Task", "TodoWrite", "NotebookRead"):
+                self.assertIn(tool, opts["disallowedTools"])
 
     def test_unterminated_osc_in_agent_chunk_preserves_json(self) -> None:
         with ClaudeAcpAdapter(_stand_in_cmd("--mode", "unterminated-osc"), cwd=self.tmp) as acp:
@@ -346,9 +385,14 @@ class AcpProtocolAndSecurityTests(unittest.TestCase):
             cwd=self.tmp,
         ) as acp:
             sid = acp.new_session(cwd=self.tmp)
+            assert acp._proc is not None
+            pid = acp._proc.pid
             with self.assertRaises(Refused) as caught:
                 acp.prompt(sid, "hang", timeout_s=10.0, cancel_check=kill_switch)
             self.assertEqual(caught.exception.code, "acp-cancelled")
+            self.assertIsNotNone(acp._proc.poll())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
 
     def test_oversized_line_raises_acp_oversized(self) -> None:
         with ClaudeAcpAdapter(_stand_in_cmd("--mode", "oversized"), cwd=self.tmp) as acp:
@@ -385,6 +429,249 @@ class AcpProtocolAndSecurityTests(unittest.TestCase):
             self.assertEqual(caught.exception.code, "acp-concurrent-prompt")
             t.join(timeout=3.0)
             self.assertTrue(len(err_holder) == 1)
+
+    def test_stdin_blocking_timeout_with_2mb_payload_terminates_and_reaps(self) -> None:
+        with ClaudeAcpAdapter(
+            _stand_in_cmd("--mode", "block-stdin-prompt", "--hang-seconds", "30"),
+            cwd=self.tmp,
+        ) as acp:
+            sid = acp.new_session(cwd=self.tmp)
+            assert acp._proc is not None
+            pid = acp._proc.pid
+            started = time.monotonic()
+            with self.assertRaises(Infra) as caught:
+                acp.prompt(sid, "X" * (2 * 1024 * 1024 + 64), timeout_s=0.25)
+            elapsed = time.monotonic() - started
+            self.assertEqual(caught.exception.code, "acp-stdin-timeout")
+            self.assertLess(elapsed, 4.0)
+            self.assertIsNotNone(acp._proc.poll())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+
+    def test_stdin_write_cancel_check_terminates_and_reaps(self) -> None:
+        checks = {"n": 0}
+
+        def cancel_on_second() -> bool:
+            checks["n"] += 1
+            return checks["n"] >= 2
+
+        with ClaudeAcpAdapter(
+            _stand_in_cmd("--mode", "block-stdin-prompt", "--hang-seconds", "30"),
+            cwd=self.tmp,
+        ) as acp:
+            sid = acp.new_session(cwd=self.tmp)
+            assert acp._proc is not None
+            pid = acp._proc.pid
+            with self.assertRaises(Refused) as caught:
+                acp.prompt(
+                    sid,
+                    "Y" * (2 * 1024 * 1024),
+                    timeout_s=5.0,
+                    cancel_check=cancel_on_second,
+                )
+            self.assertEqual(caught.exception.code, "acp-cancelled")
+            self.assertIsNotNone(acp._proc.poll())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+
+    def test_cumulative_usage_cost_and_prompt_response_tokens_across_turns(self) -> None:
+        script_path = self.tmp / "cum_usage.json"
+        script_path.write_text(
+            json.dumps(
+                {
+                    "turns": [
+                        {
+                            "text": json.dumps({"turn": 1}),
+                            "usage_updates": [
+                                {"used": 1000, "size": 200000, "cost": {"amount": 0.1, "currency": "USD"}},
+                                {"used": 1200, "size": 200000, "cost": {"amount": 0.2, "currency": "USD"}},
+                                {"used": 1500, "size": 200000, "cost": {"amount": 0.3, "currency": "USD"}},
+                            ],
+                            "usage": {"tokens_in": 110, "tokens_out": 40},
+                        },
+                        {
+                            "text": json.dumps({"turn": 2}),
+                            "usage_updates": [
+                                {"used": 2000, "size": 200000, "cost": {"amount": 0.45, "currency": "USD"}},
+                            ],
+                            "usage": {"tokens_in": 200, "tokens_out": 50},
+                        },
+                        {
+                            "text": json.dumps({"turn": 3}),
+                            "usage_updates": [
+                                {"inputTokens": 77, "outputTokens": 22},
+                            ],
+                            "omit_result_usage": True,
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        with ClaudeAcpAdapter(
+            _stand_in_cmd("--mode", "script", "--script", str(script_path)),
+            cwd=self.tmp,
+        ) as acp:
+            sid = acp.new_session(cwd=self.tmp)
+            r1 = acp.prompt(sid, "t1")
+            self.assertEqual((r1.tokens_in, r1.tokens_out), (110, 40))
+            self.assertAlmostEqual(r1.vendor_cost_usd, 0.3, places=6)
+
+            r2 = acp.prompt(sid, "t2")
+            self.assertEqual((r2.tokens_in, r2.tokens_out), (200, 50))
+            self.assertAlmostEqual(r2.vendor_cost_usd, 0.15, places=6)
+
+            r3 = acp.prompt(sid, "t3")
+            self.assertEqual((r3.tokens_in, r3.tokens_out), (77, 22))
+            self.assertAlmostEqual(r3.vendor_cost_usd, 0.0, places=6)
+
+    def test_malformed_usage_raises_invalid_adapter_error_not_value_error(self) -> None:
+        bad_cases = [
+            {"usage_updates": [{"cost": {"amount": "not-a-float"}}]},
+            {"usage_updates": [{"inputTokens": "not-an-int"}]},
+            {"usage_updates": [{"inputTokens": True}]},
+            {"usage_updates": [{"cost": {"amount": -1.5}}]},
+            {"usage_updates": [], "result_usage": "bad-shape"},
+            {"usage_updates": [], "result_usage": {"inputTokens": "NaN-bad"}},
+        ]
+        for idx, entry in enumerate(bad_cases):
+            with self.subTest(case=idx):
+                script_path = self.tmp / f"bad_usage_{idx}.json"
+                script_path.write_text(json.dumps({"turns": [entry]}), encoding="utf-8")
+                with ClaudeAcpAdapter(
+                    _stand_in_cmd("--mode", "script", "--script", str(script_path)),
+                    cwd=self.tmp,
+                ) as acp:
+                    sid = acp.new_session(cwd=self.tmp)
+                    with self.assertRaises(Invalid) as caught:
+                        acp.prompt(sid, "go")
+                    self.assertIsInstance(caught.exception, AdapterError)
+                    self.assertEqual(caught.exception.code, "acp-bad-usage")
+                    assert acp._proc is not None
+                    self.assertIsNotNone(acp._proc.poll())
+
+    def test_nul_tilde_unscoped_search_and_claude_dir_denied_in_readonly(self) -> None:
+        (self.tmp / ".claude").mkdir()
+        (self.tmp / ".claude" / "settings.json").write_text("{}", encoding="utf-8")
+
+        cases = [
+            ("read", "src/\x00evil.rs", "nul-path"),
+            ("read", "~/secret.txt", "tilde-path"),
+            ("read", "~root/.ssh/id_rsa", "tilde-path"),
+            ("read", ".claude/settings.json", "forbidden-file"),
+        ]
+        for idx, (kind, path, expected_reason) in enumerate(cases):
+            with self.subTest(kind=kind, path=path):
+                script_path = self.tmp / f"perm_case_{idx}.json"
+                script_path.write_text(
+                    json.dumps(
+                        {
+                            "turns": [
+                                {
+                                    "requests": [
+                                        {
+                                            "jsonrpc": "2.0",
+                                            "id": f"perm-case-{idx}",
+                                            "method": "session/request_permission",
+                                            "params": {
+                                                "sessionId": "sess-standin-1",
+                                                "toolCall": {
+                                                    "kind": kind,
+                                                    "locations": [{"path": path}],
+                                                    "rawInput": {"file_path": path},
+                                                },
+                                                "options": [
+                                                    {"optionId": "opt-allow-once", "kind": "allow_once"},
+                                                    {"optionId": "opt-reject-once", "kind": "reject_once"},
+                                                ],
+                                            },
+                                        }
+                                    ],
+                                    "text": "done",
+                                }
+                            ]
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                with ClaudeAcpAdapter(
+                    _stand_in_cmd("--mode", "script", "--script", str(script_path)),
+                    cwd=self.tmp,
+                    allowed_root=self.tmp,
+                ) as acp:
+                    self.assertEqual(acp._is_path_allowed_readonly(path), (False, expected_reason))
+                    sid = acp.new_session(cwd=self.tmp, tool_policy="read-only")
+                    res = acp.prompt(sid, "go")
+                    self.assertEqual(res.permission_events[0]["decision"], "reject_once")
+                    self.assertEqual(res.permission_events[0]["reason"], expected_reason)
+
+        # Unscoped search (empty paths) must also be denied in read-only mode.
+        script_path = self.tmp / "unscoped_search.json"
+        script_path.write_text(
+            json.dumps(
+                {
+                    "turns": [
+                        {
+                            "requests": [
+                                {
+                                    "jsonrpc": "2.0",
+                                    "id": "perm-search-empty",
+                                    "method": "session/request_permission",
+                                    "params": {
+                                        "sessionId": "sess-standin-1",
+                                        "toolCall": {"kind": "search", "rawInput": {"query": "secret"}},
+                                        "options": [
+                                            {"optionId": "opt-allow-once", "kind": "allow_once"},
+                                            {"optionId": "opt-reject-once", "kind": "reject_once"},
+                                        ],
+                                    },
+                                }
+                            ],
+                            "text": "done",
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        with ClaudeAcpAdapter(
+            _stand_in_cmd("--mode", "script", "--script", str(script_path)),
+            cwd=self.tmp,
+            allowed_root=self.tmp,
+        ) as acp:
+            sid = acp.new_session(cwd=self.tmp, tool_policy="read-only")
+            res = acp.prompt(sid, "go")
+            self.assertEqual(res.permission_events[0]["decision"], "reject_once")
+            self.assertEqual(res.permission_events[0]["reason"], "search-missing-path")
+
+    def test_bad_json_and_deep_nesting_recursion_error_terminate_agent_group(self) -> None:
+        deep_json = ("[" * 2500) + "1" + ("]" * 2500)
+        for label, raw_line in (("bad-json", "{not valid json"), ("deep-json", deep_json)):
+            with self.subTest(label=label):
+                script_path = self.tmp / f"{label}.json"
+                script_path.write_text(
+                    json.dumps({"turns": [{"raw_lines": [raw_line], "text": "{}"}]}),
+                    encoding="utf-8",
+                )
+                with ClaudeAcpAdapter(
+                    _stand_in_cmd("--mode", "script", "--script", str(script_path)),
+                    cwd=self.tmp,
+                ) as acp:
+                    sid = acp.new_session(cwd=self.tmp)
+                    assert acp._proc is not None
+                    pid = acp._proc.pid
+                    with self.assertRaises(Infra) as caught:
+                        acp.prompt(sid, "go", timeout_s=2.0)
+                    self.assertEqual(caught.exception.code, "acp-bad-json")
+                    self.assertIsNotNone(acp._proc.poll())
+                    with self.assertRaises(ProcessLookupError):
+                        os.kill(pid, 0)
+
+    def test_project_config_includes_claude_dir_in_forbidden_files(self) -> None:
+        repo_root = Path(__file__).resolve().parent.parent
+        cfg = load_config(repo_root)
+        self.assertTrue(cfg.is_forbidden(".claude/settings.json"))
+        self.assertTrue(cfg.is_forbidden(".claude/hooks/pre.sh"))
 
 
 class MicromanagerTests(unittest.TestCase):
@@ -787,6 +1074,262 @@ class MicromanagerTests(unittest.TestCase):
             self.assertEqual(mm_acp.budget.max_calls_per_card, 5)
             decision = mm_acp.shape_and_plan(self.card, {}, {})
             self.assertEqual(decision.verdict, "ready")
+
+    def test_budget_records_bad_json_eof_and_shared_night_budget(self) -> None:
+        # 1. Paid ACP calls returning bad JSON still record spend/tokens and trigger spend cap.
+        bad_json_script = self.tmp / "bad_json_paid.json"
+        bad_json_script.write_text(
+            json.dumps(
+                {
+                    "turns": [
+                        {
+                            "text": "not valid json at all",
+                            "usage": {"tokens_in": 150, "tokens_out": 40, "cost": 0.30},
+                        },
+                        {
+                            "text": "still not json",
+                            "usage": {"tokens_in": 120, "tokens_out": 30, "cost": 0.30},
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        budget = MicromanagerBudget(
+            max_calls_per_card=5, tokens_per_card=100_000, spend_per_night=0.50
+        )
+        backend = ClaudeAcpMicromanager(
+            command=_stand_in_cmd("--mode", "script", "--script", str(bad_json_script)),
+            cwd=self.tmp,
+        )
+        with Micromanager(backend, budget=budget) as mm:
+            with self.assertRaises(Invalid):
+                mm.coach(self.card, "impl", 1, {}, "", "err")
+            self.assertEqual(budget.calls, 1)
+            self.assertEqual(budget.calls_per_card["CARD-42"], 1)
+            self.assertEqual(budget.tokens_in, 150)
+            self.assertEqual(budget.tokens_out, 40)
+            self.assertAlmostEqual(budget.spend, 0.30, places=6)
+
+            with self.assertRaises(Invalid):
+                mm.coach(self.card, "impl", 2, {}, "", "err")
+            self.assertEqual(budget.calls, 2)
+            self.assertAlmostEqual(budget.spend, 0.60, places=6)
+
+            with self.assertRaises(Refused) as caught_cap:
+                mm.coach(self.card, "impl", 3, {}, "", "err")
+            self.assertEqual(caught_cap.exception.code, "micromanager-spend-cap")
+
+        # 2. Partial usage before EOF still records into MicromanagerBudget.
+        eof_script = self.tmp / "eof_partial.json"
+        eof_script.write_text(
+            json.dumps(
+                {
+                    "turns": [
+                        {
+                            "chunks": ["{\"verdict\":"],
+                            "usage_updates": [
+                                {"inputTokens": 90, "outputTokens": 10, "cost": {"amount": 0.12}}
+                            ],
+                            "eof_before_response": True,
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        eof_budget = MicromanagerBudget(max_calls_per_card=1, spend_per_night=5.0)
+        eof_backend = ClaudeAcpMicromanager(
+            command=_stand_in_cmd("--mode", "script", "--script", str(eof_script)),
+            cwd=self.tmp,
+        )
+        with Micromanager(eof_backend, budget=eof_budget) as mm_eof:
+            with self.assertRaises(Infra) as caught_eof:
+                mm_eof.shape_and_plan(self.card, {}, {})
+            self.assertEqual(caught_eof.exception.code, "acp-eof")
+            self.assertEqual(eof_budget.calls, 1)
+            self.assertEqual(eof_budget.tokens_in, 90)
+            self.assertEqual(eof_budget.tokens_out, 10)
+            self.assertAlmostEqual(eof_budget.spend, 0.12, places=6)
+            with self.assertRaises(Refused) as caught_call_cap:
+                mm_eof.shape_and_plan(self.card, {}, {})
+            self.assertEqual(caught_call_cap.exception.code, "micromanager-call-cap")
+
+        # 3. open_micromanager(..., budget=shared_budget) shares caps across cards.
+        shared = MicromanagerBudget(max_calls_per_card=5, spend_per_night=0.40)
+        s1 = self.tmp / "mm_s1.json"
+        s1.write_text(
+            json.dumps({"coach": {"root_cause": "a", "guidance": "b", "_usage": {"spend": 0.25}}}),
+            encoding="utf-8",
+        )
+        s2 = self.tmp / "mm_s2.json"
+        s2.write_text(
+            json.dumps({"coach": {"root_cause": "c", "guidance": "d", "_usage": {"spend": 0.20}}}),
+            encoding="utf-8",
+        )
+        cfg_off = SimpleNamespace(never_touch=[], forbidden_files=[".openfarm/**"])
+        card_b = Card(id="CARD-99", title="Other", state="ready", touches=["src/lib.rs"])
+        mm1 = open_micromanager(cfg_off, self.tmp, self.tmp, script=s1, budget=shared)
+        mm2 = open_micromanager(cfg_off, self.tmp, self.tmp, script=s2, budget=shared)
+        mm1.coach(self.card, "impl", 1, {}, "", "")
+        mm2.coach(card_b, "impl", 1, {}, "", "")
+        self.assertEqual(shared.calls, 2)
+        self.assertAlmostEqual(shared.spend, 0.45, places=6)
+        with self.assertRaises(Refused) as caught_shared:
+            mm2.coach(card_b, "impl", 2, {}, "", "")
+        self.assertEqual(caught_shared.exception.code, "micromanager-spend-cap")
+
+    def test_scaffold_contract_rejects_smuggled_real_fns_and_test_paths(self) -> None:
+        bad_bodies = [
+            "pub fn real() -> i32 { 1 }\n// todo!()",
+            "pub fn stub() { todo!() }\npub fn real() -> i32 { 1 }",
+            'pub fn str_smuggle() { let _ = "todo!()"; }',
+            'pub fn raw_smuggle() { let _ = r#"unimplemented!()"#; }',
+            "pub fn block_comment() { /* todo!() */ 42 }",
+            'pub fn arg_exec() { todo!("{}", evil()); }',
+            "pub fn empty() {}",
+        ]
+        for idx, body in enumerate(bad_bodies):
+            with self.subTest(idx=idx, body=body):
+                mm = Micromanager(
+                    ScriptedMicromanager(
+                        {
+                            "scaffold_contract": {
+                                "edits": [
+                                    {
+                                        "format": FORMAT_WHOLE_FILE,
+                                        "path": "src/lib.rs",
+                                        "content": body,
+                                    }
+                                ]
+                            }
+                        }
+                    )
+                )
+                with self.assertRaises(Refused) as caught:
+                    mm.scaffold_contract(self.card, {}, {})
+                self.assertEqual(caught.exception.code, "scaffold-missing-todo")
+
+        # Reject test paths even when listed in card.touches.
+        mm_test_path = Micromanager(
+            ScriptedMicromanager(
+                {
+                    "scaffold_contract": {
+                        "edits": [
+                            {
+                                "format": FORMAT_WHOLE_FILE,
+                                "path": "tests/parser_test.rs",
+                                "content": "fn my_test() { todo!() }",
+                            }
+                        ]
+                    }
+                }
+            )
+        )
+        with self.assertRaises(Refused) as caught_tp:
+            mm_test_path.scaffold_contract(self.card, {}, {})
+        self.assertEqual(caught_tp.exception.code, "scaffold-test-path")
+
+        # Allow multi-fn todo stubs, brace-free trait signatures, and pure declarations.
+        good_bodies = [
+            'pub fn a() { todo!() }\npub fn b() { unimplemented!("later") }',
+            "pub trait Parser { fn parse(&self, s: &str) -> Result<(), ()>; }",
+            "pub struct Parsed { pub len: usize }",
+        ]
+        for body in good_bodies:
+            with self.subTest(good=body):
+                mm_good = Micromanager(
+                    ScriptedMicromanager(
+                        {
+                            "scaffold_contract": {
+                                "edits": [
+                                    {
+                                        "format": FORMAT_WHOLE_FILE,
+                                        "path": "src/lib.rs",
+                                        "content": body,
+                                    }
+                                ]
+                            }
+                        }
+                    )
+                )
+                edits = mm_good.scaffold_contract(self.card, {}, {})
+                self.assertEqual(len(edits), 1)
+
+    def test_strip_edit_blocks_across_all_ops_and_claude_forbidden(self) -> None:
+        hdr = "=== whole_file: src/lib.rs\n<<< SEARCH\na\n>>> REPLACE\n"
+        mm = Micromanager(
+            ScriptedMicromanager(
+                {
+                    "shape_and_plan": {
+                        "verdict": "split",
+                        "clarified_notes": hdr + "note",
+                        "extra_context_files": [".claude/settings.json", "src/lib.rs"],
+                        "steps": [
+                            {
+                                "n": 1,
+                                "does": hdr + "step one",
+                                "tests": ["test_empty_returns_err"],
+                                "touches": ["src/lib.rs"],
+                            }
+                        ],
+                        "findings": [{"title": hdr + "ftitle", "body": hdr + "fbody"}],
+                    },
+                    "coach": {
+                        "root_cause": hdr + "rc",
+                        "guidance": hdr + "guide",
+                        "abort": True,
+                        "abort_reason": hdr + "abort why",
+                    },
+                    "adjudicate_checker": {
+                        "verdict": "uphold",
+                        "rationale": hdr + "valid",
+                        "fix_hint": hdr + "hint",
+                    },
+                    "pre_review": {
+                        "verdict": "bounce",
+                        "reviewer_brief": hdr + "brief",
+                        "missed_clause": hdr + "clause",
+                        "findings": [{"title": hdr + "pr", "body": hdr + "prb"}],
+                    },
+                    "triage_blocked": {
+                        "summary": hdr + "summary",
+                        "recommendations": [{"card_id": "C1", "action": hdr + "act"}],
+                        "findings": [{"title": hdr + "tr", "body": hdr + "trb"}],
+                    },
+                }
+            )
+        )
+        self.assertIn(".claude/**", mm.forbidden_files)
+
+        shaped = mm.shape_and_plan(self.card, {}, {})
+        self.assertEqual(shaped.extra_context_files, ["src/lib.rs"])
+        for txt in (
+            shaped.clarified_notes,
+            shaped.steps[0]["does"],
+            shaped.findings[0]["title"],
+            shaped.findings[0]["body"],
+        ):
+            self.assertNotIn("=== whole_file", txt)
+            self.assertNotIn("<<< SEARCH", txt)
+
+        coached = mm.coach(self.card, "impl", 1, {}, "", "")
+        self.assertNotIn("=== whole_file", coached.abort_reason)
+        self.assertNotIn("<<< SEARCH", coached.abort_reason)
+
+        adj = mm.adjudicate_checker(self.card, "", None, [])
+        self.assertNotIn("=== whole_file", adj.rationale)
+        self.assertNotIn("<<< SEARCH", adj.rationale)
+
+        rev = mm.triage_and_review("pre_review", {"card": self.card.as_dict()})
+        self.assertNotIn("=== whole_file", rev.reviewer_brief)
+        self.assertNotIn("=== whole_file", rev.missed_clause)
+        self.assertNotIn("=== whole_file", rev.findings[0]["title"])
+
+        tri = mm.triage_and_review("triage_blocked", {})
+        self.assertNotIn("=== whole_file", tri.summary)
+        self.assertNotIn("=== whole_file", tri.recommendations[0]["action"])
+        self.assertNotIn("=== whole_file", tri.findings[0]["body"])
 
 
 if __name__ == "__main__":
