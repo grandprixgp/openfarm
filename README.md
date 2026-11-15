@@ -9,6 +9,8 @@ and five adapters.
 
 Built from `openfarm spec v0.3.md`, which is in this folder and is the authority on
 what the tool is for. `docs/openfarm-internals.md` is about the code.
+**`docs/HANDOFF.md` is the place to start:** what is proven, what is not, and what
+comes next.
 
 ## Run it
 

@@ -19,7 +19,7 @@ it runs all 238 in about 55 s. Both modes are green.
 | A card runs to `in-review` on a real git repo, real cargo crate | `tests/test_e2e.py` |
 | A card runs to `in-review` on **`dtolnay/anyhow`**, and the branch is exactly the intended diff | `tests/test_portability.py` |
 | The branch openfarm produced passes `clippy -D warnings` (checked by hand, not in the suite) | `MECH-1` on the second repo |
-| Ten gaming tricks in the end-to-end suite, each asserting one trap is caught | `tests/test_e2e.py`, `test_flow_edges.py` |
+| Ten gaming tricks, each asserting one trap is caught (`GamingTrickTests`) | `tests/test_e2e.py` |
 | No code path pushes: allowlist + AST scan + a bare remote that stays empty | `tests/test_protocol.py` |
 | Catch-up trial merge: skipped / green / conflicting | `tests/test_catchup.py` |
 | A night: several cards, card cap, dry run, pause, kill switch, run lock, circuit breaker | `tests/test_night.py` |
@@ -70,7 +70,11 @@ Worth knowing because they are the shape of what this code gets wrong. Three ind
 
 ## 5. The second repository
 
-`~/projects/openfarm-second` is a clone of `dtolnay/anyhow` (upstream `origin` untouched), with `.openfarm/config.toml` and `cards/MECH-1.md` committed on `master`. It has two branches of its own: `openfarm-cards` (card state, generated) and `openfarm/MECH-1-root-cause-stops-needing` (the card's work branch).
+`~/projects/openfarm-second` is a clone of `dtolnay/anyhow` (upstream `origin`
+untouched), with `.openfarm/config.toml` and `cards/MECH-1.md` committed on `master`.
+Its own branches: `openfarm-cards` (generated card state) and
+`openfarm/MECH-1-root-cause-stops-needing` (the card's work branch — one file,
+once the intended edit, which is the shape a reviewer should expect).
 
 **It is not a farm target.** It is a portability fixture: `tests/test_portability.py` resets the card, runs it, and asserts openfarm's own tree is byte-for-byte unchanged. If you delete the folder, those 8 tests skip. If you re-clone it, re-create the config and card from the test file's expectations.
 
@@ -109,6 +113,7 @@ Worth knowing because they are the shape of what this code gets wrong. Three ind
     adapters/jsonl.py          telemetry and the record field lists
     roles/__init__.py          the four roles and what they return
   tests/                       238 tests, toy builder, regression list
+  docs/HANDOFF.md              start here: proven, unproven, next
   docs/openfarm-internals.md   invariants and the honest-gaps list
   README.md                    what it is, how to run it
 ```
