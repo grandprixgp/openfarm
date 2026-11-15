@@ -4,23 +4,24 @@ Technical reference for `openfarm_core`, its six protocol-versioned adapters, co
 
 ## Module Layout (`openfarm_core/`)
 
-- `config.py`: Strict TOML loader (`KNOWN_TABLES`, `_TABLE_KEYS`) with fail-closed rejection (`ConfigError`) on unknown tables, unknown keys, conflicting keys (e.g. `timeout` vs `timeout_s`), invalid policy/globs, or paths escaping the repo root.
+- `config.py`: Strict TOML loader (`KNOWN_TABLES`, `_TABLE_KEYS`, `HarnessConfig`) with fail-closed rejection (`ConfigError`) on unknown tables, unknown keys, conflicting keys (e.g. `timeout` vs `timeout_s`), invalid bounds/choices (including `[harness]` `min_confidence`, `probe_window`, `capture_on`, `editable_surfaces`), invalid policy/globs, or paths escaping the repo root.
 - `cards.py`: Card parser (`parse_card`), `Card` / `TestRef` models, `CARD_FIELDS` and `OPTIONAL_CARD_FIELDS` (`unit`, `context_files`, `type_changes`), and fenced TOML block extractor (`extract_fenced_fields` supporting ` ```openfarm ` and ` ```toml `).
 - `errors.py`: `StopCode` enum (17 per-card stop codes including `supervisor-reject`, plus `killed`, `released`, `paused`), `RELEASING_CODES`, and typed exception hierarchy (`AdapterError`, `Refused`, `Infra`, `Invalid`, `Unsupported`, `ConfigError`, `UsageError`, `GateFailure`).
 - `protocol.py`: `PROTOCOL_VERSION = 1`, `REQUIRED_OPS` / `OPTIONAL_OPS` for all 6 adapters (`cards`, `runner`, `pack`, `model`, `telemetry`, `micromanager`), and JSON-over-stdio `CmdAdapter` wrappers (`CmdCardSource`, `CmdModelBackend`, `CmdTelemetry`, `CmdPack`). `CmdRunner` lives in `adapters/direct.py` and `CmdMicromanager` lives in `micromanager.py`.
 - `globs.py`: Repo-relative glob normalization, `resolves_within` path-traversal guard, and matchers for `never_touch` / `forbidden_files`.
 - `git.py`: Git worktree lifecycle (`worktree_add`, `worktree_remove`, baseline reset), commit helpers, safe flag/config allowlisting (rejecting arbitrary `-c` / unsafe options), and repo lock coordination.
-- `state.py`: On-disk state under `state_dir` (`cards/<safe_id>/`, `leases/`, `breaker.json`, `STOP`), card ID path sanitization (`_safe_id` preventing path traversal), atomic writes, and disk-space floor enforcement (`[state] min_free_mb`).
-- `budget.py`: Per-card and nightly token/spend/build/wall-clock accounting (`BudgetTracker`), frontier cost ratio checks, and lease TTL checks.
+- `state.py`: On-disk state under `state_dir` (`cards/<safe_id>/`, `leases/`, `breaker.json`, `STOP`, `harness/` via `StateDir.harness(tag="")`), card ID path sanitization (`_safe_id` preventing path traversal), atomic writes, and disk-space floor enforcement (`[state] min_free_mb`).
+- `budget.py`: Per-card and nightly token/spend/build/wall-clock accounting (`BudgetTracker`, `NightBudget` with separate `micromanager_spend`), frontier cost ratio checks, and lease TTL checks.
 - `edits.py`: Structured search/replace/create/delete edit parser and atomic multi-file `apply_edits` (rolling back all files in a batch if any edit fails or touches a forbidden path).
-- `briefs.py`: Prompt assembly for `test_writer`, `implementer`, `checker`, and `planner`, incorporating `reference`, `context_files`, rich Rust `signatures()`, `flagged_patterns`, and sanitized failure logs.
-- `roles/__init__.py`: Role dispatch and response parsing for `test_writer`, `implementer`, `checker`, and `planner` (`plan.steps` multi-step output).
-- `micromanager.py`: Supervisory orchestration (`Micromanager`, `NullMicromanager`, `ScriptedMicromanager`, `CmdMicromanager`, `ClaudeAcpMicromanager`, `open_micromanager`) implementing 5 ops: `shape_and_plan`, `scaffold_contract`, `coach`, `adjudicate_checker`, `triage_and_review` (`pre_review`, `triage_blocked`, `prepare_queue`). Enforces `MicromanagerBudget` (`max_calls_per_card`, `tokens_per_card`, `spend_per_night`), strips/blocks edit blocks outside contracts (`_strip_edit_blocks`), validates production `todo!()`/`unimplemented!()` stubs (`_valid_production_scaffold`), and sanitizes paths (`_validate_safe_path`).
+- `briefs.py`: Prompt assembly for `test_writer`, `implementer`, `checker`, and `planner`, incorporating `reference`, `context_files`, rich Rust `signatures()`, `flagged_patterns`, sanitized failure logs, and optional fenced `harness adaptations` (`fence(harness_guidance, "harness adaptations")`).
+- `roles/__init__.py`: Role dispatch (`Roles`), plan validation (`parse_plan`, `wants_planner`), counter-test/restatement parsing, and brief forwarding (including `harness_guidance`) for `test_writer`, `implementer`, `checker`, and `planner`.
+- `harness_memory.py`: Recursive Harness Efficiency subsystem (`EDITABLE_SURFACES`, `IMMUTABLE_GATE_KEYS`, `sanitize_lesson_text`, `is_gate_bypass_directive`, `validate_harness_proposal`, `_classify_failure`, `extract_contrast`, `HarnessLedger`, `HarnessLibrary`, `GuidanceSelection`).
+- `micromanager.py`: Supervisory orchestration (`Micromanager`, `NullMicromanager`, `ScriptedMicromanager`, `CmdMicromanager`, `ClaudeAcpMicromanager`, `open_micromanager`) implementing 6 ops: `shape_and_plan`, `scaffold_contract`, `coach`, `adjudicate_checker`, `triage_and_review` (`pre_review`, `triage_blocked`, `prepare_queue`), and `reflect_harness`, plus `self.harness_context` forwarding. Enforces `MicromanagerBudget` (`max_calls_per_card`, `tokens_per_card`, `spend_per_night`), strips/blocks edit blocks outside contracts (`_strip_edit_blocks`), validates production `todo!()`/`unimplemented!()` stubs (`_valid_production_scaffold`), and sanitizes paths (`_validate_safe_path`).
 - `adapters/`:
   - `files.py`: `FileCardSource` reading markdown cards and applying safe card/checkbox updates.
   - `direct.py`: `DirectRunner` & `CmdRunner` executing build/test subprocesses with safe env scoping (`[runner.env]`) and timeout/signal reporting.
   - `openai_compat.py`: `OpenAICompatibleBackend` & `ScriptedBackend` with endpoint allowlist validation (`allowed_endpoints`), key-file loading, retry handling for HTTP `429` and `5xx` responses, and token/cost accounting.
-  - `jsonl.py`: `JsonlTelemetry` writing structured JSONL telemetry events.
+  - `jsonl.py`: `JsonlTelemetry` writing structured JSONL telemetry events (`CARD_FIELDS` includes `harness_revision`, `harness_cues_applied`, `harness_lessons_added`).
   - `acp.py`: `ClaudeAcpAdapter` speaking Agent Client Protocol v1 (NDJSON JSON-RPC 2.0 over stdio) with strict capability denial and read-only path mediation.
 - `packs/`:
   - `base.py`: `LanguagePack` abstract contract (`unit_for`, `signatures`, `format`, `check`, `test`, `lint`, `mutate`, `coverage`, `parse_counter_tests`, etc.) and `pack_for` factory. TypeScript raises `Invalid("no-typescript-pack")`.
@@ -28,11 +29,11 @@ Technical reference for `openfarm_core`, its six protocol-versioned adapters, co
 - `gates/`:
   - `eligibility.py`: `check_eligibility` enforcing 9 `KNOWN_CATEGORIES`, `max_files`, `max_units`, `require_reference`, `context_files` bounds (`max_context_files`), `type_changes` (`allow_type_changes`), multi-file `new_symbols` rules (permitted when `type_changes = true` or `scaffold_contracts = true`), `never_touch`/`forbidden_files` intersections, and card hash checks.
   - `checks.py`: Deterministic gate helpers including `revert-check` against `base + frozen-tests` (after formatting), mutation kill-rate enforcement (`mutation_required_for`), counter-test bounce-back handling, `workspace_lint`, `baseline_cache`, `catch_up`, `extra` custom gates, and circuit breaker tracking keyed by real card IDs in `breaker.json`.
-- `dossier.py`: Structured per-card artifact and Markdown/JSON dossier writer (including micromanager calls, scaffolds, coaching hints, and verdicts).
-- `flow.py`: End-to-end card scheduler, worktree manager, Phase A fail-before loop, `scaffold_commit`, checkpointed Phase B step execution, checker/adjudicator loop, pre-review, and dossier finalization.
-- `cli.py`: 11-subcommand CLI (`run`, `status`, `pause`, `resume`, `stop`, `release`, `dossier`, `check`, `verdict`, `escape`, `supervise`).
+- `dossier.py`: Structured per-card artifact and Markdown/JSON dossier writer (including micromanager calls, scaffolds, coaching hints, verdicts, and optional `harness` summary).
+- `flow.py`: End-to-end card scheduler, worktree manager, Phase A fail-before loop, `scaffold_commit`, checkpointed Phase B step execution, checker/adjudicator loop, pre-review, `HarnessLibrary` cue selection (with dynamic retry failure-class lookup) and non-`Infra` outcome recording, and dossier finalization.
+- `cli.py`: 12-subcommand CLI (`run`, `status`, `pause`, `resume`, `stop`, `release`, `dossier`, `check`, `verdict`, `escape`, `supervise`, `harness`).
 
-## Configuration Schema (12 Tables)
+## Configuration Schema (13 Tables)
 
 Exact table/key validation lives in `openfarm_core/config.py` and is verified by `tests/test_project_config.py`:
 
@@ -48,6 +49,28 @@ Exact table/key validation lives in `openfarm_core/config.py` and is verified by
 - `[cards]`: `fields_block` (`""` | `"toml"`), `required_fields` (`[]`)
 - `[micromanager]`: `mode` (`"off"` | `"advisory"` | `"active"`, default `"active"`), `binary` (`"claude-agent-acp"`), `args`, `model`, `effort` (`"low"` | `"medium"` | `"high"`), `tool_policy` (`"none"` | `"read-only"`), `timeout_s` / `timeout` (`180.0`, mutually exclusive), `max_calls_per_card` (`4`), `tokens_per_card` (`120_000`), `spend_per_night` (`10.0`), `cost_per_1k_in`, `cost_per_1k_out`, `auth_file`, `isolate_home` (`True`), `shape_cards` (`True`), `scaffold_contracts` (`True`), `coach_on_stall` (`True`), `adjudicate_counter_tests` (`True`), `pre_review` (`True`)
 - `[state]`: `min_free_mb` (`256`)
+- `[harness]`: `enabled` (`True`), `dir` (`""`), `capture_on` (`("retry_recovery", "fail", "counter_fail", "pass")`), `max_cues_per_brief` (`4`), `max_active_adaptations` (`8`), `min_confidence` (`0.55`), `probe_window` (`3`), `auto_demote` (`True`), `allow_micromanager_reflection` (`True`), `editable_surfaces` (`EDITABLE_SURFACES`)
+
+## Recursive Harness Efficiency Architecture
+
+Inspired by `google-research/harness2` (`arXiv:2610.14224`), `openfarm_core/harness_memory.py` keeps all learned state outside the git repository under `<state_dir>/harness/` (`StateDir.harness()`, or `[harness] dir`):
+
+1. **Invariants & Editable Surfaces**:
+   - `IMMUTABLE_GATE_KEYS` blocks any lesson or `proposed_patch` from touching deterministic verification gates, policy lists, touches, or budgets (`cargo_test`, `clippy`, `mutants`, `diff_check`, `revert_check`, `counter_tests`, `forbidden_files`, `never_touch`, `touches`, `eligibility`, `budget`, etc.).
+   - `EDITABLE_SURFACES` permits adaptations solely on: `test_writer_guidance`, `implementer_guidance`, `planner_guidance`, `context_hints`, and `micromanager_context`.
+2. **State Layout (`<state_dir>/harness/`)**:
+   - `active_overlay.json`: active `revision`, `parent_revision`, `next_revision`, `state` (`"confirmed"` | `"probing"`), `probe_remaining`, `probe_baseline`, `probe_outcomes`, `active_entry_ids`, and `surfaces`.
+   - `revisions/rev-XXXX.json`: immutable revision snapshots (`rev-0000.json`, `rev-0001.json`, ...).
+   - `entries/<id>/EXPERIENCE.md` + `patch.json`: atomic per-entry Markdown card and JSON metadata (`stats`: `applied`, `helped`, `hurt`, `neutral`).
+   - `INDEX.md`, `ledger.jsonl`, and `metrics.json`: rebuilt summary index, append-only event log (`card_outcome`, `lesson_added`, `revision_promoted`, `revision_confirmed`, `demotion`, `reset`), and computed efficiency metrics (`first_pass_rate`, `retry_recovery_rate`, `pass_rate`, `avg_attempts`, `avg_tokens_per_pass`, `avg_spend_per_pass`, `counter_fail_rate`, `harness_efficiency`).
+3. **Dual Capture, Anti-Injection & Feedback Loops**:
+   - `extract_contrast` extracts failure classes (`_classify_failure`) and scrubbed `evidence_pair` deltas (`_scrub_test_leaks` prevents assertion answer leaks), while `_deterministic_extract` captures fallback lessons even when `micromanager` is `"off"`.
+   - When enabled, `Micromanager.reflect_harness` proposes lessons validated by `validate_harness_proposal` and `sanitize_lesson_text` (stripping edit markers, code fences, ANSI/OSC escapes, path traversals, and gate-bypass directives).
+   - `openfarm run` shares one `HarnessLibrary` across cards so Card N updates Card N+1 immediately, retries dynamically re-query `select_guidance` with the latest `failure_class`, and persisted overlays reload across launches into fenced `harness adaptations` and `micromanager.harness_context`.
+4. **Probe-Window Auto-Demotion & `Infra` Isolation**:
+   - New revisions probe for `probe_window` non-`Infra` card outcomes and automatically roll back to `parent_revision` (`demote_reason = "probe_regression"`) when `pass_rate` or `harness_efficiency` regresses beyond `0.05` (with `auto_demote = true`).
+   - `Infra` aborts never call `HarnessLibrary.record_card_outcome` or skew `metrics.json`.
+   - `openfarm harness` exposes `status`, `index`, `show`, `promote`, `demote`, and `reset --yes`.
 
 ## Key v0.4 Pipeline & Gate Hardening
 
@@ -71,9 +94,18 @@ Exact table/key validation lives in `openfarm_core/config.py` and is verified by
    - `[state] min_free_mb` aborts before spawning worktrees on low disk space (`infra`).
    - `OpenAICompatibleBackend` retries transient HTTP `429` and `5xx` errors with backoff while enforcing `allowed_endpoints`.
 
-## Verification Status
+## Verification Status & Claim-to-Test Mapping
 
-Verified locally on deterministic suites (config schema, protocol v1 dispatch, ACP security & micromanager orchestration via `tests/acp_stand_in.py`, core git/state/edits/retry I/O, and Rust pack/gate logic). Explicitly **untested** against live external targets on this machine:
+| Subsystem / Claim | Test Coverage |
+| --- | --- |
+| 13-table config validation (`[harness]`, `[micromanager]`, `[cards]`, `[state]`) | `tests/test_project_config.py`, `tests/test_config.py`, `tests/test_harness_efficiency.py` |
+| Protocol v1 (`cmd:` wrappers), `StopCode`, `StateDir`, `DirectRunner`, `OpenAICompatibleBackend`, `JsonlTelemetry` | `tests/test_protocol.py`, `tests/test_core_io_v04.py` |
+| `RustPack` signatures/split diagnostics, atomic `apply_edits`, briefs, eligibility, `revert-check`/gates | `tests/test_pack_gates_v04.py`, `tests/test_edits.py`, `tests/test_eligibility.py`, `tests/test_gates.py`, `tests/test_rust_pack.py` |
+| ACP JSON-RPC security isolation (`clientCapabilities: {}`, `tool_policy`, isolated `$HOME`), 6 micromanager ops | `tests/test_acp_micromanager.py`, `tests/acp_stand_in.py` |
+| Recursive Harness Efficiency (`HarnessLibrary`, `HarnessLedger`, sanitization, `reflect_harness`, probe rollback, `Infra` isolation, `openfarm harness`) | `tests/test_harness_efficiency.py` |
+| End-to-end orchestration, multi-step checkpoints, Phase A retries, counter-test adjudication, `openfarm supervise`, regressions | `tests/test_v04_e2e.py`, `tests/test_e2e.py`, `tests/test_regressions.py`, `tests/test_flow_edges.py` |
+
+Explicitly **untested** against live external targets on this machine:
 - Live `claude-agent-acp` binary with real Anthropic credentials (**untested**).
 - Live hosted ZDR OpenAI-compatible endpoints (**untested**).
 - Live `cargo-mutants` binary runs (**untested**).

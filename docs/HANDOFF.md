@@ -12,21 +12,28 @@ Concise entry point for engineers reviewing, testing, or extending Openfarm v0.4
 2. **6th Built-in Adapter & ACP Micromanager (`micromanager.py`, `adapters/acp.py`)**:
    - Added `[adapters] micromanager` (`off`, `claude-acp`, `scripted`, `cmd:<argv>`), alongside `telemetry` and `pack` `cmd:<argv>` support across all six adapters (`PROTOCOL_VERSION = 1`).
    - Implemented `ClaudeAcpAdapter` speaking Agent Client Protocol v1 (NDJSON JSON-RPC 2.0 over stdio, defaulting to `claude-agent-acp`).
-   - Added five bounded supervisory ops (`shape_and_plan`, `scaffold_contract`, `coach`, `adjudicate_checker`, `triage_and_review`), `[micromanager]` budget/policy controls, `supervisor-reject` stop code, `openfarm supervise`, and `openfarm run --mm-script`.
+   - Added six bounded supervisory ops (`shape_and_plan`, `scaffold_contract`, `coach`, `adjudicate_checker`, `triage_and_review`, `reflect_harness`), `[micromanager]` budget/policy controls, `supervisor-reject` stop code, `openfarm supervise`, and `openfarm run --mm-script`.
 3. **Security & Gate Hardening**:
    - ACP capability lock-down (`clientCapabilities: {}`, `-32601` for write/terminal RPCs, `session/request_permission` restricted to `"none"` or `"read-only"` inside worktree excluding `never_touch`/`forbidden_files`, isolated `$HOME`, key isolation, ANSI/OSC stripping, `todo!()`/`unimplemented!()` stub validation).
    - Phase A fail-before retry loop inside `test_writer_attempts` (with `scaffold_commit`).
    - Formatting before `full_diff` and `revert-check`; `revert-check` evaluated against `base + frozen-tests`.
    - Split stdout/stderr Cargo parser with signal detection; `--test <stem>` counter-test execution and bounce-back adjudication.
-   - Safe git flag/config allowlist, `_safe_id` card-ID path sanitization, `[state] min_free_mb` disk guard, HTTP `429`/`5xx` retries, strict config table/key validation (`[cards]`, `[micromanager]`, `[state]`, new `[eligibility]`/`[gates]`/`[adapters]` keys), and real card IDs in `breaker.json`.
+   - Safe git flag/config allowlist, `_safe_id` card-ID path sanitization, `[state] min_free_mb` disk guard, HTTP `429`/`5xx` retries, strict config table/key validation (`[cards]`, `[micromanager]`, `[state]`, `[harness]`, new `[eligibility]`/`[gates]`/`[adapters]` keys), and real card IDs in `breaker.json`.
+4. **Recursive Harness Efficiency (`harness_memory.py`, `[harness]`, `HarnessLibrary`, `HarnessLedger`)**:
+   - Inspired by `google-research/harness2` (`arXiv:2610.14224`), stores overlays, `revisions/rev-XXXX.json`, `entries/<id>/EXPERIENCE.md` + `patch.json`, rebuilt `INDEX.md`, `ledger.jsonl`, and `metrics.json` outside the repo under `<state_dir>/harness/`.
+   - Deterministic verification and policy/budget gates (`IMMUTABLE_GATE_KEYS`) remain strictly immutable; adaptations target only the 5 `EDITABLE_SURFACES` (`test_writer_guidance`, `implementer_guidance`, `planner_guidance`, `context_hints`, `micromanager_context`).
+   - Dual capture via deterministic `extract_contrast` (even with micromanager `"off"`) and `reflect_harness`, sanitized against edit markers, path traversals, assertion leaks, and gate-bypass directives (`validate_harness_proposal`, `sanitize_lesson_text`).
+   - Intra-run transfer (Card N teaches Card N+1 + dynamic retry failure-class lookup) and cross-launch persistence feeding fenced `harness adaptations` in briefs and `micromanager.harness_context`.
+   - Propose–probe–confirm/auto-demote rollback on efficiency regression, `Infra` isolation (machine/infra aborts never skew metrics or trigger rollbacks), card telemetry (`harness_revision`, `harness_cues_applied`, `harness_lessons_added`), dossier summary, and the 12th CLI subcommand `openfarm harness` (`status`, `index`, `show`, `promote`, `demote`, `reset --yes`).
 
 ## Where to Start Reading
 
-1. `openfarm_core/config.py` and `tests/test_project_config.py` — complete 12-table configuration contract (`KNOWN_TABLES`, `_TABLE_KEYS`).
-2. `openfarm_core/adapters/acp.py` and `openfarm_core/micromanager.py` — ACP v1 protocol security boundaries, stub checks, budget caps, and the five supervisory ops.
-3. `openfarm_core/flow.py` and `openfarm_core/cli.py` — Phase A/B/checker state machine, step checkpoints, `supervise` CLI, and stop-code transitions (`openfarm_core/errors.py`).
-4. `openfarm_core/packs/rust.py` and `openfarm_core/gates/checks.py` — signature extraction, split diagnostics, `--test <stem>` counter-tests, and `revert-check`.
-5. `tests/acp_stand_in.py` and `tests/test_acp_micromanager.py` — deterministic stdio NDJSON-RPC stand-in server used to verify ACP behavior offline.
+1. `openfarm_core/config.py` and `tests/test_project_config.py` — complete 13-table configuration contract (`KNOWN_TABLES`, `_TABLE_KEYS`, `HarnessConfig`).
+2. `openfarm_core/adapters/acp.py` and `openfarm_core/micromanager.py` — ACP v1 protocol security boundaries, stub checks, budget caps, and the six supervisory ops.
+3. `openfarm_core/harness_memory.py` and `tests/test_harness_efficiency.py` — `HarnessLibrary`, `HarnessLedger`, contrast capture, anti-injection validation, probe-window rollback, and `openfarm harness` CLI.
+4. `openfarm_core/flow.py`, `openfarm_core/dossier.py`, and `openfarm_core/cli.py` — Phase A/B/checker state machine, step checkpoints, 12-subcommand CLI (`supervise` and `harness`), and stop-code transitions (`openfarm_core/errors.py`).
+5. `openfarm_core/packs/rust.py` and `openfarm_core/gates/checks.py` — signature extraction, split diagnostics, `--test <stem>` counter-tests, and `revert-check`.
+6. `tests/acp_stand_in.py`, `tests/test_acp_micromanager.py`, `tests/test_core_io_v04.py`, `tests/test_pack_gates_v04.py`, and `tests/test_v04_e2e.py` — deterministic unit, I/O, gate, ACP stand-in, and end-to-end suites.
 
 ## Security & Trust Rules to Preserve When Modifying
 
@@ -34,6 +41,7 @@ Concise entry point for engineers reviewing, testing, or extending Openfarm v0.4
 - Never relax `_is_path_allowed_readonly` in `openfarm_core/adapters/acp.py`: read-only micromanager access must remain bounded by `resolves_within` against the active card worktree and blocked from `never_touch` / `forbidden_files` (including `.openfarm/**`).
 - Keep `[model] key_file` and host credentials strictly separated from `_sanitised_env` in the ACP adapter.
 - Keep deterministic gates (`format`, `test`, `lint`, `revert-check`, `mutation`, `coverage`, `extra`) independent of micromanager overrides; `advisory` mode must never mutate repository files or block deterministic passes.
+- Never add deterministic gates, policy lists, touches, or budgets (`IMMUTABLE_GATE_KEYS`) to `EDITABLE_SURFACES`, never bypass `validate_harness_proposal` / `sanitize_lesson_text`, and never record `Infra` aborts as harness failures in `HarnessLibrary` / `HarnessLedger`.
 
 ## Explicitly Untested Integrations
 
