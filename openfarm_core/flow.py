@@ -23,14 +23,21 @@ from .gates.checks import (PASS, FAIL, INFRA, GateResult, banned_patterns_rust,
                            ignored_or_filtered, mutation_gate,
                            paths_touched_by_extra_gate, revert_check,
                            suite_green, test_loss)
-from .gates.eligibility import check_eligibility, file_is_blocked
+from .gates.eligibility import (check_eligibility, derive_cargo_unit,
+                                file_is_blocked)
 from .git import Git, GitRefused
-from .globs import matches_any, normalise
-from .roles import (Roles, build_checker_pass1_brief, build_checker_pass2_brief,
-                    build_implementer_brief, build_planner_brief,
-                    build_test_writer_brief, parse_counter_tests, parse_plan,
-                    parse_restatement, wants_planner)
+from .globs import matches_any, normalise, resolves_within
+from .micromanager import open_micromanager
+from .roles import (Plan, Roles, build_checker_pass1_brief,
+                    build_checker_pass2_brief, build_implementer_brief,
+                    build_planner_brief, build_test_writer_brief,
+                    parse_counter_tests, parse_plan, parse_restatement,
+                    wants_planner)
 from .state import append_jsonl, utc_now, utc_after, write_json
+
+#: Sentinel returned by `_judge_attempt` when an intermediate planner step
+#: succeeded and the flow should checkpoint and continue to the next step.
+_STEP_ADVANCED = "__STEP_ADVANCED__"
 
 #: Builds that a model's edit caused, and which count against the model cap.
 MODEL_BUILD_KINDS = ("test", "lint", "build")
@@ -64,7 +71,7 @@ class CardRun:
                  runner, pack, backend, book: BriefBook, run_id: str,
                  telemetry, budget: Budget | None = None,
                  deps_done: bool = True, conventions: str = "",
-                 log=None) -> None:
+                 log=None, micromanager=None) -> None:
         self.card = card
         self.cfg = cfg
         self.state = state
@@ -88,6 +95,22 @@ class CardRun:
         self.target_dir = self.card_layout / "target"
         self.target_dir.mkdir(parents=True, exist_ok=True)
 
+        self._owns_micromanager = micromanager is None
+        if micromanager is None:
+            self.micromanager = open_micromanager(
+                cfg, self.card_layout, self.worktree,
+                worktree=self.worktree, card_dir=self.card_layout,
+            )
+        else:
+            self.micromanager = micromanager
+            if hasattr(self.micromanager, "card_dir"):
+                self.micromanager.card_dir = self.card_layout
+
+        if hasattr(self.book, "allowed_extra_reads") and getattr(self.card, "context_files", None):
+            self.book.allowed_extra_reads.update(
+                normalise(p) for p in self.card.context_files
+            )
+
         self.lease_id = ""
         self.attempt = 0
         self.phase = "claim"
@@ -98,8 +121,11 @@ class CardRun:
         self.frozen_tests: dict[str, str] = {}
         self.frozen_hash = ""
         self.frozen_commit = ""
+        self.scaffold_commit = ""
+        self.step_checkpoint_commit = ""
         self.base_commit = ""
         self.branch = ""
+        self.effective_unit = self.card.unit
         self.base_test_list: dict = {"tests": []}
         self.named_passing = 0
         self.diff_hashes: list[str] = []
@@ -111,9 +137,11 @@ class CardRun:
         self.plan = None
         self.step_index = 0
         self.step_failures = 0
+        self.step_summaries: list[str] = []
         self.depth = 1
         self.counter_summary = {"written": 0, "dropped_uncompiled": 0,
-                                "passed": 0, "failed": 0}
+                                "passed": 0, "failed": 0, "not_run": 0}
+        self._last_failing_counters: list[dict] = []
         self.mutation_summary = {"killed": 0, "survived": 0, "total": 0,
                                  "capped": False}
         self.known_failing_excluded: list[str] = []
@@ -123,6 +151,19 @@ class CardRun:
         self.current_diff = ""
         self.started_at = utc_now()
         self.checker_restatement = None
+        self.checker_adjudication: dict = {}
+        self.reviewer_brief = ""
+        self.clarified_notes = ""
+        self.extra_context_files: list[str] = [
+            normalise(p) for p in (getattr(self.card, "context_files", ()) or ())
+        ]
+        self.coaching_guidance = ""
+        self.coach_used_for_stall = False
+        self.failed_on_base_by_test: dict[str, str] = {}
+        self.head_status_by_test: dict[str, str] = {}
+        self.micromanager_summary: dict = {}
+        self.phase_a_stub_files: set[str] = set()
+        self._tests_proven_in_phase_a = False
         #: Sum of every runner call's own duration, which the pilot measures.
         self.runner_seconds = 0.0
         self.catch_up_result = ""
@@ -131,6 +172,36 @@ class CardRun:
         self.ended_at = ""
 
     # -- helpers --------------------------------------------------------------
+
+    def _effective_unit(self) -> str:
+        if self.card.unit:
+            return self.card.unit
+        if not self.effective_unit:
+            self.effective_unit = derive_cargo_unit(self.card.touches, self.worktree)
+        return self.effective_unit
+
+    def _file_finding(self, entry: dict) -> str | None:
+        limit = getattr(self.cfg, "findings_per_card", 0)
+        if limit <= 0 or len(self.findings_filed) >= limit:
+            return None
+        source = getattr(self, "card_source", None)
+        if source is None:
+            return None
+        finding_fn = getattr(source, "finding", None)
+        if finding_fn is None:
+            return None
+        title = str(entry.get("title", "")).strip()
+        if not title:
+            return None
+        body_md = str(entry.get("body", "")).strip()
+        try:
+            res = finding_fn(self.card.id, title, body_md)
+        except (AdapterError, Unsupported, Refused) as exc:
+            self.log(f"{self.card.id}: could not file finding: {exc}")
+            return None
+        fid = str((res or {}).get("id", "") or title)
+        self.findings_filed.append(fid)
+        return fid
 
     def _record_gate(self, gate: GateResult) -> GateResult:
         """Write one gate's result where the spec puts it: `gates/<attempt>/<gate>`.
@@ -141,6 +212,7 @@ class CardRun:
         """
         self.gates.append(gate)
         attempt = max(1, self.attempt)
+        gate.attempt = attempt
         folder = self.card_layout / "gates" / str(attempt)
         folder.mkdir(parents=True, exist_ok=True)
         stem = gate.name.replace(":", "-")
@@ -200,14 +272,15 @@ class CardRun:
     def _run(self, kind: str, argv: list[str], counted: str = "model",
              unit: str = "", timeout_s: float | None = None):
         self._check_kill_switch()
-        env = self.cfg.runner_env.get(unit or self.card.unit, {})
+        resolved_unit = unit or self._effective_unit()
+        env = self.cfg.runner_env.get(resolved_unit, {})
         timeout = timeout_s
         if timeout is None:
             left = self.budget.wall_clock_left_s()
             timeout = max(30.0, left)
         result = self.runner.exec(
             kind=kind, argv=argv, cwd=self.worktree,
-            target_dir=self.target_dir, unit=unit or self.card.unit,
+            target_dir=self.target_dir, unit=resolved_unit,
             env=env, timeout_s=timeout)
         self.runner_seconds += getattr(result, "duration_s", 0.0) or 0.0
         if counted == "model":
@@ -314,8 +387,36 @@ class CardRun:
             self._step_plan()
             self._step_phase_a()
             self._step_prove_tests()
-            self._step_phase_b()
-            self._step_end_gates()
+            bounce_diff = ""
+            bounce_failure = ""
+            bounce_counter = ""
+            checker_bounced = False
+            pre_review_bounced = False
+            while True:
+                self._step_phase_b(
+                    initial_diff=bounce_diff,
+                    initial_failure=bounce_failure,
+                    initial_counter_tests=bounce_counter,
+                )
+                bounce = self._step_end_gates(
+                    allow_checker_bounce=(
+                        not checker_bounced
+                        and self.card.category != "test-backfill"
+                        and self.budget.implementer_attempts_left() > 0
+                    ),
+                    allow_pre_review_bounce=(
+                        not pre_review_bounced
+                        and self.card.category != "test-backfill"
+                        and self.budget.implementer_attempts_left() > 0
+                    ),
+                )
+                if bounce is None:
+                    break
+                kind, bounce_diff, bounce_failure, bounce_counter = bounce
+                if kind == "checker":
+                    checker_bounced = True
+                else:
+                    pre_review_bounced = True
             self._step_catch_up()
             final_state = "in-review"
             self.stop_code = None
@@ -343,6 +444,11 @@ class CardRun:
             self.detail = exc.message
             final_state = "blocked"
         finally:
+            if self._owns_micromanager:
+                try:
+                    self.micromanager.close()
+                except Exception:
+                    pass
             self.budget.stop_clock()
             self.ended_at = utc_now()
 
@@ -381,11 +487,17 @@ class CardRun:
         self.phase = "worktree"
         self.base_commit = self.git.head(self._base_ref())
         self.branch = f"openfarm/{self.card.id}-{self.card.slug()}"
-        if not self.git.branch_exists(self.branch):
-            self.git.create_branch(self.branch, self.base_commit)
+        if self.git.current_branch() == self.branch:
+            self.git.checkout(self.base_commit, detach=True)
+        self.git.create_branch(self.branch, self.base_commit)
         # The worktree was made by the controller and entered here; one target
         # folder per card, never shared between branches.
         self.git.checkout(self.branch, detach=False)
+        if hasattr(self.pack, "configure"):
+            self.pack.configure(self.worktree)
+        self.effective_unit = self.card.unit or derive_cargo_unit(
+            self.card.touches, self.worktree
+        )
 
     def _base_ref(self) -> str:
         name = f"refs/heads/{self.cfg.base_branch}"
@@ -395,7 +507,7 @@ class CardRun:
 
     def _step_baseline(self) -> None:
         self.phase = "baseline"
-        unit = self.card.unit
+        unit = self._effective_unit()
         cached = None
         if self.cfg.baseline_cache:
             cached = self._read_baseline_cache(unit)
@@ -416,39 +528,48 @@ class CardRun:
             runs.append((result, parsed))
 
         first, second = runs
-        if first[0].cls == INFRA or second[0].cls == INFRA:
+        sg_first = suite_green(first[1], self.cfg.known_failing,
+                               run_cls=first[0].cls, exit_code=first[0].exit_code)
+        sg_second = suite_green(second[1], self.cfg.known_failing,
+                                run_cls=second[0].cls, exit_code=second[0].exit_code)
+
+        # A baseline that does not compile is not green, and not "no failures"
+        # either. Check compile errors before INFRA/missing_footers so compile
+        # failures stay a card/repo baseline error cleanly.
+        compile_broken = (first[1].get("compile_errors")
+                          or second[1].get("compile_errors"))
+        if compile_broken:
+            detail = ("the base does not build: "
+                      + str(compile_broken[:3]))
+            self._record_gate(GateResult("baseline", FAIL, detail,
+                                         {"compile_errors": compile_broken}))
+            raise GateFailure(StopCode.DIRTY_BASELINE, detail)
+
+        if (first[0].cls == INFRA or second[0].cls == INFRA
+                or sg_first.result == INFRA or sg_second.result == INFRA):
             self._record_gate(GateResult("baseline", INFRA,
                                          "a baseline run did not finish"))
             raise Infra("baseline-infra",
                         "a baseline run did not finish, so nothing can be judged")
-
-        # A baseline that does not compile is not green, and not "no failures"
-        # either. Its per-test lines are empty and its footers are missing, so
-        # without this check a broken base would be cached as clean and every later
-        # card at that commit would get a vacuous no-test-loss gate.
-        broken = (first[1].get("compile_errors") or second[1].get("compile_errors")
-                  or first[1].get("missing_footers")
-                  or second[1].get("missing_footers"))
-        if broken:
-            detail = ("the base does not build: "
-                      + str((first[1].get("compile_errors")
-                             or first[1].get("missing_footers"))[:3]))
-            self._record_gate(GateResult("baseline", FAIL, detail,
-                                         {"compile_errors": broken}))
-            raise GateFailure(StopCode.DIRTY_BASELINE, detail)
 
         red_first = _red(parsed=first[1], known=self.cfg.known_failing)
         red_second = _red(parsed=second[1], known=self.cfg.known_failing)
         disagree = [name for name in red_first if name not in red_second]
         disagree += [name for name in red_second if name not in red_first]
 
-        if red_first or red_second:
-            detail = "red on base: " + ", ".join(sorted(set(red_first + red_second))[:10])
-            if disagree:
-                detail += f"; the two runs disagreed on {len(disagree)} test(s)"
+        if red_first or red_second or not sg_first.ok or not sg_second.ok:
+            if red_first or red_second:
+                detail = ("red on base: "
+                          + ", ".join(sorted(set(red_first + red_second))[:10]))
+                if disagree:
+                    detail += f"; the two runs disagreed on {len(disagree)} test(s)"
+            else:
+                detail = sg_first.detail or sg_second.detail or "baseline failed"
             self._record_gate(GateResult("baseline", FAIL, detail,
                                          {"red": red_first + red_second,
-                                          "disagreed": disagree}))
+                                          "disagreed": disagree,
+                                          "first": sg_first.evidence,
+                                          "second": sg_second.evidence}))
             raise GateFailure(StopCode.DIRTY_BASELINE, detail)
 
         list_result = self._run(runner_kind("list"),
@@ -494,8 +615,72 @@ class CardRun:
 
     def _step_plan(self) -> None:
         self.phase = "plan"
-        if not wants_planner(self.card):
+        if self.micromanager.enabled:
+            sigs = {}
+            for path in self.card.touches:
+                norm = normalise(path)
+                if "*" in norm or "?" in norm:
+                    continue
+                if resolves_within(self.worktree, norm) and (self.worktree / norm).is_file():
+                    try:
+                        sigs[norm] = self.book.signatures(norm, self.pack)
+                    except (OSError, Refused):
+                        pass
+            ctx_contents = {}
+            max_ctx = getattr(self.cfg, "max_context_files", 6)
+            for path in (getattr(self.card, "context_files", ()) or ())[:max_ctx]:
+                norm = normalise(path)
+                if resolves_within(self.worktree, norm) and (self.worktree / norm).is_file():
+                    try:
+                        ctx_contents[norm] = self.book.guarded_read(norm)
+                    except (OSError, Refused):
+                        pass
+            known_tests = [
+                t.get("name", "")
+                for t in self.base_test_list.get("tests", [])
+                if t.get("name")
+            ]
+            decision = self.micromanager.shape_and_plan(
+                self.card, sigs, ctx_contents, known_tests=known_tests, cfg=self.cfg
+            )
+            self._record_gate(GateResult(
+                "micromanager-shape",
+                FAIL if (self.micromanager.mode == "active"
+                         and decision.verdict in ("ineligible", "split")) else PASS,
+                decision.verdict,
+                decision.as_dict(),
+            ))
+            for entry in decision.findings:
+                self._file_finding(entry)
+            self.clarified_notes = decision.clarified_notes
+            for extra_p in decision.extra_context_files:
+                norm_e = normalise(extra_p)
+                if norm_e not in self.extra_context_files:
+                    self.extra_context_files.append(norm_e)
+                if hasattr(self.book, "allowed_extra_reads"):
+                    self.book.allowed_extra_reads.add(norm_e)
+            if self.micromanager.mode == "active":
+                if decision.verdict == "ineligible":
+                    raise GateFailure(
+                        StopCode.INELIGIBLE,
+                        decision.clarified_notes or "micromanager marked card ineligible",
+                    )
+                if decision.verdict == "split":
+                    raise GateFailure(
+                        StopCode.CANNOT_SPLIT,
+                        decision.clarified_notes or "micromanager recommended splitting card",
+                    )
+                if decision.steps:
+                    self.plan = Plan(decision.steps)
+                    self.planner_used = True
+                    self.step_index = 0
+                    self.depth = len(self.plan.steps)
+                    write_json(self.card_layout / "plan.json", self.plan.as_dict())
+                    return
+
+        if not wants_planner(self.card, getattr(self.cfg, "planner", "auto")):
             self.planner_used = False
+            self.depth = 1
             return
         brief = build_planner_brief(self.card, self.book)
         try:
@@ -505,19 +690,25 @@ class CardRun:
             self.log(f"{self.card.id}: planner unavailable, running unsplit")
             return
         self.budget.note_tokens(call.tokens_in, call.tokens_out, call.spend)
-        plan = parse_plan(call.content)
+        plan = parse_plan(call.content, card=self.card)
         if plan.cannot_split:
             raise GateFailure(StopCode.CANNOT_SPLIT,
                               "the planner could not split without leaving touches")
         self.planner_used = True
         self.plan = plan
         self.step_index = 0
+        self.depth = len(plan.steps) or 1
         write_json(self.card_layout / "plan.json", plan.as_dict())
 
     # -- step 5: phase A, the test writer ------------------------------------
 
     def _step_phase_a(self) -> None:
         self.phase = "test-writer"
+        check_disk = getattr(self.state, "check_disk_space", None)
+        if check_disk is not None:
+            check_disk(getattr(self.cfg, "min_free_mb", 0))
+
+        self.scaffold_commit = self.base_commit or self.git.head(self._base_ref())
         if not self.card.test_names and self.card.category == "mechanical":
             # A mechanical card is a compiler-guided edit: there is no new test to
             # write, and the existing suite is the judge. Freeze the tests as they
@@ -525,27 +716,36 @@ class CardRun:
             self._freeze()
             self.frozen_commit = self._commit(
                 f"{self.card.id}: freeze the existing tests")
+            self.step_checkpoint_commit = self.frozen_commit
             self._record_gate(GateResult(
                 "test-writer", PASS,
                 "skipped: a mechanical card names no new tests"))
             return
 
+        if self.micromanager.enabled and (
+                self.card.new_symbols or getattr(self.card, "type_changes", False)):
+            self._run_scaffold_contract()
+
         last_failure = ""
+        tw_guidance = self.clarified_notes
         # Bounded the same way phase B is: a refused answer gives its attempt back,
-        # so the loop is bounded by free sends rather than by the config number.
+        # so the loop is bounded by free sends rather than by the config number,
+        # while `free_retries` bounds malformed / non-unique search retries.
         free_sends = self.cfg.test_writer_attempts
+        free_retries = self.cfg.test_writer_attempts
         attempt = 0
         while free_sends > 0:
             free_sends -= 1
             attempt += 1
-            # Every test-writer attempt starts from the frozen base, so a refused or
-            # partial answer cannot leave an edit behind that the next attempt then
-            # gets committed.
-            self.git.reset_hard(self._base_ref())
+            self.attempt = attempt
+            # Every test-writer attempt starts cleanly from the scaffold commit,
+            # so a failed or refused attempt cannot leave an edit behind.
+            self.git.reset_hard(self.scaffold_commit)
             self.budget.take_test_writer_attempt()
             brief = build_test_writer_brief(
                 self.card, self.book, self.pack, self.conventions,
-                attempt=attempt, previous_failure=last_failure)
+                attempt=attempt, previous_failure=last_failure,
+                guidance=tw_guidance, context_files=self.extra_context_files)
             call = self.roles.call("test_writer", brief, attempt=attempt)
             self.budget.note_tokens(call.tokens_in, call.tokens_out, call.spend)
             write_json(self.card_layout / "responses" / f"A{attempt}-test-writer.json",
@@ -555,18 +755,24 @@ class CardRun:
                 edits = parse_edits(call.content)
             except Invalid as exc:
                 last_failure = exc.message
+                self.budget.test_writer_attempts -= 1
                 self._record_attempt("test-writer", "refused",
-                                     StopCode.TESTS_UNPROVABLE, role="test_writer")
+                                     StopCode.TESTS_UNPROVABLE, role="test_writer",
+                                     attempt=attempt)
+                free_retries -= 1
+                if free_retries <= 0:
+                    raise GateFailure(
+                        StopCode.TESTS_UNPROVABLE,
+                        "the test writer produced no usable edit in "
+                        f"{self.cfg.test_writer_attempts} attempts: {last_failure}")
+                free_sends += 1
                 continue
 
             # Production files in touches are not the test writer's to rewrite. On a
             # card that declares new symbols it may only append a stub there; on any
-            # other card it may not write them at all. The set is classified rather
-            # than taken from the raw touches: a test-backfill card's touches *are*
-            # test files, and treating those as production would make that category
-            # unrunnable.
+            # other card it may not write them at all.
             production = {
-                path for path in self.card.touches
+                normalise(path) for path in self.card.touches
                 if self.pack.classify_paths([path]).get(
                     normalise(path), "") == "production"}
             report = apply_edits(
@@ -583,42 +789,132 @@ class CardRun:
             if not report.ok:
                 last_failure = _report_detail(report)
                 self._record_attempt("test-writer", "refused",
-                                     StopCode.TESTS_UNPROVABLE, role="test_writer")
+                                     StopCode.TESTS_UNPROVABLE, role="test_writer",
+                                     attempt=attempt)
                 if report.outside_touches or report.not_additions_only:
                     raise GateFailure(
                         StopCode.REFUSED,
                         "the test writer left the allowed paths: "
                         + ", ".join(report.outside_touches or report.not_additions_only))
-                # A refusal the model could fix, such as a search block that matched
-                # twice, gets the next attempt. Anything else is the card's problem
-                # and stops it, rather than being retried into `tests-unprovable`.
                 retryable = {entry["code"] for entry in report.refused}
                 if not retryable <= {"no-unique-match"}:
                     raise GateFailure(
                         StopCode.REFUSED,
                         "the test writer's answer was refused: "
                         + _report_detail(report))
-                # A refused search block spends no attempt and no build.
-                free_sends += 1
                 self.budget.test_writer_attempts -= 1
+                free_retries -= 1
+                if free_retries <= 0:
+                    raise GateFailure(
+                        StopCode.TESTS_UNPROVABLE,
+                        "the test writer's search blocks kept matching more "
+                        f"than once in {self.cfg.test_writer_attempts} attempts: "
+                        f"{last_failure}")
+                free_sends += 1
+                continue
+
+            try:
+                self._prove_current_tests()
+            except GateFailure as exc:
+                if exc.code != StopCode.TESTS_UNPROVABLE:
+                    raise
+                self._record_attempt("test-writer", "failed-gates",
+                                     StopCode.TESTS_UNPROVABLE, role="test_writer",
+                                     attempt=attempt)
+                if free_sends <= 0:
+                    raise
+                last_failure = exc.detail
+                if self.micromanager.enabled:
+                    advice = self.micromanager.coach(
+                        self.card, "test-writer", attempt,
+                        self._working_test_texts(), "", last_failure, cfg=self.cfg)
+                    self._record_gate(GateResult(
+                        "micromanager-coach",
+                        FAIL if advice.abort else PASS,
+                        advice.abort_reason or advice.root_cause or "coaching provided",
+                        advice.as_dict(),
+                    ))
+                    if advice.abort:
+                        raise GateFailure(StopCode.TESTS_UNPROVABLE,
+                                          advice.abort_reason or exc.detail) from exc
+                    tw_guidance = advice.guidance or self.clarified_notes
                 continue
 
             # Freeze, then commit: an attempt starts from a clean tree, so the
             # frozen tests must be in the commit or `reset --hard` would delete them.
+            self.phase_a_stub_files = {
+                normalise(edit.path) for edit in edits
+                if normalise(edit.path) in production
+            }
             self._freeze()
             self.frozen_commit = self._commit(f"{self.card.id}: freeze the tests")
-            self._record_attempt("test-writer", "passed-gates", role="test_writer")
+            self.step_checkpoint_commit = self.frozen_commit
+            self._tests_proven_in_phase_a = True
+            self._record_attempt("test-writer", "passed-gates", role="test_writer",
+                                 attempt=attempt)
             return
 
         raise GateFailure(StopCode.TESTS_UNPROVABLE,
                           "the test writer produced no usable edit in "
                           f"{self.cfg.test_writer_attempts} attempts: {last_failure}")
 
+    def _run_scaffold_contract(self) -> None:
+        base_files: dict[str, str] = {}
+        sigs: dict[str, str] = {}
+        for path in self.card.touches:
+            norm = normalise(path)
+            if "*" in norm or "?" in norm or self.book.is_hidden(norm):
+                continue
+            if resolves_within(self.worktree, norm) and (self.worktree / norm).is_file():
+                try:
+                    base_files[norm] = self.book.guarded_read(norm)
+                    sigs[norm] = self.book.signatures(norm, self.pack)
+                except (OSError, Refused):
+                    pass
+        scaffold_edits = self.micromanager.scaffold_contract(
+            self.card, base_files, sigs,
+            never_touch=self.cfg.never_touch,
+            forbidden=self.cfg.forbidden_files,
+        )
+        if not scaffold_edits:
+            return
+        sc_report = apply_edits(
+            self.worktree, scaffold_edits, self.card.touches,
+            self.cfg.never_touch, self.cfg.forbidden_files,
+        )
+        write_json(self.card_layout / "edits" / "A0-scaffold.json",
+                   sc_report.as_dict())
+        self._record_gate(GateResult(
+            "micromanager-scaffold",
+            PASS if sc_report.ok else FAIL,
+            "scaffold applied" if sc_report.ok else _report_detail(sc_report),
+            sc_report.as_dict(),
+        ))
+        if sc_report.ok:
+            self.scaffold_commit = self._commit(
+                f"{self.card.id}: scaffold declared contract")
+        else:
+            self.git.reset_hard(self.scaffold_commit)
+
+    def _working_test_texts(self) -> dict[str, str]:
+        out: dict[str, str] = {}
+        for path in self._test_paths():
+            full = self.worktree / path
+            if full.exists():
+                out[path] = full.read_text()
+        return out
+
     # -- step 6: named tests exist, and fail before the code ------------------
 
     def _step_prove_tests(self) -> None:
         self.phase = "prove"
-        unit = self.card.unit
+        if self._tests_proven_in_phase_a:
+            return
+        self._prove_current_tests()
+
+    def _prove_current_tests(self) -> None:
+        self.phase = "prove"
+        unit = self._effective_unit()
 
         list_result = self._run(runner_kind("list"),
                                 self.pack.commands("list", unit=unit)["argv"],
@@ -626,8 +922,6 @@ class CardRun:
         out, err = self._output(list_result)
         listing = self.pack.parse_list(out)
         write_json(self.card_layout / "gates" / "named-tests-list.json", listing)
-        # Kept at the top of `gates/` as well, because it is evidence for every
-        # attempt rather than for one.
 
         listed = {t["name"] for t in listing.get("tests", [])}
         if not self.card.test_names:
@@ -651,30 +945,23 @@ class CardRun:
         if self.card.category == "test-backfill":
             # Backfill tests pass on base by design. Mutation is their only
             # blocking proof, run at the end.
+            self.failed_on_base_by_test = {
+                name: "ok" for name in self.card.test_names
+            }
             self._record_gate(GateResult(
                 "fail-before", PASS,
                 "skipped for test-backfill: the new tests pass on base by design"))
             return
 
-        if not self.card.test_names:
-            # A mechanical card is judged by the existing suite, which the baseline
-            # and no-test-loss gates already cover. There is nothing new to prove
-            # red, and running the whole suite again here would only spend a build.
-            self._record_gate(GateResult(
-                "fail-before", PASS,
-                f"skipped: a {self.card.category} card names no new tests, so the "
-                f"existing suite is the judge"))
-            return
-
-        base = self._base_ref()
-        rerun = self._run(runner_kind("test"), self.pack.commands("test", unit=unit)["argv"]
+        rerun = self._run(runner_kind("test"),
+                          self.pack.commands("test", unit=unit)["argv"]
                           + ["--", *self.card.test_names], counted="fixed")
         out, err = self._output(rerun)
         parsed = self.pack.parse_tests(out, err)
         failures = _named_failures(parsed, self.card.test_names)
         compile_errors = parsed.get("compile_errors", [])
 
-        if parsed.get("missing_footers") or rerun.cls == INFRA:
+        if rerun.cls == INFRA:
             self._record_gate(GateResult(
                 "fail-before", INFRA,
                 "the fail-before run did not finish", parsed))
@@ -688,7 +975,22 @@ class CardRun:
             raise GateFailure(
                 StopCode.TESTS_UNPROVABLE,
                 "the frozen tests do not compile on base. Declare the new symbols "
-                "so the test writer may append stubs, or test existing items.")
+                "so the test writer may append stubs, or test existing items.\n"
+                + (err or out).strip()[-2000:])
+
+        if parsed.get("missing_footers"):
+            if rerun.cls == FAIL and rerun.exit_code < 0 and rerun.exit_code != -9:
+                self._record_gate(GateResult(
+                    "fail-before", FAIL,
+                    f"test binary crashed with signal {-rerun.exit_code} on base",
+                    parsed))
+                raise GateFailure(
+                    StopCode.TESTS_UNPROVABLE,
+                    f"test binary crashed with signal {-rerun.exit_code} on base")
+            self._record_gate(GateResult(
+                "fail-before", INFRA,
+                "the fail-before run did not finish", parsed))
+            raise Infra("fail-before-infra", "the fail-before run did not finish")
 
         # `ignored` is not proof: an ignored test never ran on base, so it proves
         # nothing about what the code does.
@@ -703,6 +1005,7 @@ class CardRun:
                 StopCode.TESTS_UNPROVABLE,
                 "named tests do not fail on base: " + ", ".join(wrong[:10]))
 
+        self.failed_on_base_by_test = dict(failures)
         self._record_gate(GateResult(
             "fail-before", PASS,
             f"{len(self.card.test_names)} named test(s) failed at runtime on base",
@@ -710,7 +1013,8 @@ class CardRun:
 
     # -- step 7: phase B, the implementer ------------------------------------
 
-    def _step_phase_b(self) -> None:
+    def _step_phase_b(self, initial_diff: str = "", initial_failure: str = "",
+                      initial_counter_tests: str = "") -> None:
         self.phase = "implement"
         if self.card.category == "test-backfill":
             # A backfill card adds tests to code that already works: there is no
@@ -721,33 +1025,38 @@ class CardRun:
                 "the proof"))
             return
 
-        last_failure = ""
-        counter_tests = ""
-        # Bounded by a free-slots budget rather than by the config number, so a
-        # malformed or unmatched answer really does spend no attempt: the loop can
-        # make more model calls than the attempt cap, but only that many attempts are
-        # counted and only they can judge the card. `free_retries` bounds the
-        # no-attempt path, because "spends no attempt" must not mean "loops forever".
-        free_calls = self.cfg.implementer_attempts
-        free_retries = self.cfg.implementer_attempts
+        last_failure = initial_failure
+        last_failed_diff = initial_diff
+        counter_tests = initial_counter_tests
+        free_calls = self.budget.implementer_attempts_left()
+        free_retries = max(1, free_calls)
+        step_advances = 0
+        max_step_advances = len(self.plan.steps) if self.plan else 0
+        attempt_seq = int(self.budget.implementer_attempts)
 
         while free_calls > 0:
-            stashed = self._stash_diff()
+            uncommitted = self._diff_against_head_before_edits()
+            if uncommitted["diff"]:
+                last_failed_diff = uncommitted["diff"]
             free_calls -= 1
-            attempt_no = self.budget.take_implementer_attempt()
+            self.budget.take_implementer_attempt()
+            attempt_seq += 1
+            attempt_no = attempt_seq
             self._heartbeat()
             self._begin_attempt(attempt_no)
 
-            # A retry with no edits to show would leave the model with nothing, so
-            # the first attempt's shape is used whenever the tree is clean.
-            showing_diff = bool(stashed["diff"])
+            showing_diff = bool(last_failed_diff)
             step = self._current_step()
+            guidance = self.coaching_guidance or self.clarified_notes
             brief = build_implementer_brief(
                 self.card, self.book, self._frozen_texts(),
-                attempt=attempt_no if showing_diff else 1,
-                diff=stashed["diff"],
+                attempt=max(2, attempt_no) if showing_diff else 1,
+                diff=last_failed_diff,
                 failure=last_failure, counter_tests=counter_tests,
-                step=step)
+                step=step,
+                guidance=guidance,
+                step_context="\n".join(self.step_summaries),
+                context_files=self.extra_context_files)
             write_json(self.card_layout / "briefs" / f"{attempt_no}-implementer.md",
                        {"brief": brief.body})
 
@@ -759,11 +1068,9 @@ class CardRun:
             try:
                 edits = parse_edits(call.content)
             except Invalid as exc:
-                # A malformed answer spends no attempt and no build, but it does
-                # spend one free retry: otherwise a model that never produces a
-                # block would loop until the token cap.
                 last_failure = exc.message
                 self.budget.implementer_attempts -= 1
+                attempt_seq -= 1
                 self._record_attempt("implement", "refused",
                                      role="implementer", attempt=attempt_no)
                 free_retries -= 1
@@ -781,12 +1088,12 @@ class CardRun:
                        report.as_dict())
 
             if report.refused:
-                # A refused edit spends no attempt and no build.
                 if all(e["code"] == "no-unique-match" for e in report.refused):
                     last_failure = _report_detail(report)
                     self.budget.implementer_attempts -= 1
+                    attempt_seq -= 1
                     self._record_attempt("implement", "refused",
-                                         role="implementer")
+                                         role="implementer", attempt=attempt_no)
                     free_retries -= 1
                     if free_retries <= 0:
                         raise GateFailure(
@@ -806,7 +1113,18 @@ class CardRun:
             outcome = self._judge_attempt(attempt_no, report)
             if outcome is None:
                 return
+            if outcome == _STEP_ADVANCED:
+                last_failure = ""
+                last_failed_diff = ""
+                counter_tests = ""
+                self.coaching_guidance = ""
+                if step_advances < max_step_advances:
+                    step_advances += 1
+                    self.budget.implementer_attempts -= 1
+                    free_calls += 1
+                continue
             last_failure = outcome
+            last_failed_diff = self.current_diff
             if self.plan is not None:
                 # A step that fails twice is the spec's second `cannot-split`
                 # condition: the split was wrong, and retrying it cannot help.
@@ -828,7 +1146,15 @@ class CardRun:
                         "the worktree was not clean before an attempt")
 
     def _head_before_edits(self) -> str:
-        return self.frozen_commit if hasattr(self, "frozen_commit") else self._base_ref()
+        return self.step_checkpoint_commit or self.frozen_commit or self._base_ref()
+
+    def _diff_against_head_before_edits(self) -> dict:
+        ref = self._head_before_edits()
+        changed = sorted(set(self.git.diff_name_only(ref))
+                         | set(self.git.untracked_files()))
+        text = diff_text(self.worktree, changed, ref=ref) if changed else ""
+        return {"diff": text, "paths": changed,
+                "hash": hashlib.sha256(text.encode("utf-8")).hexdigest()}
 
     def _restore_frozen(self) -> None:
         """Test files and stub lines are locked by hash, not by trust."""
@@ -972,6 +1298,10 @@ class CardRun:
             base_counts=self._banned_counts(changed, at_base=True),
             head_counts=self._banned_counts(changed, at_base=False)))
         if not banned.ok:
+            self.error_signatures.append("banned:" + banned.detail[:120])
+            self._check_progress_with_coach(diff, banned.detail, attempt_no)
+            self._record_attempt("fix", "failed-gates", diff=diff,
+                                 attempt=attempt_no)
             return banned.detail
 
         frozen_gate = self._record_gate(
@@ -980,12 +1310,14 @@ class CardRun:
             raise GateFailure(StopCode.REFUSED, frozen_gate.detail)
 
         # The suite and lint a model's edit caused. These count against the cap.
-        unit = self.card.unit
+        unit = self._effective_unit()
         test_result = self._run(runner_kind("test"),
                                 self.pack.commands("test", unit=unit)["argv"])
         out, err = self._output(test_result)
         parsed = self.pack.parse_tests(out, err)
-        suite = self._record_gate(suite_green(parsed, self.cfg.known_failing))
+        suite = self._record_gate(suite_green(
+            parsed, self.cfg.known_failing,
+            run_cls=test_result.cls, exit_code=test_result.exit_code))
         passing = sum(1 for name in self.card.test_names
                       if _status_of(parsed, name) == "ok")
         self.named_passing = passing
@@ -1008,32 +1340,71 @@ class CardRun:
             raise Infra("attempt-infra",
                         "a gate did not finish, so the attempt is not judged")
 
-        signature = self.pack.error_signature(lint_err + err)["signature"]
+        signature = self.pack.error_signature(
+            lint_err + "\n" + err + "\n" + out)["signature"]
         self.error_signatures.append(signature)
 
-        if suite.ok and lint_gate.ok:
-            all_named = all(_status_of(parsed, name) == "ok"
-                            for name in self.card.test_names)
-            if all_named:
-                self._advance_step(parsed)
-                self._commit(f"{self.card.id}: make the frozen tests pass")
+        all_named = all(_status_of(parsed, name) == "ok"
+                        for name in self.card.test_names)
+        if suite.ok and lint_gate.ok and all_named:
+            if self.plan is not None and self.plan.steps:
+                self.step_index = len(self.plan.steps)
+            self._commit(f"{self.card.id}: make the frozen tests pass")
+            self._record_attempt("implement", "passed-gates", diff=diff,
+                                 attempt=attempt_no)
+            return None
+
+        if self.plan is not None and self.step_index + 1 < len(self.plan.steps):
+            step = self._current_step() or {}
+            wanted = step.get("tests") or []
+            step_tests_ok = bool(wanted) and all(
+                _status_of(parsed, name) == "ok" for name in wanted)
+            later_step_tests = {
+                t
+                for s in self.plan.steps[self.step_index + 1:]
+                for t in (s.get("tests") or [])
+            }
+            unexpected = suite.evidence.get("unexpected", [])
+            no_compile_or_infra = (
+                not suite.evidence.get("compile_errors")
+                and not parsed.get("missing_footers")
+                and test_result.cls != INFRA
+                and suite.result != INFRA
+            )
+            outside_later_ok = suite.ok or (
+                no_compile_or_infra
+                and bool(unexpected)
+                and set(unexpected) <= later_step_tests
+            )
+            if lint_gate.ok and step_tests_ok and outside_later_ok:
+                self.step_checkpoint_commit = self._commit(
+                    f"{self.card.id}: checkpoint step {self.step_index + 1}")
+                self.step_summaries.append(
+                    f"Step {self.step_index + 1} ({step.get('does', '')}): "
+                    f"passed {', '.join(wanted)}")
+                self.step_index += 1
+                self.diff_hashes.clear()
+                self.error_signatures.clear()
+                self.named_history.clear()
+                self.step_failures = 0
+                self.coach_used_for_stall = False
                 self._record_attempt("implement", "passed-gates", diff=diff,
-                                         attempt=attempt_no)
-                return None
+                                     attempt=attempt_no)
+                self.log(f"{self.card.id}: planner step done, checkpointed, now on "
+                         f"{self.step_index + 1} of {len(self.plan.steps)}")
+                return _STEP_ADVANCED
+
+        if suite.ok and lint_gate.ok:
             detail = ("named tests still failing: " + ", ".join(
                 name for name in self.card.test_names
                 if _status_of(parsed, name) != "ok"))
             # The suite can be green while a named test is still red, so the progress
             # signals have to be checked on this path too.
-            self._check_progress()
+            self._check_progress_with_coach(diff, detail, attempt_no)
             self._record_attempt("fix", "failed-gates", diff=diff,
-                                         attempt=attempt_no)
+                                 attempt=attempt_no)
             return detail
 
-        self._check_progress()
-        # The model gets the compiler's own words. A summary like "the code did not
-        # compile" is far less useful than the error and its location, and a compile
-        # error is the most common weak-model failure.
         compile_output = ""
         if suite.evidence.get("compile_errors"):
             compile_output = (err or out).strip()
@@ -1041,9 +1412,37 @@ class CardRun:
             " | " + lint_gate.detail if lint_gate.detail else "")
         if compile_output:
             detail += "\n\n" + compile_output[-6000:]
+        self._check_progress_with_coach(diff, detail, attempt_no)
         self._record_attempt("fix", "failed-gates", diff=diff,
-                                         attempt=attempt_no)
+                             attempt=attempt_no)
         return detail
+
+    def _check_progress_with_coach(self, diff: dict, detail: str,
+                                   attempt_no: int) -> None:
+        try:
+            self._check_progress()
+        except GateFailure as exc:
+            if (exc.code == StopCode.NO_PROGRESS
+                    and self.micromanager.enabled
+                    and not self.coach_used_for_stall
+                    and self.budget.implementer_attempts_left() > 0):
+                advice = self.micromanager.coach(
+                    self.card, "implementer", attempt_no,
+                    self._frozen_texts(), diff.get("diff", ""), detail,
+                    cfg=self.cfg)
+                self._record_gate(GateResult(
+                    "micromanager-coach",
+                    FAIL if advice.abort else PASS,
+                    advice.abort_reason or advice.root_cause or "coaching provided",
+                    advice.as_dict(),
+                ))
+                if advice.abort:
+                    raise GateFailure(StopCode.NO_PROGRESS,
+                                      advice.abort_reason or exc.detail) from exc
+                self.coaching_guidance = advice.guidance
+                self.coach_used_for_stall = True
+                return
+            raise
 
     def _check_progress(self) -> None:
         """Any one of three signals stops the card, per the spec.
@@ -1108,14 +1507,11 @@ class CardRun:
 
     # -- step 8: the end gates ------------------------------------------------
 
-    def _step_end_gates(self) -> None:
+    def _step_end_gates(self, allow_checker_bounce: bool = False,
+                        allow_pre_review_bounce: bool = False
+                        ) -> tuple[str, str, str, str] | None:
         self.phase = "check"
-        unit = self.card.unit
-        changed = self._changed_since_base()
-        full_diff = diff_text(self.worktree, changed,
-                              ref=self.base_commit or "HEAD")
-        self.current_diff = full_diff
-        added, removed = line_counts(full_diff)
+        unit = self._effective_unit()
 
         # pass-after: the named tests, twice, per the spec's flakiness rule. A card
         # that names no tests has nothing to pass here; the suite gate below is its
@@ -1128,6 +1524,7 @@ class CardRun:
                                    + ["--", *self.card.test_names], counted="fixed")
                 out, err = self._output(result)
                 parsed = self.pack.parse_tests(out, err)
+                self.head_status_by_test = _named_failures(parsed, self.card.test_names)
                 gate = self._record_gate(
                     ignored_or_filtered(parsed, self.card.test_names))
                 named_ok = named_ok and gate.ok
@@ -1140,19 +1537,29 @@ class CardRun:
                 "pass-after", PASS,
                 "skipped: the card names no tests, so the suite gate is the judge"))
 
-        # Suite and lint, then workspace lint.
+        # Suite and lint, then formatting and workspace lint.
         suite_result = self._run(runner_kind("test"),
                                  self.pack.commands("test", unit=unit)["argv"],
                                  counted="fixed")
         out, err = self._output(suite_result)
         parsed = self.pack.parse_tests(out, err)
-        suite = self._record_gate(suite_green(parsed, self.cfg.known_failing))
+        suite = self._record_gate(suite_green(
+            parsed, self.cfg.known_failing,
+            run_cls=suite_result.cls, exit_code=suite_result.exit_code))
         if suite.result == INFRA:
             raise Infra("suite-infra", suite.detail)
         if not suite.ok:
             raise GateFailure(StopCode.ATTEMPTS, suite.detail)
 
-        self._format_touched(changed)
+        # Format production files (never frozen tests) BEFORE computing full_diff
+        # and running revert-check / banned-patterns / checker.
+        self._format_touched(self._changed_since_base())
+
+        changed = self._changed_since_base()
+        full_diff = diff_text(self.worktree, changed,
+                              ref=self.base_commit or "HEAD")
+        self.current_diff = full_diff
+        added, removed = line_counts(full_diff)
 
         if self.cfg.workspace_lint:
             ws = self._run(runner_kind("ws-lint"),
@@ -1169,9 +1576,7 @@ class CardRun:
 
         self._extra_gates(changed)
 
-        # Banned patterns again over the card's whole diff. The per-attempt scan only
-        # sees the implementer's edit, so without this the test writer's added lines
-        # would never be scanned.
+        # Banned patterns again over the card's whole diff.
         from .packs.rust import added_lines_from_diff
         whole_added = added_lines_from_diff(full_diff)
         production_all = {
@@ -1191,8 +1596,6 @@ class CardRun:
             self.pack.commands("list", unit=unit)["argv"], counted="fixed")
         list_out, list_err = self._output(final_list_result)
         final_list = self.pack.parse_list(list_out)
-        # Section 3 of the dossier names every test left out of the counts, so a
-        # reader can see what is hidden rather than take a number on trust.
         self.known_failing_excluded = sorted(
             set(self.cfg.known_failing) & {test["name"]
                                           for test in final_list.get("tests", [])})
@@ -1207,13 +1610,125 @@ class CardRun:
             gate = self._record_gate(frozen_check(self.frozen_tests, current))
             if not gate.ok:
                 raise GateFailure(StopCode.REFUSED, gate.detail)
-            self._record_gate(revert_check(
-                self.frozen_hash, _tests_hash(current)))
+            if not self.card.test_names:
+                self._record_gate(revert_check(
+                    self.frozen_hash, _tests_hash(current)))
+            else:
+                trial_wt = self.card_layout / "revert-check-wt"
+                revert_target = self.card_layout / "revert-check-target"
+                if trial_wt.exists():
+                    self.git.worktree_remove(trial_wt)
+                    shutil.rmtree(trial_wt, ignore_errors=True)
+                shutil.rmtree(revert_target, ignore_errors=True)
+                base_ref = self.scaffold_commit or self.base_commit or "HEAD"
+                self.git.worktree_add(trial_wt, base_ref)
+                try:
+                    overlay = sorted(set(self.frozen_tests) | set(self.phase_a_stub_files))
+                    for rel in overlay:
+                        blob = self.git.show_blob(f"{self.frozen_commit}:{rel}")
+                        if blob is not None:
+                            dst = trial_wt / rel
+                            dst.parent.mkdir(parents=True, exist_ok=True)
+                            dst.write_text(blob)
+                    env = self.cfg.runner_env.get(unit, {})
+                    rev_result = self.runner.exec(
+                        kind=runner_kind("test"),
+                        argv=self.pack.commands("test", unit=unit)["argv"]
+                        + ["--", *self.card.test_names],
+                        cwd=trial_wt,
+                        target_dir=revert_target,
+                        unit=unit,
+                        env=env,
+                        timeout_s=max(30.0, self.budget.wall_clock_left_s()),
+                    )
+                    self.runner_seconds += getattr(rev_result, "duration_s", 0.0) or 0.0
+                    self.budget.note_fixed_build()
+                    r_out, r_err = self._output(rev_result)
+                    r_parsed = self.pack.parse_tests(r_out, r_err)
+                    r_failures = _named_failures(r_parsed, self.card.test_names)
+                    r_compile = r_parsed.get("compile_errors", [])
+                    if (rev_result.cls == INFRA
+                            or (r_parsed.get("missing_footers") and not r_compile
+                                and not (rev_result.cls == FAIL
+                                         and rev_result.exit_code < 0
+                                         and rev_result.exit_code != -9))):
+                        self._record_gate(GateResult(
+                            "revert-check", INFRA,
+                            "the revert-check run did not finish", r_parsed))
+                        raise Infra("revert-check-infra",
+                                    "the revert-check run did not finish")
+                    wrong = [n for n, st in r_failures.items() if st != "FAILED"]
+                    if r_compile or wrong:
+                        detail = (
+                            "revert-check failed to reproduce red tests on base"
+                            if r_compile else
+                            "tests did not fail when implementation was reverted: "
+                            + ", ".join(wrong[:10])
+                        )
+                        self._record_gate(GateResult(
+                            "revert-check", FAIL, detail,
+                            {"compile_errors": r_compile, "not_failing": wrong}))
+                        raise GateFailure(StopCode.TESTS_UNPROVABLE, detail)
+                    self._record_gate(GateResult(
+                        "revert-check", PASS,
+                        f"{len(self.card.test_names)} named test(s) reverted to failing",
+                        {"failures": r_failures}))
+                finally:
+                    self.git.worktree_remove(trial_wt)
+                    shutil.rmtree(trial_wt, ignore_errors=True)
+                    shutil.rmtree(revert_target, ignore_errors=True)
 
         self._mutation_gate(changed, test_paths=self._test_paths())
 
-        # Checker pass 1, then pass 2 with counter-tests.
-        self._checker(changed, full_diff)
+        # Checker pass 1, then pass 2 with counter-tests (plus adjudication/bounce).
+        checker_bounce = self._checker(changed, full_diff,
+                                       allow_bounce=allow_checker_bounce)
+        if checker_bounce is not None:
+            return checker_bounce
+
+        if self.micromanager.enabled:
+            report = self.micromanager.triage_and_review("pre_review", {
+                "card_id": self.card.id,
+                "card": self.card.as_dict(),
+                "full_diff": full_diff,
+                "gates": [g.as_dict() for g in self.gates],
+                "touches": list(self.card.touches),
+                "counter_tests": dict(self.counter_summary),
+                "mutation": dict(self.mutation_summary),
+            })
+            self._record_gate(GateResult(
+                "micromanager-pre-review",
+                PASS if report.verdict == "approve" else FAIL,
+                report.verdict,
+                report.as_dict(),
+            ))
+            for entry in report.findings:
+                self._file_finding(entry)
+            if report.reviewer_brief:
+                self.reviewer_brief = report.reviewer_brief
+            if report.verdict == "block":
+                raise GateFailure(
+                    StopCode.SUPERVISOR_REJECT,
+                    report.missed_clause or report.summary
+                    or "micromanager blocked pre-review",
+                )
+            if report.verdict == "bounce":
+                if allow_pre_review_bounce:
+                    self.coaching_guidance = (
+                        report.missed_clause or report.reviewer_brief
+                        or report.summary)
+                    return (
+                        "pre_review",
+                        full_diff,
+                        report.missed_clause
+                        or "supervisor requested changes during pre-review",
+                        "",
+                    )
+                raise GateFailure(
+                    StopCode.SUPERVISOR_REJECT,
+                    report.missed_clause or report.summary
+                    or "micromanager bounced pre-review with no attempts left",
+                )
 
         self.existing_tests_changed = [
             path for path in changed
@@ -1223,14 +1738,16 @@ class CardRun:
                    {"gates": [g.as_dict() for g in self.gates],
                     "files_changed": changed, "lines_added": added,
                     "lines_removed": removed})
+        return None
 
     def _format_touched(self, changed: list[str]) -> None:
-        """Format only files in touches that were format-clean at base.
+        """Format only non-frozen files in touches that were format-clean at base.
 
         A file that wasn't clean at base is left alone and named in the dossier,
         because formatting it could change lines the card never touched.
         """
         candidates = [path for path in changed if path.endswith(".rs")
+                      and path not in self.frozen_tests
                       and matches_any(path, self.card.touches)]
         if not candidates:
             return
@@ -1307,7 +1824,8 @@ class CardRun:
             return
 
         try:
-            argv = self.pack.commands("mutation", files=production)["argv"]
+            argv = self.pack.commands(
+                "mutation", files=production, tests=self.card.test_names)["argv"]
             result = self._run(runner_kind("mutation"), argv, counted="mutation")
         except (Infra, Invalid) as exc:
             self._record_gate(GateResult(
@@ -1358,7 +1876,8 @@ class CardRun:
             "total": parsed.get("total", 0),
             "capped": parsed.get("capped", False) or self.budget.mutation_capped()}
         gate = self._record_gate(mutation_gate(
-            parsed, self.cfg.mutation_min_kill_rate, mode, self.card.category))
+            parsed, self.cfg.mutation_min_kill_rate, mode, self.card.category,
+            required_for=self.cfg.mutation_required_for))
         if not gate.ok and breaking:
             code = StopCode.MUTATION_CAP if parsed.get("capped") else \
                 StopCode.TESTS_UNPROVABLE
@@ -1375,7 +1894,7 @@ class CardRun:
                  if self.pack.classify_paths([path]).get(path) == "production"]
         if named:
             return named
-        unit = self.card.unit
+        unit = self._effective_unit()
         roots = [self.worktree / unit / "src", self.worktree / "src"] \
             if unit and unit != "." else [self.worktree / "src"]
         out: list[str] = []
@@ -1387,10 +1906,12 @@ class CardRun:
             break
         return out
 
-    def _checker(self, changed: list[str], full_diff: str) -> None:
+    def _checker(self, changed: list[str], full_diff: str,
+                 allow_bounce: bool = False) -> tuple[str, str, str, str] | None:
         test_diff = diff_text(
             self.worktree,
-            [path for path in changed if self._is_test_path(path)])
+            [path for path in changed if self._is_test_path(path)],
+            ref=self.base_commit or "HEAD")
         brief1 = build_checker_pass1_brief(self.card, test_diff)
         call1 = self.roles.call("checker_pass1", brief1, attempt=1)
         self.budget.note_tokens(call1.tokens_in, call1.tokens_out, call1.spend)
@@ -1417,7 +1938,14 @@ class CardRun:
                    call2.as_dict())
 
         counters = parse_counter_tests(call2.content)
-        self.counter_summary["written"] = len(counters.tests)
+        self.counter_summary = {
+            "written": len(counters.tests),
+            "dropped_uncompiled": 0,
+            "passed": 0,
+            "failed": 0,
+            "not_run": 0,
+        }
+        self._last_failing_counters = []
         if counters.tests:
             self._run_counter_tests(counters.tests)
 
@@ -1430,9 +1958,47 @@ class CardRun:
 
         if (self.cfg.counter_tests == "reject"
                 and self.counter_summary["failed"] > 0):
+            fix_hint = ""
+            if self.micromanager.enabled:
+                verdict = self.micromanager.adjudicate_checker(
+                    self.card, full_diff, restatement,
+                    self._last_failing_counters,
+                )
+                self.checker_adjudication = verdict.as_dict()
+                self._record_gate(GateResult(
+                    "micromanager-adjudicate",
+                    PASS if verdict.verdict == "dismiss_false_reject" else FAIL,
+                    verdict.verdict,
+                    verdict.as_dict(),
+                ))
+                if verdict.verdict == "dismiss_false_reject":
+                    return None
+                fix_hint = verdict.fix_hint
+            if allow_bounce:
+                if fix_hint:
+                    self.coaching_guidance = fix_hint
+                counter_text = "\n\n".join(
+                    f"Counter-test {c.get('name')} ({c.get('file')}):\n"
+                    f"{c.get('output', '')}"
+                    for c in self._last_failing_counters
+                )
+                return (
+                    "checker",
+                    full_diff,
+                    f"{self.counter_summary['failed']} counter-test(s) fail on the diff"
+                    + (f": {fix_hint}" if fix_hint else ""),
+                    counter_text,
+                )
             raise GateFailure(
                 StopCode.CHECKER_REJECT,
                 f"{self.counter_summary['failed']} counter-test(s) fail on the diff")
+        return None
+
+    def _counter_fallback_path(self, index: int) -> str:
+        unit = self._effective_unit()
+        if unit and unit != "." and (self.worktree / unit / "Cargo.toml").is_file():
+            return f"{unit.strip('/')}/tests/openfarm_counter_{index}.rs"
+        return f"tests/openfarm_counter_{index}.rs"
 
     def _run_counter_tests(self, tests: list[dict]) -> None:
         """Run the checker's counter-tests in this card's own worktree and target.
@@ -1440,9 +2006,17 @@ class CardRun:
         Never committed. One that doesn't compile is dropped and counted, because
         a counter-test can itself be wrong.
         """
+        unit = self._effective_unit()
         for index, counter in enumerate(tests, start=1):
-            path = (counter.get("file")
-                    or f"tests/counter_test_{index}.rs")
+            raw_path = str(counter.get("file", "") or "").strip()
+            path = self._counter_fallback_path(index)
+            if raw_path and resolves_within(self.worktree, raw_path):
+                candidate = normalise(raw_path)
+                if (candidate
+                        and not matches_any(candidate, self.cfg.never_touch)
+                        and not matches_any(candidate, self.cfg.forbidden_files)
+                        and self._is_test_path(candidate)):
+                    path = candidate
             target = self.worktree / path
             content = counter.get("content", "")
             if not content:
@@ -1455,8 +2029,8 @@ class CardRun:
                 target.write_text(content)
                 result = self._run(
                     runner_kind("test"),
-                    self.pack.commands("test", unit=self.card.unit)["argv"]
-                    + ["--test", path],
+                    self.pack.commands("test", unit=unit)["argv"]
+                    + ["--test", Path(path).stem],
                     counted="model")
                 out, err = self._output(result)
                 parsed = self.pack.parse_tests(out, err)
@@ -1466,11 +2040,25 @@ class CardRun:
                 status = _status_of(parsed, counter.get("name", ""))
                 if status == "ok":
                     self.counter_summary["passed"] += 1
-                else:
+                elif status == "FAILED":
                     self.counter_summary["failed"] += 1
+                    detail_entry = {
+                        "name": counter.get("name"),
+                        "file": path,
+                        "status": status,
+                        "content": content,
+                        "output": (out + err)[-4000:],
+                    }
+                    self._last_failing_counters.append(detail_entry)
                     write_json(self.card_layout / "gates"
                                / f"counter-test-{index}.json",
-                               {"name": counter.get("name"), "status": status,
+                               detail_entry)
+                else:
+                    self.counter_summary["not_run"] += 1
+                    write_json(self.card_layout / "gates"
+                               / f"counter-test-{index}.json",
+                               {"name": counter.get("name"), "file": path,
+                                "status": status,
                                 "output": (out + err)[-4000:]})
             finally:
                 if existed:
@@ -1488,9 +2076,7 @@ class CardRun:
             self._record_gate(GateResult("catch-up", PASS, "off in this config"))
             return
 
-        # The base as it is now, which is what the frontier lane would merge into.
-        # `base_commit` is where the card's branch started, so the two only differ
-        # when someone landed work while the card ran.
+        unit = self._effective_unit()
         current_base = self.git.head(self._base_ref())
         if current_base == self.base_commit:
             self.catch_up_result = "skipped: the base has not moved"
@@ -1513,16 +2099,23 @@ class CardRun:
                 raise GateFailure(StopCode.STALE_CONFLICT, self.catch_up_result)
 
             trial_target = self.card_layout / "catch-up-target"
-            env = self.cfg.runner_env.get(self.card.unit, {})
+            env = self.cfg.runner_env.get(unit, {})
             result = self.runner.exec(
                 kind="test",
-                argv=self.pack.commands("test", unit=self.card.unit)["argv"],
-                cwd=trial, target_dir=trial_target, unit=self.card.unit,
+                argv=self.pack.commands("test", unit=unit)["argv"],
+                cwd=trial, target_dir=trial_target, unit=unit,
                 env=env, timeout_s=max(60.0, self.budget.wall_clock_left_s()))
             self.budget.note_fixed_build()
             out, err = self._output(result)
             parsed = self.pack.parse_tests(out, err)
-            gate = suite_green(parsed, self.cfg.known_failing)
+            gate = suite_green(parsed, self.cfg.known_failing,
+                               run_cls=result.cls, exit_code=result.exit_code)
+            if gate.result == INFRA or result.cls == INFRA:
+                self.catch_up_result = gate.detail or "catch-up test run did not finish"
+                self._record_gate(GateResult(
+                    "catch-up", INFRA, self.catch_up_result,
+                    {"suite": gate.as_dict()}))
+                raise Infra("catch-up-infra", self.catch_up_result)
             if gate.result != PASS:
                 self.catch_up_result = "the merged result is not green"
                 self._record_gate(GateResult(
@@ -1545,6 +2138,13 @@ class CardRun:
         self.budget.stop_clock()
         if not self.ended_at:
             self.ended_at = utc_now()
+        mm_budget = getattr(self.micromanager, "budget", None)
+        if mm_budget is not None and hasattr(mm_budget, "as_dict"):
+            self.micromanager_summary = {
+                **mm_budget.as_dict(),
+                "mode": getattr(self.micromanager, "mode", "off"),
+                "reviewer_brief": self.reviewer_brief,
+            }
         self._write_dossier(final_state)
 
         record = self._card_record(final_state)
@@ -1612,13 +2212,14 @@ class CardRun:
         except AdapterError:
             hash_at_end = self.card.hash()
 
+        mm_budget = getattr(self.micromanager, "budget", None)
         record = {
             "run_id": self.run_id,
             "card_id": self.card.id,
             "card_hash_at_claim": self.card_hash_at_claim,
             "card_hash_at_end": hash_at_end,
             "category": self.card.category,
-            "unit": self.card.unit,
+            "unit": self._effective_unit(),
             "claimed_at": self.started_at,
             "ended_at": self.ended_at,
             "final_state": final_state,
@@ -1632,6 +2233,12 @@ class CardRun:
             "tokens_in": self.budget.tokens_in,
             "tokens_out": self.budget.tokens_out,
             "spend": round(self.budget.spend, 6),
+            "micromanager_calls": int(getattr(mm_budget, "calls", 0) or 0),
+            "micromanager_tokens_in": int(getattr(mm_budget, "tokens_in", 0) or 0),
+            "micromanager_tokens_out": int(getattr(mm_budget, "tokens_out", 0) or 0),
+            "micromanager_spend": round(float(getattr(mm_budget, "spend", 0.0) or 0.0), 6),
+            "false_rejects_dismissed": int(
+                getattr(mm_budget, "false_rejects_dismissed", 0) or 0),
             "files_changed": len(self._changed_since_base()),
             "lines_added": line_counts(self.current_diff or "")[0],
             "lines_removed": line_counts(self.current_diff or "")[1],

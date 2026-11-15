@@ -7,6 +7,7 @@ files and command output, never from another model's notes.
 from __future__ import annotations
 
 import json
+import os
 import random
 import re
 from pathlib import Path
@@ -16,6 +17,7 @@ from ..briefs import (Brief, checker_pass1_brief, checker_pass2_brief,
 from ..cards import Card
 from ..edits import Edit, parse_edits
 from ..errors import Invalid, Refused
+from ..globs import matches_any, normalise
 
 
 class RoleCall:
@@ -45,11 +47,14 @@ class RoleCall:
 class Roles:
     """Calling the backend for each role, with its own model and temperature."""
 
-    def __init__(self, cfg, backend, card_id: str = "") -> None:
+    def __init__(self, cfg, backend, card_id: str = "",
+                 rng_seed: int | None = None) -> None:
         self.cfg = cfg
         self.backend = backend
         self.card_id = card_id
-        self._rng = random.Random(0)
+        seed_value = (rng_seed if rng_seed is not None
+                      else int.from_bytes(os.urandom(16), "big"))
+        self._rng = random.Random(seed_value)
         self.calls: list[RoleCall] = []
 
     def _settings(self, role: str):
@@ -105,30 +110,59 @@ class Plan:
         return {"steps": self.steps, "cannot_split": self.cannot_split}
 
 
-def parse_plan(content: str) -> Plan:
+def parse_plan(content: str, card: Card | None = None) -> Plan:
     text = content.strip()
-    if "CANNOT_SPLIT" in text:
-        return Plan([], cannot_split=True)
     payload = _json_block(text)
+    if text == "CANNOT_SPLIT" or (payload is None and "CANNOT_SPLIT" in text):
+        return Plan([], cannot_split=True)
     steps = payload.get("steps") if isinstance(payload, dict) else None
     if not isinstance(steps, list) or not 2 <= len(steps) <= 5:
         raise Invalid("bad-plan",
                       "a plan needs 2 to 5 steps, or exactly CANNOT_SPLIT")
+    allowed_tests = set(card.test_names) if card is not None else None
+    allowed_touches = list(card.touches) if card is not None else []
     cleaned = []
     for index, step in enumerate(steps, start=1):
         if not isinstance(step, dict):
             raise Invalid("bad-plan", f"step {index} is not an object")
-        cleaned.append({
+        tests = [str(t) for t in step.get("tests", []) or []]
+        if allowed_tests is not None and allowed_tests:
+            if not tests or any(t not in allowed_tests for t in tests):
+                raise Invalid(
+                    "bad-plan-test",
+                    f"step {index} tests {tests!r} must be non-empty and in {sorted(allowed_tests)!r}",
+                )
+        entry: dict = {
             "n": int(step.get("n", index)),
             "does": str(step.get("does", "")),
-            "tests": [str(t) for t in step.get("tests", []) or []],
-        })
+            "tests": tests,
+        }
+        if "touches" in step and step["touches"] is not None:
+            raw_touches = step["touches"]
+            if not isinstance(raw_touches, list):
+                raise Invalid("bad-plan", f"step {index} touches must be a list")
+            step_touches = [normalise(str(t)) for t in raw_touches]
+            if allowed_touches:
+                for t in step_touches:
+                    if not matches_any(t, allowed_touches):
+                        raise Invalid(
+                            "bad-plan-touch",
+                            f"step {index} touch {t!r} is outside card.touches {allowed_touches!r}",
+                        )
+            entry["touches"] = step_touches
+        cleaned.append(entry)
     return Plan(cleaned)
 
 
-def wants_planner(card: Card) -> bool:
-    """Planner on only when the done text names two or more independent groups."""
+def wants_planner(card: Card, mode: str = "auto") -> bool:
+    """Planner on only when mode/card criteria indicate multi-step splitting."""
+    if mode == "off":
+        return False
+    if mode == "on":
+        return len(card.tests) >= 2
     if len(card.tests) >= 4 and len({t.file for t in card.tests if t.file}) >= 2:
+        return True
+    if len(card.touches) >= 3 and len(card.tests) >= 2:
         return True
     text = (card.done_text or "")
     groups = re.findall(r"^\s*(?:[-*]|\d+[.)])\s+", text, flags=re.MULTILINE)
@@ -228,15 +262,21 @@ def build_planner_brief(card, book) -> Brief:
 
 
 def build_test_writer_brief(card, book, pack, conventions="", attempt=1,
-                            previous_failure="") -> Brief:
+                            previous_failure="", guidance: str = "",
+                            context_files: list[str] | None = None) -> Brief:
     return test_writer_brief(card, book, pack, conventions, attempt,
-                            previous_failure)
+                             previous_failure, guidance=guidance,
+                             context_files=context_files)
 
 
 def build_implementer_brief(card, book, frozen_tests, attempt=1, diff="",
-                            failure="", counter_tests="", step=None) -> Brief:
+                            failure="", counter_tests="", step=None,
+                            guidance: str = "", step_context: str = "",
+                            context_files: list[str] | None = None) -> Brief:
     return implementer_brief(card, book, frozen_tests, attempt, diff, failure,
-                             counter_tests, step)
+                             counter_tests, step, guidance=guidance,
+                             step_context=step_context,
+                             context_files=context_files)
 
 
 def build_checker_pass1_brief(card, test_diff) -> Brief:

@@ -24,12 +24,15 @@ never_touch = [
   "openfarm_core/git.py",
   "openfarm_core/gates/eligibility.py",
   "openfarm_core/packs/rust.py",
+  "openfarm_core/adapters/acp.py",
+  "openfarm_core/micromanager.py",
   "openfarm",
 ]
 forbidden_files = [
   ".openfarm/**",
   "tests/toy.py",
   "openfarm spec v0.3.md",
+  "openfarm spec v0.4.md",
 ]
 known_failing = []
 flagged_patterns = []

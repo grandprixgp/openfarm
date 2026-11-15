@@ -1,4 +1,4 @@
-"""The `openfarm` command: one entry point, ten subcommands, shared exit codes.
+"""The `openfarm` command: one entry point, eleven subcommands, shared exit codes.
 
 Exit codes are the same for every command:
 
@@ -21,8 +21,8 @@ import sys
 import time as _time
 from pathlib import Path
 
-from .adapters.files import FileCardSource, open_file_source
-from .adapters.jsonl import JsonlTelemetry, TelemetrySink
+from .adapters.files import FileCardSource, open_card_source
+from .adapters.jsonl import TelemetrySink, open_telemetry
 from .adapters.openai_compat import open_backend
 from .adapters.direct import open_runner
 from .briefs import BriefBook
@@ -33,11 +33,14 @@ from .dossier import build_dossier, render_markdown
 from .errors import (AdapterError, ConfigError, GateFailure, Infra, Invalid,
                      Refused, StopCode, UsageError)
 from .flow import CardRun
+from .gates.checks import suite_green
+from .gates.eligibility import check_eligibility, derive_cargo_unit
 from .git import Git, GitRefused
-from .gates.eligibility import check_eligibility
 from .globs import matches_any
+from .micromanager import open_micromanager
 from .packs.base import pack_for
-from .state import (StateDir, read_json, utc_now, utc_after, write_json)
+from .state import (StateDir, _safe_id, read_json, utc_now, utc_after,
+                    write_json)
 
 EXIT_OK = 0
 EXIT_REFUSED = 1
@@ -66,8 +69,8 @@ class Context:
                 print(f"{key}: {value}")
 
     def cards(self, worktree: Path | None = None) -> FileCardSource:
-        source = open_file_source(self.cfg, self.state.root)
-        if worktree is not None:
+        source = open_card_source(self.cfg, self.state.root)
+        if worktree is not None and hasattr(source, "worktree"):
             source.worktree = worktree
         return source
 
@@ -75,16 +78,24 @@ class Context:
         return open_runner(self.cfg, worktree, output_dir)
 
 
+def _check_id(value: str, what: str = "card id") -> str:
+    try:
+        return _safe_id(value, what)
+    except Invalid as exc:
+        raise Refused("bad-id", exc.message) from exc
+
+
 # -- commands ------------------------------------------------------------------
 
 def cmd_check(ctx: Context, args) -> int:
     """Eligibility on one card, without claiming it."""
+    card_id = _check_id(args.card, "card id")
     source = ctx.cards()
     source.prepare()
     try:
-        card = Card.from_dict(source.read(args.card)["card"])
+        card = Card.from_dict(source.read(card_id)["card"])
     except Refused as exc:
-        ctx.emit({"card": args.card, "eligible": False,
+        ctx.emit({"card": card_id, "eligible": False,
                   "failures": [{"rule": "read", "detail": exc.message}]})
         return EXIT_REFUSED
 
@@ -119,38 +130,86 @@ def _deps_done(source: FileCardSource, card: Card) -> bool:
 
 
 def _baseline_check(ctx: Context, source: FileCardSource, card: Card) -> dict:
-    """Build base and confirm the named tests fail at runtime.
-
-    The spec's `check --baseline`: "it also builds base and confirms the named tests
-    fail at runtime, through the baseline cache". A compile error is not a runtime
-    failure, so it is reported separately.
-    """
+    """Build base, verify whole-suite health (with cache), and check named tests."""
     worktree = ctx.state.root / "checks" / "worktree" / card.id
     git = Git(ctx.repo)
     base = (f"refs/heads/{ctx.cfg.base_branch}"
             if git.ref_exists(f"refs/heads/{ctx.cfg.base_branch}") else "HEAD")
+    base_commit = git.head(base)
     if worktree.exists():
         git.worktree_remove(worktree)
     git.worktree_add(worktree, base)
     try:
-        pack = pack_for(ctx.cfg.languages[0], ctx.cfg.cargo_flags)
+        pack = pack_for(
+            ctx.cfg.languages[0], ctx.cfg.cargo_flags,
+            spec=ctx.cfg.pack_adapter, cwd=worktree,
+        )
         pack.configure(worktree)
+        unit = card.unit or derive_cargo_unit(card.touches, worktree)
         runner = ctx.runner(worktree)
         target = ctx.state.check_dir(card.id) / "target"
-        env = ctx.cfg.runner_env.get(card.unit, {})
-        argv = pack.commands("test", unit=card.unit)["argv"]
-        if card.test_names:
-            argv = argv + ["--", *card.test_names]
+        env = ctx.cfg.runner_env.get(unit, {})
+        empty_named = {name: "not-run" for name in card.test_names}
+
+        cache_path = ctx.state.cache_path(
+            base_commit or "unknown", unit or "workspace",
+            ctx.cfg.known_failing_hash(), ctx.cfg.env_hash(unit),
+        )
+        cached = read_json(cache_path) if ctx.cfg.baseline_cache else None
+        if not (isinstance(cached, dict)
+                and cached.get("known_failing_hash") == ctx.cfg.known_failing_hash()
+                and cached.get("env_hash") == ctx.cfg.env_hash(unit)):
+            runs = []
+            for _ in (1, 2):
+                res = runner.exec(
+                    kind="test", argv=pack.commands("test", unit=unit)["argv"],
+                    cwd=worktree, target_dir=target, unit=unit, env=env,
+                )
+                parsed_suite = pack.parse_tests(res.stdout, res.stderr)
+                sg = suite_green(parsed_suite, ctx.cfg.known_failing,
+                                 run_cls=res.cls, exit_code=res.exit_code)
+                runs.append((res, parsed_suite, sg))
+            first, second = runs
+            if (first[1].get("compile_errors") or second[1].get("compile_errors")):
+                return {"ok": False, "class": first[0].cls, "named": empty_named,
+                        "error": "the base does not compile",
+                        "compile_errors": first[1].get("compile_errors") or second[1].get("compile_errors")}
+            if (first[0].cls == "infra" or second[0].cls == "infra"
+                    or first[2].result == "infra" or second[2].result == "infra"):
+                return {"ok": False, "class": "infra", "named": empty_named,
+                        "error": "the base suite run did not finish"}
+            if not first[2].ok or not second[2].ok:
+                return {"ok": False, "class": "fail", "named": empty_named,
+                        "error": first[2].detail or second[2].detail}
+            list_res = runner.exec(
+                kind="list", argv=pack.commands("list", unit=unit)["argv"],
+                cwd=worktree, target_dir=target, unit=unit, env=env,
+            )
+            listing = pack.parse_list(list_res.stdout)
+            if ctx.cfg.baseline_cache:
+                write_json(cache_path, {
+                    "commit": base_commit, "unit": unit,
+                    "known_failing_hash": ctx.cfg.known_failing_hash(),
+                    "env_hash": ctx.cfg.env_hash(unit),
+                    "agreed": True, "list": listing, "at": utc_now(),
+                })
+
+        if not card.test_names:
+            return {"ok": True, "class": "pass", "named": {},
+                    "failed_on_base": [], "passing_on_base": []}
+
+        argv = pack.commands("test", unit=unit)["argv"] + ["--", *card.test_names]
         result = runner.exec(
             kind="test", argv=argv, cwd=worktree, target_dir=target,
-            unit=card.unit, env=env)
+            unit=unit, env=env)
         parsed = pack.parse_tests(result.stdout, result.stderr)
 
-        if result.cls == "infra" or parsed.get("missing_footers"):
-            return {"ok": False, "class": result.cls,
+        if result.cls == "infra" or (
+                parsed.get("missing_footers") and not parsed.get("compile_errors")):
+            return {"ok": False, "class": result.cls, "named": empty_named,
                     "error": "the base run did not finish"}
         if parsed.get("compile_errors"):
-            return {"ok": False, "class": result.cls,
+            return {"ok": False, "class": result.cls, "named": empty_named,
                     "error": "the frozen tests do not compile on base, so a failure "
                              "would prove nothing",
                     "compile_errors": parsed.get("compile_errors", [])}
@@ -198,13 +257,15 @@ def cmd_run(ctx: Context, args) -> int:
 
 
 def _do_run(ctx: Context, args, run_id: str) -> int:
+    ctx.state.check_disk_space(getattr(ctx.cfg, "min_free_mb", 0))
     source = ctx.cards()
     source.prepare()
     run_dir = ctx.state.create_run(run_id)
-    telemetry = TelemetrySink(JsonlTelemetry(run_dir))
+    telemetry_raw = open_telemetry(ctx.cfg, run_dir)
+    telemetry = TelemetrySink(telemetry_raw)
 
     cfg = ctx.cfg
-    handshake = _handshake(ctx, source, args)
+    handshake = _handshake(ctx, source, args, telemetry_raw=telemetry_raw)
     if handshake["refused"]:
         ctx.emit({"refused": True, "reason": handshake["reason"],
                   "adapters": handshake["adapters"]})
@@ -218,8 +279,9 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
         except OSError:
             pass
 
-    identifiers = [args.card] if args.card else source.next(cfg.lane,
-                                                           limit=args.cards)["cards"]
+    identifiers = ([_check_id(args.card, "card id")]
+                   if args.card else source.next(cfg.lane,
+                                                 limit=args.cards)["cards"])
     # `--spend` may lower the night's cap but never raise the config's, because the
     # config is the operator's standing limit and the flag is one night's. A zero or
     # negative flag is a usage error rather than "no cap": silently turning a limit
@@ -237,7 +299,10 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
     night = NightBudget(cap, cards_cap=args.cards)
     deadline = _deadline(args)
     outcomes: list[dict] = []
-    consecutive: list[tuple[str, str]] = []
+    consecutive: list[tuple[str, str, str]] = []
+    script_path = Path(args.script) if getattr(args, "script", None) else None
+    mm_script_path = (Path(args.mm_script)
+                      if getattr(args, "mm_script", None) else None)
 
     for card_id in identifiers:
         if ctx.state.kill_requested(cfg.kill_switch):
@@ -263,24 +328,36 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
         if reason:
             outcomes.append({"card": card_id, "skipped": reason})
             continue
+        ctx.state.check_disk_space(getattr(cfg, "min_free_mb", 0))
         if args.dry_run:
             outcomes.append(_dry_run(ctx, source, card_id))
             continue
 
         outcome = _run_card(ctx, source, card_id, run_id, telemetry,
-                            run_dir, args.script)
+                            run_dir, script_path, mm_script=mm_script_path)
         outcomes.append(outcome)
-        if outcome.get("final_state") in ("blocked", "released"):
+        final_state = outcome.get("final_state")
+        if final_state == "blocked":
             code = outcome.get("stop_code", "")
-            consecutive.append((code, outcome.get("detail", "")))
-        else:
+            consecutive.append((card_id, code, outcome.get("detail", "")))
+            if code == StopCode.INFRA.value:
+                ctx.state.pause(
+                    f"infra error on {card_id}: {outcome.get('detail', '')}")
+                night.note_card()
+                night.note_spend(outcome.get("spend", 0.0) or 0.0)
+                night.note_micromanager(
+                    outcome.get("micromanager_spend", 0.0) or 0.0)
+                _update_breaker(ctx, consecutive)
+                break
+        elif final_state != "released":
             consecutive = []
         night.note_card()
         night.note_spend(outcome.get("spend", 0.0) or 0.0)
+        night.note_micromanager(outcome.get("micromanager_spend", 0.0) or 0.0)
         _update_breaker(ctx, consecutive)
 
     notes: list[str] = []
-    if not _backend_prices_spend(cfg, args.script):
+    if not _backend_prices_spend(cfg, script_path):
         notes.append(
             "the backend reports no prices, so every spend is zero and the spend "
             "caps cannot fire: set [model] cost_per_1k_in and cost_per_1k_out")
@@ -292,8 +369,9 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
     record = {"run_id": run_id, "started_at": utc_now(),
               "finished_at": utc_now(), "caps": {"spend": night.spend_cap,
                                                 "cards": args.cards},
-              "spend": night.spend,
-              "spend_measured": _backend_prices_spend(cfg, args.script),
+              "spend": round(night.total_spend(), 6),
+              "micromanager_spend": round(night.micromanager_spend, 6),
+              "spend_measured": _backend_prices_spend(cfg, script_path),
               "notes": notes,
               "outcomes": outcomes,
               "dry_run": bool(args.dry_run),
@@ -335,7 +413,8 @@ def _dry_run(ctx: Context, source: FileCardSource, card_id: str) -> dict:
 
 def _run_card(ctx: Context, source: FileCardSource, card_id: str, run_id: str,
               telemetry, run_dir: Path, script: Path | None,
-              backend=None) -> dict:
+              backend=None, mm_script: Path | None = None,
+              micromanager=None) -> dict:
     """Claim one card and drive it. `backend` overrides the configured one."""
     cfg = ctx.cfg
     holder = f"openfarm:{run_id}"
@@ -356,7 +435,8 @@ def _run_card(ctx: Context, source: FileCardSource, card_id: str, run_id: str,
     Git(ctx.repo).worktree_add(worktree, base_ref)
 
     card_dir = ctx.state.create_card(card.id, run_id)
-    pack = pack_for(cfg.languages[0], cfg.cargo_flags)
+    pack = pack_for(cfg.languages[0], cfg.cargo_flags,
+                    spec=cfg.pack_adapter, cwd=worktree)
     pack.configure(worktree)
     backend = backend if backend is not None else open_backend(cfg, script)
     runner = ctx.runner(worktree, output_dir=card_dir / "gates" / "output")
@@ -367,16 +447,27 @@ def _run_card(ctx: Context, source: FileCardSource, card_id: str, run_id: str,
         if note.exists() and not book.is_hidden(str(cfg.test_conventions_path)):
             conventions = note.read_text()
 
+    owns_mm = micromanager is None
+    mm = (micromanager if micromanager is not None else open_micromanager(
+        cfg, card_dir, ctx.repo, script=mm_script,
+        worktree=worktree, card_dir=card_dir,
+    ))
     run = CardRun(
         card=card, cfg=cfg, state=ctx.state, card_dir=card_dir,
         worktree=worktree, runner=runner, pack=pack, backend=backend,
         book=book, run_id=run_id, telemetry=telemetry,
         deps_done=_deps_done(source, card), conventions=conventions,
-        log=lambda message: print(message, file=sys.stderr))
+        log=lambda message: print(message, file=sys.stderr),
+        micromanager=mm)
     run.card_source = source
     try:
         record = run.run(claim=claim)
     finally:
+        if owns_mm:
+            try:
+                mm.close()
+            except Exception:
+                pass
         try:
             Git(ctx.repo).worktree_remove(worktree)
         except (Infra, OSError):
@@ -438,14 +529,14 @@ def _deadline(args) -> float | None:
     return None
 
 
-def _handshake(ctx: Context, source, args) -> dict:
+def _handshake(ctx: Context, source, args, telemetry_raw=None) -> dict:
     """Ask every adapter `hello`, and refuse to start if one is incompatible.
 
     The spec is explicit: "A run refuses to start if no version is shared or an op it
     needs is missing." Doing it here, before any card is claimed, turns version skew
     into an honest refusal instead of a mid-run adapter failure.
     """
-    from .protocol import OPTIONAL_OPS, REQUIRED_OPS, check_hello
+    from .protocol import REQUIRED_OPS, check_hello
 
     names = {}
     try:
@@ -469,7 +560,8 @@ def _handshake(ctx: Context, source, args) -> dict:
                 "adapters": names}
 
     try:
-        pack = pack_for(ctx.cfg.languages[0], ctx.cfg.cargo_flags)
+        pack = pack_for(ctx.cfg.languages[0], ctx.cfg.cargo_flags,
+                        spec=ctx.cfg.pack_adapter, cwd=ctx.repo)
         hello = pack.hello()
         needed = set(REQUIRED_OPS["pack"])
         offered = set(hello.get("ops") or [])
@@ -484,6 +576,50 @@ def _handshake(ctx: Context, source, args) -> dict:
         return {"refused": True, "reason": f"language pack: {exc.message}",
                 "adapters": names}
 
+    script_path = Path(args.script) if getattr(args, "script", None) else None
+    try:
+        backend = open_backend(ctx.cfg, script_path)
+        hello = backend.hello() if hasattr(backend, "hello") else {
+            "versions": [1], "ops": ["hello", "complete"]}
+        check_hello(hello, "model", set(REQUIRED_OPS["model"]))
+        names["model"] = hello.get("name", "")
+    except Invalid as exc:
+        return {"refused": True, "reason": f"model: {exc.message}",
+                "adapters": names}
+
+    if telemetry_raw is not None:
+        try:
+            hello = (telemetry_raw.hello()
+                     if hasattr(telemetry_raw, "hello") else {"versions": [1],
+                                                             "ops": []})
+            check_hello(hello, "telemetry", set(REQUIRED_OPS["telemetry"]))
+            names["telemetry"] = hello.get("name", "")
+        except Invalid as exc:
+            return {"refused": True, "reason": f"telemetry: {exc.message}",
+                    "adapters": names}
+
+    mm_script_raw = getattr(args, "mm_script", None)
+    mm_cfg = getattr(ctx.cfg, "micromanager", None)
+    if (mm_cfg and getattr(mm_cfg, "mode", "off") != "off") or mm_script_raw:
+        mm_script = Path(mm_script_raw) if mm_script_raw else None
+        mm = None
+        try:
+            mm = open_micromanager(ctx.cfg, ctx.state.root, ctx.repo,
+                                   script=mm_script, worktree=ctx.repo)
+            hello = mm.hello() if hasattr(mm, "hello") else {
+                "versions": [1], "ops": ["hello", "assist"]}
+            check_hello(hello, "micromanager", set(REQUIRED_OPS["micromanager"]))
+            names["micromanager"] = hello.get("name", "")
+        except Invalid as exc:
+            return {"refused": True, "reason": f"micromanager: {exc.message}",
+                    "adapters": names}
+        finally:
+            if mm is not None:
+                try:
+                    mm.close()
+                except Exception:
+                    pass
+
     return {"refused": False, "reason": "", "adapters": names}
 
 
@@ -495,18 +631,19 @@ def _backend_prices_spend(cfg, script: Path | None) -> bool:
                 or getattr(cfg, "cost_per_1k_out", 0.0))
 
 
-def _update_breaker(ctx: Context, consecutive: list[tuple[str, str]]) -> None:
+def _update_breaker(ctx: Context, consecutive: list[tuple[str, str, str]]) -> None:
     limit = ctx.cfg.circuit_breaker
     if not limit:
         return
     if len(consecutive) < limit:
         ctx.state.write_breaker(False, [])
         return
-    reasons = {code for code, _detail in consecutive[-limit:]}
+    window = consecutive[-limit:]
+    reasons = {code for _cid, code, _detail in window}
     if len(reasons) == 1:
         code = reasons.pop()
         ctx.state.write_breaker(
-            True, [f"card-{index}" for index in range(len(consecutive))],
+            True, [cid for cid, _c, _d in window],
             f"{limit} cards blocked in a row for {code}")
 
 
@@ -523,12 +660,13 @@ def cmd_status(ctx: Context, args) -> int:
         "last_run": _last_run(ctx),
     }
     if args.card:
-        payload["card"] = str(ctx.state.card_dir(args.card, ""))
+        card_id = _check_id(args.card, "card id")
+        payload["card"] = str(ctx.state.card_dir(card_id, ""))
         payload["history"] = [
             {"run": path.parent.name,
              "state": (read_json(path) or {}).get("final_state", ""),
              "stop_code": (read_json(path) or {}).get("stop_code", "")}
-            for path in sorted(ctx.state.cards.glob(f"{args.card}/*/card-record.json"))
+            for path in sorted(ctx.state.cards.glob(f"{card_id}/*/card-record.json"))
         ]
     ctx.emit(payload)
     return EXIT_OK
@@ -581,10 +719,19 @@ def cmd_stop(ctx: Context, args) -> int:
 
 
 def cmd_release(ctx: Context, args) -> int:
-    """Free a stuck card, archiving its partial work first."""
+    """Free a stuck card via card source first, then archive partial work."""
+    card_id = _check_id(args.card, "card id")
     source = ctx.cards()
     source.prepare()
-    card_dir = ctx.state.cards / args.card
+    try:
+        source.release(card_id, reason=args.reason,
+                       stop_code=StopCode.RELEASED.value)
+    except Refused as exc:
+        ctx.emit({"released": False, "reason": exc.message,
+                  "archived": []})
+        return EXIT_REFUSED
+
+    card_dir = ctx.state.cards / card_id
     archived = []
     if card_dir.exists():
         partial = card_dir / "partial"
@@ -599,14 +746,7 @@ def cmd_release(ctx: Context, args) -> int:
                 archived.append(str(target))
             except OSError:
                 pass
-    try:
-        source.release(args.card, reason=args.reason,
-                       stop_code=StopCode.RELEASED.value)
-    except Refused as exc:
-        ctx.emit({"released": False, "reason": exc.message,
-                  "archived": archived})
-        return EXIT_REFUSED
-    ctx.emit({"released": True, "card": args.card, "archived": archived})
+    ctx.emit({"released": True, "card": card_id, "archived": archived})
     return EXIT_OK
 
 
@@ -617,13 +757,15 @@ def cmd_dossier(ctx: Context, args) -> int:
     attempt's gate results to show rather than choosing a different file. Asking for
     an attempt the card never reached is a refusal, not a silent fallback.
     """
+    card_id = _check_id(args.card, "card id")
     if args.run:
-        path = ctx.state.cards / args.card / args.run / "dossier.json"
+        run_id = _check_id(args.run, "run id")
+        path = ctx.state.cards / card_id / run_id / "dossier.json"
     else:
-        candidates = sorted(ctx.state.cards.glob(f"{args.card}/*/dossier.json"))
+        candidates = sorted(ctx.state.cards.glob(f"{card_id}/*/dossier.json"))
         path = candidates[-1] if candidates else None
     if not path or not Path(path).exists():
-        ctx.emit({"card": args.card, "error": "no dossier yet"})
+        ctx.emit({"card": card_id, "error": "no dossier yet"})
         return EXIT_REFUSED
     payload = read_json(path) or {}
 
@@ -631,13 +773,21 @@ def cmd_dossier(ctx: Context, args) -> int:
         gates = [entry for entry in payload.get("2_gates", [])
                  if entry.get("attempt") == args.attempt]
         if not gates:
-            ctx.emit({"card": args.card,
+            ctx.emit({"card": card_id,
                       "error": f"no gate ran on attempt {args.attempt}",
                       "attempts_run": sorted({entry.get("attempt")
                                               for entry in payload.get("2_gates", [])})})
             return EXIT_REFUSED
         payload["2_gates"] = gates
         payload["attempt"] = args.attempt
+        diff_file = Path(path).parent / "edits" / f"{args.attempt}.diff"
+        if diff_file.exists():
+            attempt_diff = diff_file.read_text()
+            diffs = dict(payload.get("9_diffs") or {})
+            diffs["attempt"] = args.attempt
+            diffs["attempt_diff"] = attempt_diff
+            diffs["production_diff"] = attempt_diff
+            payload["9_diffs"] = diffs
 
     if args.format == "json" or ctx.json:
         ctx.emit(payload)
@@ -648,12 +798,13 @@ def cmd_dossier(ctx: Context, args) -> int:
 
 def cmd_verdict(ctx: Context, args) -> int:
     """Records the reviewing lane's verdict. Writes the state folder only."""
-    candidates = sorted(ctx.state.cards.glob(f"{args.card}/*/card-record.json"))
+    card_id = _check_id(args.card, "card id")
+    candidates = sorted(ctx.state.cards.glob(f"{card_id}/*/card-record.json"))
     if not candidates:
-        ctx.emit({"card": args.card, "error": "no run for this card"})
+        ctx.emit({"card": card_id, "error": "no run for this card"})
         return EXIT_REFUSED
     card_dir = candidates[-1].parent
-    payload = {"card": args.card, "verdict": args.verdict,
+    payload = {"card": card_id, "verdict": args.verdict,
                "review_tokens": args.review_tokens,
                "minutes": args.minutes, "note": args.note or "",
                "at": utc_now()}
@@ -664,14 +815,106 @@ def cmd_verdict(ctx: Context, args) -> int:
 
 def cmd_escape(ctx: Context, args) -> int:
     """Records a defect found later in farm work. Writes the state folder only."""
-    candidates = sorted(ctx.state.cards.glob(f"{args.card}/*/card-record.json"))
+    card_id = _check_id(args.card, "card id")
+    candidates = sorted(ctx.state.cards.glob(f"{card_id}/*/card-record.json"))
     if not candidates:
-        ctx.emit({"card": args.card, "error": "no run for this card"})
+        ctx.emit({"card": card_id, "error": "no run for this card"})
         return EXIT_REFUSED
     from .state import append_jsonl
     path = candidates[-1].parent / "escapes.jsonl"
-    payload = {"card": args.card, "note": args.note, "at": utc_now()}
+    payload = {"card": card_id, "note": args.note, "at": utc_now()}
     append_jsonl(path, payload)
+    ctx.emit(payload)
+    return EXIT_OK
+
+
+def cmd_supervise(ctx: Context, args) -> int:
+    """Supervisor triage for blocked cards and ready/backlog queue preparation."""
+    if not args.triage_blocked and not args.prepare_queue:
+        raise UsageError("supervise requires --triage-blocked or --prepare-queue")
+
+    card_id = _check_id(args.card, "card id") if args.card else None
+    source = ctx.cards()
+    source.prepare()
+    mm_script = Path(args.mm_script) if getattr(args, "mm_script", None) else None
+    mm = open_micromanager(
+        ctx.cfg, ctx.state.root, ctx.repo,
+        script=mm_script, worktree=ctx.repo,
+    )
+    all_cards = source.all_cards()
+
+    def _file_supervise_findings(findings: list[dict], default_card: str) -> list[str]:
+        filed: list[str] = []
+        limit = getattr(ctx.cfg, "findings_per_card", 2)
+        for entry in findings:
+            if len(filed) >= limit:
+                break
+            title = str(entry.get("title", "")).strip()
+            if not title:
+                continue
+            from_card = str(entry.get("from_card") or default_card or "SUPERVISE")
+            res = source.finding(from_card, title, str(entry.get("body", "")))
+            filed.append(str(res.get("id", "") or title))
+        return filed
+
+    results: dict[str, dict] = {}
+    applied: dict[str, object] = {"released": [], "findings": []}
+    try:
+        if args.triage_blocked:
+            blocked = [c for c in all_cards
+                       if c.state == "blocked"
+                       and (card_id is None or c.id == card_id)]
+            records = {}
+            for c in blocked:
+                rec_files = sorted(ctx.state.cards.glob(f"{c.id}/*/card-record.json"))
+                if rec_files:
+                    records[c.id] = read_json(rec_files[-1], {}) or {}
+            report = mm.triage_and_review("triage_blocked", {
+                "card_id": card_id or "",
+                "cards": [c.as_dict() for c in blocked],
+                "records": records,
+            })
+            results["triage_blocked"] = report.as_dict()
+            if args.apply:
+                for rec in report.recommendations:
+                    if isinstance(rec, dict) and rec.get("action") == "release":
+                        cid = rec.get("card_id") or rec.get("card")
+                        if cid and any(c.id == cid for c in blocked):
+                            source.release(
+                                cid,
+                                reason=str(rec.get("reason") or report.summary or "supervisor triage release"),
+                                stop_code=StopCode.RELEASED.value,
+                            )
+                            applied["released"].append(cid)
+                default_c = card_id or (blocked[0].id if blocked else "TRIAGE")
+                applied["findings"].extend(
+                    _file_supervise_findings(report.findings, default_c))
+
+        if args.prepare_queue:
+            queued = [c for c in all_cards
+                      if c.state in ("ready", "backlog")
+                      and (card_id is None or c.id == card_id)]
+            report = mm.triage_and_review("prepare_queue", {
+                "card_id": card_id or "",
+                "cards": [c.as_dict() for c in queued],
+            })
+            results["prepare_queue"] = report.as_dict()
+            if args.apply:
+                default_c = card_id or (queued[0].id if queued else "QUEUE")
+                applied["findings"].extend(
+                    _file_supervise_findings(report.findings, default_c))
+
+        mm_budget = mm.budget.as_dict() if hasattr(mm, "budget") else {}
+    finally:
+        mm.close()
+
+    if len(results) == 1:
+        only = next(iter(results.values()))
+        payload = {**only, "applied": applied if args.apply else None,
+                   "micromanager": mm_budget}
+    else:
+        payload = {"reports": results, "applied": applied if args.apply else None,
+                   "micromanager": mm_budget}
     ctx.emit(payload)
     return EXIT_OK
 
@@ -701,6 +944,8 @@ def build_parser() -> argparse.ArgumentParser:
                      help="eligibility and baselines only: no model calls, no claims")
     run.add_argument("--script", default=None,
                      help="a scripted model backend, for tests and dry runs")
+    run.add_argument("--mm-script", dest="mm_script", default=None,
+                     help="a scripted micromanager backend, for tests")
     run.add_argument("--run-id", default=None, help="name this run")
 
     status = sub.add_parser("status", help="read-only state")
@@ -742,6 +987,13 @@ def build_parser() -> argparse.ArgumentParser:
     escape.add_argument("card")
     escape.add_argument("--note", required=True)
 
+    supervise = sub.add_parser("supervise", help="run micromanager triage/queue prep")
+    supervise.add_argument("--triage-blocked", action="store_true")
+    supervise.add_argument("--prepare-queue", action="store_true")
+    supervise.add_argument("--card", default=None)
+    supervise.add_argument("--apply", action="store_true")
+    supervise.add_argument("--mm-script", dest="mm_script", default=None)
+
     return parser
 
 
@@ -756,6 +1008,7 @@ COMMANDS = {
     "check": cmd_check,
     "verdict": cmd_verdict,
     "escape": cmd_escape,
+    "supervise": cmd_supervise,
 }
 
 
@@ -771,14 +1024,18 @@ def _normalise_argv(argv: list[str]) -> list[str]:
     index = 0
     while index < len(argv):
         token = argv[index]
+        if token == "--":
+            rest.extend(argv[index:])
+            break
         if token == "--json":
             early.append(token)
             index += 1
             continue
         if token in taking_value:
+            if index + 1 >= len(argv) or argv[index + 1] in ("--", "--json"):
+                raise UsageError(f"{token} requires a value")
             early.append(token)
-            if index + 1 < len(argv):
-                early.append(argv[index + 1])
+            early.append(argv[index + 1])
             index += 2
             continue
         if any(token.startswith(name + "=") for name in taking_value):
@@ -791,10 +1048,44 @@ def _normalise_argv(argv: list[str]) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    want_json = False
+    for token in raw_argv:
+        if token == "--":
+            break
+        if token == "--json":
+            want_json = True
+            break
+
+    def _emit_error(kind: str, message: str, code: int) -> int:
+        if want_json:
+            print(json.dumps({"error": message, "kind": kind},
+                             indent=2, ensure_ascii=False))
+        else:
+            print(f"openfarm: {kind}: {message}", file=sys.stderr)
+        return code
+
     parser = build_parser()
-    args = parser.parse_args(_normalise_argv(
-        list(sys.argv[1:] if argv is None else argv)))
+    try:
+        normalised = _normalise_argv(raw_argv)
+    except UsageError as exc:
+        return _emit_error("usage error", str(exc), EXIT_USAGE)
+
+    if want_json:
+        import contextlib
+        import io
+        err_buf = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(err_buf):
+                args = parser.parse_args(normalised)
+        except SystemExit as exc:
+            msg = err_buf.getvalue().strip().splitlines()[-1] if err_buf.getvalue().strip() else "invalid arguments"
+            return _emit_error("usage error", msg, int(exc.code) if isinstance(exc.code, int) else EXIT_USAGE)
+    else:
+        args = parser.parse_args(normalised)
     if not args.command:
+        if want_json:
+            return _emit_error("usage error", "no subcommand specified", EXIT_USAGE)
         parser.print_help()
         return EXIT_USAGE
 
@@ -802,35 +1093,26 @@ def main(argv: list[str] | None = None) -> int:
         ctx = Context(Path(args.repo), Path(args.config) if args.config else None,
                       json_output=args.json)
     except ConfigError as exc:
-        print(f"openfarm: config error: {exc}", file=sys.stderr)
-        return EXIT_USAGE
+        return _emit_error("config error", str(exc), EXIT_USAGE)
     except OSError as exc:
-        print(f"openfarm: cannot read the repository: {exc}", file=sys.stderr)
-        return EXIT_USAGE
+        return _emit_error("cannot read the repository", str(exc), EXIT_USAGE)
 
     try:
         return COMMANDS[args.command](ctx, args)
     except UsageError as exc:
-        print(f"openfarm: {exc}", file=sys.stderr)
-        return EXIT_USAGE
+        return _emit_error("usage error", str(exc), EXIT_USAGE)
     except GitRefused as exc:
-        print(f"openfarm: refused: {exc}", file=sys.stderr)
-        return EXIT_REFUSED
+        return _emit_error("refused", str(exc), EXIT_REFUSED)
     except Refused as exc:
-        print(f"openfarm: refused: {exc.message}", file=sys.stderr)
-        return EXIT_REFUSED
+        return _emit_error("refused", exc.message, EXIT_REFUSED)
     except Invalid as exc:
-        print(f"openfarm: adapter trouble: {exc.message}", file=sys.stderr)
-        return EXIT_TROUBLE
+        return _emit_error("adapter trouble", exc.message, EXIT_TROUBLE)
     except Infra as exc:
-        print(f"openfarm: trouble: {exc.message}", file=sys.stderr)
-        return EXIT_TROUBLE
+        return _emit_error("trouble", exc.message, EXIT_TROUBLE)
     except AdapterError as exc:
-        print(f"openfarm: trouble: {exc.message}", file=sys.stderr)
-        return EXIT_TROUBLE
+        return _emit_error("trouble", exc.message, EXIT_TROUBLE)
     except KeyboardInterrupt:
-        print("openfarm: interrupted", file=sys.stderr)
-        return EXIT_TROUBLE
+        return _emit_error("interrupted", "interrupted", EXIT_TROUBLE)
 
 
 if __name__ == "__main__":

@@ -179,6 +179,7 @@ class NightBudget:
         self.spend_cap = spend_cap
         self.cards_cap = cards_cap
         self.spend = 0.0
+        self.micromanager_spend = 0.0
         self.cards_claimed = 0
 
     def note_card(self) -> None:
@@ -187,12 +188,19 @@ class NightBudget:
     def note_spend(self, amount: float) -> None:
         self.spend += amount
 
+    def note_micromanager(self, amount: float) -> None:
+        self.micromanager_spend += amount
+
+    def total_spend(self) -> float:
+        return self.spend + self.micromanager_spend
+
     def exhausted(self) -> str | None:
         # A zero cap means "do not spend", which a scripted backend satisfies
         # without being refused outright. It is enforced on the first real spend,
         # in `note_spend`, not by refusing every card up front.
-        if self.spend_cap > 0 and self.spend >= self.spend_cap:
-            return f"night spend {self.spend:.4f} reached its cap of {self.spend_cap:.4f}"
+        total = self.total_spend()
+        if self.spend_cap > 0 and total >= self.spend_cap:
+            return f"night spend {total:.4f} reached its cap of {self.spend_cap:.4f}"
         if self.cards_cap is not None and self.cards_claimed >= self.cards_cap:
             return f"{self.cards_claimed} cards claimed, the run's cap"
         return None
