@@ -167,7 +167,7 @@ Each run starts from a fresh copy of the task's project and runs its card. Then 
 - **farm**: your worker model, with Claude supervising if you like.
 - **solo**: Claude doing every worker role itself, through the same briefs and gates.
 
-An arm file sets only the model and supervisor tables; copy one from [`bench/arms/`](bench/arms/). Each task runs 3 times per arm by default. The report (`bench-report.md` and `.json`) gives pass rate, spend, cost per pass and per-category pass rates for each arm, and stays on your machine. The workers and Claude still see each card and starting project, as in any run.
+An arm file sets only the model and supervisor tables; copy one from [`bench/arms/`](bench/arms/). Each task runs 3 times per arm by default. The report (`bench-report.md` and `.json`) gives pass rate, tokens, tokens per pass, the worker's share of those tokens and per-category pass rates for each arm, and stays on your machine. The workers and Claude still see each card and starting project, as in any run.
 
 ## How it works
 

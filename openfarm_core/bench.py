@@ -143,12 +143,15 @@ def score(records: list[dict]) -> dict:
         passed = bool(record["passed"])
 
         arm_stats = arm_totals.setdefault(
-            arm, {"runs": 0, "passed": 0, "spend": 0.0}
+            arm, {"runs": 0, "passed": 0, "spend": 0.0, "tokens": 0, "worker_tokens": 0}
         )
         arm_stats["runs"] += 1
         if passed:
             arm_stats["passed"] += 1
         arm_stats["spend"] += record["spend"]
+        arm_stats["tokens"] += int(record["tokens"])
+        # Older records have no split; count all their tokens as the worker's.
+        arm_stats["worker_tokens"] += int(record.get("worker_tokens", record["tokens"]))
 
         category_arms = category_totals.setdefault(category, {})
         category_stats = category_arms.setdefault(arm, {"runs": 0, "passed": 0})
@@ -161,10 +164,15 @@ def score(records: list[dict]) -> dict:
         runs = stats["runs"]
         passed = stats["passed"]
         spend = round(stats["spend"], 4)
+        tokens = stats["tokens"]
         arms[arm] = {
             "runs": runs,
             "passed": passed,
             "pass_rate": round(passed / runs, 4),
+            "tokens": tokens,
+            "tokens_per_pass": round(tokens / passed) if passed else None,
+            "worker_share": round(stats["worker_tokens"] / tokens, 4) if tokens else 0.0,
+            # Dollars at API list prices; on a subscription they are not a cost.
             "spend": spend,
             "cost_per_pass": round(spend / passed, 4) if passed else None,
         }
@@ -183,23 +191,23 @@ def render_report(summary: dict) -> str:
     def percent(value: float) -> str:
         return f"{value * 100:.1f}%"
 
-    def money(value: float | None) -> str:
+    def count(value: int | None) -> str:
         if value is None:
             return "—"
-        return f"${value:.2f}"
+        return f"{value:,}"
 
     lines = [
         "# openfarm bench report",
         "",
-        "| Arm | Runs | Passed | Pass rate | Spend | Cost per pass |",
-        "| --- | --- | --- | --- | --- | --- |",
+        "| Arm | Runs | Passed | Pass rate | Tokens | Tokens per pass | Worker share |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
     ]
     for arm in sorted(summary.get("arms", {})):
         stats = summary["arms"][arm]
         lines.append(
             f"| {arm} | {stats['runs']} | {stats['passed']} | "
-            f"{percent(stats['pass_rate'])} | {money(stats['spend'])} | "
-            f"{money(stats['cost_per_pass'])} |"
+            f"{percent(stats['pass_rate'])} | {count(stats['tokens'])} | "
+            f"{count(stats['tokens_per_pass'])} | {percent(stats['worker_share'])} |"
         )
 
     lines += [
@@ -471,8 +479,11 @@ def run_once(task: BenchTask, arm: str, arm_text: str | None, repeat: int,
     record["stop_code"] = str(outcome.get("stop_code", "") or "")
     record["spend"] = round(float(outcome.get("spend", 0.0) or 0.0)
                             + float(outcome.get("micromanager_spend", 0.0) or 0.0), 6)
-    record["tokens"] = sum(int(outcome.get(k, 0) or 0) for k in (
-        "tokens_in", "tokens_out", "micromanager_tokens_in", "micromanager_tokens_out"))
+    record["worker_tokens"] = sum(int(outcome.get(k, 0) or 0)
+                                  for k in ("tokens_in", "tokens_out"))
+    record["supervisor_tokens"] = sum(int(outcome.get(k, 0) or 0) for k in (
+        "micromanager_tokens_in", "micromanager_tokens_out"))
+    record["tokens"] = record["worker_tokens"] + record["supervisor_tokens"]
     record["diff_lines"] = (int(outcome.get("lines_added", 0) or 0)
                             + int(outcome.get("lines_removed", 0) or 0))
     if record["final_state"] != "in-review":

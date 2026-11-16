@@ -31,17 +31,17 @@ class BenchReportTests(unittest.TestCase):
         ]
         report = render_report(score(records))
         self.assertIn(
-            "| farm | 3 | 2 | 66.7% | $0.30 | $0.15 |",
+            "| farm | 3 | 2 | 66.7% | 30 | 15 | 100.0% |",
             report.splitlines(),
         )
 
-    def test_no_cost_per_pass_is_a_dash(self):
+    def test_no_tokens_per_pass_is_a_dash(self):
         records = [
             record("t1", "small-feature", "solo", False, 0.10),
         ]
         report = render_report(score(records))
         self.assertIn(
-            "| solo | 1 | 0 | 0.0% | $0.10 | — |",
+            "| solo | 1 | 0 | 0.0% | 10 | — | 100.0% |",
             report.splitlines(),
         )
 

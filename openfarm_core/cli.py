@@ -43,7 +43,7 @@ from .bootstrap import (
     install_skill_bundle,
 )
 from .briefs import BriefBook
-from .budget import NightBudget
+from .budget import NightBudget, token_split
 from .cards import Card
 from .config import load_config, parse_duration
 from .dossier import build_dossier, render_markdown
@@ -458,6 +458,12 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
     record = {"run_id": run_id, "started_at": utc_now(),
               "finished_at": utc_now(), "caps": {"spend": night.spend_cap,
                                                 "cards": args.cards},
+              "tokens": token_split(
+                  sum(int(o.get("tokens_in", 0) or 0) + int(o.get("tokens_out", 0) or 0)
+                      for o in outcomes),
+                  sum(int(o.get("micromanager_tokens_in", 0) or 0)
+                      + int(o.get("micromanager_tokens_out", 0) or 0) for o in outcomes)),
+              # Dollars at API list prices: what the spend caps count, not a cost.
               "spend": round(night.total_spend(), 6),
               "micromanager_spend": round(night.micromanager_spend, 6),
               "spend_measured": _backend_prices_spend(cfg, script_path),

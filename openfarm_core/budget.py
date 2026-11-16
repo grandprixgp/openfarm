@@ -203,3 +203,22 @@ class NightBudget:
         if self.cards_cap is not None and self.cards_claimed >= self.cards_cap:
             return f"{self.cards_claimed} cards claimed, the run's cap"
         return None
+
+
+def token_split(worker: int, supervisor: int) -> dict:
+    """Who used a run's tokens: the worker model or the supervisor (Claude).
+
+    Reports compare runs by tokens, not by dollars: on a subscription the
+    supervisor's API list price says nothing about what it costs.
+    """
+    worker, supervisor = max(0, int(worker)), max(0, int(supervisor))
+    total = worker + supervisor
+    return {"worker": worker, "supervisor": supervisor, "total": total,
+            "worker_share": round(worker / total, 4) if total else 0.0,
+            "supervisor_share": round(supervisor / total, 4) if total else 0.0}
+
+
+def describe_split(split: dict) -> str:
+    """`"68,212 tokens: 54% worker, 46% supervisor"`."""
+    return (f"{split['total']:,} tokens: {split['worker_share'] * 100:.0f}% worker, "
+            f"{split['supervisor_share'] * 100:.0f}% supervisor")

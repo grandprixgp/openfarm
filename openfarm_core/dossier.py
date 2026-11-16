@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from .budget import describe_split, token_split
 from .state import write_json
 
 
@@ -96,6 +97,11 @@ def build_dossier(card_run, final_state: str,
             "test_writer_attempts": card_run.budget.test_writer_attempts,
             "planner_split": card_run.planner_used,
             "failed_attempts": _failed_attempts(card_run),
+            "tokens": token_split(
+                int(getattr(card_run.budget, "tokens_in", 0) or 0)
+                + int(getattr(card_run.budget, "tokens_out", 0) or 0),
+                int(mm_summary.get("tokens_in", 0) or 0)
+                + int(mm_summary.get("tokens_out", 0) or 0)),
         },
         "6_checker": {
             "restatement": restatement,
@@ -332,6 +338,8 @@ def render_markdown(payload: dict) -> str:
               f"- Attempts: {struggle['attempts']} implementer, "
               f"{struggle['test_writer_attempts']} test writer",
               f"- Planner split it: {'yes' if struggle['planner_split'] else 'no'}"]
+    if struggle.get("tokens"):
+        lines.append(f"- Tokens: {describe_split(struggle['tokens'])}")
     for failure in struggle["failed_attempts"]:
         lines.append(f"- {failure}")
 
