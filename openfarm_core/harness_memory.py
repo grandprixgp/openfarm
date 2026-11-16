@@ -22,6 +22,8 @@ from typing import NamedTuple
 
 from .errors import AdapterError, Invalid, Refused, Unsupported
 from .globs import escapes, matches_any, normalise
+from .harness_global import GlobalLibrary, should_promote, should_veto
+from .harness_scope import global_eligibility, scope_of
 from .state import _safe_id, append_jsonl, read_json, utc_now
 
 EDITABLE_SURFACES: tuple[str, ...] = (
@@ -570,6 +572,11 @@ def validate_harness_proposal(
         "tags": tags,
         "proposed_patch": cleaned_patch,
         "source": str(raw.get("source", "") or "micromanager"),
+        # v0.7: the proposer's claim; `harness_scope.scope_of` checks it at capture.
+        "scope": scope if (scope := str(raw.get("scope", "") or "").strip().lower())
+        in ("project", "general") else "project",
+        "scope_reason": sanitize_lesson_text(str(raw.get("scope_reason", "") or ""),
+                                             max_len=200),
     }, ""
 
 
@@ -1116,6 +1123,8 @@ class HarnessLibrary:
         self.harness_dir = Path(harness_dir)
         self._cfg = config
         self.harness_cfg = self._resolve_harness_cfg(config)
+        # v0.7: which lessons this run applies: "both", "project" or "global".
+        self.learn_from = str(getattr(self.harness_cfg, "learn_from", "both") or "both")
         self.never_touch = list(getattr(config, "never_touch", ()) or ()) if config is not None else []
         self.forbidden_files = list(getattr(config, "forbidden_files", ()) or ()) if config is not None else []
         if ".openfarm/**" not in self.forbidden_files:
@@ -1402,6 +1411,15 @@ class HarnessLibrary:
             "metrics": metrics,
         }
 
+    def _applies_here(self, entry: dict) -> bool:
+        """`learn_from` decides whether a project's own or imported global lessons apply."""
+        is_global = entry.get("origin") == "global"
+        if self.learn_from == "project":
+            return not is_global
+        if self.learn_from == "global":
+            return is_global
+        return True
+
     def _entry_matches_role(self, entry: dict, role: str) -> bool:
         entry_role = str(entry.get("role", "*"))
         surface = str(entry.get("surface", ""))
@@ -1444,6 +1462,8 @@ class HarnessLibrary:
             entry = self._load_entry(eid)
             if not entry or entry.get("status") not in ("active", "probing"):
                 continue
+            if not self._applies_here(entry):
+                continue
             conf = float(entry.get("confidence", 0.0) or 0.0)
             if conf < min_conf:
                 continue
@@ -1473,6 +1493,7 @@ class HarnessLibrary:
             helpfulness = int(stats.get("helped", 0) or 0) - int(stats.get("hurt", 0) or 0)
             score = (
                 specificity,
+                0 if entry.get("origin") == "global" else 1,
                 helpfulness,
                 conf,
                 int(entry.get("revision", 0) or 0),
@@ -1571,6 +1592,8 @@ class HarnessLibrary:
             entry = self._load_entry(eid)
             if not entry or entry.get("status") not in ("active", "probing"):
                 continue
+            if not self._applies_here(entry):
+                continue
             if entry.get("surface") != "context_hints":
                 continue
             entry_role = str(entry.get("role", "*") or "*")
@@ -1605,6 +1628,7 @@ class HarnessLibrary:
             helpfulness = int(stats.get("helped", 0) or 0) - int(stats.get("hurt", 0) or 0)
             score = (
                 specificity,
+                0 if entry.get("origin") == "global" else 1,
                 helpfulness,
                 conf,
                 int(entry.get("revision", 0) or 0),
@@ -1703,6 +1727,8 @@ class HarnessLibrary:
                 "tags": list(contrast.get("tags") or ()),
                 "proposed_patch": {surface: cue},
                 "source": "deterministic",
+                "scope": "general",
+                "scope_reason": "fixed-rule cue",
             }
         ]
 
@@ -1979,6 +2005,7 @@ class HarnessLibrary:
         failure: str = "",
         micromanager=None,
         reflect: bool = True,
+        scope_markers: set[str] | None = None,
     ) -> dict:
         """Record a card run outcome, update probe state, capture adaptations, and refresh metrics."""
         with self._locked():
@@ -2061,6 +2088,14 @@ class HarnessLibrary:
                     if cleaned is None:
                         rejected_proposals.append({"reason": reason, "raw": raw_cand})
                         continue
+                    if cleaned["scope"] == "general":
+                        # No markers means nothing to check the claim against.
+                        cleaned["scope"], checked = (
+                            scope_of(cleaned, set(scope_markers))
+                            if scope_markers is not None
+                            else ("project", "no project markers to check against"))
+                        if cleaned["scope"] != "general":
+                            cleaned["scope_reason"] = sanitize_lesson_text(checked, max_len=200)
                     if cleaned["confidence"] < self.harness_cfg.min_confidence:
                         rejected_proposals.append({
                             "reason": f"confidence {cleaned['confidence']} below min_confidence {self.harness_cfg.min_confidence}",
@@ -2112,6 +2147,9 @@ class HarnessLibrary:
                             "confidence": cleaned["confidence"],
                             "status": "candidate",
                             "source": cleaned["source"],
+                            "scope": cleaned["scope"],
+                            "scope_reason": cleaned["scope_reason"],
+                            "origin": "project",
                             "card_id": contrast["card_id"],
                             "revision": 0,
                             "created_at": now,
@@ -2150,6 +2188,9 @@ class HarnessLibrary:
                             "confidence": cleaned["confidence"],
                             "status": "probing",
                             "source": cleaned["source"],
+                            "scope": cleaned["scope"],
+                            "scope_reason": cleaned["scope_reason"],
+                            "origin": "project",
                             "card_id": contrast["card_id"],
                             "revision": next_rev,
                             "created_at": now,
@@ -2363,6 +2404,143 @@ class HarnessLibrary:
                 "revision": int(overlay["revision"]),
                 "metrics": metrics,
             }
+
+    # -- v0.7: the global library -------------------------------------------------
+
+    def _drop_from_overlay(self, entry_ids: list[str]) -> None:
+        if not entry_ids:
+            return
+        overlay = self._load_overlay()
+        kept = [eid for eid in (overlay.get("active_entry_ids") or ()) if eid not in entry_ids]
+        if len(kept) == len(overlay.get("active_entry_ids") or ()):
+            return
+        overlay["active_entry_ids"] = kept
+        overlay["surfaces"] = self._rebuild_surfaces(kept)
+        if overlay.get("state") == "probing" and not any(
+            (self._load_entry(eid) or {}).get("status") == "probing" for eid in kept
+        ):
+            overlay["state"] = "confirmed"
+            overlay["probe_remaining"] = 0
+            overlay["probe_outcomes"] = []
+        self._save_overlay(overlay)
+
+    def sync_from_global(self, glib: GlobalLibrary) -> dict:
+        """Import new global lessons as candidates and drop retired ones.
+
+        An imported lesson is an ordinary entry with `origin = "global"`, so this
+        project's probe cycle and scores judge it like its own. With `learn_from =
+        "project"` nothing is imported, but retired lessons are still dropped.
+        """
+        imported: list[str] = []
+        dropped: list[str] = []
+        with self._locked():
+            local = self.list_entries()
+            by_gid = {str(e["global_id"]): e for e in local if e.get("global_id")}
+            fingerprints = {self._cue_fingerprint(e) for e in local}
+            ids = {str(e["id"]) for e in local}
+            for g in glib.list_entries():
+                gid = str(g.get("id", ""))
+                mine = by_gid.get(gid)
+                if g.get("status") == "retired":
+                    if (mine and mine.get("origin") == "global"
+                            and mine.get("status") in ("active", "probing", "candidate")):
+                        mine["status"] = "demoted"
+                        mine["demote_reason"] = "global_retired"
+                        self._save_entry(mine)
+                        dropped.append(str(mine["id"]))
+                    continue
+                if self.learn_from == "project" or mine is not None:
+                    continue
+                if g.get("surface") not in self.harness_cfg.editable_surfaces:
+                    continue
+                if self._cue_fingerprint(g) in fingerprints:
+                    continue
+                entry_id = f"exp-{gid}"
+                if entry_id in ids:
+                    continue
+                cleaned, _ = validate_harness_proposal(
+                    g, allowed_surfaces=self.harness_cfg.editable_surfaces,
+                    never_touch=self.never_touch, forbidden_files=self.forbidden_files)
+                if cleaned is None:
+                    continue
+                now = utc_now()
+                sources = [str(s.get("project", "")) for s in g.get("sources") or ()]
+                record = {**cleaned, "id": entry_id, "status": "candidate",
+                          "source": "global", "scope": "general",
+                          "scope_reason": "imported from the global library",
+                          "origin": "global", "global_id": gid,
+                          "source_project": sources[0] if sources else "",
+                          "card_id": "", "revision": 0, "created_at": now,
+                          "updated_at": now,
+                          "stats": {"applied": 0, "helped": 0, "hurt": 0, "neutral": 0}}
+                self._save_entry(record)
+                ids.add(entry_id)
+                imported.append(entry_id)
+                self.ledger.record_lesson_added(
+                    entry_id=entry_id, surface=record["surface"],
+                    confidence=record["confidence"], revision=0, source="global",
+                    card_id="", status="candidate")
+            self._drop_from_overlay(dropped)
+            promoted = None
+            if imported:
+                promoted = self._promote_buffered_candidates(
+                    self._load_overlay(), self.ledger.compute_metrics())
+            if imported or dropped:
+                if dropped:
+                    self.ledger.record_demotion("global", int(self._load_overlay().get(
+                        "revision", 0)), dropped, reason="global_retired")
+                self.ledger.refresh_metrics()
+                self._rebuild_index()
+            return {"imported": imported, "dropped": dropped, "promoted": promoted}
+
+    def report_to_global(self, glib: GlobalLibrary, project: str, *, share: bool) -> dict:
+        """Send this project's scores for linked lessons, veto losers, promote winners."""
+        reported: list[str] = []
+        vetoed: list[str] = []
+        promoted: list[str] = []
+        refused: dict[str, str] = {}
+        with self._locked():
+            for entry in self.list_entries():
+                gid = str(entry.get("global_id") or "")
+                stats = entry.get("stats") or {}
+                if gid:
+                    veto = bool(entry.get("demote_reason") == "global_veto")
+                    if not veto and should_veto(stats):
+                        veto = True
+                        if (entry.get("origin") == "global"
+                                and entry.get("status") in ("active", "probing", "candidate")):
+                            entry["status"] = "demoted"
+                            entry["demote_reason"] = "global_veto"
+                            self._save_entry(entry)
+                            vetoed.append(str(entry["id"]))
+                    if glib.report(gid, project, stats, vetoed=veto) is not None:
+                        reported.append(gid)
+                    continue
+                if not share or entry.get("origin") == "global":
+                    continue
+                if not should_promote(entry):
+                    continue
+                ok, why = global_eligibility(entry)
+                if not ok:
+                    if entry.get("global_refused") != why:
+                        entry["global_refused"] = why
+                        self._save_entry(entry)
+                    refused[str(entry["id"])] = why
+                    continue
+                g = glib.add(entry, project)
+                entry["global_id"] = g["id"]
+                entry.pop("global_refused", None)
+                self._save_entry(entry)
+                glib.report(g["id"], project, stats, vetoed=False)
+                promoted.append(str(entry["id"]))
+            if vetoed:
+                self._drop_from_overlay(vetoed)
+                self.ledger.record_demotion("global", int(self._load_overlay().get(
+                    "revision", 0)), vetoed, reason="global_veto")
+                self.ledger.refresh_metrics()
+                self._rebuild_index()
+            return {"reported": reported, "vetoed": vetoed, "promoted": promoted,
+                    "refused": refused}
 
     def reset(self) -> dict:
         """Clear active overlay back to revision 0 and deactivate active/probing/candidate entries."""

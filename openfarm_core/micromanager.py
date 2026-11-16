@@ -493,6 +493,14 @@ _OP_RULES = {
         "classes and typed fields are fine; no other logic, no default values "
         "computed from input. Return {\"edits\": []} if nothing is needed."
     ),
+    "reflect_harness": (
+        "Give every lesson a scope. \"general\" means it would help on any project "
+        "in that language: it names no file, module, function, type, card or "
+        "project of this repository, and holds no code. Otherwise \"project\". "
+        "Say why in scope_reason. A general lesson may later be shared with other "
+        "projects, so when in doubt say \"project\". Notes about openfarm's own "
+        "harness bookkeeping are always \"project\"."
+    ),
 }
 
 
@@ -532,7 +540,8 @@ def _build_op_prompt(op: str, payload: dict) -> str:
             '"role": "planner|test_writer|implementer|micromanager", '
             '"language": "*", "kind": "*", "failure_class": "", '
             '"cue": "...", "lesson": "...", "evidence": "...", '
-            '"confidence": 0.75, "tags": ["..."], "proposed_patch": {}}]}'
+            '"confidence": 0.75, "tags": ["..."], "proposed_patch": {}, '
+            '"scope": "project|general", "scope_reason": "..."}]}'
         ),
     }
     schema = schemas.get(op, "{}")
