@@ -29,7 +29,9 @@ from .acp_setup import (
     probe_acp,
     run_acp_login,
 )
+from .adopt import adopt_project
 from .adapters.files import FileCardSource, open_card_source
+
 from .adapters.jsonl import TelemetrySink, open_telemetry
 from .adapters.openai_compat import open_backend
 from .adapters.direct import open_runner
@@ -1310,7 +1312,16 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--force", action="store_true",
                       help="overwrite scaffold files in non-empty directory")
 
+    adopt = sub.add_parser("adopt", help="add openfarm to an existing repository")
+    adopt.add_argument("--dir", default=None,
+                       help="repository directory (default: the current directory)")
+    adopt.add_argument("--lang", choices=("rust", "python"), default=None,
+                       help="language pack to use (default: detect from manifests)")
+    adopt.add_argument("--state-dir", default=None, help="external state directory")
+    adopt.add_argument("--key-file", default=None, help="external API key file path")
+
     install_skill = sub.add_parser(
+
         "install-skill", help="install bundled agent skills, commands, and optional bin shim"
     )
     install_skill.add_argument("--target", choices=INSTALL_TARGETS, default="all",
@@ -1384,7 +1395,25 @@ def cmd_init(args) -> int:
     return EXIT_OK
 
 
+def cmd_adopt(args) -> int:
+    directory = Path(args.dir) if args.dir else Path.cwd()
+    try:
+        payload = adopt_project(
+            directory,
+            language=args.lang,
+            state_dir=Path(args.state_dir) if args.state_dir else None,
+            key_file=Path(args.key_file) if args.key_file else None,
+        )
+    except Refused as exc:
+        _emit_standalone({"error": exc.message, "kind": "refused"},
+                         bool(getattr(args, "json", False)))
+        return EXIT_REFUSED
+    _emit_standalone(payload, bool(getattr(args, "json", False)))
+    return EXIT_OK
+
+
 def cmd_install_skill(args) -> int:
+
     payload = install_skill_bundle(
         target=args.target,
         dest=Path(args.dest) if args.dest else None,
@@ -1433,6 +1462,7 @@ def cmd_acp(args) -> int:
 
 
 PRE_CONFIG_COMMANDS = {
+    "adopt": cmd_adopt,
     "init": cmd_init,
     "install-skill": cmd_install_skill,
     "acp": cmd_acp,
