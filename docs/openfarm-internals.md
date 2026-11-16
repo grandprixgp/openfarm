@@ -46,7 +46,7 @@ Exact table/key validation lives in `openfarm_core/config.py` and is verified by
 
 - `[project]`: `name`, `lane`, `base_branch`, `state_dir`
 - `[adapters]`: `cards`, `runner`, `languages`, `model`, `micromanager`, `telemetry`, `pack`
-- `[model]`: `endpoint`, `allowed_endpoints`, `key_file`, `headers` (v0.6: extra request headers, never `Authorization`, `Content-Type`, `Content-Length` or `Host`), `test_writer`, `implementer`, `checker`, `planner`, `cost_per_1k_in`, `cost_per_1k_out` (`RoleModel`: `model`, `temperature`, `vary_seed`; `checker` defaults `temperature=0.35`, `vary_seed=True`)
+- `[model]`: `endpoint`, `allowed_endpoints`, `key_file`, `headers` (v0.6: extra request headers, never `Authorization`, `Content-Type`, `Content-Length` or `Host`), `max_tokens` (v0.6, default 4096; an answer with `finish_reason` `length` is refused as `answer-cut-off` by `roles.parse_answer_edits`), `test_writer`, `implementer`, `checker`, `planner`, `cost_per_1k_in`, `cost_per_1k_out` (`RoleModel`: `model`, `temperature`, `vary_seed`; `checker` defaults `temperature=0.35`, `vary_seed=True`)
 - `[policy]`: `never_touch`, `forbidden_files` (always includes `.openfarm/**` and `.claude/**`), `known_failing`, `flagged_patterns`, `categories`
 - `[eligibility]`: `max_files` (`6`), `max_units` (`1` or `len(languages)`), `require_reference` (`["pattern", "small-feature"]`), `refuse_touches_prefixes`, `rust_tests_in_separate_files` (`True`), `python_tests_in_test_files` (`True`: a Python card's named tests live in `tests/**/test_*.py`), `allow_type_changes` (`True`), `max_context_files` (`8`)
 - `[brief]`: `test_conventions`

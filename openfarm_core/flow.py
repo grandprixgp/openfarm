@@ -30,7 +30,7 @@ from .globs import matches_any, normalise, resolves_within
 from .harness_memory import (GuidanceSelection, HarnessLibrary, _classify_failure,
                              _is_unsafe_path)
 from .micromanager import open_micromanager
-from .roles import (Plan, Roles, build_checker_pass1_brief,
+from .roles import (Plan, Roles, parse_answer_edits, build_checker_pass1_brief,
                     build_checker_pass2_brief, build_implementer_brief,
                     build_planner_brief, build_test_writer_brief,
                     parse_counter_tests, parse_plan, parse_restatement,
@@ -1088,7 +1088,7 @@ class CardRun:
                        call.as_dict())
 
             try:
-                edits = parse_edits(call.content)
+                edits = parse_answer_edits(call)
             except Invalid as exc:
                 last_failure = exc.message
                 self.budget.test_writer_attempts -= 1
@@ -1473,7 +1473,7 @@ class CardRun:
                        call.as_dict())
 
             try:
-                edits = parse_edits(call.content)
+                edits = parse_answer_edits(call)
             except Invalid as exc:
                 last_failure = exc.message
                 self.budget.implementer_attempts -= 1
