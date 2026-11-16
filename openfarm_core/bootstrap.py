@@ -13,6 +13,7 @@ import shutil
 import stat
 from pathlib import Path
 
+from .config_template import render_config
 from .config import load_config
 from .errors import ConfigError, Refused, UsageError
 from .git import Git
@@ -214,129 +215,13 @@ def _render_config_toml(
     mm_binary: str = "auto",
     mutation: str,
 ) -> str:
-    mutation_req = '["test-backfill"]' if mutation != "off" else "[]"
-    return (
-        "[project]\n"
-        f"name = {_toml_str(project_slug)}\n"
-        'lane = "farm"\n'
-        f"base_branch = {_toml_str(base_branch)}\n"
-        f"state_dir = {_toml_str(str(state_dir))}\n\n"
-        "[adapters]\n"
-        'cards = "files:cards/"\n'
-        'runner = "direct"\n'
-        'languages = ["rust"]\n'
-        'model = "openai-compatible"\n'
-        f"micromanager = {_toml_str(mm_adapter)}\n"
-        'telemetry = "jsonl"\n'
-        'pack = ""\n\n'
-        "[model]\n"
-        f"endpoint = {_toml_str(endpoint)}\n"
-        f"allowed_endpoints = [{_toml_str(endpoint)}]\n"
-        f"key_file = {_toml_str(str(key_file))}\n"
-        "cost_per_1k_in = 0.0005\n"
-        "cost_per_1k_out = 0.0015\n"
-        f"test_writer = {{ model = {_toml_str(model)}, temperature = 0.2 }}\n"
-        f"implementer = {{ model = {_toml_str(model)}, temperature = 0.3, vary_seed = true }}\n"
-        f"checker     = {{ model = {_toml_str(model)}, temperature = 0.35, vary_seed = true }}\n"
-        f"planner     = {{ model = {_toml_str(model)}, temperature = 0.2 }}\n\n"
-        "[policy]\n"
-        'never_touch = ["src/invariants.rs"]\n'
-        'forbidden_files = ["**/Cargo.toml", "Cargo.lock", ".openfarm/**", ".claude/**"]\n'
-        "known_failing = []\n"
-        'flagged_patterns = ["std::env::set_var", "sleep("]\n'
-        "categories = [\n"
-        '  "test-backfill",\n'
-        '  "mechanical",\n'
-        '  "pattern",\n'
-        '  "pinned-bugfix",\n'
-        '  "small-feature",\n'
-        '  "feature",\n'
-        '  "refactor",\n'
-        '  "integration",\n'
-        '  "port",\n'
-        "]\n\n"
-        "[eligibility]\n"
-        "max_files = 6\n"
-        "max_units = 1\n"
-        'require_reference = ["pattern", "small-feature"]\n'
-        'refuse_touches_prefixes = ["seam:"]\n'
-        "rust_tests_in_separate_files = true\n"
-        "allow_type_changes = true\n"
-        "max_context_files = 8\n\n"
-        "[brief]\n"
-        'test_conventions = ".openfarm/test-conventions.md"\n\n'
-        "[runner]\n"
-        'cargo_flags = ["--locked"]\n\n'
-        "[runner.env]\n\n"
-        "[budget]\n"
-        "implementer_attempts = 3\n"
-        "test_writer_attempts = 2\n"
-        "model_build_calls_per_card = 10\n"
-        "mutation_build_calls_per_card = 40\n"
-        "tokens_per_card = 400_000\n"
-        'wall_clock_per_card = "45m"\n'
-        "frontier_cost_ratio = 0.30\n"
-        "spend_per_night = 20.00\n"
-        "concurrent_builds = 2\n"
-        "concurrent_cards = 3\n"
-        'lease_ttl = "20m"\n'
-        f"kill_switch = {_toml_str(str(state_dir / 'STOP'))}\n\n"
-        "[gates]\n"
-        'revert_check = "required"\n'
-        f"mutation = {_toml_str(mutation)}\n"
-        f"mutation_required_for = {mutation_req}\n"
-        "mutation_min_kill_rate = 0.8\n"
-        'counter_tests = "report"\n'
-        'coverage = "off"\n'
-        "workspace_lint = true\n"
-        "baseline_cache = true\n"
-        'catch_up = "check"\n'
-        "findings_per_card = 2\n"
-        "circuit_breaker = 3\n"
-        'planner = "auto"\n\n'
-        "[cards]\n"
-        'fields_block = "toml"\n'
-        "required_fields = []\n\n"
-        "[micromanager]\n"
-        f"mode = {_toml_str(mm_mode)}\n"
-        f"auth = {_toml_str(mm_auth)}\n"
-        f"binary = {_toml_str(mm_binary)}\n"
-        "args = []\n"
-        'model = ""\n'
-        'effort = "medium"\n'
-        'tool_policy = "none"\n'
-        "timeout_s = 180.0\n"
-        "max_calls_per_card = 4\n"
-        "tokens_per_card = 120_000\n"
-        "spend_per_night = 10.0\n"
-        "cost_per_1k_in = 0.003\n"
-        "cost_per_1k_out = 0.015\n"
-        "isolate_home = true\n"
-        "shape_cards = true\n"
-        "scaffold_contracts = true\n"
-        "coach_on_stall = true\n"
-        "adjudicate_counter_tests = true\n"
-        "pre_review = true\n\n"
-        "[state]\n"
-        "min_free_mb = 256\n\n"
-        "[harness]\n"
-        "enabled = true\n"
-        'dir = ""\n'
-        'capture_on = ["retry_recovery", "fail", "counter_fail", "pass"]\n'
-        "max_cues_per_brief = 4\n"
-        "max_active_adaptations = 8\n"
-        "min_confidence = 0.55\n"
-        "probe_window = 3\n"
-        "auto_demote = true\n"
-        "allow_micromanager_reflection = true\n"
-        "editable_surfaces = [\n"
-        '  "test_writer_guidance",\n'
-        '  "implementer_guidance",\n'
-        '  "planner_guidance",\n'
-        '  "context_hints",\n'
-        '  "micromanager_context",\n'
-        "]\n"
-    )
+    return render_config(
+        name=project_slug, language="rust", base_branch=base_branch,
+        state_dir=state_dir, key_file=key_file, endpoint=endpoint, model=model,
+        never_touch=["src/invariants.rs"],
+        test_conventions=".openfarm/test-conventions.md", cargo_flags=["--locked"],
+        mutation=mutation, mm_adapter=mm_adapter, mm_mode=mm_mode, mm_auth=mm_auth,
+        mm_binary=mm_binary)
 
 
 def initialize_project(
