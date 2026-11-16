@@ -8,7 +8,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from ..errors import Invalid
+import re
+
+from ..errors import Invalid, Refused
 
 
 class Pack:
@@ -61,7 +63,8 @@ class Pack:
         return {"formats": ["search_replace", "whole_file"]}
 
     def apply_edit(self, fmt: str, path: Path, edit: dict) -> dict:
-        raise NotImplementedError
+        """Plain-text edits, the same in every language."""
+        return apply_text_edit(fmt, path, edit)
 
     def append_stub(self, path: Path, test_name: str, body: str) -> dict:
         raise NotImplementedError
@@ -112,9 +115,68 @@ class UnsupportedPack(Pack):
         self._refuse("parse_tests")
 
 
+def apply_text_edit(fmt: str, path: Path, edit: dict) -> dict:
+    """`whole_file` or `search_replace` on one file; a search must match once."""
+    path = Path(path)
+    if fmt == "whole_file":
+        content = edit.get("content")
+        if content is None:
+            raise Invalid("bad-edit", "whole_file needs `content`")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(str(content))
+        return {"ok": True}
+
+    if fmt == "search_replace":
+        search = edit.get("search")
+        replace = edit.get("replace", "")
+        if search is None:
+            raise Invalid("bad-edit", "search_replace needs `search`")
+        text = path.read_text() if path.exists() else ""
+        count = text.count(str(search))
+        if count != 1:
+            raise Refused(
+                "no-unique-match",
+                f"{path}: search block matched {count} times, not exactly once")
+        path.write_text(text.replace(str(search), str(replace), 1))
+        return {"ok": True}
+
+    raise Invalid("bad-format", f"{fmt!r} is not an edit format")
+
+
+def added_lines_from_diff(diff_text: str) -> list[dict]:
+    """Added lines from a unified diff, with their new-file line numbers."""
+    out: list[dict] = []
+    path = ""
+    new_line = 0
+    for line in diff_text.splitlines():
+        if line.startswith("+++ "):
+            target = line[4:].strip()
+            path = "" if target == "/dev/null" else target
+            if path.startswith("b/"):
+                path = path[2:]
+            continue
+        if line.startswith("@@ "):
+            match = re.search(r"\+(\d+)(?:,\d+)?", line)
+            new_line = int(match.group(1)) if match else 0
+            continue
+        if line.startswith("+") and not line.startswith("+++"):
+            out.append({"path": path, "line": new_line, "text": line[1:]})
+            new_line += 1
+        elif line.startswith("-") and not line.startswith("---"):
+            continue
+        else:
+            new_line += 1
+    return out
+
+
 def pack_for(language: str, cargo_flags: list[str] | None = None,
-             spec: str = "", cwd: Path | None = None) -> Pack:
-    """The pack for a language. `cargo_flags` comes from `[runner] cargo_flags`."""
+             spec: str = "", cwd: Path | None = None,
+             python: str = "") -> Pack:
+    """The pack for a language.
+
+    `cargo_flags` comes from `[runner] cargo_flags` and `python` from
+    `[runner] python`; each pack ignores the other's setting.
+    """
     cmd_spec = spec if str(spec).startswith("cmd:") else (
         language if str(language).startswith("cmd:") else "")
     if cmd_spec:
@@ -132,6 +194,9 @@ def pack_for(language: str, cargo_flags: list[str] | None = None,
     if language == "rust":
         from .rust import RustPack
         return RustPack(cargo_flags)
+    if language in ("python", "py"):
+        from .python import PythonPack
+        return PythonPack(python or None)
     if language in ("typescript", "ts", "javascript", "js"):
         raise Invalid(
             "no-typescript-pack",

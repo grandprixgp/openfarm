@@ -17,7 +17,7 @@ from .edits import (apply_edits, diff_text, line_counts, parse_edits,
                     touched_paths)
 from .errors import (AdapterError, GateFailure, Infra, Invalid, Refused,
                      StopCode, Unsupported)
-from .gates.checks import (PASS, FAIL, INFRA, GateResult, banned_patterns_rust,
+from .gates.checks import (PASS, FAIL, INFRA, GateResult, banned_patterns,
                            diff_within_touches, extra_gate_result, frozen_check,
                            _code_of,
                            ignored_or_filtered, mutation_gate,
@@ -1349,8 +1349,8 @@ class CardRun:
             return
 
         rerun = self._run(runner_kind("test"),
-                          self.pack.commands("test", unit=unit)["argv"]
-                          + ["--", *self.card.test_names], counted="fixed")
+                          self.pack.commands("test", unit=unit,
+                                             tests=self.card.test_names)["argv"], counted="fixed")
         out, err = self._output(rerun)
         parsed = self.pack.parse_tests(out, err)
         failures = _named_failures(parsed, self.card.test_names)
@@ -1727,14 +1727,15 @@ class CardRun:
             raise GateFailure(StopCode.REFUSED, touches_gate.detail)
 
         # Banned patterns on added lines, before anything is built.
-        from .packs.rust import added_lines_from_diff
+        from .packs.base import added_lines_from_diff
         added = added_lines_from_diff(diff["diff"])
         production = {path for path in changed
                       if self.pack.classify_paths([path]).get(path) == "production"}
-        banned = self._record_gate(banned_patterns_rust(
+        banned = self._record_gate(banned_patterns(
             added, self.cfg, production,
             base_counts=self._banned_counts(changed, at_base=True),
-            head_counts=self._banned_counts(changed, at_base=False)))
+            head_counts=self._banned_counts(changed, at_base=False),
+            pack=self.pack))
         if not banned.ok:
             sig = "banned:" + banned.detail[:120]
             self.error_signatures.append(sig)
@@ -1967,8 +1968,7 @@ class CardRun:
         this card; one that did not was already there and is flagged. Counting the
         file's whole content is what makes a moved line safe to allow.
         """
-        from .packs.rust import RustPack
-        pack = RustPack()
+        pack = self.pack
         out: dict[str, dict[str, int]] = {}
         for path in paths:
             if at_base:
@@ -2014,8 +2014,8 @@ class CardRun:
         if self.card.test_names:
             for index in (1, 2):
                 result = self._run(runner_kind("test"),
-                                   self.pack.commands("test", unit=unit)["argv"]
-                                   + ["--", *self.card.test_names], counted="fixed")
+                                   self.pack.commands("test", unit=unit,
+                                                      tests=self.card.test_names)["argv"], counted="fixed")
                 out, err = self._output(result)
                 parsed = self.pack.parse_tests(out, err)
                 self.head_status_by_test = _named_failures(parsed, self.card.test_names)
@@ -2071,16 +2071,17 @@ class CardRun:
         self._extra_gates(changed)
 
         # Banned patterns again over the card's whole diff.
-        from .packs.rust import added_lines_from_diff
+        from .packs.base import added_lines_from_diff
         whole_added = added_lines_from_diff(full_diff)
         production_all = {
             path for path in changed
             if self.pack.classify_paths([path]).get(path) == "production"}
         final_banned = self._record_gate(
-            banned_patterns_rust(
+            banned_patterns(
                 whole_added, self.cfg, production_all,
                 base_counts=self._banned_counts(changed, at_base=True),
-                head_counts=self._banned_counts(changed, at_base=False)))
+                head_counts=self._banned_counts(changed, at_base=False),
+                pack=self.pack))
         if not final_banned.ok:
             raise GateFailure(StopCode.REFUSED, final_banned.detail)
 
@@ -2132,8 +2133,8 @@ class CardRun:
                     env = self.cfg.runner_env.get(unit, {})
                     rev_result = self.runner.exec(
                         kind=runner_kind("test"),
-                        argv=self.pack.commands("test", unit=unit)["argv"]
-                        + ["--", *self.card.test_names],
+                        argv=self.pack.commands("test", unit=unit,
+                                           tests=self.card.test_names)["argv"],
                         cwd=trial_wt,
                         target_dir=revert_target,
                         unit=unit,
@@ -2258,7 +2259,10 @@ class CardRun:
         A file that wasn't clean at base is left alone and named in the dossier,
         because formatting it could change lines the card never touched.
         """
-        candidates = [path for path in changed if path.endswith(".rs")
+        # Only the pack's own language is formatted; everything else is `other`.
+        kinds = self.pack.classify_paths(list(changed)) if changed else {}
+        candidates = [path for path in changed
+                      if kinds.get(path, "other") != "other"
                       and path not in self.frozen_tests
                       and matches_any(path, self.card.touches)]
         if not candidates:
@@ -2278,7 +2282,8 @@ class CardRun:
                            self.pack.commands("format", files=clean)["argv"],
                            counted="fixed")
         if result.cls != PASS:
-            self.log(f"{self.card.id}: rustfmt could not format {len(clean)} file(s)")
+            self.log(f"{self.card.id}: the formatter could not format "
+                     f"{len(clean)} file(s)")
         else:
             # The reviewer gets the branch, so the formatting has to be on it. Without
             # this commit the dossier's diff and the branch disagree.
@@ -2432,7 +2437,7 @@ class CardRun:
 
         A `test-backfill` card's diff is all tests, so its mutation target has to come
         from the unit it covers. The card may name them in `touches` alongside the
-        tests; otherwise every `.rs` file under the unit's `src/` is the target.
+        tests; otherwise every source file under the unit's `src/` is the target.
         """
         named = [path for path in self.card.touches
                  if self.pack.classify_paths([path]).get(path) == "production"]
@@ -2445,7 +2450,7 @@ class CardRun:
         for root in roots:
             if not root.is_dir():
                 continue
-            for path in sorted(root.rglob("*.rs")):
+            for path in sorted(root.rglob("*" + self._extension())):
                 out.append(str(path.relative_to(self.worktree)))
             break
         return out
@@ -2553,11 +2558,21 @@ class CardRun:
                 f"{self.counter_summary['failed']} counter-test(s) fail on the diff")
         return None
 
+    def _extension(self) -> str:
+        """The pack's source extension; `.rs` for packs that predate the field."""
+        return str(getattr(self.pack, "extension", "") or ".rs")
+
     def _counter_fallback_path(self, index: int) -> str:
         unit = self._effective_unit()
-        if unit and unit != "." and (self.worktree / unit / "Cargo.toml").is_file():
-            return f"{unit.strip('/')}/tests/openfarm_counter_{index}.rs"
-        return f"tests/openfarm_counter_{index}.rs"
+        ext = self._extension()
+        # Python test files are found by their `test_` prefix.
+        stem = (f"test_openfarm_counter_{index}" if ext == ".py"
+                else f"openfarm_counter_{index}")
+        if unit and unit != "." and (self.worktree / unit).is_dir() and any(
+                (self.worktree / unit / manifest).is_file()
+                for manifest in ("Cargo.toml", "pyproject.toml", "setup.py")):
+            return f"{unit.strip('/')}/tests/{stem}{ext}"
+        return f"tests/{stem}{ext}"
 
     def _run_counter_tests(self, tests: list[dict]) -> None:
         """Run the checker's counter-tests in this card's own worktree and target.
@@ -2588,8 +2603,7 @@ class CardRun:
                 target.write_text(content)
                 result = self._run(
                     runner_kind("test"),
-                    self.pack.commands("test", unit=unit)["argv"]
-                    + ["--test", Path(path).stem],
+                    self.pack.commands("test", unit=unit, files=[path])["argv"],
                     counted="model")
                 out, err = self._output(result)
                 parsed = self.pack.parse_tests(out, err)

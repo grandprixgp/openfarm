@@ -210,6 +210,7 @@ def _baseline_check(ctx: Context, source: FileCardSource, card: Card) -> dict:
         pack = pack_for(
             ctx.cfg.languages[0], ctx.cfg.cargo_flags,
             spec=ctx.cfg.pack_adapter, cwd=worktree,
+            python=ctx.cfg.runner_python,
         )
         pack.configure(worktree)
         unit = card.unit or derive_cargo_unit(card.touches, worktree)
@@ -265,7 +266,7 @@ def _baseline_check(ctx: Context, source: FileCardSource, card: Card) -> dict:
             return {"ok": True, "class": "pass", "named": {},
                     "failed_on_base": [], "passing_on_base": []}
 
-        argv = pack.commands("test", unit=unit)["argv"] + ["--", *card.test_names]
+        argv = pack.commands("test", unit=unit, tests=card.test_names)["argv"]
         result = runner.exec(
             kind="test", argv=argv, cwd=worktree, target_dir=target,
             unit=unit, env=env)
@@ -533,11 +534,13 @@ def _run_card(ctx: Context, source: FileCardSource, card_id: str, run_id: str,
 
     card_dir = ctx.state.create_card(card.id, run_id)
     pack = pack_for(cfg.languages[0], cfg.cargo_flags,
-                    spec=cfg.pack_adapter, cwd=worktree)
+                    spec=cfg.pack_adapter, cwd=worktree,
+                    python=cfg.runner_python)
     pack.configure(worktree)
     backend = backend if backend is not None else open_backend(cfg, script)
     runner = ctx.runner(worktree, output_dir=card_dir / "gates" / "output")
     book = BriefBook(worktree, cfg.never_touch, cfg.forbidden_files)
+    book.pack = pack
     conventions = _load_test_conventions(cfg, worktree)
 
     owns_mm = micromanager is None
@@ -661,7 +664,8 @@ def _handshake(ctx: Context, source, args, telemetry_raw=None) -> dict:
 
     try:
         pack = pack_for(ctx.cfg.languages[0], ctx.cfg.cargo_flags,
-                        spec=ctx.cfg.pack_adapter, cwd=ctx.repo)
+                        spec=ctx.cfg.pack_adapter, cwd=ctx.repo,
+                        python=ctx.cfg.runner_python)
         hello = pack.hello()
         needed = set(REQUIRED_OPS["pack"])
         offered = set(hello.get("ops") or [])

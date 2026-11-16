@@ -205,7 +205,9 @@ def _failed_attempts(card_run) -> list[str]:
 
 
 def _not_checked(card_run) -> list[str]:
-    out = ["doc-tests were not run: the suite uses --lib --bins --tests"]
+    out = []
+    if str(getattr(card_run.pack, "name", "rust")) == "rust":
+        out.append("doc-tests were not run: the suite uses --lib --bins --tests")
     if card_run.cfg.coverage == "off":
         out.append("coverage is off")
     required_for = getattr(card_run.cfg, "mutation_required_for",
@@ -221,7 +223,7 @@ def _not_checked(card_run) -> list[str]:
     # reader assume the gate ran the way it would elsewhere.
     for note in getattr(card_run.pack, "notes", []) or []:
         out.append(note)
-    out.append("visual layout and behaviour across crates are not checked by any gate")
+    out.append("visual layout and behaviour across units are not checked by any gate")
     return out
 
 

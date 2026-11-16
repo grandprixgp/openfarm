@@ -36,6 +36,8 @@ VAGUE_WORDS = ("handle", "properly", "robust")
 DESIGN_WORDS = ("decide how", "design", "choose an approach", "figure out how")
 
 _SOURCE_CONTAINERS = ("src", "tests", "benches", "examples")
+#: A folder holding one of these is a unit: a crate, a Python project, a package.
+_UNIT_MANIFESTS = ("Cargo.toml", "package.json", "pyproject.toml", "setup.py")
 
 
 class EligibilityResult:
@@ -222,6 +224,13 @@ def check_eligibility(card: Card, cfg, deps_done: bool = True,
                     "rust-tests-in-separate-files",
                     f"test {test.name!r} is declared in {test.file!r}; pilot tests "
                     f"go in a crate's tests/ folder")
+    if getattr(cfg, "python_tests_in_test_files", True) and "python" in cfg.languages:
+        for test in card.tests:
+            if test.file and not _is_python_test_file(test.file):
+                result.fail(
+                    "python-tests-in-test-files",
+                    f"test {test.name!r} is declared in {test.file!r}; Python card "
+                    f"tests go in tests/test_<subject>.py")
     allow_multi_new_symbols = type_changes or (
         getattr(cfg, "micromanager_adapter", "off") != "off"
         and getattr(getattr(cfg, "micromanager", None), "scaffold_contracts", False)
@@ -273,7 +282,8 @@ def _units_of(touches: list[str], worktree=None) -> set[str]:
     """The crate, package or view folder each touch belongs to.
 
     A repository can be flat (one crate at the root) or a workspace (many crates
-    under a folder). The unit is the crate: the directory holding `Cargo.toml`, or
+    under a folder). The unit is the crate: the directory holding `Cargo.toml` (or a
+    Python project's `pyproject.toml`/`setup.py`, or `package.json`), or
     the segment before `src`/`tests` when the tree is not readable. Counting the
     first path segment would make every workspace crate one unit and let a card span
     three crates at `max_units = 1`.
@@ -294,8 +304,8 @@ def _units_of(touches: list[str], worktree=None) -> set[str]:
             found = None
             for depth in range(len(raw_dir), -1, -1):
                 candidate = base / "/".join(raw_dir[:depth]) if depth > 0 else base
-                if (candidate / "Cargo.toml").exists() or (
-                        candidate / "package.json").exists():
+                if any((candidate / manifest).exists()
+                       for manifest in _UNIT_MANIFESTS):
                     found = "/".join(raw_dir[:depth]) if depth > 0 else "."
                     break
             if found is not None:
@@ -341,6 +351,14 @@ def derive_cargo_unit(touches: list[str], worktree: Path | None) -> str:
 def _is_integration_test_file(path: str) -> bool:
     text = normalise(path)
     return text.startswith("tests/") or "/tests/" in text
+
+
+def _is_python_test_file(path: str) -> bool:
+    """`tests/**/test_*.py`: the files unittest discovery and pytest both find."""
+    text = normalise(path)
+    name = text.rsplit("/", 1)[-1]
+    return _is_integration_test_file(text) and name.startswith("test_") \
+        and name.endswith(".py")
 
 
 def is_eligible(card: Card, cfg, **kwargs) -> bool:

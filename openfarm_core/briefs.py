@@ -56,6 +56,9 @@ class BriefBook:
         self.allowed_extra_reads = {
             normalise(p) for p in (allowed_extra_reads or ()) if p
         }
+        #: The card's language pack, for briefs built without one (the planner's).
+        #: None falls back to the Rust pack, as before v0.6.
+        self.pack = None
 
     def _resolve_safe(self, path: str) -> Path:
         """Resolve `path` inside the worktree, refusing escapes and hidden targets."""
@@ -178,7 +181,8 @@ def planner_brief(card: Card, book: BriefBook, harness_guidance: str = "") -> Br
     for path in card.touches:
         if book.is_hidden(path):
             continue
-        parts.append(f"\n### {path}\n{book.signatures(path, _EXPECTED_PACK)}")
+        parts.append(f"\n### {path}\n"
+                     f"{book.signatures(path, getattr(book, 'pack', None) or _EXPECTED_PACK)}")
     if card.reference and not book.is_hidden(card.reference):
         parts.append(f"\nReference (do not copy wholesale): {card.reference}")
     if harness_guidance and harness_guidance.strip():

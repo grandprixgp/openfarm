@@ -36,9 +36,10 @@ _TABLE_KEYS = {
                "flagged_patterns", "categories"},
     "eligibility": {"max_files", "max_units", "require_reference",
                     "refuse_touches_prefixes", "rust_tests_in_separate_files",
+                    "python_tests_in_test_files",
                     "allow_type_changes", "max_context_files"},
     "brief": {"test_conventions"},
-    "runner": {"env", "cargo_flags"},
+    "runner": {"env", "cargo_flags", "python"},
     "budget": {"implementer_attempts", "test_writer_attempts",
                "model_build_calls_per_card", "mutation_build_calls_per_card",
                "tokens_per_card", "wall_clock_per_card", "frontier_cost_ratio",
@@ -378,6 +379,9 @@ class Config:
         self.rust_tests_in_separate_files = _as_bool(
             elig.get("rust_tests_in_separate_files"),
             "[eligibility] rust_tests_in_separate_files", True)
+        self.python_tests_in_test_files = _as_bool(
+            elig.get("python_tests_in_test_files"),
+            "[eligibility] python_tests_in_test_files", True)
         self.allow_type_changes = _as_bool(
             elig.get("allow_type_changes"),
             "[eligibility] allow_type_changes", True)
@@ -403,6 +407,11 @@ class Config:
         runner = self._table("runner")
         self.cargo_flags = _as_str_list(runner.get("cargo_flags", []),
                                         "[runner] cargo_flags")
+        python = runner.get("python", "")
+        if not isinstance(python, str) or "\n" in python:
+            raise ConfigError("[runner] python must be one interpreter path or name")
+        #: The interpreter the Python pack runs under; openfarm's own when empty.
+        self.runner_python = python.strip()
         env_table = runner.get("env") or {}
         if not isinstance(env_table, dict):
             raise ConfigError("[runner.env] must be a table")
@@ -705,6 +714,8 @@ class Config:
         """The cache key component for a unit's environment."""
         payload = {"unit": unit, "env": self.runner_env.get(unit, {}),
                    "cargo_flags": self.cargo_flags, "languages": self.languages}
+        if self.runner_python:
+            payload["python"] = self.runner_python
         return hashlib.sha256(
             str(sorted(payload.items())).encode("utf-8")).hexdigest()[:16]
 
