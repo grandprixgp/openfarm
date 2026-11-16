@@ -348,4 +348,23 @@ def adopt_project(
 
 
 def propose_known_failing(parsed: dict) -> list[str]:
-    raise NotImplementedError
+    """Return the sorted, de-duplicated names of failed tests.
+
+    Raises `openfarm_core.errors.Refused` with code "suite-does-not-compile"
+    when the pack's parser reported compile errors.
+    """
+    compile_errors = parsed.get("compile_errors") or []
+    if compile_errors:
+        first = compile_errors[0]
+        binary = first.get("binary", "") if isinstance(first, dict) else str(first)
+        raise Refused(
+            "suite-does-not-compile",
+            f"the suite does not compile: {binary}",
+        )
+
+    names = [
+        result["name"]
+        for result in parsed.get("results") or []
+        if result.get("status") == "FAILED"
+    ]
+    return sorted(set(names))
