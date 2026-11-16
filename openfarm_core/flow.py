@@ -27,6 +27,8 @@ from .gates.eligibility import (check_eligibility, derive_cargo_unit,
                                 file_is_blocked)
 from .git import Git, GitRefused
 from .globs import matches_any, normalise, resolves_within
+from .harness_global import GlobalLibrary, global_dir_for
+from .harness_scope import project_markers
 from .harness_memory import (GuidanceSelection, HarnessLibrary, _classify_failure,
                              _is_unsafe_path)
 from .micromanager import open_micromanager
@@ -214,6 +216,20 @@ class CardRun:
             self.harness_library = HarnessLibrary(hdir, config=cfg)
         else:
             self.harness_library = None
+        # v0.7: the global library. Each card first imports new global lessons
+        # and drops retired ones; after the card, scores go back and proven
+        # lessons go out (when `[harness] share`).
+        self.global_library: GlobalLibrary | None = None
+        self.global_summary: dict = {}
+        if self.harness_library is not None and harness_enabled:
+            try:
+                self.global_library = GlobalLibrary(global_dir_for(harness_cfg))
+                self.global_summary = {
+                    "dir": str(self.global_library.root),
+                    "learn_from": self.harness_library.learn_from,
+                    **self.harness_library.sync_from_global(self.global_library)}
+            except Exception as exc:  # noqa: BLE001 — global learning never stops a card
+                self.global_summary = {"error": f"{type(exc).__name__}: {exc}"}
         self.harness_cues_applied: list[str] = []
         self.harness_lessons_added: list[str] = []
         self.harness_revision: int = int(
@@ -2721,6 +2737,24 @@ class CardRun:
 
     # -- finishing ------------------------------------------------------------
 
+    def _project_name(self) -> str:
+        name = str(getattr(self.cfg, "name", "") or "").strip()
+        if name:
+            return name
+        repo = getattr(self.cfg, "repo", None)
+        return Path(repo).name if repo else self.worktree.name
+
+    def _scope_markers(self) -> set[str] | None:
+        """What ties a lesson to this project (`harness_scope.project_markers`).
+
+        None when they can't be worked out; every lesson is then kept `project`.
+        """
+        try:
+            tracked = self.git.tracked_files()
+        except Exception:  # noqa: BLE001
+            return None
+        return project_markers(self.worktree, self._project_name(), tracked)
+
     def _record_harness_outcome(self, final_state: str) -> None:
         if not self._harness_enabled() or self.harness_library is None:
             return
@@ -2783,6 +2817,7 @@ class CardRun:
                 failure=self.detail,
                 micromanager=self.micromanager,
                 reflect=self._should_reflect_harness(),
+                scope_markers=self._scope_markers(),
             )
             post_revision = int(res.get("revision", pre_revision) or 0)
             self.harness_revision = pre_revision
@@ -2794,6 +2829,15 @@ class CardRun:
                 "post_revision": post_revision,
                 "cues_applied": list(self.harness_cues_applied),
             }
+            if self.global_library is not None:
+                try:
+                    share = bool(getattr(getattr(self.cfg, "harness", None), "share", True))
+                    self.global_summary.update(self.harness_library.report_to_global(
+                        self.global_library, self._project_name(), share=share))
+                except Exception as exc:  # noqa: BLE001
+                    self.global_summary["error"] = f"{type(exc).__name__}: {exc}"
+            if self.global_summary:
+                self.harness_summary["global"] = dict(self.global_summary)
             metrics = res.get("metrics") or {}
             eff = float(metrics.get("harness_efficiency", 0.0) or 0.0)
             self._record_gate(GateResult(

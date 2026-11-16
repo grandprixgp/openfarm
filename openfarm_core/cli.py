@@ -323,6 +323,10 @@ def cmd_run(ctx: Context, args) -> int:
                       "code": "self-host-unpinned"})
             return EXIT_REFUSED
 
+    if getattr(args, "learn_from", None):
+        import dataclasses
+        ctx.cfg.harness = dataclasses.replace(ctx.cfg.harness, learn_from=args.learn_from)
+
     run_id = args.run_id or f"run-{utc_now().replace('-', '').replace(':', '')}"
     if not ctx.state.acquire_run_lock(run_id):
         holder = ctx.state.lock_holder() or {}
@@ -1235,6 +1239,9 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--mm-script", dest="mm_script", default=None,
                      help="a scripted micromanager backend, for tests")
     run.add_argument("--run-id", default=None, help="name this run")
+    run.add_argument("--learn-from", dest="learn_from", default=None,
+                     choices=("both", "project", "global"),
+                     help="which lessons this run applies, over [harness] learn_from")
 
     status = sub.add_parser("status", help="read-only state")
     status.add_argument("--card", default=None)
