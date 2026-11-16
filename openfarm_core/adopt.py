@@ -278,12 +278,18 @@ def adopt_project(
             f"{root} is not a git repository: .git is missing",
         )
 
+    # Adopting never commits, so a second adopt always meets a dirty tree; the
+    # already-adopted check has to come first to be the one it reports.
     config_path = root / ".openfarm" / "config.toml"
-    if config_path.exists():
-        raise Refused(
-            "already-adopted",
-            f"{root} is already adopted: {config_path} exists",
-        )
+    spec_path = root / ".openfarm" / "PROJECT_SPEC.md"
+    gitkeep_path = root / "cards" / ".gitkeep"
+    # Checked before anything is written, so a refusal never leaves half an adoption.
+    for path in (config_path, spec_path, gitkeep_path):
+        if path.exists():
+            raise Refused(
+                "already-adopted",
+                f"{root} is already adopted: {path} exists",
+            )
 
     git = Git(root)
     if not git.is_clean():
@@ -317,9 +323,6 @@ def adopt_project(
 
     resolved_state.mkdir(parents=True, exist_ok=True)
     os.chmod(resolved_state, 0o700)
-
-    spec_path = root / ".openfarm" / "PROJECT_SPEC.md"
-    gitkeep_path = root / "cards" / ".gitkeep"
 
     config_path.parent.mkdir(parents=True, exist_ok=True)
     with config_path.open("x", encoding="utf-8") as handle:

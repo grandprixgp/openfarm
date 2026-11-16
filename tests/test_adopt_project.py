@@ -105,5 +105,18 @@ class AdoptProjectTest(unittest.TestCase):
         self.assertIn('base_branch = "trunk"', project_lines)
 
 
+    def test_an_existing_spec_refuses_before_anything_is_written(self) -> None:
+        _make_committed_python_repo(self.root)
+        (self.root / ".openfarm").mkdir()
+        (self.root / ".openfarm" / "PROJECT_SPEC.md").write_text("# mine\n")
+        Git(self.root).commit_all("my own spec")
+        with self.assertRaises(Refused) as caught:
+            adopt_project(self.root, state_dir=self.state_dir, key_file=self.key_file)
+        self.assertEqual(caught.exception.code, "already-adopted")
+        self.assertFalse((self.root / ".openfarm" / "config.toml").exists())
+        self.assertEqual((self.root / ".openfarm" / "PROJECT_SPEC.md").read_text(),
+                         "# mine\n")
+
+
 if __name__ == "__main__":
     unittest.main()
