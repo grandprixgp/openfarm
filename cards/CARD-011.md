@@ -9,6 +9,7 @@ reference = "openfarm_core/cli.py"
 frontier_estimate = 0.75
 new_symbols = false
 unit = "."
+context_files = ["openfarm_core/bench.py"]
 type_changes = false
 
 [[tests]]
@@ -26,4 +27,5 @@ asserts = "a task.toml missing \"id\" makes the command exit non-zero with \"kin
 
 - New subcommand `openfarm bench list [--dir DIR]` (`--dir` defaults to `bench`) that calls `load_task` on every direct subfolder holding a `task.toml`.
 - `--json` prints `{"tasks": [{"id": ..., "language": ..., "category": ...}]}` sorted by `id`; without `--json` it prints one `id  language  category` line per task.
+- `load_task(task_dir: Path) -> BenchTask` lives in `openfarm_core/bench.py` (read-only here); `BenchTask` has `id`, `language` and `category` attributes. Import it, don't search for it.
 - An `Invalid` from `load_task` prints `{"error": <message>, "kind": "invalid"}` and exits with the code other invalid answers use.

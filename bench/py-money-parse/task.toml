@@ -1,0 +1,5 @@
+id = "py-money-parse"
+language = "python"
+category = "small-feature"
+card = "card.md"
+hidden_tests = ["hidden/tests/test_hidden_money.py"]

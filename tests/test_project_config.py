@@ -19,7 +19,7 @@ SPEC_KEYS = {
     "project": {"name", "lane", "base_branch", "state_dir"},
     "adapters": {"cards", "runner", "languages", "model",
                  "micromanager", "telemetry", "pack"},
-    "model": {"endpoint", "allowed_endpoints", "key_file", "headers", "test_writer",
+    "model": {"endpoint", "allowed_endpoints", "key_file", "headers", "max_tokens", "test_writer",
               "implementer", "checker", "planner", "cost_per_1k_in",
               "cost_per_1k_out"},
     "policy": {"never_touch", "forbidden_files", "known_failing",

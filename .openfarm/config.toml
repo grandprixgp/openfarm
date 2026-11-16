@@ -1,7 +1,7 @@
 [project]
 name = "openfarm"
 lane = "farm"
-base_branch = "v0.6"
+base_branch = "master"
 state_dir = "/home/prix/.openfarm/openfarm"
 
 [adapters]
@@ -21,6 +21,9 @@ key_file = "/home/prix/.config/openfarm/openfarm.key"
 # Zero retention and no training on every call; a model without a zero-retention
 # upstream fails with 422 instead of falling back. Never remove this.
 headers = { "x-cmd-zdr" = "1" }
+# DeepSeek thinks before it answers, and the thinking counts against this.
+# At 4096 a test file was cut off mid-line (wave 2, CARD-003).
+max_tokens = 32768
 # DeepSeek V4.1 Flash at its peak rate ($0.30 / $1.20 per million), so caps err high.
 cost_per_1k_in = 0.0003
 cost_per_1k_out = 0.0012
@@ -116,7 +119,8 @@ args = []
 model = ""
 effort = "medium"
 tool_policy = "none"
-timeout_s = 180.0
+# Planning a bigger card took Claude longer than 180s (wave 2, CARD-008).
+timeout_s = 600.0
 max_calls_per_card = 4
 tokens_per_card = 120_000
 spend_per_night = 10.0

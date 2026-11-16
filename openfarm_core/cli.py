@@ -29,6 +29,8 @@ from .acp_setup import (
     probe_acp,
     run_acp_login,
 )
+from .adopt import adopt_project
+from .bench import load_task
 from .adapters.files import FileCardSource, open_card_source
 from .adapters.jsonl import TelemetrySink, open_telemetry
 from .adapters.openai_compat import open_backend
@@ -547,6 +549,7 @@ def _run_card(ctx: Context, source: FileCardSource, card_id: str, run_id: str,
                     spec=cfg.pack_adapter, cwd=worktree,
                     python=cfg.runner_python)
     pack.configure(worktree)
+    owns_backend = backend is None
     backend = backend if backend is not None else open_backend(cfg, script)
     runner = ctx.runner(worktree, output_dir=card_dir / "gates" / "output")
     book = BriefBook(worktree, cfg.never_touch, cfg.forbidden_files)
@@ -579,6 +582,11 @@ def _run_card(ctx: Context, source: FileCardSource, card_id: str, run_id: str,
         if owns_mm:
             try:
                 mm.close()
+            except Exception:
+                pass
+        if owns_backend and hasattr(backend, "close"):
+            try:
+                backend.close()
             except Exception:
                 pass
         try:
@@ -741,6 +749,8 @@ def _backend_prices_spend(cfg, script: Path | None) -> bool:
     """Whether this configuration can report a cost at all."""
     if script is not None or cfg.model_adapter in ("scripted", "stub"):
         return False
+    if cfg.model_adapter == "claude-acp":
+        return True  # Claude reports its own cost per turn.
     return bool(getattr(cfg, "cost_per_1k_in", 0.0)
                 or getattr(cfg, "cost_per_1k_out", 0.0))
 
@@ -864,6 +874,43 @@ def cmd_release(ctx: Context, args) -> int:
             except OSError:
                 pass
     ctx.emit({"released": True, "card": card_id, "archived": archived})
+    return EXIT_OK
+
+
+def cmd_done(ctx: Context, args) -> int:
+    """Mark a reviewed card done once its branch is merged into the base branch.
+
+    A card waiting on others is claimed only when they are done, so without this
+    step a wave never moves past its first cards.
+    """
+    card_id = _check_id(args.card, "card id")
+    source = ctx.cards()
+    source.prepare()
+    card = next((c for c in source.all_cards() if c.id == card_id), None)
+    if card is None:
+        ctx.emit({"card": card_id, "done": False, "reason": "no such card"})
+        return EXIT_REFUSED
+    git = Git(ctx.repo)
+    base = ctx.cfg.base_branch
+    branch = f"openfarm/{card.id}-{card.slug()}"
+    reason = ""
+    if not git.ref_exists(f"refs/heads/{base}"):
+        reason = f"the base branch {base} does not exist"
+    elif not git.branch_exists(branch):
+        reason = f"there is no branch {branch} to check"
+    else:
+        unmerged = git.count_commits(f"refs/heads/{branch}", f"refs/heads/{base}")
+        if unmerged:
+            reason = f"{branch} has {unmerged} commit(s) not merged into {base}"
+    if reason:
+        ctx.emit({"card": card_id, "done": False, "reason": reason})
+        return EXIT_REFUSED
+    try:
+        source.mark_done(card_id, note=args.note or "")
+    except Refused as exc:
+        ctx.emit({"card": card_id, "done": False, "reason": exc.message})
+        return EXIT_REFUSED
+    ctx.emit({"card": card_id, "done": True, "branch": branch, "base": base})
     return EXIT_OK
 
 
@@ -1206,6 +1253,10 @@ def build_parser() -> argparse.ArgumentParser:
     release.add_argument("card")
     release.add_argument("--reason", required=True)
 
+    done = sub.add_parser("done", help="mark a reviewed, merged card done")
+    done.add_argument("card")
+    done.add_argument("--note", default=None)
+
     dossier = sub.add_parser("dossier", help="print a card's dossier")
     dossier.add_argument("card")
     dossier.add_argument("--run", default=None)
@@ -1246,6 +1297,27 @@ def build_parser() -> argparse.ArgumentParser:
     harness.add_argument("--reason", default="manual")
     harness.add_argument("--yes", action="store_true")
 
+    bench = sub.add_parser("bench", help="run the efficacy bench")
+    bench_sub = bench.add_subparsers(dest="bench_command")
+    bench_list = bench_sub.add_parser("list", help="list bench tasks")
+    bench_list.add_argument("--dir", default="bench",
+                            help="directory of bench tasks")
+    bench_run = bench_sub.add_parser(
+        "run", help="run bench tasks in each arm and write a local report")
+    bench_run.add_argument("--dir", default="bench",
+                           help="directory of bench tasks")
+    bench_run.add_argument("--task", action="append", default=[],
+                           help="task id to run (repeatable; default: all)")
+    bench_run.add_argument("--arm", action="append", default=[],
+                           metavar="NAME=FILE",
+                           help="an arm (farm or solo) and its config file; repeatable")
+    bench_run.add_argument("--repeats", type=int, default=None,
+                           help="runs per task and arm (default 3; 1 with --dry-run)")
+    bench_run.add_argument("--out", default=None,
+                           help="report folder (default ~/.openfarm/bench/<time>)")
+    bench_run.add_argument("--dry-run", action="store_true",
+                           help="scripted answers from each task's script.json; costs nothing")
+
     init = sub.add_parser("init", help="scaffold a new openfarm Rust project")
     init.add_argument("name", help="project name or slug (e.g. calorie-log)")
     init.add_argument("--dir", default=None,
@@ -1268,6 +1340,16 @@ def build_parser() -> argparse.ArgumentParser:
                       help="commit initial scaffold on base branch")
     init.add_argument("--force", action="store_true",
                       help="overwrite scaffold files in non-empty directory")
+
+    adopt = sub.add_parser("adopt", help="add openfarm to an existing repository")
+    adopt.add_argument("--dir", default=None,
+                       help="repository directory (default: the current directory)")
+    adopt.add_argument("--lang", choices=("rust", "python"), default=None,
+                       help="language pack to use (default: detect from manifests)")
+    adopt.add_argument("--state-dir", default=None, help="external state directory")
+    adopt.add_argument("--key-file", default=None, help="external API key file path")
+    adopt.add_argument("--no-suite", action="store_true",
+                       help="skip running the suite once to propose known_failing")
 
     install_skill = sub.add_parser(
         "install-skill", help="install bundled agent skills, commands, and optional bin shim"
@@ -1319,6 +1401,102 @@ def _emit_standalone(payload: dict, want_json: bool) -> None:
             print(f"{key}: {value}")
 
 
+def _emit_bench_error(message: str, want_json: bool) -> int:
+    _emit_standalone({"error": message, "kind": "invalid"}, want_json)
+    return EXIT_TROUBLE
+
+
+def cmd_bench(args) -> int:
+    action = getattr(args, "bench_command", None)
+    if action == "list":
+        return cmd_bench_list(args)
+    if action == "run":
+        return cmd_bench_run(args)
+    raise UsageError("bench requires a subcommand")
+
+
+def cmd_bench_list(args) -> int:
+    want_json = bool(getattr(args, "json", False))
+    tasks_dir = Path(args.dir)
+    if not tasks_dir.exists():
+        return _emit_bench_error(f"{tasks_dir}: no such directory", want_json)
+    if not tasks_dir.is_dir():
+        return _emit_bench_error(f"{tasks_dir}: not a directory", want_json)
+
+    tasks: list[dict[str, str]] = []
+    for child in sorted(tasks_dir.iterdir(), key=lambda path: path.name):
+        if not child.is_dir():
+            continue
+        if not (child / "task.toml").is_file():
+            continue
+        task_dir = child
+        try:
+            task = load_task(task_dir)
+        except Invalid as exc:
+            return _emit_bench_error(f"{task_dir}: {exc.message}", want_json)
+        tasks.append({
+            "id": task.id,
+            "language": task.language,
+            "category": task.category,
+        })
+
+    tasks.sort(key=lambda task: task["id"])
+    if want_json:
+        _emit_standalone({"tasks": tasks}, True)
+    else:
+        for task in tasks:
+            print(f"{task['id']}  {task['language']}  {task['category']}")
+    return EXIT_OK
+
+
+def cmd_bench_run(args) -> int:
+    from .bench import load_arm, run_bench
+    want_json = bool(getattr(args, "json", False))
+    tasks_dir = Path(args.dir)
+    if not tasks_dir.is_dir():
+        return _emit_bench_error(f"{tasks_dir}: no such directory", want_json)
+    try:
+        tasks = [load_task(child) for child in sorted(tasks_dir.iterdir())
+                 if child.is_dir() and (child / "task.toml").is_file()]
+        if args.task:
+            wanted = set(args.task)
+            unknown = sorted(wanted - {task.id for task in tasks})
+            if unknown:
+                return _emit_bench_error(f"unknown task(s): {unknown}", want_json)
+            tasks = [task for task in tasks if task.id in wanted]
+        arms: dict[str, str | None] = {}
+        for spec in args.arm:
+            name, sep, path = spec.partition("=")
+            if not sep or name not in ("farm", "solo"):
+                return _emit_bench_error(
+                    f"--arm takes farm=FILE or solo=FILE, not {spec!r}", want_json)
+            arms[name] = None if args.dry_run else load_arm(Path(path))
+        if not arms:
+            if not args.dry_run:
+                return _emit_bench_error(
+                    "name at least one arm: --arm farm=FILE and/or --arm solo=FILE "
+                    "(examples in bench/arms/), or pass --dry-run", want_json)
+            arms = {"farm": None}
+        repeats = args.repeats if args.repeats is not None else (1 if args.dry_run else 3)
+        if repeats < 1:
+            return _emit_bench_error("--repeats must be at least 1", want_json)
+        out = (Path(args.out) if args.out else
+               Path.home() / ".openfarm" / "bench"
+               / _time.strftime("%Y%m%dT%H%M%SZ", _time.gmtime()))
+        report = run_bench(tasks, arms, repeats, out, dry_run=args.dry_run,
+                           log=lambda message: print(message, file=sys.stderr))
+    except Invalid as exc:
+        return _emit_bench_error(exc.message, want_json)
+    payload = {"out": str(out), "summary": report["summary"],
+               "runs": len(report["records"])}
+    if want_json:
+        _emit_standalone(payload, True)
+    else:
+        print((out / "bench-report.md").read_text(encoding="utf-8"))
+        print(f"report: {out}")
+    return EXIT_OK
+
+
 def cmd_init(args) -> int:
     directory = Path(args.dir) if args.dir else None
     repo_base = Path(args.repo) if getattr(args, "repo", None) else Path.cwd()
@@ -1339,6 +1517,31 @@ def cmd_init(args) -> int:
         commit=bool(args.commit),
         force=bool(args.force),
     )
+    _emit_standalone(payload, bool(getattr(args, "json", False)))
+    return EXIT_OK
+
+
+def cmd_adopt(args) -> int:
+    directory = Path(args.dir) if args.dir else Path.cwd()
+    try:
+        payload = adopt_project(
+            directory,
+            language=args.lang,
+            state_dir=Path(args.state_dir) if args.state_dir else None,
+            key_file=Path(args.key_file) if args.key_file else None,
+            run_suite=not args.no_suite,
+        )
+    except Refused as exc:
+        _emit_standalone({"error": exc.message, "kind": "refused"},
+                         bool(getattr(args, "json", False)))
+        return EXIT_REFUSED
+    if payload.get("known_failing_proposed"):
+        payload["next"] = ("the suite has failing tests; they are proposed in a "
+                           "comment above [policy] known_failing in "
+                           ".openfarm/config.toml. Copy them in if you agree, then "
+                           "commit .openfarm/ and cards/")
+    else:
+        payload["next"] = "commit .openfarm/ and cards/, then write cards"
     _emit_standalone(payload, bool(getattr(args, "json", False)))
     return EXIT_OK
 
@@ -1392,6 +1595,8 @@ def cmd_acp(args) -> int:
 
 
 PRE_CONFIG_COMMANDS = {
+    "adopt": cmd_adopt,
+    "bench": cmd_bench,
     "init": cmd_init,
     "install-skill": cmd_install_skill,
     "acp": cmd_acp,
@@ -1405,6 +1610,7 @@ COMMANDS = {
     "resume": cmd_resume,
     "stop": cmd_stop,
     "release": cmd_release,
+    "done": cmd_done,
     "dossier": cmd_dossier,
     "check": cmd_check,
     "verdict": cmd_verdict,

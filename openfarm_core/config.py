@@ -29,7 +29,8 @@ _TABLE_KEYS = {
     "project": {"name", "lane", "base_branch", "state_dir"},
     "adapters": {"cards", "runner", "languages", "model",
                  "micromanager", "telemetry", "pack"},
-    "model": {"endpoint", "allowed_endpoints", "key_file", "headers", "test_writer",
+    "model": {"endpoint", "allowed_endpoints", "key_file", "headers", "max_tokens",
+              "test_writer",
               "implementer", "checker", "planner", "cost_per_1k_in",
               "cost_per_1k_out"},
     "policy": {"never_touch", "forbidden_files", "known_failing",
@@ -349,6 +350,12 @@ class Config:
         key_file = model.get("key_file")
         self.key_file = self._outside_repo(key_file, "[model] key_file") if key_file else None
         self.model_headers = _model_headers(model.get("headers"))
+        # The most a worker may write in one answer. A model that reasons before it
+        # answers spends part of this on thinking, so 4096 can cut a file off.
+        self.model_max_tokens = _as_int(model.get("max_tokens"),
+                                        "[model] max_tokens", 4096)
+        if self.model_max_tokens <= 0:
+            raise ConfigError("[model] max_tokens must be > 0")
         # Prices are what make a spend cap mean anything. Without them every call
         # reports a zero cost and no spend cap can fire, so the run record says so.
         self.cost_per_1k_in = _as_float(model.get("cost_per_1k_in"),
@@ -601,7 +608,7 @@ class Config:
     def _parse_micromanager(self, mm: dict) -> MicromanagerConfig:
         if "timeout_s" in mm and "timeout" in mm:
             raise ConfigError("[micromanager] specify either timeout_s or timeout, not both")
-        raw_timeout = mm.get("timeout_s", mm.get("timeout", 180.0))
+        raw_timeout = mm.get("timeout_s", mm.get("timeout", 600.0))
         timeout_s = parse_duration(raw_timeout, "[micromanager] timeout_s")
         if timeout_s <= 0:
             raise ConfigError("[micromanager] timeout_s must be > 0")

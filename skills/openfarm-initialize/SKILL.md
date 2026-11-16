@@ -3,7 +3,7 @@ name: openfarm-initialize
 description: >-
   Initialize a new software project from an empty directory and a plain-English
   idea (invoked via /openfarm-initialize <project_name> <project_idea> or when
-  starting a fresh app with Openfarm v0.5.1). Integrates /openfarm-grill-me
+  starting a fresh app with Openfarm v0.6.0). Integrates /openfarm-grill-me
   alignment, configures native Claude ACP via OAuth for Frontier + API key for
   Workers, scaffolds protected seams, a golden slice, and checked Wave cards.
 ---
@@ -20,6 +20,7 @@ Use this workflow to turn a plain-English project idea inside an empty directory
 
 Unless the user passed `--no-grill`, explicitly requested zero questions, or an agreed `.openfarm/GRILL_DECISIONS.md` already exists, invoke the `openfarm-grill-me` protocol first:
 - Interview **one frontier question at a time** (recommended answer included, `"yes"` accepts) to lock down `src/invariants.rs` rules, golden slice, v1 non-goals, Frontier Claude ACP OAuth setup, and concrete `## Done` assertions.
+- `--batch-grill` runs step 0 in batch mode; serial questions stay the default.
 - Confirm shared understanding with the owner before modifying files.
 
 ### 1. Parse Arguments & Check Environment + Frontier OAuth
@@ -38,6 +39,15 @@ ls -la ~/.config/openfarm/ 2>/dev/null || true
   - If `resolved_transport` is `"claude-agent-acp"` or `"claude-native-acp"` and `oauth_ready: true`, Frontier ACP supervision is ready with zero extra API keys.
   - If `oauth_ready: false`, guide the owner once to sign in via `openfarm acp login` (or `claude auth login --claudeai`), or pass `--profile solo` if intentionally disabling Frontier ACP supervision.
 - **Worker Models (ZDR OpenAI-compatible API key):** Ask **at most once** if a ZDR endpoint URL / Worker API key file is not yet configured (or proceed immediately with placeholder settings if the user wants an offline dry-run or scripted run).
+
+### Existing repository instead of an empty directory
+
+When the directory already holds a git repository with code, `openfarm init` refuses it. Take this path instead:
+
+1. Make sure the work tree is clean, then run `openfarm adopt --dir . --json`. It writes `.openfarm/config.toml`, `.openfarm/PROJECT_SPEC.md` and `cards/.gitkeep`, commits nothing, and runs the suite once. If `known_failing_proposed` is not empty, show the owner those tests and copy them into `[policy] known_failing` only if they agree.
+2. Grill as in step 0, reading the existing code for facts instead of asking.
+3. Instead of step 3's new skeleton: propose `never_touch` from the code (the modules that hold the project's invariants), and pick one existing, well-tested module as the reference slice that `pattern` and `small-feature` cards name in `reference`. Write no new skeleton. Put both, and the module ownership map, in `.openfarm/PROJECT_SPEC.md`, and confirm `never_touch` with the owner.
+4. Fill in `[model]` (endpoint, key file, models and any zero-retention header) as in step 1, then continue at step 4 (cards) and step 5 (commit and check) on the repository's own base branch rather than `main`.
 
 ### 2. Run Deterministic Bootstrap (`openfarm init`)
 

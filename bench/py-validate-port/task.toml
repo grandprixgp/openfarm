@@ -1,0 +1,5 @@
+id = "py-validate-port"
+language = "python"
+category = "pattern"
+card = "card.md"
+hidden_tests = ["hidden/tests/test_hidden_port.py"]

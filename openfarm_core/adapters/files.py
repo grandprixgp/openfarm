@@ -372,6 +372,23 @@ class FileCardSource:
                     + (f" ({stop_code})" if stop_code else ""))
         return {"state": header["state"]}
 
+    def mark_done(self, card_id: str, note: str = "") -> dict:
+        """The reviewer's move: a card in review whose work is merged is done.
+
+        Cards that depend on it can be claimed from then on. The farm itself never
+        makes this move; only `openfarm done` does, after checking the merge.
+        """
+        header, body, _ = self._read_raw(card_id)
+        if header.get("state") != "in_review":
+            raise Refused("not-in-review",
+                          f"{card_id} is {header.get('state')}, not in review")
+        header["state"] = "done"
+        header["done_at"] = utc_now()
+        if note:
+            header["note"] = note
+        self._write(card_id, header, body, f"{card_id}: done")
+        return {"state": "done"}
+
     def release(self, card_id: str, lease_id: str = "", reason: str = "",
                 stop_code: str = "") -> dict:
         header, body, _ = self._read_raw(card_id)

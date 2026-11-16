@@ -30,7 +30,7 @@ from .globs import matches_any, normalise, resolves_within
 from .harness_memory import (GuidanceSelection, HarnessLibrary, _classify_failure,
                              _is_unsafe_path)
 from .micromanager import open_micromanager
-from .roles import (Plan, Roles, build_checker_pass1_brief,
+from .roles import (Plan, Roles, parse_answer_edits, build_checker_pass1_brief,
                     build_checker_pass2_brief, build_implementer_brief,
                     build_planner_brief, build_test_writer_brief,
                     parse_counter_tests, parse_plan, parse_restatement,
@@ -948,7 +948,11 @@ class CardRun:
                 decision = self.micromanager.shape_and_plan(
                     self.card, sigs, ctx_contents, known_tests=known_tests, cfg=self.cfg
                 )
-            except (Refused, Invalid, ValueError) as exc:
+            except (Refused, Invalid, ValueError, Infra) as exc:
+                # Planning is help, not a gate: a supervisor that is slow to answer
+                # costs the card its plan, not its run. Other infra still stops it.
+                if isinstance(exc, Infra) and exc.code != "acp-timeout":
+                    raise
                 self._record_gate(GateResult(
                     "micromanager-shape",
                     FAIL if isinstance(exc, Refused) else INFRA,
@@ -1088,7 +1092,7 @@ class CardRun:
                        call.as_dict())
 
             try:
-                edits = parse_edits(call.content)
+                edits = parse_answer_edits(call)
             except Invalid as exc:
                 last_failure = exc.message
                 self.budget.test_writer_attempts -= 1
@@ -1160,8 +1164,8 @@ class CardRun:
                 if free_retries <= 0:
                     raise GateFailure(
                         StopCode.TESTS_UNPROVABLE,
-                        "the test writer's search blocks kept matching more "
-                        f"than once in {self.cfg.test_writer_attempts} attempts: "
+                        "the test writer's search blocks kept failing to match "
+                        f"exactly once in {self.cfg.test_writer_attempts} attempts: "
                         f"{last_failure}")
                 free_sends += 1
                 continue
@@ -1192,7 +1196,9 @@ class CardRun:
                         advice = self.micromanager.coach(
                             self.card, "test-writer", attempt,
                             self._working_test_texts(), "", last_failure, cfg=self.cfg)
-                    except (Refused, Invalid, ValueError) as mm_exc:
+                    except (Refused, Invalid, ValueError, Infra) as mm_exc:
+                        if isinstance(mm_exc, Infra) and mm_exc.code != "acp-timeout":
+                            raise
                         self._record_gate(GateResult(
                             "micromanager-coach",
                             FAIL if isinstance(mm_exc, Refused) else INFRA,
@@ -1256,7 +1262,9 @@ class CardRun:
                 never_touch=self.cfg.never_touch,
                 forbidden=self.cfg.forbidden_files,
             )
-        except (Refused, Invalid, ValueError) as exc:
+        except (Refused, Invalid, ValueError, Infra) as exc:
+            if isinstance(exc, Infra) and exc.code != "acp-timeout":
+                raise
             self._record_gate(GateResult(
                 "micromanager-scaffold",
                 FAIL if isinstance(exc, Refused) else INFRA,
@@ -1326,13 +1334,15 @@ class CardRun:
             return
         missing = [name for name in self.card.test_names if name not in listed]
         if missing:
+            load_errors = [str(e) for e in listing.get("errors", []) or []][:5]
+            why = ("; could not load: " + " | ".join(load_errors)) if load_errors else ""
             self._record_gate(GateResult(
                 "named-tests-exist", FAIL,
-                "not reported by the test binary: " + ", ".join(missing[:10]),
-                {"missing": missing}))
+                "not reported by the test binary: " + ", ".join(missing[:10]) + why,
+                {"missing": missing, "load_errors": load_errors}))
             raise GateFailure(StopCode.TESTS_UNPROVABLE,
                               "the test binary does not list: "
-                              + ", ".join(missing[:10]))
+                              + ", ".join(missing[:10]) + why)
         self._record_gate(GateResult("named-tests-exist", PASS,
                                      f"{len(self.card.test_names)} named test(s) "
                                      f"listed"))
@@ -1473,7 +1483,7 @@ class CardRun:
                        call.as_dict())
 
             try:
-                edits = parse_edits(call.content)
+                edits = parse_answer_edits(call)
             except Invalid as exc:
                 last_failure = exc.message
                 self.budget.implementer_attempts -= 1
@@ -1519,8 +1529,8 @@ class CardRun:
                     if free_retries <= 0:
                         raise GateFailure(
                             StopCode.ATTEMPTS,
-                            "the implementer's search blocks kept matching more "
-                            f"than once, after {self.cfg.implementer_attempts} "
+                            "the implementer's search blocks kept failing to match "
+                            f"exactly once, after {self.cfg.implementer_attempts} "
                             f"tries: {last_failure}")
                     free_calls += 1
                     continue
@@ -1915,7 +1925,9 @@ class CardRun:
                         self.card, "implementer", attempt_no,
                         self._frozen_texts(), diff.get("diff", ""), detail,
                         cfg=self.cfg)
-                except (Refused, Invalid, ValueError) as mm_exc:
+                except (Refused, Invalid, ValueError, Infra) as mm_exc:
+                    if isinstance(mm_exc, Infra) and mm_exc.code != "acp-timeout":
+                        raise
                     self._record_gate(GateResult(
                         "micromanager-coach",
                         FAIL if isinstance(mm_exc, Refused) else INFRA,
@@ -2198,7 +2210,9 @@ class CardRun:
                     "counter_tests": dict(self.counter_summary),
                     "mutation": dict(self.mutation_summary),
                 })
-            except (Refused, Invalid, ValueError) as exc:
+            except (Refused, Invalid, ValueError, Infra) as exc:
+                if isinstance(exc, Infra) and exc.code != "acp-timeout":
+                    raise
                 self._record_gate(GateResult(
                     "micromanager-pre-review",
                     FAIL if isinstance(exc, Refused) else INFRA,
@@ -2517,7 +2531,9 @@ class CardRun:
                         self.card, full_diff, restatement,
                         self._last_failing_counters,
                     )
-                except (Refused, Invalid, ValueError) as exc:
+                except (Refused, Invalid, ValueError, Infra) as exc:
+                    if isinstance(exc, Infra) and exc.code != "acp-timeout":
+                        raise
                     self._record_gate(GateResult(
                         "micromanager-adjudicate",
                         FAIL if isinstance(exc, Refused) else INFRA,
@@ -2918,6 +2934,7 @@ class CardRun:
             "ended_at": self.ended_at,
             "final_state": final_state,
             "stop_code": self.stop_code.value if self.stop_code else "",
+            "detail": (self.detail or "")[-2000:] if self.stop_code else "",
             "attempts": len(self.attempts),
             "depth": self.depth,
             "planner_used": self.planner_used,

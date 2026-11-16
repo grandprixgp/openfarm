@@ -1,0 +1,3 @@
+//! Stacks.
+
+pub mod stack;

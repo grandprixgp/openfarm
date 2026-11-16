@@ -1,0 +1,25 @@
+# The solo arm: Claude does every worker role itself, through the same briefs,
+# edit format and gates, with no supervisor. It uses your claude.ai login over
+# ACP; no key file. Pass it as --arm solo=<file>.
+
+[adapters]
+model = "claude-acp"
+micromanager = "off"
+
+[model]
+max_tokens = 32768
+# An empty model name means Claude's default; "opus" or "sonnet" pick one.
+test_writer = { model = "", temperature = 0.2 }
+implementer = { model = "", temperature = 0.3 }
+checker     = { model = "", temperature = 0.35 }
+planner     = { model = "", temperature = 0.2 }
+
+# How to reach Claude. mode stays "off": in this arm nothing supervises.
+[micromanager]
+mode = "off"
+auth = "oauth"
+binary = "auto"
+args = []
+effort = "medium"
+timeout_s = 600.0
+isolate_home = true

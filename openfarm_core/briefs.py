@@ -211,6 +211,10 @@ def planner_brief(card: Card, book: BriefBook, harness_guidance: str = "") -> Br
     for path in card.touches:
         if book.is_hidden(path):
             continue
+        # A new file (a test-backfill card's test file, say) has no signatures yet.
+        if _safe_existing_target(book, path) is None:
+            parts.append(f"\n### {normalise(path)} (does not exist yet)")
+            continue
         parts.append(f"\n### {path}\n"
                      f"{book.signatures(path, getattr(book, 'pack', None) or _EXPECTED_PACK)}")
     if card.reference and not book.is_hidden(card.reference):
@@ -319,7 +323,9 @@ def test_writer_brief(card: Card, book: BriefBook, pack,
     return Brief("test_writer", "\n".join(parts))
 
 
-_MAX_RETRY_FILE_CHARS = 32_768
+# Attempt 1 sends every touched file whole; a retry must too, or the worker writes
+# search blocks blind. At 32k, cli.py (66k) vanished from every retry (CARD-011).
+_MAX_RETRY_FILE_CHARS = 200_000
 
 
 def implementer_brief(card: Card, book: BriefBook, frozen_tests: dict[str, str],
@@ -365,6 +371,10 @@ def implementer_brief(card: Card, book: BriefBook, frozen_tests: dict[str, str],
                 text = target.read_text()
                 if len(text) <= _MAX_RETRY_FILE_CHARS:
                     current_sections.append(f"\n### {normalise(path)}\n{text}")
+                else:
+                    current_sections.append(
+                        f"\n### {normalise(path)} ({len(text)} characters, too long "
+                        "to repeat: copy search lines only from the first brief)")
         if current_sections:
             parts.append("\nCurrent files in touches:")
             parts.extend(current_sections)

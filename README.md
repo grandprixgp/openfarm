@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.5.1-16a34a?style=flat-square" alt="version 0.5.1">
+  <img src="https://img.shields.io/badge/version-0.6.0-16a34a?style=flat-square" alt="version 0.6.0">
   <img src="https://img.shields.io/badge/status-pre--release-d97706?style=flat-square" alt="status: pre-release">
   <img src="https://img.shields.io/badge/python-3.11%2B-7c3aed?style=flat-square" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/runtime%20deps-stdlib%20only-0284c7?style=flat-square" alt="runtime dependencies: standard library only">
@@ -28,11 +28,11 @@
 </p>
 
 <p align="center">
-  <img src="docs/assets/openfarm-stats.svg" alt="400 tests passing in the full offline end-to-end suite, 15 CLI subcommands, 6 adapter interfaces, 0 runtime dependencies" width="100%">
+  <img src="docs/assets/openfarm-stats.svg" alt="545 tests passing in the full offline end-to-end suite, 18 CLI subcommands, 6 adapter interfaces, 0 runtime dependencies" width="100%">
 </p>
 
 > [!IMPORTANT]
-> **Pre-release (v0.5.1).** The core is built and covered by a deterministic, offline test suite, but it has not yet been run end to end against live model endpoints. **Validation and efficacy results are still to come.** Nothing here is a benchmark or a measured cost saving; see [Not yet tested](#not-yet-tested) for exactly what is still open.
+> **Pre-release (v0.6.0).** The core is covered by a deterministic, offline test suite, and v0.6 was partly built by openfarm itself: 14 cards on its own repository, worked live by a cheap worker model with Claude supervising, reviewed and merged. That is a working pipeline, not an efficacy result. The bench that would measure one now ships but has not been run live. Nothing here is a benchmark or a measured cost saving; see [Not yet tested](#not-yet-tested) for exactly what is still open.
 
 ---
 
@@ -115,6 +115,49 @@ The full walkthrough of this example is in [`docs/FROM-IDEA-TO-SHIPPED-APP.md`](
 
 > [!NOTE]
 > **Requirements:** Python 3.11+ and git. The built-in Rust pack also needs `cargo`, `clippy` and `rustfmt`, and mutation testing needs `cargo-mutants`. Frontier supervision plugs in by default via **native Claude ACP over OAuth** (`openfarm acp status` / `openfarm acp login`, supporting `claude` CLI directly or external `claude-agent-acp`), while **coding Workers still authenticate via API key** against a zero-retention OpenAI-compatible endpoint enforced by `allowed_endpoints`.
+
+## Existing projects and Python
+
+For a repository that already exists, adopt it first:
+
+```bash
+openfarm adopt --dir .
+```
+
+Adopt writes `.openfarm/config.toml`, `.openfarm/PROJECT_SPEC.md` and `cards/.gitkeep` and commits nothing. Commit them, and your cards, before `openfarm check` or `openfarm run`: openfarm reads cards from the committed base branch.
+
+Adopt also runs your suite once (`--no-suite` skips it). A suite that does not build is refused before anything is written. Tests that fail are listed in a comment above `[policy] known_failing`; openfarm refuses a red base, so copy them in only if you want to work with them failing.
+
+Then batch-grill the project:
+
+```text
+/openfarm-grill-me --batch
+```
+
+Check the first card:
+
+```bash
+openfarm check CARD-001
+```
+
+Python repositories use `unittest` unless they configure pytest, and formatting is checked only when `ruff` is installed.
+
+## Efficacy bench
+
+`openfarm bench` measures whether the farm pays off, with your own models. It ships 12 tasks in `bench/` (6 Rust, 6 Python, across small features, pinned bug fixes, patterns and refactors), each with a starting project, a card, and hidden tests that the models never see.
+
+```bash
+openfarm bench list
+openfarm bench run --dry-run                      # scripted answers, costs nothing
+openfarm bench run --arm farm=farm.toml --arm solo=solo.toml
+```
+
+Each run starts from a fresh copy of the task's project and runs its card. Then it copies the hidden tests onto the result and runs the whole suite. There are two arms:
+
+- **farm**: your worker model, with Claude supervising if you like.
+- **solo**: Claude doing every worker role itself, through the same briefs and gates.
+
+An arm file sets only the model and supervisor tables; copy one from [`bench/arms/`](bench/arms/). Each task runs 3 times per arm by default. The report (`bench-report.md` and `.json`) gives pass rate, spend, cost per pass and per-category pass rates for each arm, and stays on your machine. The workers and Claude still see each card and starting project, as in any run.
 
 ## How it works
 
@@ -221,7 +264,7 @@ Each repository carries `.openfarm/config.toml` on its base branch, and `openfar
 
 **Three hooks** keep a repository's quirks out of the core: `[[gates.extra]]` for named commands that must pass, `[runner.env]` for per-unit environment variables, and `[brief] test_conventions` for a test-writing guide.
 
-Every key, gate, stop code and record format is documented in [`docs/openfarm-internals.md`](docs/openfarm-internals.md) (and the owner's local spec `openfarm spec v0.5.1.md` when present).
+Every key, gate, stop code and record format is documented in [`docs/openfarm-internals.md`](docs/openfarm-internals.md) (and the owner's local spec `openfarm spec v0.6.md` when present).
 
 </details>
 
@@ -231,8 +274,8 @@ All checks below are deterministic and offline (see [`tests/test_v05_skill_boots
 
 | Suite | Result |
 | --- | --- |
-| Fast suite | **400 tests ran**, 57 opt-in end-to-end tests skipped, **0 failures** |
-| Full suite (`OPENFARM_E2E=1`, real `git` and `cargo`) | **400 tests passed**, 0 skipped, **0 failures** |
+| Fast suite | **486 tests ran**, 59 opt-in end-to-end tests skipped, **0 failures** |
+| Full suite (`OPENFARM_E2E=1`, real `git` and `cargo`) | **545 tests passed**, 0 skipped, **0 failures** |
 
 The full suite includes:
 
@@ -241,7 +284,9 @@ The full suite includes:
 - `openfarm init` defaults (`profile = active`, `micromanager = claude-acp`, `auth = oauth`, `binary = auto`), `Cargo.lock`, containment and permissions;
 - native `claude -p` ACP bridge (`claude_native_acp.py`) over stdio pipes with a mock `claude` CLI, OAuth env/credential isolation & refresh sync-back, `[micromanager] auth` validation, and `openfarm acp status|login|configure|probe`;
 - the scaffolded project passing `cargo test --locked`, `cargo clippy --locked --all-targets -- -D warnings` and `rustfmt --edition 2021 --check`;
-- a card that touches a never-touch path being rejected, and a scripted card running all the way to `in-review`.
+- a card that touches a never-touch path being rejected, and a scripted card running all the way to `in-review`;
+- `openfarm adopt` on Python and Rust repositories, including a red suite proposed in a comment and a crate that does not build refused before anything is written;
+- every one of the 12 bench tasks: its scripted answer passes its hidden tests through a real `openfarm run`, and its untouched starting project fails them.
 
 Model calls in these tests use a scripted backend and local HTTP test servers, and the micromanager tests use deterministic stand-ins/mocks over real stdio pipes (alongside a local zero-token `openfarm acp status` and `openfarm acp probe` check against the installed `claude` CLI).
 
@@ -251,21 +296,23 @@ Model calls in these tests use a scripted backend and local HTTP test servers, a
 > These have **not** been run yet:
 >
 > - Live remote GitHub URL installs via `uv`, `pipx` or `pip`.
-> - Live paid Anthropic prompt turns through `claude-agent-acp` or `claude_native_acp.py` (only zero-token `openfarm acp status` + `initialize` handshake `probe` were run against the local `claude` binary).
-> - Live hosted zero-retention OpenAI-compatible model endpoints doing card work. (v0.6 branch: two small cards on openfarm itself reached review and were merged with DeepSeek V4.1 Flash on Command Code as the worker and the Claude supervisor on, after three fixes to how openfarm reads the worker's edits. Two cards is not an efficacy result.)
+> - Live paid Anthropic prompt turns through `claude-agent-acp`. Through the built-in native bridge they have run: Claude supervised all 14 v0.6 cards.
+> - Any worker endpoint other than one. v0.6 ran 14 cards on openfarm itself with DeepSeek V4.1 Flash on Command Code (zero data retention on) and Claude supervising. All 14 were reviewed and merged, 5 with small fixes on merge, and the runs turned up about 15 openfarm bugs, each now fixed. That is one repository and one worker, not an efficacy result.
+> - `openfarm bench run` with live arms, and the `solo` arm (Claude as the worker), which has only run against a stand-in.
+> - `openfarm adopt` on someone else's real repository.
 > - Live `cargo-mutants` runs (the parser and gate logic are tested with synthetic output).
 > - Live unattended multi-wave LLM execution of a generated app (for example all `calorie-log` cards) end to end.
 > - External `cmd:` adapters against live repository tools, beyond subprocess test harnesses.
 > - The TypeScript language pack, which is not implemented and refuses with `Invalid("no-typescript-pack")`.
 > - The Python pack (v0.6 branch) against pytest: pytest is not installed here, so its output parsing is tested on copied `-v` and `--collect-only -q` shapes only. `unittest` parsing is tested against real interpreter output.
 > - The Python pack's `ruff` lint and format path: `ruff` is not installed here, so only the no-ruff path (syntax check, formatting not checked) has run.
-> - openfarm working on itself with a live worker model. Two cards have run on a throwaway clone of openfarm to `in-review` with a scripted model, from a pinned copy, with every gate on the real 446-test suite.
 >
-> Because none of the live runs have happened, there are no efficacy numbers yet: no acceptance rate, review time, or cost comparison against a frontier-only baseline.
+> No bench has run live, so there are no efficacy numbers yet: no acceptance rate, review time, or cost comparison against a frontier-only baseline.
 
 ## Roadmap
 
 - [ ] **Live validation:** run everything in [Not yet tested](#not-yet-tested) against real endpoints, tools and installs.
+- [ ] **Run the bench live:** both arms, 3 repeats, and publish the report, failures included.
 - [ ] **Efficacy pilot:** an all-Rust pilot of 25 cards in two batches, with five frontier-baseline cards chosen in advance and all kept in the comparison, measuring per category whether a farm card pays for itself once review time is counted. Test-backfill cards wait for mutation tooling.
 - [ ] **Calibrate the report-only gates:** measure the checker's counter-test false-reject rate and what mutation testing adds before letting either block more broadly.
 - [ ] **Second repository:** run the core unchanged on a second, independent Rust repository before calling it done.

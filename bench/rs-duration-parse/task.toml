@@ -1,0 +1,5 @@
+id = "rs-duration-parse"
+language = "rust"
+category = "small-feature"
+card = "card.md"
+hidden_tests = ["hidden/tests/hidden_duration.rs"]

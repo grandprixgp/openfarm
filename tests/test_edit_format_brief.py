@@ -46,6 +46,17 @@ class EditFormatTests(unittest.TestCase):
         text = "=== whole_file: tests/test_a.py\nimport unittest\n</parameter>\n</invoke>\n"
         self.assertEqual(parse_edits(text)[0].content, "import unittest\n")
 
+    def test_any_closing_tag_ending_a_python_or_rust_block_is_dropped(self) -> None:
+        # Seen live: an append_stub ending in `</test>` (wave 2, CARD-003).
+        text = ("=== append_stub: pkg/adopt.py\ntest_x\ndef f():\n"
+                "    raise NotImplementedError\n</test>\n")
+        self.assertEqual(parse_edits(text)[0].content,
+                         "def f():\n    raise NotImplementedError\n")
+        text = "=== whole_file: src/lib.rs\npub fn f() {}\n</answer>\n"
+        self.assertEqual(parse_edits(text)[0].content, "pub fn f() {}\n")
+        page = "=== whole_file: notes/page.xml\n<doc>\n</doc>\n"
+        self.assertEqual(parse_edits(page)[0].content, "<doc>\n</doc>\n")
+
     def test_real_code_at_the_end_is_kept(self) -> None:
         text = "=== whole_file: a.py\nx = a >> 3\nprint('>>>')\n"
         self.assertEqual(parse_edits(text)[0].content, "x = a >> 3\nprint('>>>')\n")

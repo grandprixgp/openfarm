@@ -26,7 +26,8 @@ class RoleCall:
     def __init__(self, role: str, brief: Brief, content: str,
                  model: str = "", temperature: float = 0.0,
                  seed: int | None = None, tokens_in: int = 0,
-                 tokens_out: int = 0, spend: float = 0.0) -> None:
+                 tokens_out: int = 0, spend: float = 0.0,
+                 finish_reason: str = "stop") -> None:
         self.role = role
         self.brief = brief
         self.content = content
@@ -36,12 +37,18 @@ class RoleCall:
         self.tokens_in = tokens_in
         self.tokens_out = tokens_out
         self.spend = spend
+        self.finish_reason = finish_reason
+
+    @property
+    def cut_off(self) -> bool:
+        """The answer stopped at the token limit, so its last block is unfinished."""
+        return self.finish_reason == "length"
 
     def as_dict(self) -> dict:
         return {"role": self.role, "content": self.content, "model": self.model,
                 "temperature": self.temperature, "seed": self.seed,
                 "tokens_in": self.tokens_in, "tokens_out": self.tokens_out,
-                "spend": self.spend}
+                "spend": self.spend, "finish_reason": self.finish_reason}
 
 
 class Roles:
@@ -76,28 +83,46 @@ class Roles:
              response_format: str | None = None) -> RoleCall:
         model, temperature, seed = self._settings(role)
         messages = [{"role": "user", "content": brief.body}]
+        max_tokens = getattr(self.cfg, "model_max_tokens", 4096)
         try:
             completion = self.backend.complete(
                 role=role, model=model, temperature=temperature,
-                messages=messages, seed=seed,
+                messages=messages, seed=seed, max_tokens=max_tokens,
                 response_format=response_format, card_id=self.card_id,
                 attempt=attempt)
         except TypeError:
             # A backend that does not take card_id/attempt (a plain stub).
             completion = self.backend.complete(
                 role=role, model=model, temperature=temperature,
-                messages=messages, seed=seed, response_format=response_format)
+                messages=messages, seed=seed, max_tokens=max_tokens,
+                response_format=response_format)
 
         record = RoleCall(role, brief, completion.content, model=model,
                           temperature=temperature, seed=seed,
                           tokens_in=completion.tokens_in,
                           tokens_out=completion.tokens_out,
-                          spend=completion.cost)
+                          spend=completion.cost,
+                          finish_reason=str(getattr(completion, "finish_reason",
+                                                    "stop") or "stop"))
         self.calls.append(record)
         return record
 
 
 # -- parsing what a role returned ---------------------------------------------
+
+def parse_answer_edits(call: RoleCall) -> list[Edit]:
+    """The edits in a worker's answer, refusing one the token limit cut off.
+
+    A cut-off answer can still parse: its last file simply ends mid-line. Applying
+    it would freeze a broken test file and blame the worker for a syntax error.
+    """
+    if call.cut_off:
+        raise Invalid(
+            "answer-cut-off",
+            f"the answer was cut off at the token limit ({call.tokens_out} tokens "
+            "out) before it finished; write less, or raise [model] max_tokens")
+    return parse_edits(call.content)
+
 
 class Plan:
     """A planner's split: 2 to 5 sequential steps."""

@@ -1,0 +1,6 @@
+{
+ "CARD-1/test_writer": "=== whole_file: tests/pop_n.rs\nuse stacks::stack::Stack;\n\n#[test]\nfn pop_n_takes_the_top_values_top_first() {\n    let mut stack = Stack::new();\n    stack.push(1);\n    stack.push(2);\n    stack.push(3);\n    assert_eq!(stack.pop_n(2), vec![3, 2]);\n    assert_eq!(stack.len(), 1);\n}\n\n=== append_stub: src/stack.rs\npop_n_takes_the_top_values_top_first\nimpl<T> Stack<T> {\n    /// Take up to `n` values off the top.\n    pub fn pop_n(&mut self, _n: usize) -> Vec<T> {\n        todo!()\n    }\n}\n",
+ "CARD-1/implementer": "=== search_replace: src/stack.rs\n<<< SEARCH\n    /// Take up to `n` values off the top.\n    pub fn pop_n(&mut self, _n: usize) -> Vec<T> {\n        todo!()\n    }\n>>> REPLACE\n    /// Take up to `n` values off the top and return them top first.\n    pub fn pop_n(&mut self, n: usize) -> Vec<T> {\n        let keep = self.items.len().saturating_sub(n);\n        let mut taken = self.items.split_off(keep);\n        taken.reverse();\n        taken\n    }\n",
+ "CARD-1/checker_pass1": "RESTATEMENT: pop_n pops several values",
+ "CARD-1/checker_pass2": "{}"
+}

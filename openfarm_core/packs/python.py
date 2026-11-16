@@ -24,6 +24,7 @@ import hashlib
 import re
 import shutil
 import sys
+import textwrap
 from pathlib import Path
 
 from ..errors import Invalid, Refused
@@ -77,7 +78,11 @@ _LIST_SCRIPT = (
     "for case in walk(suite):\n"
     "    ident = case.id()\n"
     "    if type(case).__name__ == '_FailedTest':\n"
-    "        print('ERROR ' + ident.split('._FailedTest.', 1)[-1])\n"
+    "        exc = getattr(case, '_exception', None)\n"
+    "        lines = [l for l in str(exc or '').splitlines() if l.strip()]\n"
+    "        why = lines[-1].strip()[:300] if lines else ''\n"
+    "        print('ERROR ' + ident.split('._FailedTest.', 1)[-1]"
+    " + (': ' + why if why else ''))\n"
     "    else:\n"
     "        print(ident)\n"
 )
@@ -297,10 +302,20 @@ class PythonPack(Pack):
     # -- listing and parsing --------------------------------------------------
 
     def parse_list(self, stdout: str) -> dict:
+        """Test ids, plus `errors`: modules that could not load, and why.
+
+        A test file that fails to import lists none of its tests. Without the
+        reason the worker only hears "not listed" and guesses (CARD-014 imported a
+        name its package does not export, twice).
+        """
         tests = []
+        errors = []
         for raw in (stdout or "").splitlines():
             line = raw.strip()
-            if not line or line.startswith("ERROR "):
+            if line.startswith("ERROR "):
+                errors.append(line[len("ERROR "):])
+                continue
+            if not line:
                 continue
             if self.runner == "pytest":
                 if "::" not in line:
@@ -311,7 +326,7 @@ class PythonPack(Pack):
                     continue
                 binary, _, name = line.rpartition(".")
             tests.append({"name": name, "binary": binary})
-        return {"tests": tests}
+        return {"tests": tests, "errors": errors} if errors else {"tests": tests}
 
     def parse_tests(self, stdout: str, stderr: str = "") -> dict:
         text = f"{stdout or ''}\n{stderr or ''}"
@@ -704,3 +719,62 @@ def _render_node(node: ast.AST, indent: str) -> str:
             rendered = rendered[:157] + "..."
         return indent + rendered
     return ""
+
+
+def _raises_not_implemented(stmt: ast.stmt) -> bool:
+    return (isinstance(stmt, ast.Raise) and stmt.exc is not None
+            and "NotImplementedError" in ast.unparse(stmt.exc))
+
+
+def _is_docstring(stmt: ast.stmt) -> bool:
+    return (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant)
+            and isinstance(stmt.value.value, str))
+
+
+def _stub_function(node: ast.AST) -> bool:
+    body = [stmt for stmt in node.body if not _is_docstring(stmt)]
+    return len(body) == 1 and _raises_not_implemented(body[0])
+
+
+def _declaration_only(stmts: list[ast.stmt], in_class: bool) -> bool:
+    for stmt in stmts:
+        if _is_docstring(stmt) or isinstance(stmt, (ast.Import, ast.ImportFrom, ast.Pass)):
+            continue
+        if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant) \
+                and stmt.value.value is Ellipsis:
+            continue
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if not _stub_function(stmt):
+                return False
+            continue
+        if isinstance(stmt, ast.ClassDef):
+            if not _declaration_only(stmt.body, in_class=True):
+                return False
+            continue
+        if isinstance(stmt, ast.AnnAssign):
+            # A field or a typed name. In a class it may carry a plain default.
+            if stmt.value is None or (in_class and isinstance(stmt.value, ast.Constant)):
+                continue
+            return False
+        if isinstance(stmt, ast.Assign) and not in_class and all(
+                isinstance(t, ast.Name) and t.id == "__all__" for t in stmt.targets):
+            continue
+        return False
+    return True
+
+
+def valid_python_scaffold(body: str) -> bool:
+    """True when `body` declares contracts and has no behaviour of its own.
+
+    Imports, classes, typed fields and functions whose only statement is
+    `raise NotImplementedError`. The scaffold sets the shape a worker fills in;
+    any real logic in it would be frontier code nobody tested.
+    """
+    text = textwrap.dedent(str(body or ""))
+    if not text.strip():
+        return False
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return False
+    return _declaration_only(tree.body, in_class=False)

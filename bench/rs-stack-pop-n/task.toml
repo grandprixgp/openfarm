@@ -1,0 +1,5 @@
+id = "rs-stack-pop-n"
+language = "rust"
+category = "small-feature"
+card = "card.md"
+hidden_tests = ["hidden/tests/hidden_pop_n.rs"]

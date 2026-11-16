@@ -1,0 +1,5 @@
+id = "rs-config-refactor"
+language = "rust"
+category = "refactor"
+card = "card.md"
+hidden_tests = ["hidden/tests/hidden_config.rs"]

@@ -29,4 +29,5 @@ asserts = "the same failure with \"in 0.05s\" and \"in 1.20s\" footers gives the
 ## Done
 
 - Tests only, for the existing `PythonPack.error_signature` on pytest-shaped output: `FAILED <nodeid> - ...` lines appear in `failed_tests`, `E   <Name>Error:` lines appear in `codes`, and footer durations do not change `signature`.
+- Import it as `from openfarm_core.packs.python import PythonPack`; the package root does not export it. Tests are methods on a `unittest.TestCase` subclass, like the rest of `tests/`.
 - No production file changes.

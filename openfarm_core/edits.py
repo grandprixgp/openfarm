@@ -100,7 +100,7 @@ def parse_edits(text: str) -> list[Edit]:
         fmt = header.group("fmt")
         path = header.group("path").strip()
 
-        body = _unfence(body)
+        body = _unfence(body, path)
         if fmt == FORMAT_WHOLE_FILE:
             content = body.lstrip("\n")
             if content.endswith("\n\n"):
@@ -139,9 +139,13 @@ _TRAILING_JUNK = re.compile(
     r"^\s*(```|(>{3,}|<{3,}|={3,})\s*(END|REPLACE|SEARCH)?"
     r"|</?[｜|]+\s*DSML[^>]*>"
     r"|</(parameter|invoke|function_calls|tool_calls?|calls)>)\s*$")
+# Any bare closing tag (`</test>`, `</answer>`). No Python or Rust file can end on
+# one, so for those it is always leaked markup; elsewhere `</html>` is real.
+_CLOSING_TAG = re.compile(r"^\s*</[A-Za-z_][\w-]*>\s*$")
+_TAGLESS_SUFFIXES = (".py", ".pyi", ".rs")
 
 
-def _unfence(body: str) -> str:
+def _unfence(body: str, path: str = "") -> str:
     """Drop a Markdown code fence a model wrapped around a block.
 
     A leading fence line right under the header, and a closing fence as the
@@ -159,10 +163,13 @@ def _unfence(body: str) -> str:
     # closing marker the format does not have (`>>>`, `>>> END`), or a model's own
     # tool-call tags leaking through (DeepSeek's `</｜｜DSML｜｜ invoke>`). None of
     # these is ever source code.
+    tagless = path.endswith(_TAGLESS_SUFFIXES)
     trimmed = False
     while True:
         last = next((i for i in range(len(lines) - 1, -1, -1) if lines[i].strip()), None)
-        if last is None or not _TRAILING_JUNK.match(lines[last]):
+        if last is None or not (
+                _TRAILING_JUNK.match(lines[last])
+                or (tagless and _CLOSING_TAG.match(lines[last]))):
             break
         del lines[last:]
         trimmed = True

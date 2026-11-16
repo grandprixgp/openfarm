@@ -1,0 +1,6 @@
+{
+ "CARD-1/test_writer": "=== whole_file: tests/duration.rs\nuse units::parse::parse_duration;\n\n#[test]\nfn parses_minutes() {\n    assert_eq!(parse_duration(\"5m\"), Ok(300));\n}\n\n#[test]\nfn refuses_an_unknown_suffix() {\n    assert!(parse_duration(\"5x\").is_err());\n}\n\n=== append_stub: src/parse.rs\nparses_minutes\n/// Read a duration as seconds.\npub fn parse_duration(_text: &str) -> Result<u64, UnitError> {\n    todo!()\n}\n",
+ "CARD-1/implementer": "=== search_replace: src/parse.rs\n<<< SEARCH\n/// Read a duration as seconds.\npub fn parse_duration(_text: &str) -> Result<u64, UnitError> {\n    todo!()\n}\n>>> REPLACE\n/// Read `\"90s\"`, `\"5m\"`, `\"2h\"` or bare seconds `\"45\"` as seconds.\npub fn parse_duration(text: &str) -> Result<u64, UnitError> {\n    let (digits, factor) = match text.chars().last() {\n        Some('s') => (&text[..text.len() - 1], 1),\n        Some('m') => (&text[..text.len() - 1], 60),\n        Some('h') => (&text[..text.len() - 1], 3600),\n        _ => (text, 1),\n    };\n    let number: u64 = digits\n        .parse()\n        .map_err(|_| UnitError(format!(\"not a duration: {text:?}\")))?;\n    number\n        .checked_mul(factor)\n        .ok_or_else(|| UnitError(format!(\"duration too large: {text:?}\")))\n}\n",
+ "CARD-1/checker_pass1": "RESTATEMENT: parse_duration reads seconds",
+ "CARD-1/checker_pass2": "{}"
+}

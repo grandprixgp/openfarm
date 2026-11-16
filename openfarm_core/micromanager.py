@@ -7,7 +7,8 @@ structured operations while keeping all authority in deterministic Python code:
    and optionally split into steps validated against ``card.test_names`` and
    ``card.touches``.
 2. ``scaffold_contract``: produce initial type/function contract stubs
-   (containing ``todo!(`` or ``unimplemented!(`` in production files) strictly
+   (Rust ``todo!(`` / ``unimplemented!(``, Python ``raise NotImplementedError``)
+   strictly
    within ``card.touches`` and outside ``never_touch`` / ``forbidden_files``.
 3. ``coach``: diagnose failure root causes and emit prose coaching stripped of
    raw edit-block headers so DSF remains the sole code author.
@@ -26,6 +27,7 @@ from pathlib import Path
 from typing import Callable
 
 from .adapters.acp import ClaudeAcpAdapter
+from .packs.python import valid_python_scaffold
 from .cards import Card
 from .edits import (
     Edit,
@@ -480,6 +482,20 @@ class CmdMicromanager:
         pass
 
 
+# What an operation's answer may contain, where the schema alone does not say.
+_OP_RULES = {
+    "scaffold_contract": (
+        "Declare the new symbols' contracts so the frozen tests can import them, "
+        "and nothing else. Edit only production files listed in card.touches, "
+        "never a test file: the test writer writes those. Every new function's "
+        "body is only a stub that fails when called: Rust `todo!()` or "
+        "`unimplemented!()`, Python `raise NotImplementedError`. Imports, types, "
+        "classes and typed fields are fine; no other logic, no default values "
+        "computed from input. Return {\"edits\": []} if nothing is needed."
+    ),
+}
+
+
 def _build_op_prompt(op: str, payload: dict) -> str:
     schemas = {
         "shape_and_plan": (
@@ -521,9 +537,11 @@ def _build_op_prompt(op: str, payload: dict) -> str:
     }
     schema = schemas.get(op, "{}")
     body = json.dumps(payload, indent=2, ensure_ascii=False, default=str)
+    rules = _OP_RULES.get(op, "")
     return (
         f"Operation: {op}\n"
-        f"Required JSON schema: {schema}\n"
+        + (f"Rules: {rules}\n" if rules else "")
+        + f"Required JSON schema: {schema}\n"
         f"Return ONLY one valid JSON object matching the schema.\n"
         f"--- BEGIN DATA ---\n{body}\n--- END DATA ---\n"
     )
@@ -582,6 +600,17 @@ class ClaudeAcpMicromanager:
         return {"name": self.name, "versions": [1], "ops": ["hello", "assist"]}
 
     def _ensure_session(self) -> tuple[ClaudeAcpAdapter, str]:
+        # A timed-out turn kills the adapter's process. The card goes on without
+        # that answer, so the next call needs a fresh adapter, not "not running".
+        if self._adapter is not None:
+            proc = getattr(self._adapter, "_proc", None)
+            if proc is not None and proc.poll() is not None:
+                try:
+                    self._adapter.close()
+                except Exception:  # noqa: BLE001 - a dead adapter is replaced regardless
+                    pass
+                self._adapter = None
+                self._session_id = None
         if self._adapter is None:
             self._adapter = ClaudeAcpAdapter(
                 command=self.command,
@@ -840,6 +869,11 @@ class Micromanager:
 
             step_touches: list[str] = []
             for raw_touch in step.get("touches") or []:
+                # A step naming the card's own test file says where its tests live.
+                # Those are frozen before any step runs, so it is not a touch; drop
+                # it rather than throw the whole plan away (seen live, CARD-010).
+                if _is_test_path(str(raw_touch), card):
+                    continue
                 norm_touch = _validate_safe_path(
                     str(raw_touch),
                     never_touch=nt,
@@ -959,8 +993,19 @@ class Micromanager:
                     "scaffold-test-path",
                     f"{edit.path}: scaffold_contract may only target production paths in card.touches",
                 )
-            body = _scaffold_body_to_validate(edit)
-            if not _valid_production_scaffold(body):
+            if norm_path.endswith((".py", ".pyi")):
+                body = _python_scaffold_addition(edit)
+            else:
+                body = _scaffold_body_to_validate(edit)
+            if norm_path.endswith((".py", ".pyi")):
+                if not valid_python_scaffold(body):
+                    raise Refused(
+                        "scaffold-missing-todo",
+                        f"{edit.path}: a Python scaffold may only declare: imports, "
+                        "classes, typed fields and functions whose body is "
+                        "`raise NotImplementedError`",
+                    )
+            elif not _valid_production_scaffold(body):
                 raise Refused(
                     "scaffold-missing-todo",
                     f"{edit.path}: production scaffold must contain "
@@ -1361,6 +1406,23 @@ def _strip_rust_comments_and_strings(src: str) -> str:
     return "".join(out)
 
 
+def _python_scaffold_addition(edit: Edit) -> str:
+    """What a Python scaffold edit adds: the replace minus the search it keeps.
+
+    The Rust helper below only trusts a search with balanced braces, which a
+    Python search ending in a dict's `}` is not, so it fell back to the whole
+    replace and judged existing code as if it were the scaffold (CARD-007).
+    """
+    if edit.format != FORMAT_SEARCH_REPLACE:
+        return edit.content or ""
+    search, replace = edit.search or "", edit.replace or ""
+    if search and replace.startswith(search):
+        return replace[len(search):]
+    if search and replace.endswith(search):
+        return replace[: len(replace) - len(search)]
+    return replace
+
+
 def _scaffold_body_to_validate(edit: Edit) -> str:
     if edit.format != FORMAT_SEARCH_REPLACE:
         return edit.content or ""
@@ -1614,7 +1676,7 @@ def open_micromanager(
         _cfg_get(
             mm_cfg,
             "timeout_s",
-            _cfg_get(cfg, "micromanager_timeout_s", 180.0),
+            _cfg_get(cfg, "micromanager_timeout_s", 600.0),
         )
     )
 

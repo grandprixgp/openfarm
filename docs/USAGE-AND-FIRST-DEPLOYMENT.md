@@ -11,7 +11,7 @@
   - [1. Mental Model & Architecture](#1-mental-model--architecture)
   - [2. Annotated Configuration (`.openfarm/config.toml`)](#2-annotated-configuration-openfarmconfigtoml)
   - [3. Authoring Cards That Pass Eligibility](#3-authoring-cards-that-pass-eligibility)
-  - [4. Operations & Runbook Controls (All 12 CLI Subcommands)](#4-operations--runbook-controls-all-12-cli-subcommands)
+  - [4. Operations & Runbook Controls (All 18 CLI Subcommands)](#4-operations--runbook-controls-all-18-cli-subcommands)
 - [Part 2 — Contrast-Rich First-Target App (`tallybox`)](#part-2--contrast-rich-first-target-app-tallybox)
   - [Crate Layout & Protected Seam](#crate-layout--protected-seam)
   - [Why `tallybox` Produces High Contrast for Weak Models & Harness²](#why-tallybox-produces-high-contrast-for-weak-models--harness²)
@@ -100,7 +100,7 @@ All core orchestration, config validation, Rust pack parsing, ACP v1 stdio conta
 | --- | --- | --- |
 | `[project]` | `name`, `lane`, `base_branch`, `state_dir` | `name` and `state_dir` are required. `state_dir` is checked by `_outside_repo`—pointing it inside the repo raises `ConfigError`. Keep it off unencrypted cloud-synced folders because prompts contain repo text. |
 | `[adapters]` | `cards`, `runner`, `languages`, `model`, `micromanager`, `telemetry`, `pack` | Defaults: `cards = "files:cards/"`, `runner = "direct"`, `languages = ["rust"]`, `model = "openai-compatible"`, `micromanager = "off"`, `telemetry = "jsonl"`, `pack = ""`. `micromanager` accepts `"off"`, `"claude-acp"`, `"scripted"`, or `"cmd:<argv>"`. `telemetry` accepts `"jsonl"` or `"cmd:<argv>"`. `pack` accepts `""` or `"cmd:<argv>"`. |
-| `[model]` | `endpoint`, `allowed_endpoints`, `key_file`, `headers`, `test_writer`, `implementer`, `checker`, `planner`, `cost_per_1k_in`, `cost_per_1k_out` | `endpoint` must be in `allowed_endpoints` (redirects off allowlist are refused). `key_file` must sit outside the repo (`_outside_repo`). Set non-zero `cost_per_1k_in` / `cost_per_1k_out` so spend caps can trigger. `headers` (v0.6) is a table of extra request headers sent with every worker call, such as a provider's zero-retention opt-in (`headers = { "x-cmd-zdr" = "1" }` on Command Code); it may not set `Authorization`, `Content-Type`, `Content-Length` or `Host`. Role sub-tables accept `model`, `temperature`, `vary_seed` (or a bare string model name). Omitted role models inherit `implementer.model`; `checker` defaults to `temperature = 0.35`, `vary_seed = true` (others `0.2`, `false`). |
+| `[model]` | `endpoint`, `allowed_endpoints`, `key_file`, `headers`, `max_tokens`, `test_writer`, `implementer`, `checker`, `planner`, `cost_per_1k_in`, `cost_per_1k_out` | `endpoint` must be in `allowed_endpoints` (redirects off allowlist are refused). `key_file` must sit outside the repo (`_outside_repo`). Set non-zero `cost_per_1k_in` / `cost_per_1k_out` so spend caps can trigger. `headers` (v0.6) is a table of extra request headers sent with every worker call, such as a provider's zero-retention opt-in (`headers = { "x-cmd-zdr" = "1" }` on Command Code); it may not set `Authorization`, `Content-Type`, `Content-Length` or `Host`. `max_tokens` (v0.6, default 4096) is the most a worker may write in one answer; a model that thinks before it answers spends part of it on thinking, so raise it for those (openfarm's own config uses 32768). An answer that stops at the limit is refused as cut off rather than applied half-written. Role sub-tables accept `model`, `temperature`, `vary_seed` (or a bare string model name). Omitted role models inherit `implementer.model`; `checker` defaults to `temperature = 0.35`, `vary_seed = true` (others `0.2`, `false`). |
 | `[policy]` | `never_touch`, `forbidden_files`, `known_failing`, `flagged_patterns`, `categories` | `categories` is required and must be non-empty. `.openfarm/**` and `.claude/**` are automatically appended to `forbidden_files` in code. `known_failing` matches exact full test names only (never substrings). |
 | `[eligibility]` | `max_files`, `max_units`, `require_reference`, `refuse_touches_prefixes`, `rust_tests_in_separate_files`, `python_tests_in_test_files`, `allow_type_changes`, `max_context_files` | Defaults: `max_files = 6`, `max_units = 1` (or `len(languages)` if > 1), `require_reference = ["pattern", "small-feature"]`, `refuse_touches_prefixes = []`, `rust_tests_in_separate_files = true`, `allow_type_changes = true`, `max_context_files = 8`. |
 | `[brief]` | `test_conventions` | Optional repo-relative path to a test conventions guide (`.openfarm/test-conventions.md` is permitted even though `.openfarm/**` is in `forbidden_files`). Escapes (`../`) or absolute paths raise `ConfigError` at load time, while `never_touch`, `.openfarm/config.toml`, and other `forbidden_files` paths are hidden by `BriefBook` at runtime. |
@@ -226,7 +226,7 @@ asserts = "reserve_with_policy returns Ok(IntegrationOutcome { ... }) with SeamF
 - `context_files`: Read-only files outside `touches` shown in `test_writer` (signatures) and `implementer` (full text), bounded by `[eligibility] max_context_files` (default `8`) and checked against `never_touch`, `forbidden_files`, escapes, and symlinks.
 - `type_changes`: When `true` (and `[eligibility] allow_type_changes = true`), `test_writer` receives full base production files in `touches` as a read-only base type contract instead of signatures only.
 - `new_symbols`: Disallowed on `pinned-bugfix` and `test-backfill`. If `new_symbols = true` and `len(touches) > 1`, eligibility **requires** either `type_changes = true` OR active micromanager `scaffold_contracts = true` (`new-symbols-touches` otherwise).
-- `depends` (or `deps` in `FileCardSource`): Card IDs that must be in `"done"` state before claiming (`deps` rule otherwise).
+- `depends` (or `deps` in `FileCardSource`): Card IDs that must be in `"done"` state before claiming (`deps` rule otherwise). A card becomes done through `openfarm done <CARD>` once its branch is merged.
 - **Explicit `tests` naming & `pub` reachability**: When `[eligibility] rust_tests_in_separate_files = true` (default), every `tests[].file` must live under `tests/` (`rust-tests-in-separate-files` otherwise). Because Cargo integration tests under `tests/` are separate crates, every named test can reach only `pub` items exported by your crate! Prefer one `tests/<subject>_tests.rs` file per card/subject so cards do not contend on a single test file.
 
 #### Common Eligibility Rejections & Fixes
@@ -246,7 +246,7 @@ asserts = "reserve_with_policy returns Ok(IntegrationOutcome { ... }) with SeamF
 
 ---
 
-### 4. Operations & Runbook Controls (All 12 CLI Subcommands)
+### 4. Operations & Runbook Controls (All 18 CLI Subcommands)
 
 Invoke via `./openfarm` (when copied/installed) or `python3 -m openfarm_core.cli` from the Openfarm checkout (`PYTHONPATH=/path/to/openfarm`).
 
@@ -257,10 +257,15 @@ Invoke via `./openfarm` (when copied/installed) or `python3 -m openfarm_core.cli
   - `2`: usage or `ConfigError`
   - `3`: trouble (`Infra`, `Invalid`, or adapter failure)
 
-#### All 12 Subcommands
+#### All 18 Subcommands
+
+`init`, `install-skill` and `acp` are covered in Part 3. The table below has the rest.
 
 | Stage | Command & Exact Flags | Purpose |
 | --- | --- | --- |
+| Setup | `openfarm adopt [--dir DIR] [--lang rust\|python] [--state-dir PATH] [--key-file PATH] [--no-suite]` | Add openfarm to an existing git repository without touching its source: writes `.openfarm/config.toml`, `.openfarm/PROJECT_SPEC.md` and `cards/.gitkeep` and commits nothing. Refuses a folder that is not a repository, uncommitted changes, or a second adopt. Runs the suite once (unless `--no-suite`): a suite that does not build is refused before anything is written, and failing tests are proposed in a comment above `[policy] known_failing` for you to copy in. Cargo builds into the state folder. |
+| Bench | `openfarm bench list [--dir bench]` | List the bench tasks (`id  language  category`, or JSON with `--json`). |
+| Bench | `openfarm bench run [--dir bench] [--task ID]... [--arm farm=FILE] [--arm solo=FILE] [--repeats N] [--out DIR] [--dry-run]` | Run each task in each arm `N` times (default 3) in fresh throwaway repos, score each result on the task's hidden tests, and write `records.jsonl`, `bench-report.json` and `bench-report.md` to `--out` (default `~/.openfarm/bench/<time>`). An arm file sets only `[adapters]` model/micromanager, `[model]` and `[micromanager]`; examples are in `bench/arms/`. `--dry-run` uses each task's scripted answers and costs nothing. Nothing is uploaded. |
 | Pre-flight | `openfarm check <CARD> [--baseline]` | Check card eligibility (exit `0` eligible, `1` ineligible). `--baseline` also runs base suite 2x + confirms named tests compile & fail on base. |
 | Pre-flight | `openfarm supervise (--triage-blocked \| --prepare-queue) [--card ID] [--apply] [--mm-script PATH]` | Run micromanager `prepare_queue` on `ready`/`backlog` cards (or `triage_blocked` on `blocked` cards). Writes `<state_dir>/supervision/<stamp>-supervise.json`. `--apply` files findings or releases cards. |
 | Pre-flight | `openfarm run --dry-run [--cards N] [--card ID]` | Validate eligibility and baseline health across the next `N` ready cards without claiming cards or calling models. |
@@ -272,6 +277,7 @@ Invoke via `./openfarm` (when copied/installed) or `python3 -m openfarm_core.cli
 | Recovery | `openfarm release <CARD> --reason TEXT` | Release a stuck/blocked card via card source first, then archive prior card artifacts under `<state_dir>/cards/<CARD>/partial/`. Refuses (`1`) if a live unexpired lease holds it. |
 | Review | `openfarm dossier <CARD> [--run RUN] [--attempt N] [--format md\|json]` | Print the 9-section dossier (`dossier.md` / `dossier.json`) including `1_risk`, `2_gates`, `4_red_green`, `6_checker`, `9_diffs` (test diff first, production diff second), and `harness` summary. |
 | Review | `openfarm verdict <CARD> (clean\|minor-fix\|bounced\|scrapped) --review-tokens N [--minutes M] [--note TEXT]` | Record reviewer verdict in `<state_dir>/cards/<CARD>/<latest_run>/verdict.json` for payback accounting. |
+| Done | `openfarm done <CARD> [--note TEXT]` | After merging a reviewed card's branch: moves the card from in review to `done`, so cards that `depend` on it can be claimed. Refuses unless `openfarm/<CARD>-<slug>` is fully merged into `base_branch`. The farm itself never marks a card done. |
 | Review | `openfarm escape <CARD> --note TEXT` | Append a post-merge defect record to `<state_dir>/cards/<CARD>/<latest_run>/escapes.jsonl`. |
 | Harness² | `openfarm harness [status\|index\|show\|promote\|demote\|reset] [TARGET] [--reason TEXT] [--yes]` | Inspect or curate `<state_dir>/harness/` (`status` default; `index` prints `INDEX.md`; `show <id>` shows entry + `EXPERIENCE.md`; `promote <id>` validates & activates; `demote <id\|rev-XXXX>` rolls back; `reset --yes` resets to `rev-0000`). |
 
