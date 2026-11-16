@@ -1348,6 +1348,8 @@ def build_parser() -> argparse.ArgumentParser:
                        help="language pack to use (default: detect from manifests)")
     adopt.add_argument("--state-dir", default=None, help="external state directory")
     adopt.add_argument("--key-file", default=None, help="external API key file path")
+    adopt.add_argument("--no-suite", action="store_true",
+                       help="skip running the suite once to propose known_failing")
 
     install_skill = sub.add_parser(
         "install-skill", help="install bundled agent skills, commands, and optional bin shim"
@@ -1527,11 +1529,19 @@ def cmd_adopt(args) -> int:
             language=args.lang,
             state_dir=Path(args.state_dir) if args.state_dir else None,
             key_file=Path(args.key_file) if args.key_file else None,
+            run_suite=not args.no_suite,
         )
     except Refused as exc:
         _emit_standalone({"error": exc.message, "kind": "refused"},
                          bool(getattr(args, "json", False)))
         return EXIT_REFUSED
+    if payload.get("known_failing_proposed"):
+        payload["next"] = ("the suite has failing tests; they are proposed in a "
+                           "comment above [policy] known_failing in "
+                           ".openfarm/config.toml. Copy them in if you agree, then "
+                           "commit .openfarm/ and cards/")
+    else:
+        payload["next"] = "commit .openfarm/ and cards/, then write cards"
     _emit_standalone(payload, bool(getattr(args, "json", False)))
     return EXIT_OK
 

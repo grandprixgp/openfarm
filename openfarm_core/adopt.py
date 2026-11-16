@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from pathlib import Path
 
 from .errors import Refused
@@ -56,6 +57,67 @@ def _toml_list(values: list[str]) -> str:
     return json.dumps([str(value) for value in values], ensure_ascii=False)
 
 
+def _known_failing_lines(proposed: list[str] | None, base_branch: str) -> list[str]:
+    """`known_failing = []`, after a commented proposal when the suite had red tests.
+
+    The proposal stays a comment: openfarm refuses a red base until the owner copies
+    the names in, so no failing test is ever set aside without someone choosing to.
+    """
+    if not proposed:
+        return ["known_failing = []"]
+    return [
+        f"# adopt ran the suite on {base_branch} and these tests failed. openfarm",
+        "# refuses a red base, so to work with them failing, copy them into",
+        "# known_failing below:",
+        f"# {_toml_list(proposed)}",
+        "known_failing = []",
+    ]
+
+
+def baseline_known_failing(root: Path, language: str, *, target_dir: Path,
+                           timeout_s: float = 1800.0) -> dict:
+    """Run the suite once on the clean base and propose its red tests.
+
+    Returns {"ran": bool, "known_failing": [...], "notes": [...]}. A Python repo
+    with no tests/ folder is not run. Raises `Refused` "suite-does-not-compile"
+    when the suite does not build, or "suite-did-not-run" when it could not run
+    or failed without naming a failed test.
+    """
+    from .packs.base import pack_for
+
+    root = Path(root)
+    cargo_flags = ["--locked"] if (root / "Cargo.lock").is_file() else []
+    pack = pack_for(language, cargo_flags, cwd=root)
+    pack.configure(root)
+    notes = [str(note) for note in getattr(pack, "notes", [])]
+    if (language == "python" and getattr(pack, "runner", "") == "unittest"
+            and not (root / getattr(pack, "test_dir", "tests")).is_dir()):
+        return {"ran": False, "known_failing": [], "notes": notes}
+
+    argv = pack.commands("test")["argv"]
+    env = dict(os.environ)
+    # Cargo builds into openfarm's state, not into the repository being adopted.
+    env["CARGO_TARGET_DIR"] = str(target_dir)
+    try:
+        done = subprocess.run(argv, cwd=root, capture_output=True, text=True,
+                              env=env, timeout=timeout_s, check=False)
+    except FileNotFoundError as exc:
+        raise Refused("suite-did-not-run",
+                      f"could not run the suite: {argv[0]} was not found") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise Refused("suite-did-not-run",
+                      f"the suite took longer than {timeout_s:.0f}s; pass --no-suite "
+                      "to adopt without running it") from exc
+    parsed = pack.parse_tests(done.stdout, done.stderr)
+    proposed = propose_known_failing(parsed)
+    if done.returncode != 0 and not proposed:
+        tail = (done.stderr or done.stdout).strip().splitlines()[-3:]
+        raise Refused("suite-did-not-run",
+                      "the suite failed without naming a failed test: "
+                      + " | ".join(tail))
+    return {"ran": True, "known_failing": proposed, "notes": notes}
+
+
 def adopt_config_text(
     root: Path,
     language: str,
@@ -63,6 +125,7 @@ def adopt_config_text(
     base_branch: str,
     state_dir: Path,
     key_file: Path,
+    proposed_known_failing: list[str] | None = None,
 ) -> str:
     """Return the text of `.openfarm/config.toml` for adopting `root` as `language`.
 
@@ -161,7 +224,7 @@ def adopt_config_text(
         "[policy]",
         "never_touch = []",
         f"forbidden_files = {_toml_list(forbidden_files)}",
-        "known_failing = []",
+        *_known_failing_lines(proposed_known_failing, base_branch),
         f"flagged_patterns = {_toml_list(flagged_patterns)}",
         f"categories = {_toml_list(categories)}",
         "",
@@ -260,6 +323,8 @@ def adopt_project(
     language: str | None = None,
     state_dir: Path | None = None,
     key_file: Path | None = None,
+    run_suite: bool = False,
+    suite_timeout_s: float = 1800.0,
 ) -> dict:
     """Adopt the existing git repository at `root` without touching its source.
 
@@ -313,12 +378,20 @@ def adopt_project(
     else:
         resolved_key = Path(key_file).expanduser().resolve()
 
+    baseline = None
+    if run_suite:
+        # Before anything is written: a suite that does not build refuses adoption.
+        baseline = baseline_known_failing(
+            root, resolved_language, target_dir=resolved_state / "adopt-target",
+            timeout_s=suite_timeout_s)
+
     config_text = adopt_config_text(
         root,
         resolved_language,
         base_branch=base_branch,
         state_dir=resolved_state,
         key_file=resolved_key,
+        proposed_known_failing=baseline["known_failing"] if baseline else None,
     )
 
     resolved_state.mkdir(parents=True, exist_ok=True)
@@ -336,7 +409,7 @@ def adopt_project(
     with gitkeep_path.open("x", encoding="utf-8") as handle:
         handle.write("")
 
-    return {
+    result = {
         "ok": True,
         "language": resolved_language,
         "written": [
@@ -345,6 +418,11 @@ def adopt_project(
             "cards/.gitkeep",
         ],
     }
+    if baseline is not None:
+        result["suite_ran"] = baseline["ran"]
+        result["known_failing_proposed"] = baseline["known_failing"]
+        result["suite_notes"] = baseline["notes"]
+    return result
 
 
 def propose_known_failing(parsed: dict) -> list[str]:
