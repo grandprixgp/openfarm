@@ -62,16 +62,36 @@ def should_promote(entry: dict) -> bool:
     `hurt < helped`. Eligibility (decisions 6 and 7) is checked separately by
     `harness_scope.global_eligibility`.
     """
-    return False
+    stats = entry.get("stats") or {}
+    helped = stats.get("helped", 0)
+    hurt = stats.get("hurt", 0)
+    return (
+        entry.get("scope", "") == "general"
+        and entry.get("status", "") == "active"
+        and helped >= 3
+        and hurt < helped
+    )
 
 
 def should_veto(stats: dict) -> bool:
     """Whether a project switches a global lesson off for itself (decision 5)."""
-    return False
+    return stats.get("hurt", 0) > stats.get("helped", 0)
 
 
 def retire_reason(global_entry: dict) -> str:
     """Why a global lesson should be retired, or "" to keep it (decision 5)."""
+    projects = global_entry.get("projects") or {}
+    vetoed = sum(
+        1 for project in projects.values() if project.get("vetoed", False)
+    )
+    if vetoed >= 2:
+        return f"vetoed by {vetoed} projects"
+    score = sum(
+        project.get("helped", 0) - project.get("hurt", 0)
+        for project in projects.values()
+    )
+    if score < 0:
+        return f"combined score {score}"
     return ""
 
 
