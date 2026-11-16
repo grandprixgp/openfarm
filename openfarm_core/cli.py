@@ -1,4 +1,4 @@
-"""The `openfarm` command: one entry point, fourteen subcommands, shared exit codes.
+"""The `openfarm` command: one entry point, fifteen subcommands, shared exit codes.
 
 Exit codes are the same for every command:
 
@@ -21,6 +21,13 @@ import sys
 import time as _time
 from pathlib import Path
 
+from .acp_setup import (
+    ACP_ACTIONS,
+    configure_acp_repo,
+    inspect_acp_status,
+    probe_acp,
+    run_acp_login,
+)
 from .adapters.files import FileCardSource, open_card_source
 from .adapters.jsonl import TelemetrySink, open_telemetry
 from .adapters.openai_compat import open_backend
@@ -1258,6 +1265,30 @@ def build_parser() -> argparse.ArgumentParser:
     install_skill.add_argument("--dry-run", action="store_true",
                                help="plan installation without writing files")
 
+    acp = sub.add_parser(
+        "acp",
+        help="inspect, log in via OAuth, configure, or probe Frontier Claude ACP",
+    )
+    acp.add_argument("action", nargs="?", default="status", choices=ACP_ACTIONS)
+    acp.add_argument("--mode", choices=("active", "advisory", "off"), default=None)
+    acp.add_argument("--auth", choices=("oauth", "api-key", "auto"), default=None)
+    acp.add_argument("--binary", default=None,
+                     help="ACP binary or resolution mode (`auto`, `claude`, `claude-agent-acp`)")
+    acp.add_argument("--model", default=None)
+    acp.add_argument("--effort", choices=("low", "medium", "high"), default=None)
+    acp.add_argument("--tool-policy", choices=("none", "read-only"), default=None)
+    acp.add_argument("--auth-file", default=None)
+    acp.add_argument("--clear-auth-file", action="store_true")
+    login_grp = acp.add_mutually_exclusive_group()
+    login_grp.add_argument("--claudeai", action="store_true",
+                           help="authenticate using Claude subscription OAuth (default)")
+    login_grp.add_argument("--console", action="store_true",
+                           help="authenticate via Anthropic Console login")
+    acp.add_argument("--sso", action="store_true", help="force SSO login flow")
+    acp.add_argument("--email", default="", help="pre-populate login email")
+    acp.add_argument("--setup-token", action="store_true",
+                     help="run `claude setup-token` for long-lived CLAUDE_CODE_OAUTH_TOKEN")
+
     return parser
 
 
@@ -1307,9 +1338,47 @@ def cmd_install_skill(args) -> int:
     return EXIT_OK
 
 
+def cmd_acp(args) -> int:
+    repo = Path(args.repo) if getattr(args, "repo", None) else Path.cwd()
+    action = args.action
+    if action == "status":
+        payload = inspect_acp_status(repo)
+    elif action == "login":
+        login_mode = "console" if args.console else "claudeai"
+        payload = run_acp_login(
+            mode=login_mode,
+            sso=bool(args.sso),
+            email=args.email,
+            setup_token=bool(args.setup_token),
+        )
+    elif action == "configure":
+        payload = configure_acp_repo(
+            repo,
+            mode=args.mode,
+            auth=args.auth,
+            binary=args.binary,
+            model=args.model,
+            effort=args.effort,
+            tool_policy=args.tool_policy,
+            auth_file=args.auth_file,
+            clear_auth_file=bool(args.clear_auth_file),
+        )
+    elif action == "probe":
+        payload = probe_acp(
+            repo,
+            command=args.binary,
+            auth_mode=args.auth,
+        )
+    else:
+        raise UsageError(f"unknown acp action: {action}")
+    _emit_standalone(payload, bool(getattr(args, "json", False)))
+    return EXIT_OK
+
+
 PRE_CONFIG_COMMANDS = {
     "init": cmd_init,
     "install-skill": cmd_install_skill,
+    "acp": cmd_acp,
 }
 
 

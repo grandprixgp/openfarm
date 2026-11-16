@@ -132,7 +132,7 @@ def install_skill_bundle(
 
     assets = skill_assets_root()
     skills_src = assets / "skills"
-    command_src = assets / "commands" / "openfarm-initialize.md"
+    commands_src = assets / "commands"
     plugin_src = assets / "plugin"
 
     base_home = Path(home).expanduser().resolve() if home is not None else Path.home().resolve()
@@ -150,13 +150,9 @@ def install_skill_bundle(
                 else (explicit_dest or base_home) / ".claude"
             )
             entry["skills"] = _copy_tree(skills_src, claude_root / "skills", dry_run=dry_run)
-            entry["commands"] = [
-                _copy_file(
-                    command_src,
-                    claude_root / "commands" / "openfarm-initialize.md",
-                    dry_run=dry_run,
-                )
-            ]
+            entry["commands"] = _copy_tree(
+                commands_src, claude_root / "commands", dry_run=dry_run
+            )
         elif item == "antigravity":
             ag_root = (
                 explicit_dest
@@ -181,13 +177,9 @@ def install_skill_bundle(
             entry["skills"] = _copy_tree(
                 skills_src, ws_root / ".agents" / "skills", dry_run=dry_run
             )
-            entry["commands"] = [
-                _copy_file(
-                    command_src,
-                    ws_root / ".claude" / "commands" / "openfarm-initialize.md",
-                    dry_run=dry_run,
-                )
-            ]
+            entry["commands"] = _copy_tree(
+                commands_src, ws_root / ".claude" / "commands", dry_run=dry_run
+            )
         installed[item] = entry
 
     bin_shim = ""
@@ -218,6 +210,8 @@ def _render_config_toml(
     model: str,
     mm_adapter: str,
     mm_mode: str,
+    mm_auth: str = "oauth",
+    mm_binary: str = "auto",
     mutation: str,
 ) -> str:
     mutation_req = '["test-backfill"]' if mutation != "off" else "[]"
@@ -305,7 +299,8 @@ def _render_config_toml(
         "required_fields = []\n\n"
         "[micromanager]\n"
         f"mode = {_toml_str(mm_mode)}\n"
-        'binary = "claude-agent-acp"\n'
+        f"auth = {_toml_str(mm_auth)}\n"
+        f"binary = {_toml_str(mm_binary)}\n"
         "args = []\n"
         'model = ""\n'
         'effort = "medium"\n'
@@ -412,12 +407,11 @@ def initialize_project(
     if resolved_key.is_relative_to(target_dir):
         raise ConfigError("[model] key_file must be outside the repository")
 
-    resolved_profile = (
-        "active" if (profile == "auto" and shutil.which("claude-agent-acp")) else
-        "solo" if profile == "auto" else profile
-    )
+    resolved_profile = "active" if profile == "auto" else profile
     mm_adapter = "off" if resolved_profile == "solo" else "claude-acp"
     mm_mode = "off" if resolved_profile == "solo" else resolved_profile
+    mm_auth = "oauth"
+    mm_binary = "auto"
 
     resolved_mutation = (
         "report" if (mutation == "auto" and shutil.which("cargo-mutants")) else
@@ -503,7 +497,7 @@ def initialize_project(
             f"# {project_slug} Specification\n\n"
             f"- **Idea**: {idea_text}\n"
             f"- **Crate**: `{crate_name}` (Rust edition 2021, zero external crates by default)\n"
-            f"- **Openfarm Profile**: `{resolved_profile}` (`micromanager = {mm_adapter}`, `mutation = {resolved_mutation}`)\n\n"
+            f"- **Openfarm Profile**: `{resolved_profile}` (`micromanager = {mm_adapter}`, `auth = {mm_auth}`, `mutation = {resolved_mutation}`)\n\n"
             "## Protected Seam Invariants (`never_touch = [\"src/invariants.rs\"]`)\n\n"
             "- Document domain constants, checked arithmetic rules, and bounds locked in `src/invariants.rs`.\n"
             "- Never reference `src/invariants.rs` in card `touches`, `reference`, or `context_files`.\n\n"
@@ -520,7 +514,8 @@ def initialize_project(
             "1. Keep domain invariants in `src/invariants.rs` (`never_touch`) and never weaken `.openfarm/config.toml`.\n"
             "2. Ensure every integration-tested type or function is `pub` and re-exported in `src/lib.rs`.\n"
             f"3. Commit changes on `{branch}` before running `openfarm check` or `openfarm run`.\n"
-            "4. Run waves through `openfarm supervise --prepare-queue --apply` and `openfarm run --cards N --json`,\n"
+            "4. Frontier supervision defaults to native Claude ACP via OAuth (`openfarm acp status` / `openfarm acp login`); lesser workers use the configured ZDR API key file.\n"
+            "5. Run waves through `openfarm supervise --prepare-queue --apply` and `openfarm run --cards N --json`,\n"
             "   then review `openfarm dossier <ID>`, record `openfarm verdict`, and merge locally via `git merge --no-ff`.\n"
         ),
         ".openfarm/config.toml": _render_config_toml(
@@ -532,6 +527,8 @@ def initialize_project(
             model=str(model or "lesser-coder"),
             mm_adapter=mm_adapter,
             mm_mode=mm_mode,
+            mm_auth=mm_auth,
+            mm_binary=mm_binary,
             mutation=resolved_mutation,
         ),
     }
@@ -564,12 +561,15 @@ def initialize_project(
         "profile": resolved_profile,
         "micromanager_adapter": cfg.micromanager_adapter,
         "micromanager_mode": cfg.micromanager.mode,
+        "micromanager_auth": cfg.micromanager.auth,
+        "micromanager_binary": cfg.micromanager.binary,
         "mutation": cfg.mutation,
         "idea": idea_text,
         "config_valid": True,
         "created_files": created_files,
         "next_steps": [
-            f"Place your ZDR model API key in {resolved_key} (chmod 600).",
+            "Ensure Frontier Claude OAuth is signed in (`openfarm acp status` / `openfarm acp login`).",
+            f"Place your Worker ZDR model API key in {resolved_key} (chmod 600).",
             "Expand .openfarm/PROJECT_SPEC.md, src/invariants.rs, a golden slice, and tests/baseline_tests.rs.",
             "Verify `cargo test`, `cargo clippy --all-targets -- -D warnings`, and `rustfmt --edition 2021 --check`.",
             "Author cards/CARD-001.md.. under cards/, commit on main, then run `openfarm check <ID>` and `openfarm run --dry-run`.",

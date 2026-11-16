@@ -1,6 +1,6 @@
-# From Empty Folder to Shipped App (Openfarm v0.5 Starter Guide)
+# From Empty Folder to Shipped App (Openfarm v0.5.1 Starter Guide)
 
-This guide shows **both human owners and prospective frontier AI agents** how to go from an **empty folder** and a **plain-English idea** (`"An app to track my calories"`) to a gate-verified, human-reviewed application using **Openfarm v0.5**.
+This guide shows **both human owners and prospective frontier AI agents** how to go from an **empty folder** and a **plain-English idea** (`"An app to track my calories"`) to a gate-verified, human-reviewed application using **Openfarm v0.5.1**.
 
 > **For related docs:** See [README.md](../README.md) for architecture overview, [docs/USAGE-AND-FIRST-DEPLOYMENT.md](USAGE-AND-FIRST-DEPLOYMENT.md) for detailed configuration & operator runbooks on existing repositories (`tallybox`), and [docs/openfarm-internals.md](openfarm-internals.md) for module internals.
 
@@ -8,14 +8,14 @@ This guide shows **both human owners and prospective frontier AI agents** how to
 
 ## Part 1 — For Human Owners: The Two-Step Workflow
 
-You do **not** need to hand-write `.openfarm/config.toml`, memorize card schemas, or copy Rust boilerplate by hand. Openfarm v0.5 packages the CLI, slash command, plugin rules, and frontier architect/operator skills into a **single repository or package target**.
+You do **not** need to hand-write `.openfarm/config.toml`, memorize card schemas, or copy Rust boilerplate by hand. Openfarm v0.5.1 packages the CLI, slash commands (`/openfarm-grill-me` and `/openfarm-initialize`), native Claude ACP OAuth setup (`openfarm acp`), plugin rules, and frontier architect/operator skills into a **single repository or package target**.
 
 ### Your Two Prompts
 
 | Step | What you type to your frontier agent | What happens behind the scenes |
 | --- | --- | --- |
-| **1. Install** | `"Read and install this skill <github_or_local_link>"` | The agent reads root [`SKILL.md`](../SKILL.md) (`openfarm-installer`), installs Openfarm (`uv`/`pipx`/`pip`, or zero-`pip` `python3 -m openfarm_core.cli install-skill`), and deploys `openfarm-initialize`, `openfarm`, `/openfarm-initialize`, and workspace plugin rules. |
-| **2. Initialize** | `"/openfarm-initialize calorie-log An app to track my calories"` | Inside your empty folder, the agent runs deterministic `openfarm init`, executes one brief **Frontier Architect Pass** (protected seam + thin skeleton + golden reference slice), decomposes **Wave 1–3 cards**, commits on `main`, and validates every card with `openfarm check` and `openfarm run --dry-run`. |
+| **1. Install** | `"Read and install this skill <github_or_local_link>"` | The agent reads root [`SKILL.md`](../SKILL.md) (`openfarm-installer`), installs Openfarm (`uv`/`pipx`/`pip`, or zero-`pip` `python3 -m openfarm_core.cli install-skill`), deploys `openfarm-grill-me`, `openfarm-initialize`, `openfarm`, slash commands, and workspace plugin rules, and checks Frontier OAuth readiness (`openfarm acp status`). |
+| **2. Initialize** | `"/openfarm-initialize calorie-log An app to track my calories"` | Inside your empty folder, the agent first runs `/openfarm-grill-me` (one question at a time, with a recommended answer) to lock down invariants and boundaries (pass `--no-grill` to skip), runs deterministic `openfarm init` (defaulting Frontier to Claude ACP via OAuth and Workers to ZDR API keys), executes the **Frontier Architect Pass**, decomposes **Wave 1–3 cards**, commits on `main`, and validates every card with `openfarm check` and `openfarm run --dry-run`. |
 
 ### Why This Saves Frontier Tokens & Prevents Context Rot
 
@@ -60,7 +60,14 @@ Ensure `~/.local/bin` is on your `PATH`, then verify:
 openfarm --help
 ```
 
-You should see all **14 subcommands**: `init`, `install-skill`, `run`, `status`, `pause`, `resume`, `stop`, `release`, `dossier`, `check`, `verdict`, `escape`, `supervise`, `harness`.
+You should see all **15 subcommands**: `init`, `install-skill`, `acp`, `run`, `status`, `pause`, `resume`, `stop`, `release`, `dossier`, `check`, `verdict`, `escape`, `supervise`, `harness`.
+
+Sign in once with your Claude OAuth subscription for Frontier ACP supervision (no Frontier API key needed; Workers remain API-key authenticated):
+
+```bash
+openfarm acp status --json
+openfarm acp login          # optional if already signed into Claude Code
+```
 
 #### Option B — Package Install (`uv`, `pipx`, or `pip`)
 
@@ -85,11 +92,11 @@ Create and enter an empty directory, then run `/openfarm-initialize calorie-log 
 
 #### Stage 1 — Environment Check & `openfarm init`
 
-First, check available local tools once:
+First, check available local tools and Frontier OAuth readiness once:
 
 ```bash
 rustc --version && cargo --version && cargo clippy --version && rustfmt --version
-command -v claude-agent-acp || echo "solo mode (no ACP binary found)"
+openfarm acp status --json
 command -v cargo-mutants || echo "mutation=off (no cargo-mutants found)"
 ```
 
@@ -104,8 +111,8 @@ openfarm init calorie-log \
 ```
 
 Useful optional flags on `openfarm init`:
-- `--endpoint https://<your-zdr-provider>/v1 --model <model-id>` — configure your Zero Data Retention (ZDR) OpenAI-compatible coding model endpoint.
-- `--profile auto|solo|advisory|active` — `auto` selects `active` (`claude-acp`) if `claude-agent-acp` is on `PATH`, or `solo` (`micromanager = "off"`) otherwise.
+- `--endpoint https://<your-zdr-provider>/v1 --model <model-id>` — configure your Zero Data Retention (ZDR) OpenAI-compatible Worker coding model endpoint and model name.
+- `--profile auto|solo|advisory|active` — `auto` selects `active` (`claude-acp`, `auth = "oauth"`, `binary = "auto"`) as the default way to plug the Frontier supervisor in (`openfarm acp configure` adjusts settings later; `--profile solo` disables Frontier ACP).
 - `--mutation auto|off|report|required` — `auto` selects `report` if `cargo-mutants` is on `PATH`, else `off`.
 - `--state-dir PATH` / `--key-file PATH` — override external state/key paths (enforced strictly **outside** the repository, created with `0o700` permissions).
 - `--force` — allow scaffolding into a non-empty directory (without `--force`, `openfarm init` refuses non-empty dirs with exit code `1`).

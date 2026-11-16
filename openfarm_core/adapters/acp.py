@@ -33,6 +33,7 @@ import shlex
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -108,6 +109,12 @@ _LONE_PREFIX_RE = re.compile(r"\x1b\]|\x1b\[|\x1b\\|\x1b|\x9b")
 _C0_C1_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 
 _STRIPPED_ENV_EXACT = frozenset({"CLAUDECODE", "ANTHROPIC_AUTH_TOKEN", "AI_AGENT"})
+_OAUTH_ENV_ALLOW = frozenset({"CLAUDE_CODE_OAUTH_TOKEN"})
+_AUTH_ERROR_RE = re.compile(
+    r"authentication_failed|not logged in|please run /login|claude auth login|"
+    r"invalid bearer token|unauthorized|\b401\b|\boauth\b",
+    re.IGNORECASE,
+)
 _PATH_INPUT_KEYS = (
     "path",
     "file_path",
@@ -134,30 +141,82 @@ def strip_control_sequences(text: str) -> str:
     return cleaned
 
 
+def _is_acp_auth_error(code: object, message: str, data: object) -> bool:
+    if isinstance(data, dict):
+        if str(data.get("errorKind") or "") == "authentication_failed":
+            return True
+        if str(data.get("code") or "") == "acp-auth-required":
+            return True
+    return bool(_AUTH_ERROR_RE.search(str(message or "")))
+
+
+def resolve_acp_command(
+    command: str | list[str],
+    *,
+    python_exe: str | None = None,
+) -> list[str]:
+    """Resolve an ACP command string/argv (`auto`, `claude`, `claude-agent-acp`, etc.)."""
+    if isinstance(command, str):
+        argv = shlex.split(command)
+    else:
+        argv = [str(part) for part in command]
+    if not argv:
+        raise Invalid("acp-bad-command", "ACP adapter command must not be empty")
+
+    head = argv[0]
+    rest = argv[1:]
+    py = python_exe or sys.executable
+    native_script = str(Path(__file__).resolve().with_name("claude_native_acp.py"))
+
+    if head == "auto":
+        acp_bin = shutil.which("claude-agent-acp")
+        if acp_bin:
+            return [acp_bin, *rest]
+        claude_bin = shutil.which("claude")
+        if claude_bin:
+            return [py, native_script, "--claude-bin", claude_bin, *rest]
+        return ["claude-agent-acp", *rest]
+
+    if head in ("claude", "claude-native") or Path(head).name == "claude":
+        resolved_claude = shutil.which(head) or head
+        return [py, native_script, "--claude-bin", resolved_claude, *rest]
+
+    return argv
+
+
 def _sanitised_env(
     *,
     base_env: dict[str, str] | None = None,
     extra_env: dict[str, str] | None = None,
     isolate_home: bool = True,
     auth_file: Path | str | None = None,
+    auth_mode: str = "oauth",
     never_touch: list[str] | tuple[str, ...] = (),
     forbidden_files: list[str] | tuple[str, ...] = (),
 ) -> tuple[dict[str, str], Path | None]:
     """Build a sanitised subprocess environment and optional isolated HOME dir."""
     source = os.environ if base_env is None else base_env
-    orig_home = source.get("HOME", "")
+    orig_home = (extra_env or {}).get("HOME") or source.get("HOME", "")
+    allow_oauth = auth_file is None and auth_mode in ("oauth", "auto")
+
+    def _keep_var(key: str, val: object) -> bool:
+        if key in _STRIPPED_ENV_EXACT:
+            return False
+        if key == "ANTHROPIC_API_KEY" and auth_mode == "oauth" and auth_file is None:
+            return False
+        if key.startswith("CLAUDE_CODE_"):
+            return allow_oauth and key in _OAUTH_ENV_ALLOW and bool(str(val or "").strip())
+        return True
 
     env: dict[str, str] = {}
     for key, val in source.items():
-        if key in _STRIPPED_ENV_EXACT or key.startswith("CLAUDE_CODE_"):
-            continue
-        env[key] = val
+        if _keep_var(key, val):
+            env[key] = val
 
     if extra_env:
         for key, val in extra_env.items():
-            if key in _STRIPPED_ENV_EXACT or key.startswith("CLAUDE_CODE_"):
-                continue
-            env[str(key)] = str(val)
+            if _keep_var(str(key), val):
+                env[str(key)] = str(val)
 
     isolated_home: Path | None = None
     if isolate_home:
@@ -200,7 +259,7 @@ def _sanitised_env(
                 os.chmod(helper_path, 0o700)
                 settings["apiKeyHelper"] = str(helper_path)
             else:
-                if orig_home:
+                if orig_home and allow_oauth:
                     creds_src = Path(orig_home) / ".claude" / ".credentials.json"
                     try:
                         if creds_src.is_file():
@@ -208,6 +267,27 @@ def _sanitised_env(
                             shutil.copyfile(creds_src, creds_dst)
                             os.chmod(creds_dst, 0o600)
                     except OSError:
+                        pass
+                    claude_json_src = Path(orig_home) / ".claude.json"
+                    try:
+                        if claude_json_src.is_file():
+                            raw_meta = json.loads(
+                                claude_json_src.read_text(encoding="utf-8")
+                            )
+                            if isinstance(raw_meta, dict) and (
+                                "oauthAccount" in raw_meta or "userID" in raw_meta
+                            ):
+                                slim_meta: dict[str, object] = {}
+                                for k in ("oauthAccount", "userID"):
+                                    if k in raw_meta:
+                                        slim_meta[k] = raw_meta[k]
+                                slim_meta["hasCompletedOnboarding"] = True
+                                claude_json_dst = isolated_home / ".claude.json"
+                                claude_json_dst.write_text(
+                                    json.dumps(slim_meta) + "\n", encoding="utf-8"
+                                )
+                                os.chmod(claude_json_dst, 0o600)
+                    except (OSError, ValueError):
                         pass
 
             settings_path = claude_dir / "settings.json"
@@ -371,6 +451,7 @@ class ClaudeAcpAdapter:
         *,
         isolate_home: bool = True,
         auth_file: Path | str | None = None,
+        auth_mode: str = "oauth",
         env: dict[str, str] | None = None,
         never_touch: list[str] | tuple[str, ...] = (),
         forbidden_files: list[str] | tuple[str, ...] = (),
@@ -378,17 +459,18 @@ class ClaudeAcpAdapter:
         max_line_bytes: int = DEFAULT_MAX_LINE_BYTES,
         stderr_tail_lines: int = 100,
     ) -> None:
-        if isinstance(command, str):
-            self.argv = shlex.split(command)
-        else:
-            self.argv = [str(part) for part in command]
-        if not self.argv:
-            raise Invalid("acp-bad-command", "ACP adapter command must not be empty")
+        if auth_mode not in ("oauth", "api-key", "auto"):
+            raise Invalid(
+                "acp-bad-auth-mode",
+                f"auth_mode must be 'oauth', 'api-key', or 'auto', got {auth_mode!r}",
+            )
+        self.argv = resolve_acp_command(command)
 
         self.cwd = Path(cwd or Path.cwd())
         self.allowed_root = Path(allowed_root or self.cwd).resolve()
         self.isolate_home = bool(isolate_home)
         self.auth_file = Path(auth_file) if auth_file is not None else None
+        self.auth_mode = str(auth_mode)
         self.extra_env = dict(env) if env is not None else None
         self.never_touch = list(never_touch or ())
         self.forbidden_files = list(forbidden_files or ())
@@ -399,6 +481,8 @@ class ClaudeAcpAdapter:
 
         self._proc: subprocess.Popen[bytes] | None = None
         self._isolated_home: Path | None = None
+        self._orig_home: str = ""
+        self._initial_creds_bytes: bytes | None = None
         self._msg_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self._stderr_tail: collections.deque[str] = collections.deque(
             maxlen=max(1, int(stderr_tail_lines))
@@ -410,8 +494,10 @@ class ClaudeAcpAdapter:
 
         self._req_counter = 0
         self._initialized = False
+        self._authenticated = False
         self._replaying_history = False
         self.agent_capabilities: dict = {}
+        self.auth_methods: list[dict] = []
         self._session_policies: dict[str, str] = {}
         self._seen_request_ids: dict[str, set[tuple[type, object]]] = {}
         self._session_ids: list[str] = []
@@ -453,14 +539,24 @@ class ClaudeAcpAdapter:
 
         self._msg_queue = queue.Queue()
         self._stderr_tail.clear()
+        self._orig_home = (self.extra_env or {}).get("HOME") or os.environ.get("HOME", "")
+        self._initial_creds_bytes = None
         env, isolated_home = _sanitised_env(
             extra_env=self.extra_env,
             isolate_home=self.isolate_home,
             auth_file=self.auth_file,
+            auth_mode=self.auth_mode,
             never_touch=self.never_touch,
             forbidden_files=self.forbidden_files,
         )
         self._isolated_home = isolated_home
+        if isolated_home is not None:
+            iso_creds = isolated_home / ".claude" / ".credentials.json"
+            if iso_creds.is_file():
+                try:
+                    self._initial_creds_bytes = iso_creds.read_bytes()
+                except OSError:
+                    self._initial_creds_bytes = None
         try:
             proc = subprocess.Popen(
                 self.argv,
@@ -665,6 +761,51 @@ class ClaudeAcpAdapter:
         self._stderr_thread = None
         self._proc = None
 
+    def _persist_refreshed_oauth_credentials(self) -> None:
+        """Persist refreshed `.credentials.json` back to host HOME safely."""
+        if (
+            self._isolated_home is None
+            or self.auth_file is not None
+            or self.auth_mode not in ("oauth", "auto")
+            or not self._orig_home
+        ):
+            return
+        iso_creds = self._isolated_home / ".claude" / ".credentials.json"
+        if not iso_creds.is_file():
+            return
+        try:
+            raw = iso_creds.read_bytes()
+        except OSError:
+            return
+        if not raw or raw == self._initial_creds_bytes:
+            return
+        try:
+            parsed = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return
+        if not isinstance(parsed, dict) or not isinstance(
+            parsed.get("claudeAiOauth"), dict
+        ):
+            return
+        target_dir = Path(self._orig_home) / ".claude"
+        if not target_dir.is_dir():
+            return
+        target = target_dir / ".credentials.json"
+        try:
+            fd, tmp_name = tempfile.mkstemp(prefix=".credentials-", dir=str(target_dir))
+            tmp_path = Path(tmp_name)
+            try:
+                os.chmod(tmp_path, 0o600)
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(raw)
+                os.replace(tmp_path, target)
+                os.chmod(target, 0o600)
+            except Exception:
+                tmp_path.unlink(missing_ok=True)
+                raise
+        except OSError:
+            return
+
     def _cleanup_isolated_home(self) -> None:
         if self._isolated_home is not None:
             path = self._isolated_home
@@ -699,10 +840,13 @@ class ClaudeAcpAdapter:
                 except subprocess.TimeoutExpired:
                     self._terminate_process_group()
             self._cleanup_process_and_threads()
+            self._persist_refreshed_oauth_credentials()
         finally:
             self._initialized = False
+            self._authenticated = False
             self._session_ids.clear()
             self._session_cost_usd = 0.0
+            self._initial_creds_bytes = None
             self._cleanup_isolated_home()
 
     # -- ACP RPC methods ------------------------------------------------------
@@ -790,9 +934,19 @@ class ClaudeAcpAdapter:
                     if isinstance(err, dict):
                         code = err.get("code", -1)
                         message = str(err.get("message", "ACP error"))
+                        data = err.get("data")
+                        if isinstance(data, dict) and data.get("kind") == "refused":
+                            raise Refused(str(data.get("code", "acp-refused")), message)
                     else:
                         code = -1
                         message = str(err)
+                        data = None
+                    if _is_acp_auth_error(code, message, data):
+                        raise Refused(
+                            "acp-auth-required",
+                            f"Claude ACP OAuth authentication failed ({message}); "
+                            "run `openfarm acp login` or `claude auth login --claudeai`.",
+                        )
                     raise Infra(f"acp-rpc-{code}", message)
                 result = msg.get("result")
                 return result if isinstance(result, dict) else {}
@@ -823,7 +977,42 @@ class ClaudeAcpAdapter:
             )
         caps = result.get("agentCapabilities")
         self.agent_capabilities = caps if isinstance(caps, dict) else {}
+        raw_auth = result.get("authMethods")
+        self.auth_methods = (
+            [m for m in raw_auth if isinstance(m, dict)]
+            if isinstance(raw_auth, list)
+            else []
+        )
+        self._authenticated = False
         self._initialized = True
+        return result
+
+    def authenticate(
+        self,
+        method_id: str,
+        params: dict | None = None,
+        timeout_s: float = 30.0,
+    ) -> dict:
+        if not self._initialized:
+            self.initialize(timeout_s=timeout_s)
+        req_id = self._next_id()
+        deadline = time.monotonic() + float(timeout_s)
+        req_params: dict = {"methodId": str(method_id)}
+        if params:
+            req_params.update(params)
+        self._send_json(
+            {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "method": "authenticate",
+                "params": req_params,
+            },
+            timeout_s=timeout_s,
+        )
+        result = self._wait_simple_response(
+            req_id, timeout_s=max(0.05, deadline - time.monotonic())
+        )
+        self._authenticated = True
         return result
 
     def new_session(
@@ -842,6 +1031,20 @@ class ClaudeAcpAdapter:
             )
         if not self._initialized:
             self.initialize(timeout_s=timeout_s)
+        if (
+            not self._authenticated
+            and self.auth_methods
+            and self.auth_mode in ("oauth", "auto")
+        ):
+            oauth_id = ""
+            for method in self.auth_methods:
+                m_type = str(method.get("type") or "").strip().lower()
+                m_id = str(method.get("id") or method.get("methodId") or "").strip()
+                if m_type == "oauth" or m_id.lower() in ("oauth", "claude-ai", "claude.ai"):
+                    oauth_id = m_id or "oauth"
+                    break
+            if oauth_id:
+                self.authenticate(oauth_id, timeout_s=min(30.0, float(timeout_s)))
 
         options: dict[str, object] = {}
         if model:
@@ -1372,6 +1575,13 @@ class ClaudeAcpAdapter:
                         else:
                             code = -1
                             message = str(err)
+                            data = None
+                        if _is_acp_auth_error(code, message, data):
+                            raise Refused(
+                                "acp-auth-required",
+                                f"Claude ACP OAuth authentication failed ({message}); "
+                                "run `openfarm acp login` or `claude auth login --claudeai`.",
+                            )
                         raise Infra(f"acp-rpc-{code}", message)
 
                     result = msg.get("result")

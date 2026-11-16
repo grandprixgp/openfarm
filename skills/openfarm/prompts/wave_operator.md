@@ -9,7 +9,8 @@ Follow this protocol whenever running Openfarm waves on a project:
 3. **Always record `openfarm verdict`** (`clean`, `minor-fix`, `bounced`, `scrapped` with `--review-tokens <n>`) so payback and review metrics remain accurate.
 4. **Recover cleanly from blocks**:
    - `dirty-baseline`: inspect failing test on `main`, fix or add exact test name to `known_failing` outside the farm, clear cache if needed, re-run `--dry-run`.
-   - `infra`: fix disk/endpoint/ACP issue, run `openfarm resume`, `openfarm release <ID> --reason "infra retry"`, and re-run.
+   - `infra`: fix disk/endpoint/ACP issue (if OAuth expired, run `openfarm acp login`), run `openfarm resume`, `openfarm release <ID> --reason "infra retry"`, and re-run.
+   - `acp-auth-required`: Frontier OAuth credentials are missing or expired — run `openfarm acp login` (or `claude auth login --claudeai`), verify with `openfarm acp probe --json`, then `openfarm release <ID> --reason "oauth refreshed"`.
    - Circuit breaker tripped (`3` consecutive blocks with same stop code): inspect `breaker.json`, run `openfarm supervise --triage-blocked`, fix card scope, then `openfarm resume --clear-breaker`.
 5. **Curate `<state_dir>/harness/` carefully**:
    - Let `HarnessLibrary` auto-promote, probe for `probe_window`, and auto-demote regressions automatically.

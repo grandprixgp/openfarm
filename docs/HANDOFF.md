@@ -1,8 +1,8 @@
-# Openfarm v0.5 Engineering Handoff
+# Openfarm v0.5.1 Engineering Handoff
 
-Concise entry point for engineers reviewing, testing, or extending Openfarm v0.5.
+Concise entry point for engineers reviewing, testing, or extending Openfarm v0.5.1.
 
-For greenfield empty-folder initialization (`"Read and install this skill <link>"` -> `"/openfarm-initialize calorie-log ..."`), see [docs/FROM-IDEA-TO-SHIPPED-APP.md](FROM-IDEA-TO-SHIPPED-APP.md). For step-by-step operator instructions, 13-table config reference, card authoring rules, and the executable `tallybox` first-deployment runbook on existing repos, see [docs/USAGE-AND-FIRST-DEPLOYMENT.md](USAGE-AND-FIRST-DEPLOYMENT.md).
+For greenfield empty-folder initialization (`"Read and install this skill <link>"` -> `/openfarm-grill-me` -> `"/openfarm-initialize calorie-log ..."`), see [docs/FROM-IDEA-TO-SHIPPED-APP.md](FROM-IDEA-TO-SHIPPED-APP.md). For step-by-step operator instructions, 13-table config reference, card authoring rules, and the executable `tallybox` first-deployment runbook on existing repos, see [docs/USAGE-AND-FIRST-DEPLOYMENT.md](USAGE-AND-FIRST-DEPLOYMENT.md).
 
 ## What Changed in v0.4
 
@@ -31,9 +31,9 @@ For greenfield empty-folder initialization (`"Read and install this skill <link>
 ## Where to Start Reading
 
 1. `openfarm_core/config.py` and `tests/test_project_config.py` — complete 13-table configuration contract (`KNOWN_TABLES`, `_TABLE_KEYS`, `HarnessConfig`).
-2. `openfarm_core/adapters/acp.py` and `openfarm_core/micromanager.py` — ACP v1 protocol security boundaries, stub checks, budget caps, and the six supervisory ops.
+2. `openfarm_core/adapters/acp.py`, `openfarm_core/adapters/claude_native_acp.py`, `openfarm_core/acp_setup.py`, and `openfarm_core/micromanager.py` — ACP v1 protocol security boundaries, native `claude -p` OAuth bridge (`binary = "auto"`, `auth = "oauth"` default for Frontier while Workers use `[model] key_file`), `openfarm acp` CLI helpers, stub checks, budget caps, and the six supervisory ops (verified by `tests/test_v051_acp_oauth_grill.py`).
 3. `openfarm_core/harness_memory.py` and `tests/test_harness_efficiency.py` — `HarnessLibrary`, `HarnessLedger`, contrast capture, anti-injection validation, probe-window rollback, and `openfarm harness` CLI.
-4. `openfarm_core/flow.py`, `openfarm_core/dossier.py`, `openfarm_core/bootstrap.py`, and `openfarm_core/cli.py` — Phase A/B/checker state machine, step checkpoints, greenfield project bootstrap (`openfarm init`) & bundled skill installer (`openfarm install-skill`, `openfarm_core/skill_assets/`, `pyproject.toml`, `SKILL.md`, `skills/`, `Git.init`), 14-subcommand CLI (`PRE_CONFIG_COMMANDS`, `supervise`, `harness`), and stop-code transitions (`openfarm_core/errors.py`), verified by `tests/test_v05_skill_bootstrap.py`.
+4. `openfarm_core/flow.py`, `openfarm_core/dossier.py`, `openfarm_core/bootstrap.py`, and `openfarm_core/cli.py` — Phase A/B/checker state machine, step checkpoints, greenfield project bootstrap (`openfarm init`) & bundled skill installer (`openfarm install-skill`, `openfarm_core/skill_assets/` incl. `openfarm-grill-me`, `pyproject.toml`, `SKILL.md`, `skills/`, `Git.init`), 15-subcommand CLI (`PRE_CONFIG_COMMANDS` for `init`, `install-skill`, `acp`, plus `supervise`, `harness`), and stop-code transitions (`openfarm_core/errors.py`), verified by `tests/test_v05_skill_bootstrap.py`.
 5. `openfarm_core/packs/rust.py` and `openfarm_core/gates/checks.py` — signature extraction, split diagnostics, `--test <stem>` counter-tests, and `revert-check`.
 6. `tests/acp_stand_in.py`, `tests/test_acp_micromanager.py`, `tests/test_core_io_v04.py`, `tests/test_pack_gates_v04.py`, and `tests/test_v04_e2e.py` — deterministic unit, I/O, gate, ACP stand-in, and end-to-end suites.
 

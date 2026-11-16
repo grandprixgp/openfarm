@@ -530,14 +530,14 @@ def _build_op_prompt(op: str, payload: dict) -> str:
 
 
 class ClaudeAcpMicromanager:
-    """ACP-backed micromanager running against ``claude-agent-acp``."""
+    """ACP-backed micromanager running against ``claude-agent-acp`` or native ``claude``."""
 
     name = "claude-acp"
     enabled = True
 
     def __init__(
         self,
-        command: str | list[str] = "claude-agent-acp",
+        command: str | list[str] = "auto",
         cwd: Path | str | None = None,
         *,
         model: str = "",
@@ -546,6 +546,7 @@ class ClaudeAcpMicromanager:
         timeout_s: float = 180.0,
         isolate_home: bool = True,
         auth_file: Path | str | None = None,
+        auth_mode: str = "oauth",
         never_touch: tuple[str, ...] | list[str] = (),
         forbidden_files: tuple[str, ...] | list[str] = (),
         cost_per_1k_in: float = 0.0,
@@ -563,6 +564,7 @@ class ClaudeAcpMicromanager:
         self.timeout_s = float(timeout_s)
         self.isolate_home = isolate_home
         self.auth_file = auth_file
+        self.auth_mode = str(auth_mode or "oauth")
         self.never_touch = list(never_touch or ())
         self.forbidden_files = list(forbidden_files or ())
         self.cost_per_1k_in = float(cost_per_1k_in)
@@ -586,6 +588,7 @@ class ClaudeAcpMicromanager:
                 cwd=self.cwd,
                 isolate_home=self.isolate_home,
                 auth_file=self.auth_file,
+                auth_mode=self.auth_mode,
                 never_touch=self.never_touch,
                 forbidden_files=self.forbidden_files,
                 allowed_root=self.cwd,
@@ -1646,7 +1649,7 @@ def open_micromanager(
         if explicit_cmd is not None:
             command = explicit_cmd
         else:
-            binary = str(_cfg_get(mm_cfg, "binary", "claude-agent-acp") or "claude-agent-acp")
+            binary = str(_cfg_get(mm_cfg, "binary", "auto") or "auto")
             raw_args = _cfg_get(mm_cfg, "args", None) or []
             command = [binary, *[str(a) for a in raw_args]] if raw_args else binary
         model = str(
@@ -1668,6 +1671,14 @@ def open_micromanager(
             mm_cfg,
             "auth_file",
             _cfg_get(cfg, "micromanager_auth_file", None),
+        )
+        auth_mode = str(
+            _cfg_get(
+                mm_cfg,
+                "auth",
+                "api-key" if auth_file is not None else "oauth",
+            )
+            or ("api-key" if auth_file is not None else "oauth")
         )
         cost_in = float(
             _cfg_get(
@@ -1693,6 +1704,7 @@ def open_micromanager(
             timeout_s=timeout_s,
             isolate_home=isolate_home,
             auth_file=auth_file,
+            auth_mode=auth_mode,
             never_touch=never_touch,
             forbidden_files=forbidden_files,
             cost_per_1k_in=cost_in,

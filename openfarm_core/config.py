@@ -53,7 +53,7 @@ _TABLE_KEYS = {
                      "tool_policy", "timeout_s", "timeout",
                      "max_calls_per_card", "tokens_per_card",
                      "spend_per_night", "cost_per_1k_in", "cost_per_1k_out",
-                     "auth_file", "isolate_home", "shape_cards",
+                     "auth", "auth_file", "isolate_home", "shape_cards",
                      "scaffold_contracts", "coach_on_stall",
                      "adjudicate_counter_tests", "pre_review"},
     "state": {"min_free_mb"},
@@ -200,8 +200,9 @@ class MicromanagerConfig:
         "mode", "binary", "args", "model", "effort", "tool_policy",
         "timeout_s", "max_calls_per_card", "tokens_per_card",
         "spend_per_night", "cost_per_1k_in", "cost_per_1k_out",
-        "auth_file", "isolate_home", "shape_cards", "scaffold_contracts",
-        "coach_on_stall", "adjudicate_counter_tests", "pre_review",
+        "auth", "auth_file", "isolate_home", "shape_cards",
+        "scaffold_contracts", "coach_on_stall",
+        "adjudicate_counter_tests", "pre_review",
     )
 
     def __init__(self, **kwargs) -> None:
@@ -576,10 +577,23 @@ class Config:
             self._outside_repo(auth_file, "[micromanager] auth_file")
             if auth_file else None
         )
+        raw_auth_mode = mm.get("auth")
+        if raw_auth_mode is None:
+            auth_mode = "api-key" if resolved_auth is not None else "oauth"
+        else:
+            auth_mode = _as_choice(
+                raw_auth_mode, "[micromanager] auth",
+                "oauth", ("oauth", "api-key", "auto"))
+        if auth_mode == "oauth" and resolved_auth is not None:
+            raise ConfigError(
+                "[micromanager] auth = 'oauth' cannot be combined with auth_file")
+        raw_binary = mm.get("binary", "auto")
+        if not isinstance(raw_binary, str) or not raw_binary.strip():
+            raise ConfigError("[micromanager] binary: expected a non-empty string")
         return MicromanagerConfig(
             mode=_as_choice(mm.get("mode"), "[micromanager] mode",
                             "active", ("off", "advisory", "active")),
-            binary=str(mm.get("binary", "claude-agent-acp")),
+            binary=raw_binary.strip(),
             args=_as_str_list(mm.get("args", []), "[micromanager] args"),
             model=str(mm.get("model", "")),
             effort=_as_choice(mm.get("effort"), "[micromanager] effort",
@@ -598,6 +612,7 @@ class Config:
                 mm.get("cost_per_1k_in"), "[micromanager] cost_per_1k_in", 0.0),
             cost_per_1k_out=_nonneg_float(
                 mm.get("cost_per_1k_out"), "[micromanager] cost_per_1k_out", 0.0),
+            auth=auth_mode,
             auth_file=resolved_auth,
             isolate_home=_as_bool(mm.get("isolate_home"),
                                   "[micromanager] isolate_home", True),

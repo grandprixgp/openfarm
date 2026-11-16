@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.5.0-16a34a?style=flat-square" alt="version 0.5.0">
+  <img src="https://img.shields.io/badge/version-0.5.1-16a34a?style=flat-square" alt="version 0.5.1">
   <img src="https://img.shields.io/badge/status-pre--release-d97706?style=flat-square" alt="status: pre-release">
   <img src="https://img.shields.io/badge/python-3.11%2B-7c3aed?style=flat-square" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/runtime%20deps-stdlib%20only-0284c7?style=flat-square" alt="runtime dependencies: standard library only">
@@ -24,15 +24,15 @@
   <a href="#commands"><b>Commands</b></a> &nbsp;&bull;&nbsp;
   <a href="#whats-verified"><b>What's verified</b></a> &nbsp;&bull;&nbsp;
   <a href="#roadmap"><b>Roadmap</b></a> &nbsp;&bull;&nbsp;
-  <a href="openfarm%20spec%20v0.5.md"><b>Full spec</b></a>
+  <a href="docs/openfarm-internals.md"><b>Internals &amp; spec</b></a>
 </p>
 
 <p align="center">
-  <img src="docs/assets/openfarm-stats.svg" alt="389 tests passing in the full offline end-to-end suite, 14 CLI subcommands, 6 adapter interfaces, 0 runtime dependencies" width="100%">
+  <img src="docs/assets/openfarm-stats.svg" alt="400 tests passing in the full offline end-to-end suite, 15 CLI subcommands, 6 adapter interfaces, 0 runtime dependencies" width="100%">
 </p>
 
 > [!IMPORTANT]
-> **Pre-release (v0.5.0).** The core is built and covered by a deterministic, offline test suite, but it has not yet been run end to end against live model endpoints. **Validation and efficacy results are still to come.** Nothing here is a benchmark or a measured cost saving; see [Not yet tested](#not-yet-tested) for exactly what is still open.
+> **Pre-release (v0.5.1).** The core is built and covered by a deterministic, offline test suite, but it has not yet been run end to end against live model endpoints. **Validation and efficacy results are still to come.** Nothing here is a benchmark or a measured cost saving; see [Not yet tested](#not-yet-tested) for exactly what is still open.
 
 ---
 
@@ -87,9 +87,16 @@ cd openfarm
 python3 -m openfarm_core.cli install-skill --target all --install-bin ~/.local/bin --json
 ```
 
-This deploys the `/openfarm-initialize` and `openfarm` skills, the slash command and the Antigravity plugin, plus an optional `openfarm` launcher on your `PATH`.
+This deploys the `/openfarm-grill-me`, `/openfarm-initialize` and `openfarm` skills, slash commands and the Antigravity plugin, plus an optional `openfarm` launcher on your `PATH`.
 
-### 2. Initialize
+Sign in once with your Claude OAuth subscription for the Frontier supervisor (optional if you already run Claude Code logged in, or pass `--profile solo` to disable ACP supervision):
+
+```bash
+openfarm acp status --json
+openfarm acp login          # native Claude OAuth login (--claudeai default)
+```
+
+### 2. Grill (Optional) & Initialize
 
 In an empty folder, ask your agent:
 
@@ -97,9 +104,12 @@ In an empty folder, ask your agent:
 /openfarm-initialize calorie-log An app to track my calories
 ```
 
+By default `/openfarm-initialize` starts with `/openfarm-grill-me` (one frontier question at a time, with a recommended answer) to lock down invariants, golden slice boundaries, and Frontier OAuth + Worker API setup before touching code (pass `--no-grill` or run `/openfarm-grill-me` separately beforehand).
+
 | Stage | Lane | What happens |
 | --- | --- | --- |
-| **Scaffold** | Code | `openfarm init` writes a validated `.openfarm/config.toml`, a protected `src/invariants.rs`, starter Rust files and baseline tests, `.openfarm/PROJECT_SPEC.md` and `AGENTS.md`, creates the git repo, and puts state outside the repo with `0700` permissions |
+| **Grill** | You + Frontier | One-question-at-a-time decision tree settles invariants, public crate surface, dependencies, and exact `Done` boundaries into `.openfarm/GRILL_DECISIONS.md` |
+| **Scaffold** | Code | `openfarm init` writes a validated `.openfarm/config.toml` (Frontier Claude ACP OAuth default + Workers ZDR API key), protected `src/invariants.rs`, starter Rust files, `Cargo.lock` and git, putting state outside the repo with `0700` permissions |
 | **Architect** | Frontier | Expands the invariants, exports clean `pub` types and builds one complete, green golden slice that passes `cargo test`, `clippy -D warnings` and `rustfmt --check` |
 | **Decompose** | Frontier | Writes dependency-ordered Wave 1 to 3 cards under `cards/`, commits them on `main`, and checks every one with `openfarm check` and `openfarm run --dry-run` |
 | **Run** | Farm | `openfarm supervise --prepare-queue --apply` then `openfarm run --cards N` work the queue out of frontier context |
@@ -108,7 +118,7 @@ In an empty folder, ask your agent:
 The full walkthrough of this example is in [`docs/FROM-IDEA-TO-SHIPPED-APP.md`](docs/FROM-IDEA-TO-SHIPPED-APP.md).
 
 > [!NOTE]
-> **Requirements:** Python 3.11+ and git. The built-in Rust pack also needs `cargo`, `clippy` and `rustfmt`, and mutation testing needs `cargo-mutants`. The farm needs an OpenAI-compatible endpoint that you have confirmed keeps no data and does not train on it; openfarm enforces the endpoint through an allowlist.
+> **Requirements:** Python 3.11+ and git. The built-in Rust pack also needs `cargo`, `clippy` and `rustfmt`, and mutation testing needs `cargo-mutants`. Frontier supervision plugs in by default via **native Claude ACP over OAuth** (`openfarm acp status` / `openfarm acp login`, supporting `claude` CLI directly or external `claude-agent-acp`), while **coding Workers still authenticate via API key** against a zero-retention OpenAI-compatible endpoint enforced by `allowed_endpoints`.
 
 ## How it works
 
@@ -122,7 +132,7 @@ The full walkthrough of this example is in [`docs/FROM-IDEA-TO-SHIPPED-APP.md`](
 | **Orchestrator** | Plain Python | Claims cards, builds every brief, applies edits, runs every gate, enforces budgets, writes dossiers and telemetry | Merge, rebase or push (the core has no code path that runs `git push`) |
 | **Farm** | Non-frontier models in four stateless roles | Splits a card into steps, writes the named tests, writes the code, tries to break it with counter-tests | Run commands, touch files outside the card, see never-touch files, report a gate result |
 
-The optional **micromanager** is a bounded frontier supervisor (for example Claude over the Agent Client Protocol) that can shape cards, scaffold contracts, coach a stalled card, adjudicate counter-tests and pre-review. It is off by default, runs on its own separate budget, gets no write or terminal capability, and never certifies a gate.
+The **micromanager** is the built-in Frontier supervisor (defaulting in `openfarm init` to native Claude ACP via OAuth with `binary = "auto"`, `mode = "active"`; opt out with `--profile solo` or `mode = "off"`). It can shape cards, scaffold contracts, coach a stalled card, adjudicate counter-tests and pre-review under its own separate budget, gets no write or terminal capability, and never certifies a gate. Coding Workers remain configured separately via `[model] key_file`.
 
 ### Every card, every time
 
@@ -189,12 +199,13 @@ Every adapter also accepts `cmd:<argv>`. Card state lives on its own `openfarm-c
 
 ## Commands
 
-One `openfarm` command with 14 subcommands, shared exit codes (`0` done, `1` refused or ineligible, `2` usage or config error, `3` trouble or infra) and `--json` output.
+One `openfarm` command with 15 subcommands, shared exit codes (`0` done, `1` refused or ineligible, `2` usage or config error, `3` trouble or infra) and `--json` output.
 
 | Command | Purpose |
 | --- | --- |
-| `openfarm init NAME` | Scaffold a new repo with a validated config, protected invariants file, starter Rust files and git. Works before any config exists |
-| `openfarm install-skill` | Deploy the bundled skills, slash command, Antigravity plugin and optional launcher. Works without a target repo |
+| `openfarm init NAME` | Scaffold a new repo with validated config (Frontier Claude ACP OAuth default + Worker API key), protected invariants, Rust starter files, `Cargo.lock` and git |
+| `openfarm install-skill` | Deploy the bundled skills (`/openfarm-grill-me`, `/openfarm-initialize`, `openfarm`), slash commands, Antigravity plugin and optional launcher |
+| `openfarm acp [ACTION]` | Check Frontier OAuth & ACP transport readiness (`status`), run interactive `claude auth login` (`login`), update `.openfarm/config.toml` (`configure`), or run a zero-token ACP handshake (`probe`) |
 | `openfarm run` | Work Ready cards, bounded by `--cards`, `--spend`, `--for` or `--until`; `--dry-run` checks without model calls |
 | `openfarm status` | Show farm, card and harness-memory status |
 | `openfarm pause` / `resume` / `stop` | Operator controls, including clearing the circuit breaker or kill switch |
@@ -221,29 +232,29 @@ Each repository carries `.openfarm/config.toml` on its base branch, and `openfar
 
 **Three hooks** keep a repository's quirks out of the core: `[[gates.extra]]` for named commands that must pass, `[runner.env]` for per-unit environment variables, and `[brief] test_conventions` for a test-writing guide.
 
-Every key, gate, stop code and record format is documented in the [full spec](openfarm%20spec%20v0.5.md).
+Every key, gate, stop code and record format is documented in [`docs/openfarm-internals.md`](docs/openfarm-internals.md) (and the owner's local spec `openfarm spec v0.5.1.md` when present).
 
 </details>
 
 ## What's verified
 
-All checks below are deterministic and offline, run at commit `bb96142` (see [`tests/test_v05_skill_bootstrap.py`](tests/test_v05_skill_bootstrap.py) and the rest of [`tests/`](tests/)).
+All checks below are deterministic and offline (see [`tests/test_v05_skill_bootstrap.py`](tests/test_v05_skill_bootstrap.py), [`tests/test_v051_acp_oauth_grill.py`](tests/test_v051_acp_oauth_grill.py) and the rest of [`tests/`](tests/)).
 
 | Suite | Result |
 | --- | --- |
-| Fast suite | **389 tests ran**, 57 opt-in end-to-end tests skipped, **0 failures** |
-| Full suite (`OPENFARM_E2E=1`, real `git` and `cargo`) | **389 tests passed**, 0 skipped, **0 failures** |
+| Fast suite | **400 tests ran**, 57 opt-in end-to-end tests skipped, **0 failures** |
+| Full suite (`OPENFARM_E2E=1`, real `git` and `cargo`) | **400 tests passed**, 0 skipped, **0 failures** |
 
 The full suite includes:
 
-- an offline wheel build, with all 9 bundled skill asset files present and byte-identical to the repo's `skills/`;
-- `install-skill` and its launcher shim executing;
-- `openfarm init` containment and permissions;
+- an offline wheel build, with all 12 bundled skill asset files present and all 8 `skills/` files byte-identical;
+- `install-skill` (deploying `openfarm-grill-me`, `openfarm-initialize`, `openfarm`, slash commands and plugin) and its launcher shim executing;
+- `openfarm init` defaults (`profile = active`, `micromanager = claude-acp`, `auth = oauth`, `binary = auto`), `Cargo.lock`, containment and permissions;
+- native `claude -p` ACP bridge (`claude_native_acp.py`) over stdio pipes with a mock `claude` CLI, OAuth env/credential isolation & refresh sync-back, `[micromanager] auth` validation, and `openfarm acp status|login|configure|probe`;
 - the scaffolded project passing `cargo test --locked`, `cargo clippy --locked --all-targets -- -D warnings` and `rustfmt --edition 2021 --check`;
-- a card that touches a never-touch path being rejected;
-- a scripted card running all the way to `in-review`.
+- a card that touches a never-touch path being rejected, and a scripted card running all the way to `in-review`.
 
-Model calls in these tests use a scripted backend and local HTTP test servers, and the micromanager uses a deterministic stand-in over real stdio pipes.
+Model calls in these tests use a scripted backend and local HTTP test servers, and the micromanager tests use deterministic stand-ins/mocks over real stdio pipes (alongside a local zero-token `openfarm acp status` and `openfarm acp probe` check against the installed `claude` CLI).
 
 ## Not yet tested
 
@@ -251,7 +262,7 @@ Model calls in these tests use a scripted backend and local HTTP test servers, a
 > These have **not** been run yet:
 >
 > - Live remote GitHub URL installs via `uv`, `pipx` or `pip`.
-> - Live `claude-agent-acp` execution with real Anthropic credentials.
+> - Live paid Anthropic prompt turns through `claude-agent-acp` or `claude_native_acp.py` (only zero-token `openfarm acp status` + `initialize` handshake `probe` were run against the local `claude` binary).
 > - Live hosted zero-retention OpenAI-compatible model endpoints.
 > - Live `cargo-mutants` runs (the parser and gate logic are tested with synthetic output).
 > - Live unattended multi-wave LLM execution of a generated app (for example all `calorie-log` cards) end to end.

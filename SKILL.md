@@ -1,12 +1,13 @@
 ---
 name: openfarm-installer
 description: >-
-  Install the Openfarm v0.5 CLI package and /openfarm-initialize frontier
-  architect skills into Claude Code, Antigravity, or workspace customization
-  directories from a single repository or package target.
+  Install the Openfarm v0.5.1 CLI package, native Claude ACP OAuth bridge,
+  /openfarm-grill-me design interview, and /openfarm-initialize skills into
+  Claude Code, Antigravity, or workspace customization directories from a single
+  repository or package target.
 ---
 
-# Openfarm Installer Skill (`v0.5.0`)
+# Openfarm Installer Skill (`v0.5.1`)
 
 Follow these steps when the user asks you to read and install this skill (`"Read and install this skill <github_or_local_link>"`):
 
@@ -56,18 +57,26 @@ Confirm both the CLI binary and installed customization files exist:
 openfarm --help
 ```
 
-Check that the output lists `init` and `install-skill` alongside `run`, `status`, `pause`, `resume`, `stop`, `release`, `dossier`, `check`, `verdict`, `escape`, `supervise`, and `harness`, and confirm the installed skill files exist in at least one active discovery root:
-- `~/.claude/skills/openfarm-initialize/SKILL.md` and `~/.claude/commands/openfarm-initialize.md`
-- `~/.gemini/config/skills/openfarm-initialize/SKILL.md` and `~/.gemini/config/plugins/openfarm/plugin.json`
-- `~/.agents/skills/openfarm-initialize/SKILL.md`
+Check that the output lists `init`, `install-skill`, and `acp` alongside `run`, `status`, `pause`, `resume`, `stop`, `release`, `dossier`, `check`, `verdict`, `escape`, `supervise`, and `harness`, and confirm the installed skill files exist in at least one active discovery root:
+- `~/.claude/skills/openfarm-initialize/SKILL.md`, `~/.claude/skills/openfarm-grill-me/SKILL.md`, `~/.claude/commands/openfarm-initialize.md`, and `~/.claude/commands/openfarm-grill-me.md`
+- `~/.gemini/config/skills/openfarm-initialize/SKILL.md`, `~/.gemini/config/skills/openfarm-grill-me/SKILL.md`, and `~/.gemini/config/plugins/openfarm/plugin.json`
+- `~/.agents/skills/openfarm-initialize/SKILL.md` and `~/.agents/skills/openfarm-grill-me/SKILL.md`
+
+Check Frontier Claude OAuth readiness (optional interactive login once if not signed in):
+```bash
+openfarm acp status --json
+# If oauth_ready is false and you want Frontier ACP supervision via OAuth:
+# openfarm acp login
+```
 
 ## Step 3 — Confirm Readiness to the Owner
 
 Report:
 1. Where `openfarm` was installed (`which openfarm` or `~/.local/bin/openfarm`).
-2. Which customization roots received `openfarm-initialize` and `openfarm`.
-3. Tell the human owner they can now start any project from an empty directory with:
+2. Which customization roots received `openfarm-grill-me`, `openfarm-initialize`, and `openfarm`.
+3. Whether Frontier Claude ACP OAuth is ready (`openfarm acp status --json`) — noting Workers still authenticate via external API `key_file`.
+4. Tell the human owner they can now grill/initialize any project from an empty directory with:
    ```text
    /openfarm-initialize <project_name> <project_idea>
    ```
-   (for example: `/openfarm-initialize calorie-log An app to track my calories`).
+   or stress-test decisions first with `/openfarm-grill-me <project_idea>` (for example: `/openfarm-initialize calorie-log An app to track my calories`).

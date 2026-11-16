@@ -1,6 +1,6 @@
-# Openfarm v0.5 Cheat Sheet
+# Openfarm v0.5.1 Cheat Sheet
 
-## 14 CLI Subcommands (`--repo`, `--config`, `--json`)
+## 15 CLI Subcommands (`--repo`, `--config`, `--json`)
 
 Exit codes: `0` ok/eligible | `1` refused/ineligible | `2` usage/config | `3` infra/trouble
 
@@ -8,6 +8,7 @@ Exit codes: `0` ok/eligible | `1` refused/ineligible | `2` usage/config | `3` in
 | --- | --- |
 | `init` | `openfarm init <NAME> [--dir PATH] [--idea TEXT] [--profile auto\|solo\|advisory\|active] [--mutation auto\|off\|report\|required] [--endpoint URL] [--model NAME] [--commit]` |
 | `install-skill` | `openfarm install-skill [--target all\|claude\|antigravity\|agents\|workspace] [--dest PATH] [--install-bin PATH] [--dry-run]` |
+| `acp` | `openfarm acp [status\|login\|configure\|probe] [--mode active\|advisory\|off] [--auth oauth\|api-key\|auto] [--binary auto\|claude\|claude-agent-acp] [--model M] [--effort low\|medium\|high] [--tool-policy none\|read-only] [--claudeai\|--console] [--setup-token]` |
 | `check` | `openfarm check <CARD> [--baseline]` |
 | `supervise` | `openfarm supervise (--triage-blocked \| --prepare-queue) [--card ID] [--apply] [--mm-script PATH]` |
 | `run` | `openfarm run [--cards N] [--spend AMT] [--for DUR \| --until UTC] [--card ID] [--dry-run] [--script PATH] [--mm-script PATH] [--run-id ID]` |

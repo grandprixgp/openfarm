@@ -1,13 +1,15 @@
 ---
 name: openfarm
 description: >-
-  Operate an initialized Openfarm v0.5 project across card waves: prepare
-  queues with openfarm supervise, execute lesser-model + ACP runs via openfarm
-  run without bloating frontier context, inspect dossiers, record verdicts,
-  merge local branches, and curate <state_dir>/harness/ recursive memory.
+  Operate an initialized Openfarm v0.5.1 project across card waves: manage
+  Frontier Claude ACP OAuth setup (openfarm acp), clarify new feature waves
+  with openfarm-grill-me, prepare queues with openfarm supervise, execute
+  lesser-model + ACP runs via openfarm run without bloating frontier context,
+  inspect dossiers, record verdicts, merge local branches, and curate
+  <state_dir>/harness/ recursive memory.
 ---
 
-# Openfarm Wave Operations Skill (`v0.5.0`)
+# Openfarm Wave Operations Skill (`v0.5.1`)
 
 Use this skill after `/openfarm-initialize` has set up `.openfarm/config.toml`, committed the baseline on `main`, and verified `cards/` via `openfarm check`.
 
@@ -15,11 +17,13 @@ See [prompts/wave_operator.md](./prompts/wave_operator.md) for the full operator
 
 ## Core Execution Loop (Per Wave)
 
-1. **Pre-flight & Queue Prep**:
+1. **Frontier OAuth Check & Queue Prep**:
    ```bash
+   openfarm acp status --json
    openfarm status --json
    openfarm supervise --prepare-queue --apply --json
    ```
+   (Use `/openfarm-grill-me` before decomposing a new feature wave, and `openfarm acp login` or `openfarm acp configure` if Frontier Claude OAuth needs sign-in or mode tuning. Workers continue using the API key in `[model] key_file`.)
 2. **Execute Bounded Wave (Out of Frontier Context)**:
    ```bash
    openfarm run --cards 3 --spend 10.00 --json

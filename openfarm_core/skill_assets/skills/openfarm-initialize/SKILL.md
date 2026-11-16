@@ -3,32 +3,41 @@ name: openfarm-initialize
 description: >-
   Initialize a new software project from an empty directory and a plain-English
   idea (invoked via /openfarm-initialize <project_name> <project_idea> or when
-  starting a fresh app with Openfarm v0.5). Scaffolds validated config, seam
-  invariants, a golden reference slice, and verified dependency-ordered cards
-  for lesser coding models and Claude ACP micromanagement.
+  starting a fresh app with Openfarm v0.5.1). Integrates /openfarm-grill-me
+  alignment, configures native Claude ACP via OAuth for Frontier + API key for
+  Workers, scaffolds protected seams, a golden slice, and checked Wave cards.
 ---
 
 # Openfarm Project Initialization (`/openfarm-initialize`)
 
-Use this workflow to turn a plain-English project idea inside an empty directory into a validated, gate-enforced Openfarm repository ready for autonomous wave execution by lesser coding models, ACP micromanagement, and Recursive Harness Memory.
+Use this workflow to turn a plain-English project idea inside an empty directory into a validated, gate-enforced Openfarm repository ready for autonomous wave execution by lesser coding models (API key), native Claude ACP Frontier supervision (OAuth default), and Recursive Harness Memory.
 
-> **Token-Efficiency Principle**: Spend ~3–8k frontier tokens **once** on architecture, protected seam invariants, public API types, and a verified golden reference slice + pre-checked card queue. Do **not** burn frontier tokens implementing routine cards or iterating compiler errors—Openfarm runs lesser models, ACP coaching, and `HarnessLibrary` outside your context window.
+> **Token-Efficiency Principle**: Spend ~3–8k frontier tokens **once** on design alignment, protected seam invariants, public API types, and a verified golden reference slice + pre-checked card queue. Do **not** burn frontier tokens implementing routine cards or iterating compiler errors—Openfarm runs lesser models, ACP coaching, and `HarnessLibrary` outside your context window.
 
 ## Workflow Steps
 
-### 1. Parse Arguments & Check Environment
+### 0. Phase 0 — Design Alignment (`/openfarm-grill-me`, Recommended)
+
+Unless the user passed `--no-grill`, explicitly requested zero questions, or an agreed `.openfarm/GRILL_DECISIONS.md` already exists, invoke the `openfarm-grill-me` protocol first:
+- Interview **one frontier question at a time** (recommended answer included, `"yes"` accepts) to lock down `src/invariants.rs` rules, golden slice, v1 non-goals, Frontier Claude ACP OAuth setup, and concrete `## Done` assertions.
+- Confirm shared understanding with the owner before modifying files.
+
+### 1. Parse Arguments & Check Environment + Frontier OAuth
 
 Extract `<project_name>` (normalized to ASCII slug, e.g. `calorie-log`) and `<project_idea>` (e.g. `"An app to track my calories"`).
 
-Check toolchain and endpoint readiness once:
+Check toolchain, Worker key availability, and Frontier Claude OAuth readiness once:
 ```bash
 rustc --version && cargo --version && cargo clippy --version && rustfmt --version
-command -v claude-agent-acp || echo "no claude-agent-acp (will default to solo profile unless configured)"
+openfarm acp status --json
 command -v cargo-mutants || echo "no cargo-mutants (will default mutation=off)"
 ls -la ~/.config/openfarm/ 2>/dev/null || true
 ```
 
-Ask the human owner **at most once** if a ZDR OpenAI-compatible endpoint URL / API key file for lesser models is not yet configured—unless they want an offline dry-run or scripted setup (`--script`), in which case proceed immediately using default placeholder endpoints.
+- **Frontier Model (Claude ACP via OAuth, default):** Look at `oauth_ready` and `resolved_transport` in `openfarm acp status --json`:
+  - If `resolved_transport` is `"claude-agent-acp"` or `"claude-native-acp"` and `oauth_ready: true`, Frontier ACP supervision is ready with zero extra API keys.
+  - If `oauth_ready: false`, guide the owner once to sign in via `openfarm acp login` (or `claude auth login --claudeai`), or pass `--profile solo` if intentionally disabling Frontier ACP supervision.
+- **Worker Models (ZDR OpenAI-compatible API key):** Ask **at most once** if a ZDR endpoint URL / Worker API key file is not yet configured (or proceed immediately with placeholder settings if the user wants an offline dry-run or scripted run).
 
 ### 2. Run Deterministic Bootstrap (`openfarm init`)
 
@@ -41,9 +50,14 @@ openfarm init <project_name> \
   --json
 ```
 
-Add `--endpoint <URL> --model <MODEL_NAME>` if known, or `--profile solo|advisory|active` if overriding auto-detection. Confirm the JSON response reports `"config_valid": true`.
+By default `openfarm init` configures `[adapters] micromanager = "claude-acp"`, `[micromanager] mode = "active"`, `auth = "oauth"`, `binary = "auto"`, while configuring Workers under `[model]`. Add `--endpoint <URL> --model <MODEL_NAME>` if known, or pass `--profile advisory|solo` / adjust later via `openfarm acp configure`. Confirm the JSON response reports `"config_valid": true`.
 
-Remind the user (if `"key_file_present": false`) to place their ZDR API key outside the repository at the printed `key_file` path with `chmod 600`.
+Verify zero-token ACP handshake works in the initialized repo when supervision is enabled:
+```bash
+openfarm acp probe --json
+```
+
+Remind the user (if `"key_file_present": false`) to place their Worker ZDR API key outside the repository at the printed `key_file` path with `chmod 600`.
 
 ### 3. Frontier Architect Pass (Seam + Thin Skeleton + Golden Reference Slice)
 

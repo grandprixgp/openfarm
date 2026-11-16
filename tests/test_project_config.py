@@ -43,7 +43,7 @@ SPEC_KEYS = {
                      "tool_policy", "timeout_s", "timeout",
                      "max_calls_per_card", "tokens_per_card",
                      "spend_per_night", "cost_per_1k_in", "cost_per_1k_out",
-                     "auth_file", "isolate_home", "shape_cards",
+                     "auth", "auth_file", "isolate_home", "shape_cards",
                      "scaffold_contracts", "coach_on_stall",
                      "adjudicate_counter_tests", "pre_review"},
     "state": {"min_free_mb"},

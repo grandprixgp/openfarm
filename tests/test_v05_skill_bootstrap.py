@@ -33,9 +33,12 @@ ENABLED = os.environ.get("OPENFARM_E2E") == "1"
 OPENFARM = ROOT / "openfarm"
 
 EXPECTED_SKILL_ASSETS = frozenset({
+    "commands/openfarm-grill-me.md",
     "commands/openfarm-initialize.md",
     "plugin/plugin.json",
     "plugin/rules/AGENTS.md",
+    "skills/openfarm-grill-me/SKILL.md",
+    "skills/openfarm-grill-me/prompts/grill_protocol.md",
     "skills/openfarm-initialize/SKILL.md",
     "skills/openfarm-initialize/prompts/architect_system.md",
     "skills/openfarm-initialize/prompts/card_decomposer.md",
@@ -495,10 +498,10 @@ class PackagingAndWheelTests(unittest.TestCase):
         data = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
         project = data["project"]
         self.assertEqual(project["name"], "openfarm")
-        self.assertEqual(project["version"], "0.5.0")
+        self.assertEqual(project["version"], "0.5.1")
         self.assertEqual(project["dependencies"], [])
         self.assertEqual(project["scripts"]["openfarm"], "openfarm_core.cli:main")
-        self.assertEqual(openfarm_core.__version__, "0.5.0")
+        self.assertEqual(openfarm_core.__version__, "0.5.1")
 
     def test_offline_wheel_contains_all_skill_assets(self) -> None:
         try:
@@ -557,7 +560,7 @@ class SkillBundleParityTests(unittest.TestCase):
             if p.is_file()
         }
         self.assertEqual(pkg_rels, repo_rels)
-        self.assertEqual(len(pkg_rels), 6)
+        self.assertEqual(len(pkg_rels), 8)
         for rel in sorted(pkg_rels):
             self.assertEqual(
                 (repo_skills / rel).read_bytes(),
@@ -571,17 +574,18 @@ class SkillBundleParityTests(unittest.TestCase):
         self.assertEqual(root_fm.get("name"), "openfarm-installer")
         self.assertTrue(root_fm.get("description"))
 
-        for skill_name in ("openfarm-initialize", "openfarm"):
+        for skill_name in ("openfarm-grill-me", "openfarm-initialize", "openfarm"):
             fm = _parse_frontmatter(
                 (assets_root / "skills" / skill_name / "SKILL.md").read_text(encoding="utf-8")
             )
             self.assertEqual(fm.get("name"), skill_name)
             self.assertTrue(fm.get("description"))
 
-        cmd_text = (assets_root / "commands" / "openfarm-initialize.md").read_text(
-            encoding="utf-8"
-        )
-        self.assertIn("$ARGUMENTS", cmd_text)
+        for cmd_name in ("openfarm-initialize.md", "openfarm-grill-me.md"):
+            cmd_text = (assets_root / "commands" / cmd_name).read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("$ARGUMENTS", cmd_text)
 
         plugin = json.loads(
             (assets_root / "plugin" / "plugin.json").read_text(encoding="utf-8")
@@ -634,12 +638,16 @@ class InstallSkillTests(unittest.TestCase):
         self.assertFalse(real_data["dry_run"])
 
         expected_paths = (
+            fake_home / ".claude" / "skills" / "openfarm-grill-me" / "SKILL.md",
             fake_home / ".claude" / "skills" / "openfarm-initialize" / "SKILL.md",
             fake_home / ".claude" / "skills" / "openfarm" / "SKILL.md",
+            fake_home / ".claude" / "commands" / "openfarm-grill-me.md",
             fake_home / ".claude" / "commands" / "openfarm-initialize.md",
+            fake_home / ".gemini" / "config" / "skills" / "openfarm-grill-me" / "SKILL.md",
             fake_home / ".gemini" / "config" / "skills" / "openfarm-initialize" / "SKILL.md",
             fake_home / ".gemini" / "config" / "plugins" / "openfarm" / "plugin.json",
             fake_home / ".gemini" / "config" / "plugins" / "openfarm" / "rules" / "AGENTS.md",
+            fake_home / ".agents" / "skills" / "openfarm-grill-me" / "SKILL.md",
             fake_home / ".agents" / "skills" / "openfarm-initialize" / "SKILL.md",
         )
         for path in expected_paths:
@@ -652,6 +660,7 @@ class InstallSkillTests(unittest.TestCase):
         self.assertEqual(help_res.returncode, 0, help_res.stderr)
         self.assertIn("install-skill", help_res.stdout)
         self.assertIn("init", help_res.stdout)
+        self.assertIn("acp", help_res.stdout)
 
     def test_install_skill_workspace_and_invalid_target(self) -> None:
         tmp = Path(tempfile.mkdtemp(prefix="of-ws-"))
@@ -664,7 +673,13 @@ class InstallSkillTests(unittest.TestCase):
         )
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertTrue(
+            (ws / ".agents" / "skills" / "openfarm-grill-me" / "SKILL.md").is_file()
+        )
+        self.assertTrue(
             (ws / ".agents" / "skills" / "openfarm-initialize" / "SKILL.md").is_file()
+        )
+        self.assertTrue(
+            (ws / ".claude" / "commands" / "openfarm-grill-me.md").is_file()
         )
         self.assertTrue(
             (ws / ".claude" / "commands" / "openfarm-initialize.md").is_file()
@@ -693,8 +708,6 @@ class InitBootstrapTests(unittest.TestCase):
             str(state),
             "--secrets-dir",
             str(secrets),
-            "--profile",
-            "solo",
             "--mutation",
             "off",
             "--idea",
@@ -709,7 +722,11 @@ class InitBootstrapTests(unittest.TestCase):
         self.assertEqual(data["project"], "calorie-log")
         self.assertEqual(data["crate_name"], "calorie_log")
         self.assertEqual(data["base_branch"], "main")
-        self.assertEqual(data["micromanager_mode"], "off")
+        self.assertEqual(data["profile"], "active")
+        self.assertEqual(data["micromanager_adapter"], "claude-acp")
+        self.assertEqual(data["micromanager_mode"], "active")
+        self.assertEqual(data["micromanager_auth"], "oauth")
+        self.assertEqual(data["micromanager_binary"], "auto")
 
         for rel in (
             "Cargo.toml",

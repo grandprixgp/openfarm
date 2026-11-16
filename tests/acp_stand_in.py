@@ -36,6 +36,8 @@ def _read_msg() -> dict | None:
 def _env_leaks() -> list[str]:
     leaks: list[str] = []
     for key in os.environ:
+        if key == "CLAUDE_CODE_OAUTH_TOKEN":
+            continue
         if key in _FORBIDDEN_ENV_EXACT or key.startswith("CLAUDE_CODE_"):
             leaks.append(key)
     return sorted(leaks)
@@ -147,6 +149,8 @@ def main() -> int:
     parser.add_argument("--cost", type=float, default=0.0125)
     parser.add_argument("--hang-seconds", type=float, default=10.0)
     parser.add_argument("--ack-cancel", action="store_true")
+    parser.add_argument("--auth-methods", default="")
+    parser.add_argument("--fail-unauthenticated", action="store_true")
     args = parser.parse_args()
 
     script_data: dict = {}
@@ -154,6 +158,7 @@ def main() -> int:
         script_data = json.loads(Path(args.script).read_text(encoding="utf-8"))
 
     replay_rejection_code = None
+    authenticated = False
     last_session_meta: dict = {}
     turn_count = 0
     session_used_tokens = 0
@@ -182,16 +187,36 @@ def main() -> int:
                     }
                 )
                 return 2
+            init_res: dict = {
+                "protocolVersion": 1,
+                "agentCapabilities": {
+                    "loadSession": True,
+                    "home": os.environ.get("HOME", ""),
+                    "authenticated": authenticated,
+                },
+            }
+            if args.auth_methods:
+                init_res["authMethods"] = [
+                    {
+                        "id": m.strip(),
+                        "name": m.strip(),
+                        "type": "oauth" if "oauth" in m else "api_key",
+                    }
+                    for m in args.auth_methods.split(",")
+                    if m.strip()
+                ]
+            _send({"jsonrpc": "2.0", "id": req_id, "result": init_res})
+            continue
+
+        if method == "authenticate":
+            authenticated = True
             _send(
                 {
                     "jsonrpc": "2.0",
                     "id": req_id,
                     "result": {
-                        "protocolVersion": 1,
-                        "agentCapabilities": {
-                            "loadSession": True,
-                            "home": os.environ.get("HOME", ""),
-                        },
+                        "authenticated": True,
+                        "methodId": params.get("methodId", ""),
                     },
                 }
             )
@@ -205,7 +230,10 @@ def main() -> int:
                 {
                     "jsonrpc": "2.0",
                     "id": req_id,
-                    "result": {"sessionId": "sess-standin-1"},
+                    "result": {
+                        "sessionId": "sess-standin-1",
+                        "authenticated": authenticated,
+                    },
                 }
             )
             if args.mode == "block-stdin-prompt":
@@ -250,6 +278,19 @@ def main() -> int:
         if method == "session/prompt":
             turn_count += 1
             sid = str(params.get("sessionId") or "sess-standin-1")
+            if args.fail_unauthenticated and not authenticated:
+                _send(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "error": {
+                            "code": -32001,
+                            "message": "Not logged in · Please run /login",
+                            "data": {"errorKind": "authentication_failed"},
+                        },
+                    }
+                )
+                continue
             prompt_items = params.get("prompt") or []
             prompt_text = ""
             if prompt_items and isinstance(prompt_items[0], dict):
