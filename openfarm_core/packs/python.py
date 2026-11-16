@@ -326,7 +326,7 @@ class PythonPack(Pack):
                     continue
                 binary, _, name = line.rpartition(".")
             tests.append({"name": name, "binary": binary})
-        return {"tests": tests, "errors": errors}
+        return {"tests": tests, "errors": errors} if errors else {"tests": tests}
 
     def parse_tests(self, stdout: str, stderr: str = "") -> dict:
         text = f"{stdout or ''}\n{stderr or ''}"
