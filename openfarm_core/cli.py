@@ -31,7 +31,6 @@ from .acp_setup import (
 )
 from .adopt import adopt_project
 from .adapters.files import FileCardSource, open_card_source
-
 from .adapters.jsonl import TelemetrySink, open_telemetry
 from .adapters.openai_compat import open_backend
 from .adapters.direct import open_runner
@@ -1321,7 +1320,6 @@ def build_parser() -> argparse.ArgumentParser:
     adopt.add_argument("--key-file", default=None, help="external API key file path")
 
     install_skill = sub.add_parser(
-
         "install-skill", help="install bundled agent skills, commands, and optional bin shim"
     )
     install_skill.add_argument("--target", choices=INSTALL_TARGETS, default="all",
@@ -1413,7 +1411,6 @@ def cmd_adopt(args) -> int:
 
 
 def cmd_install_skill(args) -> int:
-
     payload = install_skill_bundle(
         target=args.target,
         dest=Path(args.dest) if args.dest else None,
