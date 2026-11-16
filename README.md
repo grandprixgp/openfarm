@@ -252,7 +252,7 @@ Model calls in these tests use a scripted backend and local HTTP test servers, a
 >
 > - Live remote GitHub URL installs via `uv`, `pipx` or `pip`.
 > - Live paid Anthropic prompt turns through `claude-agent-acp` or `claude_native_acp.py` (only zero-token `openfarm acp status` + `initialize` handshake `probe` were run against the local `claude` binary).
-> - Live hosted zero-retention OpenAI-compatible model endpoints doing card work. (v0.6 branch: one short call through openfarm's worker client to Command Code with zero retention forced on has worked; no card has run on a live worker.)
+> - Live hosted zero-retention OpenAI-compatible model endpoints doing card work. (v0.6 branch: two small cards on openfarm itself reached review and were merged with DeepSeek V4.1 Flash on Command Code as the worker and the Claude supervisor on, after three fixes to how openfarm reads the worker's edits. Two cards is not an efficacy result.)
 > - Live `cargo-mutants` runs (the parser and gate logic are tested with synthetic output).
 > - Live unattended multi-wave LLM execution of a generated app (for example all `calorie-log` cards) end to end.
 > - External `cmd:` adapters against live repository tools, beyond subprocess test harnesses.
