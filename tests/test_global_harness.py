@@ -234,5 +234,12 @@ class CaptureScopeTests(_Base):
         self.assertEqual(check.call_args.args[1], {"alpha"})
 
 
+class BenchIsolationTests(unittest.TestCase):
+    def test_a_bench_run_gets_its_own_global_library(self) -> None:
+        from openfarm_core.bench import _openfarm_env
+        env = _openfarm_env(Path("/x/run/global/harness"))
+        self.assertEqual(env["OPENFARM_GLOBAL_HARNESS"], "/x/run/global/harness")
+
+
 if __name__ == "__main__":
     unittest.main()

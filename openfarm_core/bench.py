@@ -339,8 +339,11 @@ def _openfarm_cmd() -> list[str]:
     return [sys.executable, "-m", "openfarm_core.cli"]
 
 
-def _openfarm_env() -> dict:
+def _openfarm_env(global_dir: Path | None = None) -> dict:
     env = dict(os.environ)
+    if global_dir is not None:
+        # A bench run never reads or writes the owner's global lessons.
+        env["OPENFARM_GLOBAL_HARNESS"] = str(global_dir)
     root = str(Path(__file__).resolve().parent.parent)
     env["PYTHONPATH"] = root + (os.pathsep + env["PYTHONPATH"]
                                 if env.get("PYTHONPATH") else "")
@@ -410,7 +413,8 @@ def run_once(task: BenchTask, arm: str, arm_text: str | None, repeat: int,
         cmd += ["--script", str(task.script)]
     started = time.monotonic()
     done = subprocess.run(cmd, cwd=repo, capture_output=True, text=True,
-                          env=_openfarm_env(), timeout=timeout_s, check=False)
+                          env=_openfarm_env(run_dir / "global" / "harness"),
+                          timeout=timeout_s, check=False)
     seconds = round(time.monotonic() - started, 1)
     (run_dir / "run.out.json").write_text(done.stdout, encoding="utf-8")
     (run_dir / "run.err.log").write_text(done.stderr, encoding="utf-8")

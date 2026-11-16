@@ -184,5 +184,10 @@ def render_config(*, name: str, language: str, base_branch: str, state_dir: Path
         "auto_demote = true",
         "allow_micromanager_reflection = true",
         f"editable_surfaces = {toml_list(EDITABLE_SURFACES)}",
+        "# Lessons to apply: this project's own, the global library's, or both.",
+        'learn_from = "both"',
+        "# Whether this project's proven general lessons may go to the global library",
+        "# (global_dir, default ~/.openfarm/global/harness).",
+        "share = true",
     ]
     return "\n".join(lines) + "\n"
