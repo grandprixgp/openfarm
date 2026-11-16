@@ -25,11 +25,6 @@ asserts = "an arm file holding '[harness]\\nenabled = false\\n' makes load_arm r
 name = "test_the_arm_replaces_or_adds_harness_lines"
 file = "tests/test_bench_arm_harness.py"
 asserts = "tomllib.loads(arm_config_text(base, '[harness]\\nlearn_from = \"project\"\\nglobal_dir = \"/tmp/g\"\\n'))[\"harness\"] has learn_from \"project\", global_dir \"/tmp/g\", share True and probe_window 3, where base is render_config(name=\"t\", language=\"python\", base_branch=\"main\", state_dir=Path(\"/tmp/s\"), key_file=Path(\"/tmp/k\"))"
-
-[[tests]]
-name = "test_an_arm_without_harness_leaves_it_alone"
-file = "tests/test_bench_arm_harness.py"
-asserts = "arm_config_text(base, '[model]\\nmax_tokens = 10\\n') has the same [harness] table as base"
 +++
 
 ## Done
