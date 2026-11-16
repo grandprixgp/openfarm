@@ -117,8 +117,9 @@ class GlobalStoreTests(_Base):
 
     def test_report_keeps_a_veto_and_asks_the_retire_rule(self) -> None:
         gid = self.glib.add({**LESSON, "id": "exp-a"}, "alpha")["id"]
-        self.glib.report(gid, "beta", {"helped": 0, "hurt": 2}, vetoed=True)
-        self.glib.report(gid, "beta", {"helped": 1, "hurt": 2}, vetoed=False)
+        with mock.patch.object(harness_global, "retire_reason", return_value=""):
+            self.glib.report(gid, "beta", {"helped": 0, "hurt": 2}, vetoed=True)
+            self.glib.report(gid, "beta", {"helped": 1, "hurt": 2}, vetoed=False)
         self.assertTrue(self.glib.get(gid)["projects"]["beta"]["vetoed"])
         self.assertEqual(self.glib.get(gid)["status"], "active")
         with mock.patch.object(harness_global, "retire_reason", return_value="two vetoes"):
