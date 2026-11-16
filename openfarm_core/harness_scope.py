@@ -9,6 +9,7 @@ promotion: which kinds of lesson may ever travel to other projects.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 SCOPES = ("project", "general")
@@ -16,12 +17,57 @@ SCOPES = ("project", "general")
 
 def project_markers(repo_root: Path, project_name: str,
                     tracked_paths: list[str]) -> set[str]:
-    """The strings whose presence in a lesson ties it to this project.
+    """Return lower-cased strings whose presence in a lesson ties it to this project."""
+    markers: set[str] = set()
 
-    Filled by a v0.7 card. Until then: the project name and every tracked path.
-    """
-    markers = {str(project_name).strip().lower()} if str(project_name).strip() else set()
-    markers.update(p.strip().lower() for p in tracked_paths if p.strip())
+    name = str(project_name).strip().lower()
+    if name:
+        markers.add(name)
+
+    for raw_path in tracked_paths:
+        path = str(raw_path).strip()
+        if not path:
+            continue
+
+        lower_path = path.lower()
+        markers.add(lower_path)
+
+        file_name = Path(path).name.lower()
+        if file_name:
+            markers.add(file_name)
+
+        stem = Path(path).stem.lower()
+        if len(stem) >= 5:
+            markers.add(stem)
+
+        if not lower_path.endswith((".py", ".rs")):
+            continue
+
+        file_path = repo_root / path
+        try:
+            if not file_path.is_file():
+                continue
+            if file_path.stat().st_size >= 1_000_000:
+                continue
+            text = file_path.read_bytes().decode("utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+
+        pattern = re.compile(
+            r"^(?:async\s+def|def|class|pub\s+fn|fn|pub\s+struct|struct|"
+            r"pub\s+enum|enum|pub\s+trait|trait)\s+"
+            r"([A-Za-z_][A-Za-z0-9_]*)",
+            re.MULTILINE,
+        )
+        for match in pattern.finditer(text):
+            defined_name = match.group(1)
+            if (
+                ("_" in defined_name and len(defined_name) >= 6)
+                or len(defined_name) >= 10
+                or sum(1 for char in defined_name if char.isupper()) >= 2
+            ):
+                markers.add(defined_name.lower())
+
     return markers
 
 
