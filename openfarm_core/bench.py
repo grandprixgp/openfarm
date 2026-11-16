@@ -159,6 +159,10 @@ def score(records: list[dict]) -> dict:
     return {"arms": arms, "categories": categories}
 
 
+def render_report(summary: dict) -> str:
+    raise NotImplementedError
+
+
 def _check_record(record: dict) -> None:
     for key in _REQUIRED_RECORD_KEYS:
         if key not in record:
