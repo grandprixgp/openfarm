@@ -43,3 +43,20 @@ def detect_language(root: Path) -> str:
         "no supported language manifest found: expected Cargo.toml, pyproject.toml, "
         "or setup.py",
     )
+
+
+def adopt_config_text(
+    root: Path,
+    language: str,
+    *,
+    base_branch: str,
+    state_dir: Path,
+    key_file: Path,
+) -> str:
+    """Return the text of `.openfarm/config.toml` for adopting `root` as `language`.
+
+    Raises `openfarm_core.errors.Refused` with code "state-inside-repo" when
+    `state_dir` or `key_file` is inside `root`, or "unsupported-language" when
+    `language` is not "rust" or "python". Nothing is written.
+    """
+    raise NotImplementedError
