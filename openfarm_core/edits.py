@@ -136,7 +136,9 @@ def parse_edits(text: str) -> list[Edit]:
 
 _FENCE_LINE = re.compile(r"^\s*```[\w.+-]*\s*$")
 _TRAILING_JUNK = re.compile(
-    r"^\s*(```|(>{3,}|<{3,}|={3,})\s*(END|REPLACE|SEARCH)?|</?[｜|]+\s*DSML[^>]*>)\s*$")
+    r"^\s*(```|(>{3,}|<{3,}|={3,})\s*(END|REPLACE|SEARCH)?"
+    r"|</?[｜|]+\s*DSML[^>]*>"
+    r"|</(parameter|invoke|function_calls|tool_calls?|calls)>)\s*$")
 
 
 def _unfence(body: str) -> str:

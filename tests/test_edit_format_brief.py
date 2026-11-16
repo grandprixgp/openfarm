@@ -42,9 +42,15 @@ class EditFormatTests(unittest.TestCase):
                 "</\uff5c\uff5cDSML\uff5c\uff5c calls>")
         self.assertEqual(parse_edits(text)[0].content, "import unittest\n")
 
+    def test_bare_tool_call_closing_tags_are_dropped(self) -> None:
+        text = "=== whole_file: tests/test_a.py\nimport unittest\n</parameter>\n</invoke>\n"
+        self.assertEqual(parse_edits(text)[0].content, "import unittest\n")
+
     def test_real_code_at_the_end_is_kept(self) -> None:
         text = "=== whole_file: a.py\nx = a >> 3\nprint('>>>')\n"
         self.assertEqual(parse_edits(text)[0].content, "x = a >> 3\nprint('>>>')\n")
+        page = "=== whole_file: site/index.html\n<html>\n<body></body>\n</html>\n"
+        self.assertEqual(parse_edits(page)[0].content, "<html>\n<body></body>\n</html>\n")
 
     def test_a_diff_is_refused_with_a_pointer_to_the_format(self) -> None:
         text = "```diff\n--- /dev/null\n+++ b/tests/test_a.py\n@@ -0,0 +1 @@\n+x = 1\n```\n"
