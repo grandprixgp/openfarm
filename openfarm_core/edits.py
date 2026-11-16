@@ -87,7 +87,11 @@ def parse_edits(text: str) -> list[Edit]:
     edits: list[Edit] = []
     headers = list(_EDIT_HEADER.finditer(text))
     if not headers:
-        raise Invalid("no-edits", "the answer contains no edit blocks")
+        detail = "the answer contains no edit blocks"
+        if re.search(r"^(---|\+\+\+) ", text, re.MULTILINE):
+            detail += (" (it looks like a diff; openfarm reads only "
+                       "`=== whole_file: <path>` and `=== search_replace: <path>` blocks)")
+        raise Invalid("no-edits", detail)
 
     for index, header in enumerate(headers):
         start = header.end()
@@ -96,6 +100,7 @@ def parse_edits(text: str) -> list[Edit]:
         fmt = header.group("fmt")
         path = header.group("path").strip()
 
+        body = _unfence(body)
         if fmt == FORMAT_WHOLE_FILE:
             content = body.lstrip("\n")
             if content.endswith("\n\n"):
@@ -127,6 +132,29 @@ def parse_edits(text: str) -> list[Edit]:
                           search=_strip_one_newline(search),
                           replace=_strip_one_newline(replace)))
     return edits
+
+
+_FENCE_LINE = re.compile(r"^\s*```[\w.+-]*\s*$")
+
+
+def _unfence(body: str) -> str:
+    """Drop a Markdown code fence a model wrapped around a block.
+
+    A leading fence line right under the header, and a closing fence as the
+    block's last non-blank line, are never file content: no source file this
+    reads starts with "```lang" or ends on a bare "```".
+    """
+    lines = body.split("\n")
+    first = next((i for i, line in enumerate(lines) if line.strip()), None)
+    if first is None:
+        return body
+    opened = bool(_FENCE_LINE.match(lines[first]))
+    if opened:
+        del lines[first]
+    last = next((i for i in range(len(lines) - 1, -1, -1) if lines[i].strip()), None)
+    if last is not None and lines[last].strip() == "```":
+        del lines[last]
+    return "\n".join(lines)
 
 
 def _strip_one_newline(text: str) -> str:

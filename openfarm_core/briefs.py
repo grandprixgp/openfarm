@@ -129,6 +129,33 @@ ROLE_HEADERS = {
 }
 
 
+EDIT_FORMAT = """How to write edits. openfarm reads only these blocks, never a diff or patch.
+Start each block with a header line `=== <kind>: <path>` (the path relative to
+the repository root). Put nothing else around the blocks: no code fences, no
+diff headers.
+
+To create a file or replace all of it:
+
+=== whole_file: tests/test_example.py
+<the complete file, every line, up to the next === header or the end>
+
+To change part of a file, copy the old lines exactly as they are now:
+
+=== search_replace: path/to/module.py
+<<< SEARCH
+<old lines, exactly as they appear in the file>
+>>> REPLACE
+<new lines>
+"""
+
+STUB_FORMAT = """To add a stub for a new symbol, at the end of an existing file:
+
+=== append_stub: path/to/module.py
+<name_of_the_test_that_needs_it>
+<the stub, which must fail when called>
+"""
+
+
 class Brief:
     """One built brief, ready to send."""
 
@@ -283,7 +310,9 @@ def test_writer_brief(card: Card, book: BriefBook, pack,
             "\nThis card declares new symbols. You may append stubs that fail when\n"
             "called (Rust: `todo!()`; Python: `raise NotImplementedError`) with\n"
             "`append_stub` in files in your touches, additions only.")
+        parts.append("\n" + STUB_FORMAT)
 
+    parts.append("\n" + EDIT_FORMAT)
     return Brief("test_writer", "\n".join(parts))
 
 
@@ -370,6 +399,7 @@ def implementer_brief(card: Card, book: BriefBook, frozen_tests: dict[str, str],
         parts.append(f"\nCurrent step {step.get('n')}: {step.get('does')}\n"
                      f"Tests this step turns green: {', '.join(step.get('tests', []))}")
 
+    parts.append("\n" + EDIT_FORMAT)
     return Brief("implementer", "\n".join(parts))
 
 
