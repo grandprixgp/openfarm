@@ -345,3 +345,7 @@ def adopt_project(
             "cards/.gitkeep",
         ],
     }
+
+
+def propose_known_failing(parsed: dict) -> list[str]:
+    raise NotImplementedError
