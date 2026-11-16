@@ -9,6 +9,7 @@ promotion: which kinds of lesson may ever travel to other projects.
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -72,8 +73,44 @@ def project_markers(repo_root: Path, project_name: str,
 
 
 def scope_of(entry: dict, markers: set[str]) -> tuple[str, str]:
-    """`(scope, reason)` for a lesson. Until the v0.7 card lands, always `project`."""
-    return "project", "scope check not built yet"
+    """Return `(scope, reason)` for a lesson based on its text and project markers."""
+    parts = []
+    for key in ("title", "cue", "lesson"):
+        value = entry.get(key)
+        parts.append(value if isinstance(value, str) else "")
+    text = "\n".join(parts)
+
+    patch = entry.get("proposed_patch")
+    if "proposed_patch" in entry and patch is not None:
+        text += "\n" + json.dumps(patch, default=str)
+
+    text = text.lower()
+
+    if re.search(r"card-[0-9]+", text):
+        return "project", "names a card"
+
+    if isinstance(patch, dict):
+        for key in ("context_files", "paths", "files"):
+            value = patch.get(key)
+            if isinstance(value, list) and value:
+                return "project", "names files"
+        for key in ("path", "file"):
+            value = patch.get(key)
+            if isinstance(value, str) and value:
+                return "project", "names files"
+
+    for marker in sorted(markers):
+        marker_text = str(marker).lower()
+        if not marker_text:
+            continue
+        pattern = r"(?<!\w)" + re.escape(marker_text) + r"(?!\w)"
+        if re.search(pattern, text):
+            return "project", f"names '{marker_text}'"
+
+    reason = entry.get("scope_reason")
+    if isinstance(reason, str) and reason:
+        return "general", reason
+    return "general", "names nothing of this project"
 
 
 def global_eligibility(entry: dict) -> tuple[bool, str]:
