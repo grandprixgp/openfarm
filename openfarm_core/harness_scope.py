@@ -14,6 +14,12 @@ import re
 from pathlib import Path
 
 SCOPES = ("project", "general")
+_DEFINITION_RE = re.compile(
+    r"^(?:async\s+def|def|class|pub\s+fn|fn|pub\s+struct|struct|"
+    r"pub\s+enum|enum|pub\s+trait|trait)\s+"
+    r"([A-Za-z_][A-Za-z0-9_]*)",
+    re.MULTILINE,
+)
 
 
 def project_markers(repo_root: Path, project_name: str,
@@ -54,13 +60,7 @@ def project_markers(repo_root: Path, project_name: str,
         except (OSError, UnicodeDecodeError):
             continue
 
-        pattern = re.compile(
-            r"^(?:async\s+def|def|class|pub\s+fn|fn|pub\s+struct|struct|"
-            r"pub\s+enum|enum|pub\s+trait|trait)\s+"
-            r"([A-Za-z_][A-Za-z0-9_]*)",
-            re.MULTILINE,
-        )
-        for match in pattern.finditer(text):
+        for match in _DEFINITION_RE.finditer(text):
             defined_name = match.group(1)
             if (
                 ("_" in defined_name and len(defined_name) >= 6)
