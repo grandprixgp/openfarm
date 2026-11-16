@@ -54,8 +54,10 @@ from .gates.checks import suite_green
 from .gates.eligibility import check_eligibility, derive_cargo_unit
 from .git import Git, GitRefused
 from .globs import matches_any, normalise, resolves_within
+from .harness_global import GlobalLibrary, global_dir_for
 from .harness_memory import HarnessLibrary
 from .micromanager import MicromanagerBudget, open_micromanager
+
 from .packs.base import pack_for
 from .state import (StateDir, _safe_id, read_json, utc_now, utc_after,
                     write_json)
@@ -1148,11 +1150,44 @@ def cmd_supervise(ctx: Context, args) -> int:
 
 def cmd_harness(ctx: Context, args) -> int:
     """Inspect and manage the adaptive harness cue library."""
-    harness_lib = _open_harness_library(ctx, require_enabled=False)
-    assert harness_lib is not None
     action = getattr(args, "action", "status") or "status"
     target = getattr(args, "target", None)
     reason = getattr(args, "reason", None) or "manual"
+    use_global = bool(getattr(args, "global_", False))
+
+    if use_global and action not in ("status", "promote", "demote"):
+        raise UsageError(f"harness {action} does not take --global")
+
+    if use_global:
+        global_lib = GlobalLibrary(global_dir_for(ctx.cfg.harness))
+        if action == "status":
+            ctx.emit(global_lib.status())
+            return EXIT_OK
+        if action == "promote":
+            if not target:
+                raise UsageError("harness promote requires <id>")
+            try:
+                res = global_lib.restore(target, reason=reason)
+            except (Refused, Invalid) as exc:
+                ctx.emit({"error": exc.message, "kind": "refused",
+                          "code": exc.code})
+                return EXIT_REFUSED
+            ctx.emit(res)
+            return EXIT_OK
+        if action == "demote":
+            if not target:
+                raise UsageError("harness demote requires <id>")
+            try:
+                res = global_lib.retire(target, reason=reason)
+            except (Refused, Invalid) as exc:
+                ctx.emit({"error": exc.message, "kind": "refused",
+                          "code": exc.code})
+                return EXIT_REFUSED
+            ctx.emit(res)
+            return EXIT_OK
+
+    harness_lib = _open_harness_library(ctx, require_enabled=False)
+    assert harness_lib is not None
 
     if action == "status":
         ctx.emit(harness_lib.status())
@@ -1207,6 +1242,7 @@ def cmd_harness(ctx: Context, args) -> int:
         return EXIT_OK
 
     raise UsageError(f"unknown harness action: {action}")
+
 
 
 # -- the parser ----------------------------------------------------------------
@@ -1301,6 +1337,8 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("status", "index", "show", "promote", "demote", "reset"),
     )
     harness.add_argument("target", nargs="?", default=None)
+    harness.add_argument("--global", dest="global_", action="store_true",
+                         help="use the global harness library")
     harness.add_argument("--reason", default="manual")
     harness.add_argument("--yes", action="store_true")
 
