@@ -1164,8 +1164,8 @@ class CardRun:
                 if free_retries <= 0:
                     raise GateFailure(
                         StopCode.TESTS_UNPROVABLE,
-                        "the test writer's search blocks kept matching more "
-                        f"than once in {self.cfg.test_writer_attempts} attempts: "
+                        "the test writer's search blocks kept failing to match "
+                        f"exactly once in {self.cfg.test_writer_attempts} attempts: "
                         f"{last_failure}")
                 free_sends += 1
                 continue
@@ -1527,8 +1527,8 @@ class CardRun:
                     if free_retries <= 0:
                         raise GateFailure(
                             StopCode.ATTEMPTS,
-                            "the implementer's search blocks kept matching more "
-                            f"than once, after {self.cfg.implementer_attempts} "
+                            "the implementer's search blocks kept failing to match "
+                            f"exactly once, after {self.cfg.implementer_attempts} "
                             f"tries: {last_failure}")
                     free_calls += 1
                     continue
