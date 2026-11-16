@@ -21,6 +21,7 @@ import sys
 import time as _time
 from pathlib import Path
 
+from . import __version__
 from .acp_setup import (
     ACP_ACTIONS,
     configure_acp_repo,
@@ -1163,6 +1164,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="openfarm",
         description="A plain-code orchestrator for narrowly scoped model work.")
+    parser.add_argument("--version", action="version",
+                        version=f"openfarm {__version__}")
     parser.add_argument("--repo", default=".", help="the repository root")
     parser.add_argument("--config", default=None, help="an explicit config path")
     parser.add_argument("--json", action="store_true",
