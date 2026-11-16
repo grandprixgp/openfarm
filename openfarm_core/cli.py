@@ -867,6 +867,43 @@ def cmd_release(ctx: Context, args) -> int:
     return EXIT_OK
 
 
+def cmd_done(ctx: Context, args) -> int:
+    """Mark a reviewed card done once its branch is merged into the base branch.
+
+    A card waiting on others is claimed only when they are done, so without this
+    step a wave never moves past its first cards.
+    """
+    card_id = _check_id(args.card, "card id")
+    source = ctx.cards()
+    source.prepare()
+    card = next((c for c in source.all_cards() if c.id == card_id), None)
+    if card is None:
+        ctx.emit({"card": card_id, "done": False, "reason": "no such card"})
+        return EXIT_REFUSED
+    git = Git(ctx.repo)
+    base = ctx.cfg.base_branch
+    branch = f"openfarm/{card.id}-{card.slug()}"
+    reason = ""
+    if not git.ref_exists(f"refs/heads/{base}"):
+        reason = f"the base branch {base} does not exist"
+    elif not git.branch_exists(branch):
+        reason = f"there is no branch {branch} to check"
+    else:
+        unmerged = git.count_commits(f"refs/heads/{branch}", f"refs/heads/{base}")
+        if unmerged:
+            reason = f"{branch} has {unmerged} commit(s) not merged into {base}"
+    if reason:
+        ctx.emit({"card": card_id, "done": False, "reason": reason})
+        return EXIT_REFUSED
+    try:
+        source.mark_done(card_id, note=args.note or "")
+    except Refused as exc:
+        ctx.emit({"card": card_id, "done": False, "reason": exc.message})
+        return EXIT_REFUSED
+    ctx.emit({"card": card_id, "done": True, "branch": branch, "base": base})
+    return EXIT_OK
+
+
 def cmd_dossier(ctx: Context, args) -> int:
     """Read-only: the dossier from the card's latest run, or a named one.
 
@@ -1206,6 +1243,10 @@ def build_parser() -> argparse.ArgumentParser:
     release.add_argument("card")
     release.add_argument("--reason", required=True)
 
+    done = sub.add_parser("done", help="mark a reviewed, merged card done")
+    done.add_argument("card")
+    done.add_argument("--note", default=None)
+
     dossier = sub.add_parser("dossier", help="print a card's dossier")
     dossier.add_argument("card")
     dossier.add_argument("--run", default=None)
@@ -1405,6 +1446,7 @@ COMMANDS = {
     "resume": cmd_resume,
     "stop": cmd_stop,
     "release": cmd_release,
+    "done": cmd_done,
     "dossier": cmd_dossier,
     "check": cmd_check,
     "verdict": cmd_verdict,

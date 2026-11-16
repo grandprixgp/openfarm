@@ -226,7 +226,7 @@ asserts = "reserve_with_policy returns Ok(IntegrationOutcome { ... }) with SeamF
 - `context_files`: Read-only files outside `touches` shown in `test_writer` (signatures) and `implementer` (full text), bounded by `[eligibility] max_context_files` (default `8`) and checked against `never_touch`, `forbidden_files`, escapes, and symlinks.
 - `type_changes`: When `true` (and `[eligibility] allow_type_changes = true`), `test_writer` receives full base production files in `touches` as a read-only base type contract instead of signatures only.
 - `new_symbols`: Disallowed on `pinned-bugfix` and `test-backfill`. If `new_symbols = true` and `len(touches) > 1`, eligibility **requires** either `type_changes = true` OR active micromanager `scaffold_contracts = true` (`new-symbols-touches` otherwise).
-- `depends` (or `deps` in `FileCardSource`): Card IDs that must be in `"done"` state before claiming (`deps` rule otherwise).
+- `depends` (or `deps` in `FileCardSource`): Card IDs that must be in `"done"` state before claiming (`deps` rule otherwise). A card becomes done through `openfarm done <CARD>` once its branch is merged.
 - **Explicit `tests` naming & `pub` reachability**: When `[eligibility] rust_tests_in_separate_files = true` (default), every `tests[].file` must live under `tests/` (`rust-tests-in-separate-files` otherwise). Because Cargo integration tests under `tests/` are separate crates, every named test can reach only `pub` items exported by your crate! Prefer one `tests/<subject>_tests.rs` file per card/subject so cards do not contend on a single test file.
 
 #### Common Eligibility Rejections & Fixes
@@ -272,6 +272,7 @@ Invoke via `./openfarm` (when copied/installed) or `python3 -m openfarm_core.cli
 | Recovery | `openfarm release <CARD> --reason TEXT` | Release a stuck/blocked card via card source first, then archive prior card artifacts under `<state_dir>/cards/<CARD>/partial/`. Refuses (`1`) if a live unexpired lease holds it. |
 | Review | `openfarm dossier <CARD> [--run RUN] [--attempt N] [--format md\|json]` | Print the 9-section dossier (`dossier.md` / `dossier.json`) including `1_risk`, `2_gates`, `4_red_green`, `6_checker`, `9_diffs` (test diff first, production diff second), and `harness` summary. |
 | Review | `openfarm verdict <CARD> (clean\|minor-fix\|bounced\|scrapped) --review-tokens N [--minutes M] [--note TEXT]` | Record reviewer verdict in `<state_dir>/cards/<CARD>/<latest_run>/verdict.json` for payback accounting. |
+| Done | `openfarm done <CARD> [--note TEXT]` | After merging a reviewed card's branch: moves the card from in review to `done`, so cards that `depend` on it can be claimed. Refuses unless `openfarm/<CARD>-<slug>` is fully merged into `base_branch`. The farm itself never marks a card done. |
 | Review | `openfarm escape <CARD> --note TEXT` | Append a post-merge defect record to `<state_dir>/cards/<CARD>/<latest_run>/escapes.jsonl`. |
 | Harness² | `openfarm harness [status\|index\|show\|promote\|demote\|reset] [TARGET] [--reason TEXT] [--yes]` | Inspect or curate `<state_dir>/harness/` (`status` default; `index` prints `INDEX.md`; `show <id>` shows entry + `EXPERIENCE.md`; `promote <id>` validates & activates; `demote <id\|rev-XXXX>` rolls back; `reset --yes` resets to `rev-0000`). |
 

@@ -40,6 +40,7 @@ See [prompts/wave_operator.md](./prompts/wave_operator.md) for the full operator
    openfarm verdict <CARD-ID> clean --review-tokens 1200 --minutes 4 --note "Verified against PROJECT_SPEC"
    git checkout main && git merge --no-ff openfarm/<CARD-ID>-<slug>
    cargo test --quiet
+   openfarm done <CARD-ID>   # cards that depend on it can now run
    ```
 5. **Triage Blocks & Inspect Harness² Learning**:
    ```bash
