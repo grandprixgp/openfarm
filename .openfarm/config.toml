@@ -1,65 +1,151 @@
 [project]
 name = "openfarm"
 lane = "farm"
-base_branch = "main"
-state_dir = "~/.openfarm/openfarm"
+base_branch = "v0.6"
+state_dir = "/home/prix/.openfarm/openfarm"
 
 [adapters]
 cards = "files:cards/"
 runner = "direct"
-languages = ["rust"]
-model = "scripted"
+languages = ["python"]
+model = "openai-compatible"
+micromanager = "claude-acp"
+telemetry = "jsonl"
+pack = ""
 
 [model]
-endpoint = "https://scripted.invalid/v1"
-allowed_endpoints = ["https://scripted.invalid/v1"]
-test_writer = { model = "stub", temperature = 0.2 }
-implementer = { model = "stub", temperature = 0.3, vary_seed = true }
-checker     = { model = "stub", temperature = 0.4, vary_seed = true }
+# Workers: Command Code's Provider API on the owner's GOAT plan credits.
+endpoint = "https://api.commandcode.ai/provider/v1"
+allowed_endpoints = ["https://api.commandcode.ai/provider/v1"]
+key_file = "/home/prix/.config/openfarm/openfarm.key"
+# Zero retention and no training on every call; a model without a zero-retention
+# upstream fails with 422 instead of falling back. Never remove this.
+headers = { "x-cmd-zdr" = "1" }
+# DeepSeek V4.1 Flash at its peak rate ($0.30 / $1.20 per million), so caps err high.
+cost_per_1k_in = 0.0003
+cost_per_1k_out = 0.0012
+test_writer = { model = "deepseek/deepseek-v4.1-flash", temperature = 0.2 }
+implementer = { model = "deepseek/deepseek-v4.1-flash", temperature = 0.3, vary_seed = true }
+checker     = { model = "deepseek/deepseek-v4.1-flash", temperature = 0.35, vary_seed = true }
+planner     = { model = "deepseek/deepseek-v4.1-flash", temperature = 0.2 }
 
 [policy]
-# The seams here are the parts whose correctness is the whole claim: the git
-# allowlist, the eligibility gate, the Rust pack's parsing, and the shim.
 never_touch = [
+  # The gates and the pipeline that judge a card: a worker never edits its judge.
+  "openfarm_core/gates/**",
+  "openfarm_core/flow.py",
+  "openfarm_core/protocol.py",
+  "openfarm_core/config.py",
+  "openfarm_core/edits.py",
   "openfarm_core/git.py",
-  "openfarm_core/gates/eligibility.py",
-  "openfarm_core/packs/rust.py",
+  "openfarm_core/errors.py",
+  "openfarm_core/selfhost.py",
   "openfarm_core/adapters/acp.py",
-  "openfarm_core/micromanager.py",
-  "openfarm_core/harness_memory.py",
-  "openfarm",
+  "openfarm_core/adapters/claude_native_acp.py",
 ]
-forbidden_files = [
-  ".openfarm/**",
-  ".claude/**",
-  "tests/toy.py",
-  "openfarm spec v0.3.md",
-  "openfarm spec v0.4.md",
-  "openfarm spec v0.5.md",
-  "openfarm spec v0.5.1.md",
-]
+forbidden_files = ["pyproject.toml", ".openfarm/**", ".claude/**"]
 known_failing = []
-flagged_patterns = []
-# The core's own tests are Python, so the Rust pack exercises nothing here. This
-# config exists to check that the documented file format reads and validates.
-categories = ["mechanical"]
+flagged_patterns = ["os.environ[", "time.sleep(", "open("]
+categories = [
+  "test-backfill",
+  "mechanical",
+  "pattern",
+  "pinned-bugfix",
+  "small-feature",
+  "feature",
+  "refactor",
+  "integration",
+  "port",
+]
 
 [eligibility]
-max_files = 3
+max_files = 6
 max_units = 1
-require_reference = ["pattern"]
-rust_tests_in_separate_files = true
+require_reference = ["pattern", "small-feature"]
+refuse_touches_prefixes = ["seam:"]
+python_tests_in_test_files = true
+allow_type_changes = true
+max_context_files = 8
+
+[brief]
+test_conventions = ".openfarm/test-conventions.md"
+
+[runner]
+# Empty: the interpreter openfarm itself runs under.
+python = ""
+
+[runner.env]
 
 [budget]
 implementer_attempts = 3
 test_writer_attempts = 2
-model_build_calls_per_card = 6
-tokens_per_card = 400000
-wall_clock_per_card = "10m"
-spend_per_night = 0.0
+model_build_calls_per_card = 10
+mutation_build_calls_per_card = 40
+tokens_per_card = 400_000
+wall_clock_per_card = "45m"
+frontier_cost_ratio = 0.30
+spend_per_night = 20.00
+concurrent_builds = 2
+concurrent_cards = 3
+lease_ttl = "20m"
+kill_switch = "/home/prix/.openfarm/openfarm/STOP"
 
 [gates]
+revert_check = "required"
 mutation = "off"
+mutation_required_for = []
+mutation_min_kill_rate = 0.8
+counter_tests = "report"
 coverage = "off"
-workspace_lint = false
+workspace_lint = true
+baseline_cache = true
 catch_up = "check"
+findings_per_card = 2
+circuit_breaker = 3
+planner = "auto"
+
+[cards]
+fields_block = "toml"
+required_fields = []
+
+[micromanager]
+mode = "active"
+auth = "oauth"
+binary = "auto"
+args = []
+model = ""
+effort = "medium"
+tool_policy = "none"
+timeout_s = 180.0
+max_calls_per_card = 4
+tokens_per_card = 120_000
+spend_per_night = 10.0
+cost_per_1k_in = 0.003
+cost_per_1k_out = 0.015
+isolate_home = true
+shape_cards = true
+scaffold_contracts = true
+coach_on_stall = true
+adjudicate_counter_tests = true
+pre_review = true
+
+[state]
+min_free_mb = 256
+
+[harness]
+enabled = true
+dir = ""
+capture_on = ["retry_recovery", "fail", "counter_fail", "pass"]
+max_cues_per_brief = 4
+max_active_adaptations = 8
+min_confidence = 0.55
+probe_window = 3
+auto_demote = true
+allow_micromanager_reflection = true
+editable_surfaces = [
+  "test_writer_guidance",
+  "implementer_guidance",
+  "planner_guidance",
+  "context_hints",
+  "micromanager_context",
+]

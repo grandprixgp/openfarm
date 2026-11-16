@@ -56,6 +56,9 @@ class BriefBook:
         self.allowed_extra_reads = {
             normalise(p) for p in (allowed_extra_reads or ()) if p
         }
+        #: The card's language pack, for briefs built without one (the planner's).
+        #: None falls back to the Rust pack, as before v0.6.
+        self.pack = None
 
     def _resolve_safe(self, path: str) -> Path:
         """Resolve `path` inside the worktree, refusing escapes and hidden targets."""
@@ -126,6 +129,36 @@ ROLE_HEADERS = {
 }
 
 
+EDIT_FORMAT = """How to write edits. openfarm reads only these blocks, never a diff or patch.
+Start each block with a header line `=== <kind>: <path>` (the path relative to
+the repository root). Put nothing else around the blocks: no code fences, no
+diff headers.
+
+To create a file or replace all of it:
+
+=== whole_file: tests/test_example.py
+<the complete file, every line, up to the next === header or the end>
+
+To change part of a file, copy the old lines exactly as they are now:
+
+=== search_replace: path/to/module.py
+<<< SEARCH
+<old lines, exactly as they appear in the file>
+>>> REPLACE
+<new lines>
+
+There is no closing line: a block ends where the next `===` header starts, or at
+the end of your answer. Do not add `>>>`, `>>> END` or a fence after it.
+"""
+
+STUB_FORMAT = """To add a stub for a new symbol, at the end of an existing file:
+
+=== append_stub: path/to/module.py
+<name_of_the_test_that_needs_it>
+<the stub, which must fail when called>
+"""
+
+
 class Brief:
     """One built brief, ready to send."""
 
@@ -178,7 +211,8 @@ def planner_brief(card: Card, book: BriefBook, harness_guidance: str = "") -> Br
     for path in card.touches:
         if book.is_hidden(path):
             continue
-        parts.append(f"\n### {path}\n{book.signatures(path, _EXPECTED_PACK)}")
+        parts.append(f"\n### {path}\n"
+                     f"{book.signatures(path, getattr(book, 'pack', None) or _EXPECTED_PACK)}")
     if card.reference and not book.is_hidden(card.reference):
         parts.append(f"\nReference (do not copy wholesale): {card.reference}")
     if harness_guidance and harness_guidance.strip():
@@ -276,9 +310,12 @@ def test_writer_brief(card: Card, book: BriefBook, pack,
 
     if card.new_symbols:
         parts.append(
-            "\nThis card declares new symbols. You may append panicking stubs with\n"
+            "\nThis card declares new symbols. You may append stubs that fail when\n"
+            "called (Rust: `todo!()`; Python: `raise NotImplementedError`) with\n"
             "`append_stub` in files in your touches, additions only.")
+        parts.append("\n" + STUB_FORMAT)
 
+    parts.append("\n" + EDIT_FORMAT)
     return Brief("test_writer", "\n".join(parts))
 
 
@@ -365,6 +402,7 @@ def implementer_brief(card: Card, book: BriefBook, frozen_tests: dict[str, str],
         parts.append(f"\nCurrent step {step.get('n')}: {step.get('does')}\n"
                      f"Tests this step turns green: {', '.join(step.get('tests', []))}")
 
+    parts.append("\n" + EDIT_FORMAT)
     return Brief("implementer", "\n".join(parts))
 
 

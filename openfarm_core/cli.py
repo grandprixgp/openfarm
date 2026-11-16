@@ -21,6 +21,7 @@ import sys
 import time as _time
 from pathlib import Path
 
+from . import __version__
 from .acp_setup import (
     ACP_ACTIONS,
     configure_acp_repo,
@@ -210,6 +211,7 @@ def _baseline_check(ctx: Context, source: FileCardSource, card: Card) -> dict:
         pack = pack_for(
             ctx.cfg.languages[0], ctx.cfg.cargo_flags,
             spec=ctx.cfg.pack_adapter, cwd=worktree,
+            python=ctx.cfg.runner_python,
         )
         pack.configure(worktree)
         unit = card.unit or derive_cargo_unit(card.touches, worktree)
@@ -265,7 +267,7 @@ def _baseline_check(ctx: Context, source: FileCardSource, card: Card) -> dict:
             return {"ok": True, "class": "pass", "named": {},
                     "failed_on_base": [], "passing_on_base": []}
 
-        argv = pack.commands("test", unit=unit)["argv"] + ["--", *card.test_names]
+        argv = pack.commands("test", unit=unit, tests=card.test_names)["argv"]
         result = runner.exec(
             kind="test", argv=argv, cwd=worktree, target_dir=target,
             unit=unit, env=env)
@@ -309,6 +311,15 @@ def cmd_run(ctx: Context, args) -> int:
     if breaker.get("tripped"):
         ctx.emit({"refused": True, "reason": "the circuit breaker is tripped"})
         return EXIT_REFUSED
+
+    if not args.dry_run:
+        # Never judge a card with code the card could have edited.
+        from .selfhost import unpinned_reason
+        reason = unpinned_reason(ctx.repo, getattr(ctx.cfg, "state_dir", None))
+        if reason:
+            ctx.emit({"refused": True, "reason": reason,
+                      "code": "self-host-unpinned"})
+            return EXIT_REFUSED
 
     run_id = args.run_id or f"run-{utc_now().replace('-', '').replace(':', '')}"
     if not ctx.state.acquire_run_lock(run_id):
@@ -533,11 +544,13 @@ def _run_card(ctx: Context, source: FileCardSource, card_id: str, run_id: str,
 
     card_dir = ctx.state.create_card(card.id, run_id)
     pack = pack_for(cfg.languages[0], cfg.cargo_flags,
-                    spec=cfg.pack_adapter, cwd=worktree)
+                    spec=cfg.pack_adapter, cwd=worktree,
+                    python=cfg.runner_python)
     pack.configure(worktree)
     backend = backend if backend is not None else open_backend(cfg, script)
     runner = ctx.runner(worktree, output_dir=card_dir / "gates" / "output")
     book = BriefBook(worktree, cfg.never_touch, cfg.forbidden_files)
+    book.pack = pack
     conventions = _load_test_conventions(cfg, worktree)
 
     owns_mm = micromanager is None
@@ -661,7 +674,8 @@ def _handshake(ctx: Context, source, args, telemetry_raw=None) -> dict:
 
     try:
         pack = pack_for(ctx.cfg.languages[0], ctx.cfg.cargo_flags,
-                        spec=ctx.cfg.pack_adapter, cwd=ctx.repo)
+                        spec=ctx.cfg.pack_adapter, cwd=ctx.repo,
+                        python=ctx.cfg.runner_python)
         hello = pack.hello()
         needed = set(REQUIRED_OPS["pack"])
         offered = set(hello.get("ops") or [])
@@ -1150,6 +1164,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="openfarm",
         description="A plain-code orchestrator for narrowly scoped model work.")
+    parser.add_argument("--version", action="version",
+                        version=f"openfarm {__version__}")
     parser.add_argument("--repo", default=".", help="the repository root")
     parser.add_argument("--config", default=None, help="an explicit config path")
     parser.add_argument("--json", action="store_true",

@@ -16,6 +16,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+from .. import __version__
 from ..errors import Infra, Invalid, Refused
 
 _RETRYABLE_HTTP_CODES = frozenset({429, 502, 503, 504})
@@ -125,7 +126,8 @@ class OpenAICompatibleBackend:
     def __init__(self, endpoint: str, allowed_endpoints: list[str],
                  key_file: Path | None = None, timeout_s: float = 300.0,
                  cost_per_1k_in: float = 0.0, cost_per_1k_out: float = 0.0,
-                 retries: int = 2, sleep_fn=None) -> None:
+                 retries: int = 2, sleep_fn=None,
+                 headers: dict[str, str] | None = None) -> None:
         if not endpoint:
             raise Invalid("no-endpoint", "the model backend needs an endpoint")
         if not allowed_endpoints:
@@ -144,6 +146,7 @@ class OpenAICompatibleBackend:
         self.cost_per_1k_in = cost_per_1k_in
         self.cost_per_1k_out = cost_per_1k_out
         self.retries = max(0, int(retries))
+        self.headers = dict(headers or {})
         self._sleep = sleep_fn if sleep_fn is not None else time.sleep
         self._opener = urllib.request.build_opener(
             _AllowlistRedirectHandler(self.allowed_endpoints))
@@ -188,7 +191,11 @@ class OpenAICompatibleBackend:
 
         request = urllib.request.Request(
             url, data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json",
+            # Python's default User-Agent is blocked outright by some providers'
+            # firewalls (Command Code answers 403, Cloudflare error 1010).
+            headers={"User-Agent": f"openfarm/{__version__}",
+                     **self.headers,
+                     "Content-Type": "application/json",
                      "Authorization": f"Bearer {self._key()}"},
             method="POST")
 
@@ -337,4 +344,5 @@ def open_backend(cfg, script_path: Path | None = None):
         key_file=cfg.key_file,
         cost_per_1k_in=getattr(cfg, "cost_per_1k_in", 0.0),
         cost_per_1k_out=getattr(cfg, "cost_per_1k_out", 0.0),
+        headers=getattr(cfg, "model_headers", {}),
     )

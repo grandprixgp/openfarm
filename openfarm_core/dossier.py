@@ -64,6 +64,7 @@ def build_dossier(card_run, final_state: str,
         "run": card_run.run_id,
         "final_state": final_state,
         "stop_code": card_run.stop_code.value if card_run.stop_code else "",
+        "orchestrator": _orchestrator(),
         "1_risk": {
             "card_hash_at_claim": card_hash_at_claim,
             "card_changed": bool(card_hash_at_end and
@@ -205,7 +206,9 @@ def _failed_attempts(card_run) -> list[str]:
 
 
 def _not_checked(card_run) -> list[str]:
-    out = ["doc-tests were not run: the suite uses --lib --bins --tests"]
+    out = []
+    if str(getattr(card_run.pack, "name", "rust")) == "rust":
+        out.append("doc-tests were not run: the suite uses --lib --bins --tests")
     if card_run.cfg.coverage == "off":
         out.append("coverage is off")
     required_for = getattr(card_run.cfg, "mutation_required_for",
@@ -221,7 +224,7 @@ def _not_checked(card_run) -> list[str]:
     # reader assume the gate ran the way it would elsewhere.
     for note in getattr(card_run.pack, "notes", []) or []:
         out.append(note)
-    out.append("visual layout and behaviour across crates are not checked by any gate")
+    out.append("visual layout and behaviour across units are not checked by any gate")
     return out
 
 
@@ -247,6 +250,15 @@ def _production_diff(card_run) -> str:
         return ""
 
 
+def _orchestrator() -> dict:
+    """Which openfarm judged this card. Never fails the dossier."""
+    try:
+        from .selfhost import cached_identity
+        return cached_identity()
+    except Exception:  # a dossier must never fail the card
+        return {}
+
+
 def render_markdown(payload: dict) -> str:
     risk = payload["1_risk"]
     lines = [
@@ -255,6 +267,11 @@ def render_markdown(payload: dict) -> str:
         f"Run `{payload['run']}` · final state **{payload['final_state']}**"
         + (f" · stop code `{payload['stop_code']}`" if payload["stop_code"] else ""),
         "",
+    ]
+    if payload.get("orchestrator"):
+        from .selfhost import describe
+        lines += [f"Judged by {describe(payload['orchestrator'])}", ""]
+    lines += [
         "## 1. Risk",
         "",
         f"- Card hash at claim: `{risk['card_hash_at_claim']}`"

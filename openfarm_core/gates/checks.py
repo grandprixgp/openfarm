@@ -92,7 +92,17 @@ def banned_patterns_rust(added_lines: list[dict], cfg,
                          base_counts: dict[str, dict[str, int]] | None = None,
                          head_counts: dict[str, dict[str, int]] | None = None
                          ) -> GateResult:
-    """Added lines, scanned by the Rust pack.
+    """`banned_patterns` with the Rust pack, as before v0.6."""
+    return banned_patterns(added_lines, cfg, production_paths,
+                           base_counts=base_counts, head_counts=head_counts)
+
+
+def banned_patterns(added_lines: list[dict], cfg,
+                    production_paths: set[str],
+                    base_counts: dict[str, dict[str, int]] | None = None,
+                    head_counts: dict[str, dict[str, int]] | None = None,
+                    pack=None) -> GateResult:
+    """Added lines, scanned by the card's language pack (Rust when none is given).
 
     The decision is a **count comparison per file**, not a search for new-looking
     lines. `base_counts` and `head_counts` hold how many times each banned label
@@ -109,8 +119,9 @@ def banned_patterns_rust(added_lines: list[dict], cfg,
     When `head_counts` is absent the gate falls back to added lines alone, and every
     hit is banned: fewer allowances is the safe direction.
     """
-    from ..packs.rust import RustPack
-    pack = RustPack()
+    if pack is None:
+        from ..packs.rust import RustPack
+        pack = RustPack()
     found = pack.patterns(added_lines, cfg.flagged_patterns, production_paths)
     evidence_counts = {"base": base_counts or {}, "head": head_counts or {}}
 
@@ -208,8 +219,13 @@ def test_loss(before: dict, after: dict,
     end. Counts alone are not enough: a renamed test would hide inside one.
     """
     known = set(known_failing or [])
-    before_names = {t["name"] for t in before.get("tests", [])} - known
-    after_names = {t["name"] for t in after.get("tests", [])} - known
+    # A test is its binary and its name: the same name moved to another binary
+    # (a Python test moved to another class) is a loss too. Packs that list no
+    # binary, like Rust's, compare by name alone, as before v0.6.
+    before_names = {_listed(t) for t in before.get("tests", [])
+                    if t["name"] not in known}
+    after_names = {_listed(t) for t in after.get("tests", [])
+                   if t["name"] not in known}
 
     lost = sorted(before_names - after_names)
     if lost:
@@ -222,6 +238,11 @@ def test_loss(before: dict, after: dict,
                           f"{len(after_names)}")
     return GateResult("no-test-loss", PASS,
                       f"{len(after_names)} test(s), none lost")
+
+
+def _listed(test: dict) -> str:
+    binary = str(test.get("binary", "") or "")
+    return f"{binary}::{test['name']}" if binary else str(test["name"])
 
 
 def ignored_or_filtered(parsed: dict, named: list) -> GateResult:

@@ -16,7 +16,10 @@ import re
 from pathlib import Path
 
 from ..errors import Invalid, Refused
-from .base import Pack
+#: `added_lines_from_diff` lived here before v0.6 and is still imported from here.
+from .base import Pack, added_lines_from_diff
+
+__all__ = ["RustPack", "added_lines_from_diff"]
 
 PURPOSES = ("build", "test", "list", "lint", "ws-lint", "format", "fmt-check",
             "typecheck", "mutation", "extra")
@@ -131,8 +134,14 @@ class RustPack(Pack):
                 argv += ["-p", unit]
             # `--lib --bins --tests` keeps doc-tests out; their names have a
             # different shape and the dossier says they did not run.
-            return {"argv": argv + flags + ["--no-fail-fast",
-                                            "--lib", "--bins", "--tests"] + extra}
+            if files:
+                # One integration-test file each: `tests/foo.rs` is `--test foo`.
+                argv += flags + ["--no-fail-fast"]
+                for path in files:
+                    argv += ["--test", Path(str(path)).stem]
+                return {"argv": argv + extra + (["--", *tests] if tests else [])}
+            argv = argv + flags + ["--no-fail-fast", "--lib", "--bins", "--tests"] + extra
+            return {"argv": argv + (["--", *tests] if tests else [])}
 
         if purpose == "list":
             argv = ["cargo", "test"]
@@ -555,32 +564,6 @@ class RustPack(Pack):
     def edit_formats(self) -> dict:
         return {"formats": ["search_replace", "whole_file"]}
 
-    def apply_edit(self, fmt: str, path: Path, edit: dict) -> dict:
-        path = Path(path)
-        if fmt == "whole_file":
-            content = edit.get("content")
-            if content is None:
-                raise Invalid("bad-edit", "whole_file needs `content`")
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(str(content))
-            return {"ok": True}
-
-        if fmt == "search_replace":
-            search = edit.get("search")
-            replace = edit.get("replace", "")
-            if search is None:
-                raise Invalid("bad-edit", "search_replace needs `search`")
-            text = path.read_text() if path.exists() else ""
-            count = text.count(str(search))
-            if count != 1:
-                raise Refused(
-                    "no-unique-match",
-                    f"{path}: search block matched {count} times, not exactly once")
-            path.write_text(text.replace(str(search), str(replace), 1))
-            return {"ok": True}
-
-        raise Invalid("bad-format", f"{fmt!r} is not an edit format")
-
     def append_stub(self, path: Path, test_name: str, body: str) -> dict:
         """Append a panicking stub above the first `#[cfg(test)]` module.
 
@@ -930,29 +913,3 @@ def _has_balanced_braces(text: str) -> bool:
 def _terminates(line: str) -> bool:
     stripped = _strip_line_comment(line).rstrip()
     return stripped.endswith("{") or stripped.endswith(";") or stripped.endswith("}")
-
-
-def added_lines_from_diff(diff_text: str) -> list[dict]:
-    """Added lines from a unified diff, with their new-file line numbers."""
-    out: list[dict] = []
-    path = ""
-    new_line = 0
-    for line in diff_text.splitlines():
-        if line.startswith("+++ "):
-            target = line[4:].strip()
-            path = "" if target == "/dev/null" else target
-            if path.startswith("b/"):
-                path = path[2:]
-            continue
-        if line.startswith("@@ "):
-            match = re.search(r"\+(\d+)(?:,\d+)?", line)
-            new_line = int(match.group(1)) if match else 0
-            continue
-        if line.startswith("+") and not line.startswith("+++"):
-            out.append({"path": path, "line": new_line, "text": line[1:]})
-            new_line += 1
-        elif line.startswith("-") and not line.startswith("---"):
-            continue
-        else:
-            new_line += 1
-    return out

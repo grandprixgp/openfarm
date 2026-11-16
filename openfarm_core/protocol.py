@@ -359,13 +359,27 @@ class CmdPack:
                  tests: list[str] | None = None,
                  files: list[str] | None = None,
                  extra_flags: list[str] | None = None) -> dict:
-        return self.adapter.call("pack", "commands", {
+        # Before v0.6 the core appended `-- <names>` and `--test <stem>` to a test
+        # command itself. External packs were written against that, so the test
+        # purpose keeps it: the pack answers the plain command, and this adds them.
+        appended: list[str] = []
+        if purpose == "test" and (tests or files):
+            for path in files or []:
+                appended += ["--test", Path(str(path)).stem]
+            if tests:
+                appended += ["--", *tests]
+            tests, files = None, None
+        answer = self.adapter.call("pack", "commands", {
             "purpose": purpose,
             "unit": unit,
             "tests": list(tests or []),
             "files": list(files or []),
             "extra_flags": list(extra_flags or []),
         })
+        if appended and isinstance(answer, dict) and isinstance(answer.get("argv"), list):
+            answer = dict(answer)
+            answer["argv"] = list(answer["argv"]) + appended
+        return answer
 
     def parse_list(self, stdout: str) -> dict:
         return self.adapter.call("pack", "parse_list", {"stdout": stdout})

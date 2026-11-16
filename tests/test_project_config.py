@@ -19,16 +19,17 @@ SPEC_KEYS = {
     "project": {"name", "lane", "base_branch", "state_dir"},
     "adapters": {"cards", "runner", "languages", "model",
                  "micromanager", "telemetry", "pack"},
-    "model": {"endpoint", "allowed_endpoints", "key_file", "test_writer",
+    "model": {"endpoint", "allowed_endpoints", "key_file", "headers", "test_writer",
               "implementer", "checker", "planner", "cost_per_1k_in",
               "cost_per_1k_out"},
     "policy": {"never_touch", "forbidden_files", "known_failing",
                "flagged_patterns", "categories"},
     "eligibility": {"max_files", "max_units", "require_reference",
                     "refuse_touches_prefixes", "rust_tests_in_separate_files",
+                    "python_tests_in_test_files",
                     "allow_type_changes", "max_context_files"},
     "brief": {"test_conventions"},
-    "runner": {"env", "cargo_flags"},
+    "runner": {"env", "cargo_flags", "python"},
     "budget": {"implementer_attempts", "test_writer_attempts",
                "model_build_calls_per_card", "mutation_build_calls_per_card",
                "tokens_per_card", "wall_clock_per_card", "frontier_cost_ratio",
@@ -59,10 +60,13 @@ class ConfigFileTests(unittest.TestCase):
         self.assertEqual(set(SPEC_KEYS), KNOWN_TABLES)
 
     def test_this_repositorys_config_parses(self) -> None:
+        # Since v0.6 openfarm farms itself: Python, on the branch v0.6 is built on
+        # (`v0.6` while in development, `master` once merged).
         cfg = load_config(REPO)
         self.assertEqual(cfg.name, "openfarm")
-        self.assertEqual(cfg.base_branch, "main")
-        self.assertEqual(cfg.languages, ["rust"])
+        self.assertIn(cfg.base_branch, ("master", "v0.6"))
+        self.assertEqual(cfg.languages, ["python"])
+        self.assertEqual(cfg.mutation, "off")
 
     def test_this_repositorys_config_keeps_its_own_gates_forbidden(self) -> None:
         cfg = load_config(REPO)
