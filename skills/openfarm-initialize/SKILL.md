@@ -20,6 +20,7 @@ Use this workflow to turn a plain-English project idea inside an empty directory
 
 Unless the user passed `--no-grill`, explicitly requested zero questions, or an agreed `.openfarm/GRILL_DECISIONS.md` already exists, invoke the `openfarm-grill-me` protocol first:
 - Interview **one frontier question at a time** (recommended answer included, `"yes"` accepts) to lock down `src/invariants.rs` rules, golden slice, v1 non-goals, Frontier Claude ACP OAuth setup, and concrete `## Done` assertions.
+- `--batch-grill` runs step 0 in batch mode; serial questions stay the default.
 - Confirm shared understanding with the owner before modifying files.
 
 ### 1. Parse Arguments & Check Environment + Frontier OAuth
