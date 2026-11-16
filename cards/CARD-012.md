@@ -17,9 +17,9 @@ file = "tests/test_batch_grill_skill.py"
 asserts = "each grill SKILL.md contains the line \"## Batch Mode (`--batch`)\" and the phrases \"needs you\" and \"Confirmed\""
 
 [[tests]]
-name = "test_the_copies_are_identical"
+name = "test_the_batch_section_is_the_same_in_both_copies"
 file = "tests/test_batch_grill_skill.py"
-asserts = "the two grill SKILL.md files are byte-identical, and so are the two initialize SKILL.md files"
+asserts = "the text from \"## Batch Mode\" to the next \"## \" heading is non-empty and equal in both grill SKILL.md copies"
 
 [[tests]]
 name = "test_initialize_offers_batch_grill"

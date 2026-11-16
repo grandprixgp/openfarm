@@ -34,7 +34,7 @@ asserts = "language=\"go\" raises Invalid \"bad-bench-task\""
 
 ## Done
 
-- New module `openfarm_core/bench.py` with a frozen dataclass `BenchTask(id: str, language: str, category: str, card: Path, hidden_tests: tuple[Path, ...], root: Path)` and `load_task(task_dir: Path) -> BenchTask`.
+- In the skeleton module `openfarm_core/bench.py`, add a frozen dataclass `BenchTask(id: str, language: str, category: str, card: Path, hidden_tests: tuple[Path, ...], root: Path)` and `load_task(task_dir: Path) -> BenchTask`.
 - `load_task` reads `task_dir / "task.toml"`. Required keys: `id`, `language` (`"rust"` or `"python"`), `category` (one of `small-feature`, `pinned-bugfix`, `pattern`, `refactor`), `card` (a relative path that exists), `hidden_tests` (a non-empty list of relative paths that exist).
 - `card` and each `hidden_tests` entry become absolute paths under `task_dir`; a path that climbs out of `task_dir` raises.
 - Every problem raises `openfarm_core.errors.Invalid("bad-bench-task", ...)` whose message names the key or path at fault.

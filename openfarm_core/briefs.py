@@ -280,7 +280,8 @@ def test_writer_brief(card: Card, book: BriefBook, pack,
 
     if card.new_symbols:
         parts.append(
-            "\nThis card declares new symbols. You may append panicking stubs with\n"
+            "\nThis card declares new symbols. You may append stubs that fail when\n"
+            "called (Rust: `todo!()`; Python: `raise NotImplementedError`) with\n"
             "`append_stub` in files in your touches, additions only.")
 
     return Brief("test_writer", "\n".join(parts))

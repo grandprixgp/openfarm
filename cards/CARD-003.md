@@ -34,7 +34,7 @@ asserts = "an empty dir raises Refused with .code == \"unsupported-language\"; w
 
 ## Done
 
-- New module `openfarm_core/adopt.py` with `detect_language(root: Path) -> str`.
+- In the skeleton module `openfarm_core/adopt.py`, add `detect_language(root: Path) -> str`.
 - Returns `"rust"` when `root / "Cargo.toml"` is a file and neither `pyproject.toml` nor `setup.py` is.
 - Returns `"python"` when `pyproject.toml` or `setup.py` is a file and `Cargo.toml` is not.
 - Raises `openfarm_core.errors.Refused("ambiguous-language", ...)` when both kinds are present; the message says to pass `--lang rust` or `--lang python`.
