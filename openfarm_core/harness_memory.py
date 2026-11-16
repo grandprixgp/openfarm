@@ -2542,6 +2542,44 @@ class HarnessLibrary:
             return {"reported": reported, "vetoed": vetoed, "promoted": promoted,
                     "refused": refused}
 
+    def force_to_global(self, glib: GlobalLibrary, entry_id: str, project: str,
+                        markers: set[str] | None) -> dict:
+        """The owner sends one of this project's lessons to the global library now.
+
+        It skips the proof (`should_promote`) and the lesson's own scope claim, never
+        the safety checks: the project-name check runs again (no markers refuses),
+        then `global_eligibility` as for any promotion.
+        """
+        with self._locked():
+            entry = self._load_entry(entry_id)
+            if not entry:
+                raise Invalid("unknown-entry", f"lesson {entry_id!r} does not exist")
+            if entry.get("origin") == "global":
+                raise Refused("already-global", f"{entry_id} came from the global library")
+            if markers is None:
+                raise Refused("global-refused",
+                              f"{entry_id}: this project's names could not be listed, "
+                              f"so it cannot be checked")
+            scope, why = scope_of(entry, markers)
+            if scope != "general":
+                raise Refused("global-refused", f"{entry_id}: {why}")
+            ok, why = global_eligibility({**entry, "scope": "general"})
+            if not ok:
+                raise Refused("global-refused", f"{entry_id}: {why}")
+            g = glib.add(entry, project)
+            entry["global_id"] = g["id"]
+            entry.pop("global_refused", None)
+            self._save_entry(entry)
+            glib.report(g["id"], project, entry.get("stats") or {}, vetoed=False)
+            return {"entry_id": entry_id, "global_id": g["id"], "forced": True}
+
+    def global_id_of(self, entry_id: str) -> str:
+        """The global lesson linked to one of this project's lessons, or ""."""
+        entry = self._load_entry(entry_id)
+        if not entry:
+            raise Invalid("unknown-entry", f"lesson {entry_id!r} does not exist")
+        return str(entry.get("global_id") or "")
+
     def reset(self) -> dict:
         """Clear active overlay back to revision 0 and deactivate active/probing/candidate entries."""
         with self._locked():

@@ -1,6 +1,6 @@
-# From Empty Folder to Shipped App (Openfarm v0.6.0 Starter Guide)
+# From Empty Folder to Shipped App (Openfarm v0.7.0 Starter Guide)
 
-This guide shows **both human owners and prospective frontier AI agents** how to go from an **empty folder** and a **plain-English idea** (`"An app to track my calories"`) to a gate-verified, human-reviewed application using **Openfarm v0.6.0**.
+This guide shows **both human owners and prospective frontier AI agents** how to go from an **empty folder** and a **plain-English idea** (`"An app to track my calories"`) to a gate-verified, human-reviewed application using **Openfarm v0.7.0**.
 
 > **For related docs:** See [README.md](../README.md) for architecture overview, [docs/USAGE-AND-FIRST-DEPLOYMENT.md](USAGE-AND-FIRST-DEPLOYMENT.md) for detailed configuration & operator runbooks on existing repositories (`tallybox`), and [docs/openfarm-internals.md](openfarm-internals.md) for module internals.
 
@@ -8,7 +8,7 @@ This guide shows **both human owners and prospective frontier AI agents** how to
 
 ## Part 1 — For Human Owners: The Two-Step Workflow
 
-You do **not** need to hand-write `.openfarm/config.toml`, memorize card schemas, or copy Rust boilerplate by hand. Openfarm v0.6.0 packages the CLI, slash commands (`/openfarm-grill-me` and `/openfarm-initialize`), native Claude ACP OAuth setup (`openfarm acp`), plugin rules, and frontier architect/operator skills into a **single repository or package target**.
+You do **not** need to hand-write `.openfarm/config.toml`, memorize card schemas, or copy Rust boilerplate by hand. Openfarm v0.7.0 packages the CLI, slash commands (`/openfarm-grill-me` and `/openfarm-initialize`), native Claude ACP OAuth setup (`openfarm acp`), plugin rules, and frontier architect/operator skills into a **single repository or package target**.
 
 ### Your Two Prompts
 

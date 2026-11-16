@@ -56,6 +56,7 @@ from .git import Git, GitRefused
 from .globs import matches_any, normalise, resolves_within
 from .harness_global import GlobalLibrary, global_dir_for
 from .harness_memory import HarnessLibrary
+from .harness_scope import project_markers
 from .micromanager import MicromanagerBudget, open_micromanager
 from .packs.base import pack_for
 from .state import (StateDir, _safe_id, read_json, utc_now, utc_after,
@@ -1153,6 +1154,22 @@ def cmd_supervise(ctx: Context, args) -> int:
     return EXIT_OK
 
 
+_GLOBAL_ID_RE = re.compile(r"^g-[0-9a-f]{10}$")
+
+
+def _project_label(ctx: Context) -> str:
+    return str(getattr(ctx.cfg, "name", "") or "").strip() or Path(ctx.repo).name
+
+
+def _project_markers(ctx: Context) -> set[str] | None:
+    """What ties a lesson to this project, or None when git can't list its files."""
+    try:
+        tracked = Git(ctx.repo).tracked_files()
+    except (GitRefused, Infra, OSError):
+        return None
+    return project_markers(Path(ctx.repo), _project_label(ctx), tracked)
+
+
 def cmd_harness(ctx: Context, args) -> int:
     """Inspect and manage the adaptive harness cue library."""
     action = getattr(args, "action", "status") or "status"
@@ -1172,7 +1189,11 @@ def cmd_harness(ctx: Context, args) -> int:
             if not target:
                 raise UsageError("harness promote requires <id>")
             try:
-                res = global_lib.restore(target, reason=reason)
+                if _GLOBAL_ID_RE.match(target):
+                    res = global_lib.restore(target, reason=reason)
+                else:
+                    res = _open_harness_library(ctx, require_enabled=False).force_to_global(
+                        global_lib, target, _project_label(ctx), _project_markers(ctx))
             except (Refused, Invalid) as exc:
                 ctx.emit({"error": exc.message, "kind": "refused",
                           "code": exc.code})
@@ -1183,7 +1204,12 @@ def cmd_harness(ctx: Context, args) -> int:
             if not target:
                 raise UsageError("harness demote requires <id>")
             try:
-                res = global_lib.retire(target, reason=reason)
+                gid = target
+                if not _GLOBAL_ID_RE.match(target):
+                    gid = _open_harness_library(ctx, require_enabled=False).global_id_of(target)
+                    if not gid:
+                        raise Refused("not-global", f"{target} is not in the global library")
+                res = global_lib.retire(gid, reason=reason)
             except (Refused, Invalid) as exc:
                 ctx.emit({"error": exc.message, "kind": "refused",
                           "code": exc.code})

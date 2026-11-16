@@ -1,6 +1,6 @@
-# Openfarm v0.6.0 Engineering Handoff
+# Openfarm v0.7.0 Engineering Handoff
 
-Concise entry point for engineers reviewing, testing, or extending Openfarm v0.6.0.
+Concise entry point for engineers reviewing, testing, or extending Openfarm v0.7.0.
 
 For greenfield empty-folder initialization (`"Read and install this skill <link>"` -> `/openfarm-grill-me` -> `"/openfarm-initialize calorie-log ..."`), see [docs/FROM-IDEA-TO-SHIPPED-APP.md](FROM-IDEA-TO-SHIPPED-APP.md). For step-by-step operator instructions, 13-table config reference, card authoring rules, and the executable `tallybox` first-deployment runbook on existing repos, see [docs/USAGE-AND-FIRST-DEPLOYMENT.md](USAGE-AND-FIRST-DEPLOYMENT.md).
 

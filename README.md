@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.6.0-16a34a?style=flat-square" alt="version 0.6.0">
+  <img src="https://img.shields.io/badge/version-0.7.0-16a34a?style=flat-square" alt="version 0.7.0">
   <img src="https://img.shields.io/badge/status-pre--release-d97706?style=flat-square" alt="status: pre-release">
   <img src="https://img.shields.io/badge/python-3.11%2B-7c3aed?style=flat-square" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/runtime%20deps-stdlib%20only-0284c7?style=flat-square" alt="runtime dependencies: standard library only">
@@ -28,11 +28,11 @@
 </p>
 
 <p align="center">
-  <img src="docs/assets/openfarm-stats.svg" alt="545 tests passing in the full offline end-to-end suite, 18 CLI subcommands, 6 adapter interfaces, 0 runtime dependencies" width="100%">
+  <img src="docs/assets/openfarm-stats.svg" alt="596 tests passing in the full offline end-to-end suite, 18 CLI subcommands, 6 adapter interfaces, 0 runtime dependencies" width="100%">
 </p>
 
 > [!IMPORTANT]
-> **Pre-release (v0.6.0).** The core is covered by a deterministic, offline test suite, and v0.6 was partly built by openfarm itself: 14 cards on its own repository, worked live by a cheap worker model with Claude supervising, reviewed and merged. That is a working pipeline, not an efficacy result. The bench that would measure one now ships but has not been run live. Nothing here is a benchmark or a measured cost saving; see [Not yet tested](#not-yet-tested) for exactly what is still open.
+> **Pre-release (v0.7.0).** The core is covered by a deterministic, offline test suite, and v0.6 and v0.7 were partly built by openfarm itself: 19 cards on its own repository, worked live by a cheap worker model with Claude supervising, reviewed and merged. That is a working pipeline, not an efficacy result. The bench that would measure one now ships but has not been run live. Nothing here is a benchmark or a measured cost saving; see [Not yet tested](#not-yet-tested) for exactly what is still open.
 
 ---
 
@@ -306,10 +306,11 @@ Model calls in these tests use a scripted backend and local HTTP test servers, a
 > These have **not** been run yet:
 >
 > - Live remote GitHub URL installs via `uv`, `pipx` or `pip`.
-> - Live paid Anthropic prompt turns through `claude-agent-acp`. Through the built-in native bridge they have run: Claude supervised all 14 v0.6 cards.
-> - Any worker endpoint other than one. v0.6 ran 14 cards on openfarm itself with DeepSeek V4.1 Flash on Command Code (zero data retention on) and Claude supervising. All 14 were reviewed and merged, 5 with small fixes on merge, and the runs turned up about 15 openfarm bugs, each now fixed. That is one repository and one worker, not an efficacy result.
+> - Live paid Anthropic prompt turns through `claude-agent-acp`. Through the built-in native bridge they have run: Claude supervised every v0.6 and v0.7 card.
+> - Any worker endpoint other than one. v0.6 ran 14 cards on openfarm itself with DeepSeek V4.1 Flash on Command Code (zero data retention on) and Claude supervising. All 14 were reviewed and merged, 5 with small fixes on merge, and the runs turned up about 15 openfarm bugs, each now fixed. v0.7 ran its 6 cards the same way: 5 merged (2 with small fixes) and 1 written by hand after its frozen test proved wrong. In tokens, 65% of v0.7's card runs went to the workers and 35% to Claude. That is one repository and one worker, not an efficacy result.
 > - `openfarm bench run` with live arms, and the `solo` arm (Claude as the worker), which has only run against a stand-in.
 > - `openfarm adopt` on someone else's real repository.
+> - Sharing lessons between two real projects. The global library's rules run end to end in tests across four throwaway projects, but openfarm has only ever worked on one real repository, so no lesson has travelled for real.
 > - Live `cargo-mutants` runs (the parser and gate logic are tested with synthetic output).
 > - Live unattended multi-wave LLM execution of a generated app (for example all `calorie-log` cards) end to end.
 > - External `cmd:` adapters against live repository tools, beyond subprocess test harnesses.
