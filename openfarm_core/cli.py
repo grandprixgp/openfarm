@@ -30,7 +30,9 @@ from .acp_setup import (
     run_acp_login,
 )
 from .adopt import adopt_project
+from .bench import load_task
 from .adapters.files import FileCardSource, open_card_source
+
 from .adapters.jsonl import TelemetrySink, open_telemetry
 from .adapters.openai_compat import open_backend
 from .adapters.direct import open_runner
@@ -1288,7 +1290,14 @@ def build_parser() -> argparse.ArgumentParser:
     harness.add_argument("--reason", default="manual")
     harness.add_argument("--yes", action="store_true")
 
+    bench = sub.add_parser("bench", help="run the efficacy bench")
+    bench_sub = bench.add_subparsers(dest="bench_command")
+    bench_list = bench_sub.add_parser("list", help="list bench tasks")
+    bench_list.add_argument("--dir", default="bench",
+                            help="directory of bench tasks")
+
     init = sub.add_parser("init", help="scaffold a new openfarm Rust project")
+
     init.add_argument("name", help="project name or slug (e.g. calorie-log)")
     init.add_argument("--dir", default=None,
                       help="target directory (default: <repo>/<project_slug> or current repo)")
@@ -1369,7 +1378,54 @@ def _emit_standalone(payload: dict, want_json: bool) -> None:
             print(f"{key}: {value}")
 
 
+def _emit_bench_error(message: str, want_json: bool) -> int:
+    _emit_standalone({"error": message, "kind": "invalid"}, want_json)
+    return EXIT_TROUBLE
+
+
+def cmd_bench(args) -> int:
+    action = getattr(args, "bench_command", None)
+    if action == "list":
+        return cmd_bench_list(args)
+    raise UsageError("bench requires a subcommand")
+
+
+def cmd_bench_list(args) -> int:
+    want_json = bool(getattr(args, "json", False))
+    tasks_dir = Path(args.dir)
+    if not tasks_dir.exists():
+        return _emit_bench_error(f"{tasks_dir}: no such directory", want_json)
+    if not tasks_dir.is_dir():
+        return _emit_bench_error(f"{tasks_dir}: not a directory", want_json)
+
+    tasks: list[dict[str, str]] = []
+    for child in sorted(tasks_dir.iterdir(), key=lambda path: path.name):
+        if not child.is_dir():
+            continue
+        if not (child / "task.toml").is_file():
+            continue
+        task_dir = child
+        try:
+            task = load_task(task_dir)
+        except Invalid as exc:
+            return _emit_bench_error(f"{task_dir}: {exc.message}", want_json)
+        tasks.append({
+            "id": task.id,
+            "language": task.language,
+            "category": task.category,
+        })
+
+    tasks.sort(key=lambda task: task["id"])
+    if want_json:
+        _emit_standalone({"tasks": tasks}, True)
+    else:
+        for task in tasks:
+            print(f"{task['id']}  {task['language']}  {task['category']}")
+    return EXIT_OK
+
+
 def cmd_init(args) -> int:
+
     directory = Path(args.dir) if args.dir else None
     repo_base = Path(args.repo) if getattr(args, "repo", None) else Path.cwd()
     payload = initialize_project(
@@ -1460,6 +1516,7 @@ def cmd_acp(args) -> int:
 
 PRE_CONFIG_COMMANDS = {
     "adopt": cmd_adopt,
+    "bench": cmd_bench,
     "init": cmd_init,
     "install-skill": cmd_install_skill,
     "acp": cmd_acp,
