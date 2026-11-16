@@ -116,6 +116,28 @@ The full walkthrough of this example is in [`docs/FROM-IDEA-TO-SHIPPED-APP.md`](
 > [!NOTE]
 > **Requirements:** Python 3.11+ and git. The built-in Rust pack also needs `cargo`, `clippy` and `rustfmt`, and mutation testing needs `cargo-mutants`. Frontier supervision plugs in by default via **native Claude ACP over OAuth** (`openfarm acp status` / `openfarm acp login`, supporting `claude` CLI directly or external `claude-agent-acp`), while **coding Workers still authenticate via API key** against a zero-retention OpenAI-compatible endpoint enforced by `allowed_endpoints`.
 
+## Existing projects and Python
+
+For a repository that already exists, adopt it first:
+
+```bash
+openfarm adopt --dir .
+```
+
+Then batch-grill the project:
+
+```text
+/openfarm-grill-me --batch
+```
+
+Check the first card:
+
+```bash
+openfarm check CARD-001
+```
+
+Python repositories use `unittest` unless they configure pytest, and formatting is checked only when `ruff` is installed.
+
 ## How it works
 
 <p align="center">
