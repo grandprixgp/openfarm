@@ -24,6 +24,7 @@ import hashlib
 import re
 import shutil
 import sys
+import textwrap
 from pathlib import Path
 
 from ..errors import Invalid, Refused
@@ -704,3 +705,62 @@ def _render_node(node: ast.AST, indent: str) -> str:
             rendered = rendered[:157] + "..."
         return indent + rendered
     return ""
+
+
+def _raises_not_implemented(stmt: ast.stmt) -> bool:
+    return (isinstance(stmt, ast.Raise) and stmt.exc is not None
+            and "NotImplementedError" in ast.unparse(stmt.exc))
+
+
+def _is_docstring(stmt: ast.stmt) -> bool:
+    return (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant)
+            and isinstance(stmt.value.value, str))
+
+
+def _stub_function(node: ast.AST) -> bool:
+    body = [stmt for stmt in node.body if not _is_docstring(stmt)]
+    return len(body) == 1 and _raises_not_implemented(body[0])
+
+
+def _declaration_only(stmts: list[ast.stmt], in_class: bool) -> bool:
+    for stmt in stmts:
+        if _is_docstring(stmt) or isinstance(stmt, (ast.Import, ast.ImportFrom, ast.Pass)):
+            continue
+        if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant) \
+                and stmt.value.value is Ellipsis:
+            continue
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if not _stub_function(stmt):
+                return False
+            continue
+        if isinstance(stmt, ast.ClassDef):
+            if not _declaration_only(stmt.body, in_class=True):
+                return False
+            continue
+        if isinstance(stmt, ast.AnnAssign):
+            # A field or a typed name. In a class it may carry a plain default.
+            if stmt.value is None or (in_class and isinstance(stmt.value, ast.Constant)):
+                continue
+            return False
+        if isinstance(stmt, ast.Assign) and not in_class and all(
+                isinstance(t, ast.Name) and t.id == "__all__" for t in stmt.targets):
+            continue
+        return False
+    return True
+
+
+def valid_python_scaffold(body: str) -> bool:
+    """True when `body` declares contracts and has no behaviour of its own.
+
+    Imports, classes, typed fields and functions whose only statement is
+    `raise NotImplementedError`. The scaffold sets the shape a worker fills in;
+    any real logic in it would be frontier code nobody tested.
+    """
+    text = textwrap.dedent(str(body or ""))
+    if not text.strip():
+        return False
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return False
+    return _declaration_only(tree.body, in_class=False)

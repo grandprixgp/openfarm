@@ -7,7 +7,8 @@ structured operations while keeping all authority in deterministic Python code:
    and optionally split into steps validated against ``card.test_names`` and
    ``card.touches``.
 2. ``scaffold_contract``: produce initial type/function contract stubs
-   (containing ``todo!(`` or ``unimplemented!(`` in production files) strictly
+   (Rust ``todo!(`` / ``unimplemented!(``, Python ``raise NotImplementedError``)
+   strictly
    within ``card.touches`` and outside ``never_touch`` / ``forbidden_files``.
 3. ``coach``: diagnose failure root causes and emit prose coaching stripped of
    raw edit-block headers so DSF remains the sole code author.
@@ -26,6 +27,7 @@ from pathlib import Path
 from typing import Callable
 
 from .adapters.acp import ClaudeAcpAdapter
+from .packs.python import valid_python_scaffold
 from .cards import Card
 from .edits import (
     Edit,
@@ -480,6 +482,20 @@ class CmdMicromanager:
         pass
 
 
+# What an operation's answer may contain, where the schema alone does not say.
+_OP_RULES = {
+    "scaffold_contract": (
+        "Declare the new symbols' contracts so the frozen tests can import them, "
+        "and nothing else. Edit only production files listed in card.touches, "
+        "never a test file: the test writer writes those. Every new function's "
+        "body is only a stub that fails when called: Rust `todo!()` or "
+        "`unimplemented!()`, Python `raise NotImplementedError`. Imports, types, "
+        "classes and typed fields are fine; no other logic, no default values "
+        "computed from input. Return {\"edits\": []} if nothing is needed."
+    ),
+}
+
+
 def _build_op_prompt(op: str, payload: dict) -> str:
     schemas = {
         "shape_and_plan": (
@@ -521,9 +537,11 @@ def _build_op_prompt(op: str, payload: dict) -> str:
     }
     schema = schemas.get(op, "{}")
     body = json.dumps(payload, indent=2, ensure_ascii=False, default=str)
+    rules = _OP_RULES.get(op, "")
     return (
         f"Operation: {op}\n"
-        f"Required JSON schema: {schema}\n"
+        + (f"Rules: {rules}\n" if rules else "")
+        + f"Required JSON schema: {schema}\n"
         f"Return ONLY one valid JSON object matching the schema.\n"
         f"--- BEGIN DATA ---\n{body}\n--- END DATA ---\n"
     )
@@ -960,7 +978,15 @@ class Micromanager:
                     f"{edit.path}: scaffold_contract may only target production paths in card.touches",
                 )
             body = _scaffold_body_to_validate(edit)
-            if not _valid_production_scaffold(body):
+            if norm_path.endswith((".py", ".pyi")):
+                if not valid_python_scaffold(body):
+                    raise Refused(
+                        "scaffold-missing-todo",
+                        f"{edit.path}: a Python scaffold may only declare: imports, "
+                        "classes, typed fields and functions whose body is "
+                        "`raise NotImplementedError`",
+                    )
+            elif not _valid_production_scaffold(body):
                 raise Refused(
                     "scaffold-missing-todo",
                     f"{edit.path}: production scaffold must contain "
