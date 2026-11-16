@@ -97,6 +97,10 @@ def load_task(task_dir: Path) -> BenchTask:
     )
 
 
+def score(records: list[dict]) -> dict:
+    raise NotImplementedError
+
+
 def _resolve_task_member(root: Path, raw: str, key: str) -> Path:
     path = Path(raw)
     if path.is_absolute():
