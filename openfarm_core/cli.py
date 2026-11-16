@@ -57,7 +57,6 @@ from .globs import matches_any, normalise, resolves_within
 from .harness_global import GlobalLibrary, global_dir_for
 from .harness_memory import HarnessLibrary
 from .micromanager import MicromanagerBudget, open_micromanager
-
 from .packs.base import pack_for
 from .state import (StateDir, _safe_id, read_json, utc_now, utc_after,
                     write_json)
@@ -1242,7 +1241,6 @@ def cmd_harness(ctx: Context, args) -> int:
         return EXIT_OK
 
     raise UsageError(f"unknown harness action: {action}")
-
 
 
 # -- the parser ----------------------------------------------------------------

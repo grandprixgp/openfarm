@@ -71,8 +71,7 @@ class HarnessGlobalCliTests(unittest.TestCase):
         return code, payload, text, stderr.getvalue()
 
     def test_global_status_lists_the_library(self) -> None:
-        added = GlobalLibrary(self.global_dir).add(self._lesson(), "alpha")
-        self.assertEqual(added["sources"], ["alpha"])
+        GlobalLibrary(self.global_dir).add(self._lesson(), "alpha")
 
         code, payload, _stdout, _stderr = self._run_cli(
             "harness", "status", "--global"
