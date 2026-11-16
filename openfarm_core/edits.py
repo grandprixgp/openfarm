@@ -135,6 +135,8 @@ def parse_edits(text: str) -> list[Edit]:
 
 
 _FENCE_LINE = re.compile(r"^\s*```[\w.+-]*\s*$")
+_TRAILING_JUNK = re.compile(
+    r"^\s*(```|(>{3,}|<{3,}|={3,})\s*(END|REPLACE|SEARCH)?|</?[｜|]+\s*DSML[^>]*>)\s*$")
 
 
 def _unfence(body: str) -> str:
@@ -151,9 +153,19 @@ def _unfence(body: str) -> str:
     opened = bool(_FENCE_LINE.match(lines[first]))
     if opened:
         del lines[first]
-    last = next((i for i in range(len(lines) - 1, -1, -1) if lines[i].strip()), None)
-    if last is not None and lines[last].strip() == "```":
-        del lines[last]
+    # Trailing junk a model adds after its last real line: a closing fence, a
+    # closing marker the format does not have (`>>>`, `>>> END`), or a model's own
+    # tool-call tags leaking through (DeepSeek's `</｜｜DSML｜｜ invoke>`). None of
+    # these is ever source code.
+    trimmed = False
+    while True:
+        last = next((i for i in range(len(lines) - 1, -1, -1) if lines[i].strip()), None)
+        if last is None or not _TRAILING_JUNK.match(lines[last]):
+            break
+        del lines[last:]
+        trimmed = True
+    if trimmed:
+        lines.append("")  # keep the block's last real line ending in a newline
     return "\n".join(lines)
 
 

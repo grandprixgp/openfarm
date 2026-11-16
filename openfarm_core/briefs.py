@@ -146,6 +146,9 @@ To change part of a file, copy the old lines exactly as they are now:
 <old lines, exactly as they appear in the file>
 >>> REPLACE
 <new lines>
+
+There is no closing line: a block ends where the next `===` header starts, or at
+the end of your answer. Do not add `>>>`, `>>> END` or a fence after it.
 """
 
 STUB_FORMAT = """To add a stub for a new symbol, at the end of an existing file:
