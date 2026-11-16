@@ -1,4 +1,21 @@
-# openfarm v0.7 Design Decisions (openfarm-grill-me)
+# openfarm v0.8 Design Decisions (openfarm-grill-me, cut short)
+
+- **Idea:** openfarm v0.8. A shared board, a team whose members a coordinator picks (tier and effort), parallel cards, and seats an outside agent or person can hold.
+- **Grill mode:** one question asked, then the owner said "draft it up" (16 Nov 2026). Only the three decisions below are the owner's. Everything else in `openfarm spec v0.8.md` is my default, listed there under "Open for the owner", and not yet confirmed.
+
+## Decisions (the owner's)
+
+1. **Scope.** The full version in one release: a coordinator that picks its own members, and parallel cards. Not the smaller board-and-one-seat version I recommended.
+2. **Effort.** The coordinator sets effort per member. It matters most for now, because every member is the same model.
+3. **Members.** DeepSeek V4.1 Flash only for now, at `low`, `medium`, `high` or `max`.
+
+## Build route
+
+By hand on branch `v0.8`, by another agent overnight, from `docs/v0.8-BUILD-HANDOFF.md`. No live model calls during the build; the owner runs the first live test.
+
+---
+
+# Earlier: openfarm v0.7 Design Decisions (openfarm-grill-me)
 
 - **Idea:** openfarm v0.7. Learning extraction can mark lessons as project-independent, proven ones become global across every openfarm project, and each project chooses whether it applies its own lessons, global ones, or both.
 - **Grill mode:** serial, Q1 to Q8, every recommendation taken. Confirmed 16 Nov 2026.
