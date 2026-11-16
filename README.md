@@ -124,6 +124,8 @@ For a repository that already exists, adopt it first:
 openfarm adopt --dir .
 ```
 
+Adopt writes `.openfarm/config.toml`, `.openfarm/PROJECT_SPEC.md` and `cards/.gitkeep` and commits nothing. Commit them, and your cards, before `openfarm check` or `openfarm run`: openfarm reads cards from the committed base branch.
+
 Then batch-grill the project:
 
 ```text
