@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from .errors import Refused
+
 
 def detect_language(root: Path) -> str:
     """Return "rust" or "python" from the manifests at the top level of `root`.
@@ -16,4 +18,28 @@ def detect_language(root: Path) -> str:
     kinds of manifest are present, or "unsupported-language" when neither is.
     Only the top level of `root` is looked at; nothing is written.
     """
-    raise NotImplementedError
+    root = Path(root)
+    has_cargo = (root / "Cargo.toml").is_file()
+    has_python = ((root / "pyproject.toml").is_file()
+                  or (root / "setup.py").is_file())
+
+    if has_cargo and has_python:
+        raise Refused(
+            "ambiguous-language",
+            "both a Rust and a Python manifest are present; pass --lang rust or "
+            "--lang python",
+        )
+    if has_cargo:
+        return "rust"
+    if has_python:
+        return "python"
+    if (root / "package.json").is_file():
+        raise Refused(
+            "unsupported-language",
+            "no supported language manifest found; TypeScript has no pack yet",
+        )
+    raise Refused(
+        "unsupported-language",
+        "no supported language manifest found: expected Cargo.toml, pyproject.toml, "
+        "or setup.py",
+    )
