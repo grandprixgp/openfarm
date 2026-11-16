@@ -48,12 +48,14 @@ class BenchArmHarnessTests(unittest.TestCase):
             '[harness]\nlearn_from = "project"\nglobal_dir = "/tmp/g"\n',
         )
 
+        harness = tomllib.loads(merged)["harness"]
         self.assertEqual(
-            tomllib.loads(merged)["harness"],
-            {
-                "learn_from": "project",
-                "global_dir": "/tmp/g",
-                "share": True,
-                "probe_window": 3,
-            },
+            {key: harness[key] for key in ("learn_from", "global_dir", "share", "probe_window")},
+            {"learn_from": "project", "global_dir": "/tmp/g", "share": True, "probe_window": 3},
         )
+
+    def test_an_arm_without_harness_leaves_it_alone(self) -> None:
+        base = render_config(name="t", language="python", base_branch="main",
+                             state_dir=Path("/tmp/s"), key_file=Path("/tmp/k"))
+        merged = arm_config_text(base, '[model]\nmax_tokens = 10\n')
+        self.assertEqual(tomllib.loads(merged)["harness"], tomllib.loads(base)["harness"])

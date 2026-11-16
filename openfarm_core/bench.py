@@ -273,9 +273,13 @@ def _arm_owns(table: str) -> bool:
         ("model.", "micromanager."))
 
 
+ARM_HARNESS_KEYS = frozenset({"learn_from", "share", "global_dir"})
+
+
 def load_arm(path: Path) -> str:
     """An arm file's text, checked: only `[adapters]` model/micromanager, `[model]`
-    and `[micromanager]` (with their sub-tables) are allowed in it."""
+    and `[micromanager]` (with their sub-tables), and `[harness]` learn_from, share
+    and global_dir are allowed in it."""
     try:
         text = Path(path).read_text(encoding="utf-8")
         data = tomllib.loads(text)
@@ -283,11 +287,16 @@ def load_arm(path: Path) -> str:
         raise Invalid("bad-bench-arm", f"cannot read arm file {path}: {exc}") from exc
     except tomllib.TOMLDecodeError as exc:
         raise Invalid("bad-bench-arm", f"invalid TOML in arm file {path}: {exc}") from exc
-    extra = sorted(set(data) - {"adapters", "model", "micromanager"})
+    extra = sorted(set(data) - {"adapters", "model", "micromanager", "harness"})
     if extra:
         raise Invalid("bad-bench-arm",
-                      f"{path}: an arm sets only [adapters], [model] and "
-                      f"[micromanager], not {extra}")
+                      f"{path}: an arm sets only [adapters], [model], "
+                      f"[micromanager] and [harness], not {extra}")
+    stray_harness = sorted(set(data.get("harness", {})) - ARM_HARNESS_KEYS)
+    if stray_harness:
+        raise Invalid("bad-bench-arm",
+                      f"{path}: an arm's [harness] sets only learn_from, share and "
+                      f"global_dir, not {stray_harness}")
     adapters = data.get("adapters", {})
     stray = sorted(set(adapters) - ARM_ADAPTER_KEYS)
     if stray:
@@ -297,6 +306,29 @@ def load_arm(path: Path) -> str:
     return text
 
 
+def _toml_value(value) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return json.dumps(str(value))
+
+
+def _merge_harness_lines(lines: list[str], arm_harness: dict) -> list[str]:
+    """The base's `[harness]` lines with the arm's keys replaced or added at the end."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for line in lines:
+        key = line.split("=", 1)[0].strip() if "=" in line else ""
+        if key in arm_harness:
+            line = f"{key} = {_toml_value(arm_harness[key])}"
+            seen.add(key)
+        out.append(line)
+    while out and not out[-1].strip():
+        out.pop()
+    out.extend(f"{key} = {_toml_value(value)}" for key, value in arm_harness.items()
+               if key not in seen)
+    return out
+
+
 def arm_config_text(base: str, arm: str) -> str:
     """`base` (a full config) with the arm's adapters, `[model]` and `[micromanager]`.
 
@@ -304,7 +336,9 @@ def arm_config_text(base: str, arm: str) -> str:
     matching lines and leave the rest of the base's `[adapters]` alone.
     """
     arm_sections = _sections(arm)
-    arm_adapters = tomllib.loads(arm).get("adapters", {})
+    arm_data = tomllib.loads(arm)
+    arm_adapters = arm_data.get("adapters", {})
+    arm_harness = arm_data.get("harness", {})
     arm_tables = [(name, lines) for name, lines in arm_sections if _arm_owns(name)]
     replaced = {name.split(".")[0] for name, _lines in arm_tables}
 
@@ -318,6 +352,9 @@ def arm_config_text(base: str, arm: str) -> str:
                 if key in arm_adapters:
                     line = f"{key} = {json.dumps(str(arm_adapters[key]))}"
                 out.append(line)
+            continue
+        if name == "harness" and arm_harness:
+            out.extend(_merge_harness_lines(lines, arm_harness))
             continue
         out.extend(lines)
     for _name, lines in arm_tables:
