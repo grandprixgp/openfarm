@@ -948,7 +948,11 @@ class CardRun:
                 decision = self.micromanager.shape_and_plan(
                     self.card, sigs, ctx_contents, known_tests=known_tests, cfg=self.cfg
                 )
-            except (Refused, Invalid, ValueError) as exc:
+            except (Refused, Invalid, ValueError, Infra) as exc:
+                # Planning is help, not a gate: a supervisor that is slow to answer
+                # costs the card its plan, not its run. Other infra still stops it.
+                if isinstance(exc, Infra) and exc.code != "acp-timeout":
+                    raise
                 self._record_gate(GateResult(
                     "micromanager-shape",
                     FAIL if isinstance(exc, Refused) else INFRA,
@@ -1256,7 +1260,9 @@ class CardRun:
                 never_touch=self.cfg.never_touch,
                 forbidden=self.cfg.forbidden_files,
             )
-        except (Refused, Invalid, ValueError) as exc:
+        except (Refused, Invalid, ValueError, Infra) as exc:
+            if isinstance(exc, Infra) and exc.code != "acp-timeout":
+                raise
             self._record_gate(GateResult(
                 "micromanager-scaffold",
                 FAIL if isinstance(exc, Refused) else INFRA,
