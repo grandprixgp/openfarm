@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1280" height="340" viewBox="0 0 1280 340" role="img" aria-labelledby="banner-t banner-d">
 <title id="banner-t">openfarm: Frontier thinks. The farm grinds. Code decides.</title>
-<desc id="banner-d">Banner for openfarm v0.5.1, a pre-release portable coding farm where frontier models architect and review, cheaper models do the compile and retry grind, and plain code runs every gate.</desc>
+<desc id="banner-d">Banner for openfarm v0.6.0, a pre-release portable coding farm where frontier models architect and review, cheaper models do the compile and retry grind, and plain code runs every gate.</desc>
 <defs>
   <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
     <stop offset="0" stop-color="#0b1220"/><stop offset="1" stop-color="#17233d"/>

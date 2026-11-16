@@ -11,7 +11,7 @@
   - [1. Mental Model & Architecture](#1-mental-model--architecture)
   - [2. Annotated Configuration (`.openfarm/config.toml`)](#2-annotated-configuration-openfarmconfigtoml)
   - [3. Authoring Cards That Pass Eligibility](#3-authoring-cards-that-pass-eligibility)
-  - [4. Operations & Runbook Controls (All 12 CLI Subcommands)](#4-operations--runbook-controls-all-12-cli-subcommands)
+  - [4. Operations & Runbook Controls (All 18 CLI Subcommands)](#4-operations--runbook-controls-all-18-cli-subcommands)
 - [Part 2 — Contrast-Rich First-Target App (`tallybox`)](#part-2--contrast-rich-first-target-app-tallybox)
   - [Crate Layout & Protected Seam](#crate-layout--protected-seam)
   - [Why `tallybox` Produces High Contrast for Weak Models & Harness²](#why-tallybox-produces-high-contrast-for-weak-models--harness²)
@@ -246,7 +246,7 @@ asserts = "reserve_with_policy returns Ok(IntegrationOutcome { ... }) with SeamF
 
 ---
 
-### 4. Operations & Runbook Controls (All 12 CLI Subcommands)
+### 4. Operations & Runbook Controls (All 18 CLI Subcommands)
 
 Invoke via `./openfarm` (when copied/installed) or `python3 -m openfarm_core.cli` from the Openfarm checkout (`PYTHONPATH=/path/to/openfarm`).
 
@@ -257,10 +257,15 @@ Invoke via `./openfarm` (when copied/installed) or `python3 -m openfarm_core.cli
   - `2`: usage or `ConfigError`
   - `3`: trouble (`Infra`, `Invalid`, or adapter failure)
 
-#### All 12 Subcommands
+#### All 18 Subcommands
+
+`init`, `install-skill` and `acp` are covered in Part 3. The table below has the rest.
 
 | Stage | Command & Exact Flags | Purpose |
 | --- | --- | --- |
+| Setup | `openfarm adopt [--dir DIR] [--lang rust\|python] [--state-dir PATH] [--key-file PATH] [--no-suite]` | Add openfarm to an existing git repository without touching its source: writes `.openfarm/config.toml`, `.openfarm/PROJECT_SPEC.md` and `cards/.gitkeep` and commits nothing. Refuses a folder that is not a repository, uncommitted changes, or a second adopt. Runs the suite once (unless `--no-suite`): a suite that does not build is refused before anything is written, and failing tests are proposed in a comment above `[policy] known_failing` for you to copy in. Cargo builds into the state folder. |
+| Bench | `openfarm bench list [--dir bench]` | List the bench tasks (`id  language  category`, or JSON with `--json`). |
+| Bench | `openfarm bench run [--dir bench] [--task ID]... [--arm farm=FILE] [--arm solo=FILE] [--repeats N] [--out DIR] [--dry-run]` | Run each task in each arm `N` times (default 3) in fresh throwaway repos, score each result on the task's hidden tests, and write `records.jsonl`, `bench-report.json` and `bench-report.md` to `--out` (default `~/.openfarm/bench/<time>`). An arm file sets only `[adapters]` model/micromanager, `[model]` and `[micromanager]`; examples are in `bench/arms/`. `--dry-run` uses each task's scripted answers and costs nothing. Nothing is uploaded. |
 | Pre-flight | `openfarm check <CARD> [--baseline]` | Check card eligibility (exit `0` eligible, `1` ineligible). `--baseline` also runs base suite 2x + confirms named tests compile & fail on base. |
 | Pre-flight | `openfarm supervise (--triage-blocked \| --prepare-queue) [--card ID] [--apply] [--mm-script PATH]` | Run micromanager `prepare_queue` on `ready`/`backlog` cards (or `triage_blocked` on `blocked` cards). Writes `<state_dir>/supervision/<stamp>-supervise.json`. `--apply` files findings or releases cards. |
 | Pre-flight | `openfarm run --dry-run [--cards N] [--card ID]` | Validate eligibility and baseline health across the next `N` ready cards without claiming cards or calling models. |
