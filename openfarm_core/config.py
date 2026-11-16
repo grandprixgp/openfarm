@@ -62,7 +62,7 @@ _TABLE_KEYS = {
     "harness": {"enabled", "dir", "capture_on", "max_cues_per_brief",
                 "max_active_adaptations", "min_confidence", "probe_window",
                 "auto_demote", "allow_micromanager_reflection",
-                "editable_surfaces"},
+                "editable_surfaces", "global_dir", "learn_from", "share"},
 }
 _ROLE_MODEL_KEYS = {"model", "temperature", "vary_seed"}
 _HEADER_NAME = re.compile(r"^[A-Za-z0-9!#$%&'*+.^_`|~-]+$")
@@ -243,6 +243,7 @@ class MicromanagerConfig:
         }
 
 
+VALID_LEARN_FROM = ("both", "project", "global")
 VALID_HARNESS_CAPTURE_ON = ("retry_recovery", "fail", "counter_fail", "pass")
 VALID_HARNESS_SURFACES = (
     "test_writer_guidance",
@@ -273,6 +274,11 @@ class HarnessConfig:
         "context_hints",
         "micromanager_context",
     )
+    # v0.7 global learning. An empty global_dir means the default: the
+    # OPENFARM_GLOBAL_HARNESS environment variable, else ~/.openfarm/global/harness.
+    global_dir: str = ""
+    learn_from: str = "both"
+    share: bool = True
 
     def as_dict(self) -> dict:
         return {
@@ -286,6 +292,9 @@ class HarnessConfig:
             "auto_demote": self.auto_demote,
             "allow_micromanager_reflection": self.allow_micromanager_reflection,
             "editable_surfaces": list(self.editable_surfaces),
+            "global_dir": self.global_dir,
+            "learn_from": self.learn_from,
+            "share": self.share,
         }
 
 
@@ -592,6 +601,18 @@ class Config:
         else:
             editable_surfaces = VALID_HARNESS_SURFACES
 
+        raw_global = h.get("global_dir", "")
+        if raw_global is None:
+            raw_global = ""
+        if not isinstance(raw_global, str) or "\x00" in raw_global:
+            raise ConfigError("[harness] global_dir: expected a path string")
+        global_dir = ""
+        if raw_global.strip():
+            global_dir = str(self._outside_repo(raw_global.strip(), "[harness] global_dir"))
+        learn_from = _as_choice(h.get("learn_from"), "[harness] learn_from", "both",
+                                VALID_LEARN_FROM)
+        share = _as_bool(h.get("share"), "[harness] share", True)
+
         return HarnessConfig(
             enabled=enabled,
             dir=resolved_dir,
@@ -603,6 +624,9 @@ class Config:
             auto_demote=auto_demote,
             allow_micromanager_reflection=allow_mm_refl,
             editable_surfaces=editable_surfaces,
+            global_dir=global_dir,
+            learn_from=learn_from,
+            share=share,
         )
 
     def _parse_micromanager(self, mm: dict) -> MicromanagerConfig:
