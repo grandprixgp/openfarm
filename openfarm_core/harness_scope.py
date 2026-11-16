@@ -114,5 +114,54 @@ def scope_of(entry: dict, markers: set[str]) -> tuple[str, str]:
 
 
 def global_eligibility(entry: dict) -> tuple[bool, str]:
-    """`(eligible, reason)`: may this lesson ever go global? Until the card lands, no."""
-    return False, "eligibility check not built yet"
+    """`(eligible, reason)`: may this lesson ever go global?"""
+    source = str(entry.get("source") or "")
+    scope = str(entry.get("scope") or "")
+    origin = str(entry.get("origin") or "")
+    surface = str(entry.get("surface") or "")
+    title = str(entry.get("title") or "")
+    cue = str(entry.get("cue") or "")
+    lesson = str(entry.get("lesson") or "")
+    patch = entry.get("proposed_patch") or {}
+    if not isinstance(patch, dict):
+        patch = {}
+
+    if source == "deterministic":
+        return False, "fixed-rule cue"
+    if scope != "general":
+        return False, "project scope"
+    if origin == "global":
+        return False, "already global"
+
+    if surface == "micromanager_context":
+        scanned = "\n".join((title, cue, lesson)).lower()
+        if any(word in scanned for word in (
+            "probe", "overlay", "revision", "harness", "metrics",
+            "ledger", "index_md", "by_kind", "by_surface",
+        )):
+            return False, "harness bookkeeping"
+
+    if len(cue) > 400 or len(lesson) > 400:
+        return False, "longer than 400 characters"
+
+    if any("```" in text or "~~~" in text for text in (title, cue, lesson)):
+        return False, "holds a code block"
+
+    from .harness_memory import is_assertion_leak, is_gate_bypass_directive
+
+    texts = (title, cue, lesson)
+    if any(is_gate_bypass_directive(text) for text in texts):
+        return False, "gate bypass"
+    if any(is_assertion_leak(text) for text in texts):
+        return False, "assertion leak"
+
+    for key in ("context_files", "paths", "files"):
+        value = patch.get(key)
+        if isinstance(value, list) and value:
+            return False, "names files"
+    for key in ("path", "file"):
+        value = patch.get(key)
+        if isinstance(value, str) and value:
+            return False, "names files"
+
+    return True, ""
