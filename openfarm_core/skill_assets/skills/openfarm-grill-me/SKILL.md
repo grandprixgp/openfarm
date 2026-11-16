@@ -48,3 +48,9 @@ Read [prompts/grill_protocol.md](./prompts/grill_protocol.md) for the exact 5-br
 
 4. **Shared Understanding Gate Before Writing Code**:
    Do **not** run `openfarm init` edits or write application code while frontier questions remain open. When the frontier is empty, summarize the agreed design tree concisely and wait for the owner's confirmation (`"Confirmed"` / `"Proceed"`). Then write `.openfarm/GRILL_DECISIONS.md` (with zero secrets or API keys) and hand off seamlessly into `/openfarm-initialize` (greenfield) or `openfarm` wave card authoring (existing repo).
+
+## Batch Mode (`--batch`)
+
+With `--batch`, take the recommended answer at every decision point. Then show one numbered list grouped by branch, one line of reason each. The owner replies with numbers to challenge or `Confirmed`; only challenged numbers reopen as one-at-a-time questions.
+
+A decision that needs a fact only the owner has is listed as `needs you`, never filled with a guess. `.openfarm/GRILL_DECISIONS.md` records `mode: batch` and which numbers were challenged.
