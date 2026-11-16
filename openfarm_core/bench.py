@@ -159,6 +159,45 @@ def score(records: list[dict]) -> dict:
     return {"arms": arms, "categories": categories}
 
 
+def render_report(summary: dict) -> str:
+    def percent(value: float) -> str:
+        return f"{value * 100:.1f}%"
+
+    def money(value: float | None) -> str:
+        if value is None:
+            return "—"
+        return f"${value:.2f}"
+
+    lines = [
+        "# openfarm bench report",
+        "",
+        "| Arm | Runs | Passed | Pass rate | Spend | Cost per pass |",
+        "| --- | --- | --- | --- | --- | --- |",
+    ]
+    for arm in sorted(summary.get("arms", {})):
+        stats = summary["arms"][arm]
+        lines.append(
+            f"| {arm} | {stats['runs']} | {stats['passed']} | "
+            f"{percent(stats['pass_rate'])} | {money(stats['spend'])} | "
+            f"{money(stats['cost_per_pass'])} |"
+        )
+
+    lines += [
+        "",
+        "## By category",
+        "",
+        "| Category | farm | solo |",
+        "| --- | --- | --- |",
+    ]
+    for category in sorted(summary.get("categories", {})):
+        arms = summary["categories"][category]
+        farm = percent(arms["farm"]) if "farm" in arms else "—"
+        solo = percent(arms["solo"]) if "solo" in arms else "—"
+        lines.append(f"| {category} | {farm} | {solo} |")
+
+    return "\n".join(lines)
+
+
 def _check_record(record: dict) -> None:
     for key in _REQUIRED_RECORD_KEYS:
         if key not in record:
