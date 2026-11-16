@@ -288,6 +288,7 @@ class PythonCardTests(unittest.TestCase):
                          f"{outcome.get('stop_code')}: {outcome.get('detail')}")
         dossier = self._dossier()
         self.assertNotIn("doc-tests", dossier)
+        self.assertIn("Judged by openfarm", dossier)
         self.assertIn("## 9. Diffs", dossier)
 
         branch = subprocess.run(

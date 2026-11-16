@@ -311,6 +311,15 @@ def cmd_run(ctx: Context, args) -> int:
         ctx.emit({"refused": True, "reason": "the circuit breaker is tripped"})
         return EXIT_REFUSED
 
+    if not args.dry_run:
+        # Never judge a card with code the card could have edited.
+        from .selfhost import unpinned_reason
+        reason = unpinned_reason(ctx.repo, getattr(ctx.cfg, "state_dir", None))
+        if reason:
+            ctx.emit({"refused": True, "reason": reason,
+                      "code": "self-host-unpinned"})
+            return EXIT_REFUSED
+
     run_id = args.run_id or f"run-{utc_now().replace('-', '').replace(':', '')}"
     if not ctx.state.acquire_run_lock(run_id):
         holder = ctx.state.lock_holder() or {}
