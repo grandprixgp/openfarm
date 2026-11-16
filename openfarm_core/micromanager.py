@@ -600,6 +600,17 @@ class ClaudeAcpMicromanager:
         return {"name": self.name, "versions": [1], "ops": ["hello", "assist"]}
 
     def _ensure_session(self) -> tuple[ClaudeAcpAdapter, str]:
+        # A timed-out turn kills the adapter's process. The card goes on without
+        # that answer, so the next call needs a fresh adapter, not "not running".
+        if self._adapter is not None:
+            proc = getattr(self._adapter, "_proc", None)
+            if proc is not None and proc.poll() is not None:
+                try:
+                    self._adapter.close()
+                except Exception:  # noqa: BLE001 - a dead adapter is replaced regardless
+                    pass
+                self._adapter = None
+                self._session_id = None
         if self._adapter is None:
             self._adapter = ClaudeAcpAdapter(
                 command=self.command,

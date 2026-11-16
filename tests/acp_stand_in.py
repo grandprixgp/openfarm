@@ -636,6 +636,12 @@ def main() -> int:
             if args.mode == "script":
                 turns = script_data.get("turns") or []
                 entry = turns[min(turn_count - 1, len(turns) - 1)] if turns else {}
+                once = entry.get("hang_once_marker")
+                if once and not Path(once).exists():
+                    # The first process to reach this turn hangs; a restarted one answers.
+                    Path(once).write_text("hung\n")
+                    time.sleep(args.hang_seconds)
+                    continue
                 for raw_line in entry.get("raw_lines") or []:
                     sys.stdout.write(str(raw_line) + "\n")
                     sys.stdout.flush()

@@ -1018,6 +1018,27 @@ class MicromanagerTests(unittest.TestCase):
         self.assertEqual(rep.verdict, "approve")
         self.assertEqual(rep.reviewer_brief, "cmd ok")
 
+    def test_a_timed_out_turn_restarts_the_adapter_for_the_next_call(self) -> None:
+        # Seen live on CARD-007: the plan timed out, the card went on, and its next
+        # supervisor call failed with "ACP subprocess is not running".
+        marker = self.tmp / "hung-once"
+        script = self.tmp / "hang_then_answer.json"
+        script.write_text(json.dumps({"turns": [{
+            "hang_once_marker": str(marker),
+            "text": json.dumps({"root_cause": "r", "guidance": "g", "abort": False,
+                                "abort_reason": ""})}]}), encoding="utf-8")
+        backend = ClaudeAcpMicromanager(
+            command=_stand_in_cmd("--mode", "script", "--script", str(script),
+                                  "--hang-seconds", "30"),
+            cwd=self.tmp, timeout_s=0.5)
+        with Micromanager(backend) as mm:
+            with self.assertRaises(Infra) as caught:
+                mm.coach(self.card, "impl", 1, {}, "", "err")
+            self.assertEqual(caught.exception.code, "acp-timeout")
+            self.assertTrue(marker.exists())
+            advice = mm.coach(self.card, "impl", 2, {}, "", "err")
+            self.assertEqual(advice.guidance, "g")
+
     def test_claude_acp_micromanager_spend_and_artifacts(self) -> None:
         card_dir = self.tmp / "card-state"
         # Mode unterminated-osc emits vendor cost = 0.0, so cost_per_1k_in/out is used.
