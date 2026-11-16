@@ -303,7 +303,7 @@ class PythonPack(Pack):
             if not line or line.startswith("ERROR "):
                 continue
             if self.runner == "pytest":
-                if "::" not in line or " " in line:
+                if "::" not in line:
                     continue
                 binary, name = _split_nodeid(line)
             else:
