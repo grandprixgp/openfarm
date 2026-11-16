@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from openfarm_core.briefs import BriefBook, planner_brief
+from openfarm_core.cards import Card
+from openfarm_core.packs.python import PythonPack
 from tests.test_python_e2e import (GOOD_IMPLEMENTATION, GOOD_TEST, build_python_toy,
                                    run_cli, script)
 
@@ -55,6 +60,27 @@ class SupervisorTimeoutTests(unittest.TestCase):
         outcome = payload["outcomes"][0]
         self.assertEqual(outcome["final_state"], "blocked")
         self.assertEqual(outcome["stop_code"], "infra")
+
+
+class FallbackPlannerTests(unittest.TestCase):
+    """With the supervisor's plan gone, openfarm's own planner runs instead."""
+
+    def test_a_new_test_file_in_touches_does_not_stop_the_planner(self) -> None:
+        # Seen live: CARD-014's plan timed out, the fallback planner read its new test
+        # file's signatures, and the missing file stopped the card as infra.
+        repo = Path(tempfile.mkdtemp(prefix="openfarm-"))
+        self.addCleanup(shutil.rmtree, repo, True)
+        (repo / "pkg").mkdir()
+        (repo / "pkg" / "mod.py").write_text("def f(x: int) -> int:\n    return x\n")
+        card = Card(id="CARD-1", title="Backfill", state="ready", done_text="tests",
+                    touches=["pkg/mod.py", "tests/test_new.py"],
+                    fields={"category": "test-backfill",
+                            "tests": [{"name": "test_a", "file": "tests/test_new.py"}]})
+        book = BriefBook(repo, never_touch=[])
+        book.pack = PythonPack()
+        body = planner_brief(card, book).body
+        self.assertIn("### tests/test_new.py (does not exist yet)", body)
+        self.assertIn("def f(x: int) -> int", body)
 
 
 if __name__ == "__main__":

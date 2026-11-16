@@ -211,6 +211,10 @@ def planner_brief(card: Card, book: BriefBook, harness_guidance: str = "") -> Br
     for path in card.touches:
         if book.is_hidden(path):
             continue
+        # A new file (a test-backfill card's test file, say) has no signatures yet.
+        if _safe_existing_target(book, path) is None:
+            parts.append(f"\n### {normalise(path)} (does not exist yet)")
+            continue
         parts.append(f"\n### {path}\n"
                      f"{book.signatures(path, getattr(book, 'pack', None) or _EXPECTED_PACK)}")
     if card.reference and not book.is_hidden(card.reference):
