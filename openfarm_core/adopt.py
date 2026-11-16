@@ -7,9 +7,11 @@ appends its function here. See `.openfarm/PROJECT_SPEC.md`.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from .errors import Refused
+from .git import Git
 
 
 def detect_language(root: Path) -> str:
@@ -250,3 +252,93 @@ def adopt_config_text(
         f"editable_surfaces = {_toml_list(editable_surfaces)}",
     ]
     return "\n".join(lines) + "\n"
+
+
+def adopt_project(
+    root: Path,
+    *,
+    language: str | None = None,
+    state_dir: Path | None = None,
+    key_file: Path | None = None,
+) -> dict:
+    """Adopt the existing git repository at `root` without touching its source.
+
+    Raises `openfarm_core.errors.Refused` with code "not-a-git-repo" when
+    `root/.git` does not exist, "dirty-worktree" when the worktree is not clean,
+    or "already-adopted" when `root/.openfarm/config.toml` exists, in that order.
+    Writes `.openfarm/config.toml`, `.openfarm/PROJECT_SPEC.md` and
+    `cards/.gitkeep`, creates `state_dir` with mode 0o700, never commits, and
+    returns {"ok": True, "language": ..., "written": [...]}.
+    """
+    root = Path(root).expanduser().resolve()
+
+    if not (root / ".git").exists():
+        raise Refused(
+            "not-a-git-repo",
+            f"{root} is not a git repository: .git is missing",
+        )
+
+    config_path = root / ".openfarm" / "config.toml"
+    if config_path.exists():
+        raise Refused(
+            "already-adopted",
+            f"{root} is already adopted: {config_path} exists",
+        )
+
+    git = Git(root)
+    if not git.is_clean():
+        raise Refused(
+            "dirty-worktree",
+            f"{root} has uncommitted changes; commit or stash them before adopting",
+        )
+
+    resolved_language = language or detect_language(root)
+    base_branch = git.current_branch()
+
+    name = root.name
+    if state_dir is None:
+        resolved_state = (Path.home() / ".openfarm" / name).expanduser().resolve()
+    else:
+        resolved_state = Path(state_dir).expanduser().resolve()
+    if key_file is None:
+        resolved_key = (
+            Path.home() / ".config" / "openfarm" / f"{name}.key"
+        ).expanduser().resolve()
+    else:
+        resolved_key = Path(key_file).expanduser().resolve()
+
+    config_text = adopt_config_text(
+        root,
+        resolved_language,
+        base_branch=base_branch,
+        state_dir=resolved_state,
+        key_file=resolved_key,
+    )
+
+    resolved_state.mkdir(parents=True, exist_ok=True)
+    os.chmod(resolved_state, 0o700)
+
+    spec_path = root / ".openfarm" / "PROJECT_SPEC.md"
+    gitkeep_path = root / "cards" / ".gitkeep"
+
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    with config_path.open("x", encoding="utf-8") as handle:
+        handle.write(config_text)
+
+    spec_path.parent.mkdir(parents=True, exist_ok=True)
+    with spec_path.open("x", encoding="utf-8") as handle:
+        handle.write(f"# {name}\n")
+
+    gitkeep_path.parent.mkdir(parents=True, exist_ok=True)
+    with gitkeep_path.open("x", encoding="utf-8") as handle:
+        handle.write("")
+
+    return {
+        "ok": True,
+        "language": resolved_language,
+        "written": [
+            ".openfarm/config.toml",
+            ".openfarm/PROJECT_SPEC.md",
+            "cards/.gitkeep",
+        ],
+    }
