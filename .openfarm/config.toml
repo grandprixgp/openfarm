@@ -1,7 +1,7 @@
 [project]
 name = "openfarm"
 lane = "farm"
-base_branch = "master"
+base_branch = "v0.6"
 state_dir = "/home/prix/.openfarm/openfarm"
 
 [adapters]
