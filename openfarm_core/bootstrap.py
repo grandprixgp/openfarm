@@ -383,7 +383,8 @@ def initialize_project(
         if non_git and not force:
             raise Refused(
                 "dir-not-empty",
-                f"{target_dir} is not empty (pass --force to overwrite scaffold files)",
+                f"{target_dir} is not empty (pass --force to overwrite scaffold files); "
+                f"to add openfarm to an existing project, run: openfarm adopt --dir {target_dir}",
             )
 
     resolved_state = (
