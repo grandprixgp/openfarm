@@ -33,7 +33,7 @@ class SupervisorTimeoutTests(unittest.TestCase):
             done_text="`Bounded(1).push(8)` after one push raises `FullError`.")
         self.toy.commit("tally: CARD-1")
 
-    def _run(self, shape: dict) -> dict:
+    def _run(self, shape: dict, pre_review: dict | None = None) -> dict:
         model = script(**{
             "CARD-1/test_writer": "=== whole_file: tests/test_full.py\n" + GOOD_TEST,
             "CARD-1/implementer": GOOD_IMPLEMENTATION,
@@ -41,8 +41,9 @@ class SupervisorTimeoutTests(unittest.TestCase):
             "CARD-1/checker_pass2": "{}"})
         mm = script(**{"CARD-1/shape_and_plan": shape,
                        "CARD-1/scaffold_contract": TIMEOUT,
-                       "CARD-1/pre_review": {"verdict": "approve", "reviewer_brief": "ok",
-                                             "missed_clause": "", "findings": []}})
+                       "CARD-1/pre_review": pre_review or {
+                           "verdict": "approve", "reviewer_brief": "ok",
+                           "missed_clause": "", "findings": []}})
         result = run_cli(self.toy.root, "run", "--card", "CARD-1", "--cards", "1",
                          "--script", str(model), "--mm-script", str(mm))
         return json.loads(result.stdout)
@@ -53,6 +54,16 @@ class SupervisorTimeoutTests(unittest.TestCase):
         self.assertEqual(outcome["final_state"], "in-review", outcome.get("detail"))
         status = json.loads(run_cli(self.toy.root, "status").stdout)
         self.assertFalse(status["paused"])
+
+    def test_a_timed_out_pre_review_leaves_the_card_for_the_reviewer(self) -> None:
+        # CARD-011 passed every gate, then the pre-review timed out and blocked it.
+        payload = self._run({"verdict": "ready", "clarified_notes": "",
+                             "extra_context_files": [], "steps": [], "findings": []},
+                            pre_review=TIMEOUT)
+        outcome = payload["outcomes"][0]
+        self.assertEqual(outcome["final_state"], "in-review", outcome.get("detail"))
+        run_dir = next((self.toy.state_dir / "cards" / "CARD-1").iterdir())
+        self.assertIn("pre_review degraded", (run_dir / "dossier.md").read_text())
 
     def test_other_supervisor_infra_still_stops_the_card(self) -> None:
         payload = self._run({"fail": True, "kind": "infra", "code": "acp-exit",

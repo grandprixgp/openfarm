@@ -1196,7 +1196,9 @@ class CardRun:
                         advice = self.micromanager.coach(
                             self.card, "test-writer", attempt,
                             self._working_test_texts(), "", last_failure, cfg=self.cfg)
-                    except (Refused, Invalid, ValueError) as mm_exc:
+                    except (Refused, Invalid, ValueError, Infra) as mm_exc:
+                        if isinstance(mm_exc, Infra) and mm_exc.code != "acp-timeout":
+                            raise
                         self._record_gate(GateResult(
                             "micromanager-coach",
                             FAIL if isinstance(mm_exc, Refused) else INFRA,
@@ -1923,7 +1925,9 @@ class CardRun:
                         self.card, "implementer", attempt_no,
                         self._frozen_texts(), diff.get("diff", ""), detail,
                         cfg=self.cfg)
-                except (Refused, Invalid, ValueError) as mm_exc:
+                except (Refused, Invalid, ValueError, Infra) as mm_exc:
+                    if isinstance(mm_exc, Infra) and mm_exc.code != "acp-timeout":
+                        raise
                     self._record_gate(GateResult(
                         "micromanager-coach",
                         FAIL if isinstance(mm_exc, Refused) else INFRA,
@@ -2206,7 +2210,9 @@ class CardRun:
                     "counter_tests": dict(self.counter_summary),
                     "mutation": dict(self.mutation_summary),
                 })
-            except (Refused, Invalid, ValueError) as exc:
+            except (Refused, Invalid, ValueError, Infra) as exc:
+                if isinstance(exc, Infra) and exc.code != "acp-timeout":
+                    raise
                 self._record_gate(GateResult(
                     "micromanager-pre-review",
                     FAIL if isinstance(exc, Refused) else INFRA,
@@ -2525,7 +2531,9 @@ class CardRun:
                         self.card, full_diff, restatement,
                         self._last_failing_counters,
                     )
-                except (Refused, Invalid, ValueError) as exc:
+                except (Refused, Invalid, ValueError, Infra) as exc:
+                    if isinstance(exc, Infra) and exc.code != "acp-timeout":
+                        raise
                     self._record_gate(GateResult(
                         "micromanager-adjudicate",
                         FAIL if isinstance(exc, Refused) else INFRA,
