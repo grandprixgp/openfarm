@@ -9,7 +9,7 @@ frontier_estimate = 2.00
 new_symbols = true
 unit = "."
 type_changes = false
-context_files = ["openfarm_core/git.py", "openfarm_core/bootstrap.py"]
+context_files = ["openfarm_core/bootstrap.py"]
 
 [[tests]]
 name = "test_adopt_writes_only_its_three_files"
