@@ -142,6 +142,16 @@ openfarm check CARD-001
 
 Python repositories use `unittest` unless they configure pytest, and formatting is checked only when `ruff` is installed.
 
+## Global learning
+
+- Every project learns lessons from its own cards, as before. Each lesson is marked `project` or `general`. Claude claims one, and plain code keeps it `project` if it names one of the project's files, functions, cards or its name.
+- A general lesson that has helped on 3 or more cards, with fewer hurts than helps, goes to a global library at `~/.openfarm/global/harness`. `[harness] global_dir` moves it, unless the project sets `share = false`. Notes about openfarm's own bookkeeping, fixed-rule hints, long lessons and lessons with code never go.
+- Other projects import a global lesson as a new lesson of their own and try it like one. A project that finds it hurts switches it off for itself. Two such projects, or a negative combined score, retire it everywhere.
+- `[harness] learn_from = "both" | "project" | "global"` picks which lessons apply. The default is `both`, and `openfarm run --learn-from ...` overrides it for one run.
+- `openfarm harness status --global` lists the global lessons and their source projects. `openfarm harness demote <id> --global` retires one, and `openfarm harness promote <id> --global` brings it back.
+- Bench runs use a throwaway global library of their own, so they never read or change yours.
+- Sharing lessons between two real projects is **untested**.
+
 ## Efficacy bench
 
 `openfarm bench` measures whether the farm pays off, with your own models. It ships 12 tasks in `bench/` (6 Rust, 6 Python, across small features, pinned bug fixes, patterns and refactors), each with a starting project, a card, and hidden tests that the models never see.
