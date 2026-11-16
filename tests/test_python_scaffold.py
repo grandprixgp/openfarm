@@ -39,10 +39,10 @@ def load_task(task_dir: Path) -> BenchTask:
 '''
 
 
-def _card() -> Card:
+def _card(touches=("openfarm_core/bench.py", "tests/test_bench_tasks.py")) -> Card:
     return Card(
         id="CARD-8", title="Load a bench task", state="ready", done_text="loads",
-        touches=["openfarm_core/bench.py", "tests/test_bench_tasks.py"],
+        touches=list(touches),
         fields={"category": "feature", "new_symbols": True,
                 "tests": [{"name": "test_a_valid_task_loads",
                            "file": "tests/test_bench_tasks.py"}]})
@@ -66,6 +66,30 @@ class ValidPythonScaffoldTests(unittest.TestCase):
         ):
             with self.subTest(body=body):
                 self.assertFalse(valid_python_scaffold(body))
+
+
+class PlanStepTouchTests(unittest.TestCase):
+    def test_a_step_naming_the_cards_test_file_keeps_the_plan(self) -> None:
+        steps = [{"n": 1, "does": "load", "tests": ["test_a_valid_task_loads"],
+                  "touches": ["openfarm_core/bench.py", "tests/test_bench_tasks.py"]},
+                 {"n": 2, "does": "check", "tests": ["test_a_valid_task_loads"],
+                  "touches": ["openfarm_core/bench.py"]}]
+        mm = Micromanager(ScriptedMicromanager({"shape_and_plan": {
+            "verdict": "ready", "steps": steps}}))
+        # Like CARD-010: touches name only the production file.
+        decision = mm.shape_and_plan(_card(touches=["openfarm_core/bench.py"]), {}, {})
+        self.assertEqual([s["touches"] for s in decision.steps],
+                         [["openfarm_core/bench.py"], ["openfarm_core/bench.py"]])
+
+    def test_a_step_touching_another_file_is_still_refused(self) -> None:
+        mm = Micromanager(ScriptedMicromanager({"shape_and_plan": {
+            "verdict": "ready",
+            "steps": [{"n": 1, "does": "x", "tests": ["test_a_valid_task_loads"],
+                       "touches": ["openfarm_core/cli.py"]},
+                      {"n": 2, "does": "y", "tests": ["test_a_valid_task_loads"],
+                       "touches": ["openfarm_core/bench.py"]}]}}))
+        with self.assertRaises(Refused):
+            mm.shape_and_plan(_card(touches=["openfarm_core/bench.py"]), {}, {})
 
 
 class ScaffoldContractTests(unittest.TestCase):

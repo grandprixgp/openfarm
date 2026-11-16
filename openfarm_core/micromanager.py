@@ -858,6 +858,11 @@ class Micromanager:
 
             step_touches: list[str] = []
             for raw_touch in step.get("touches") or []:
+                # A step naming the card's own test file says where its tests live.
+                # Those are frozen before any step runs, so it is not a touch; drop
+                # it rather than throw the whole plan away (seen live, CARD-010).
+                if _is_test_path(str(raw_touch), card):
+                    continue
                 norm_touch = _validate_safe_path(
                     str(raw_touch),
                     never_touch=nt,
