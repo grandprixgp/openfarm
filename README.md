@@ -63,13 +63,9 @@ The bar openfarm sets itself is economic, not just "cheap tokens": a merged card
 
 openfarm is installed and driven through your frontier coding agent (Claude Code, Antigravity, or any agent that reads `.agents/skills`). Two sentences take you from an empty folder to a checked queue of cards.
 
-```mermaid
-flowchart LR
-    E(["Empty folder<br/>+ a plain-English idea"]) --> S1["<b>1. Install</b><br/>Read and install this skill"]
-    S1 --> S2["<b>2. Initialize</b><br/>/openfarm-initialize name idea"]
-    S2 --> Q(["Validated repo,<br/>golden slice and<br/>a checked card queue"])
-    Q --> F(["Farm works the cards<br/>you review and merge"])
-```
+<p align="center">
+  <img src="docs/assets/openfarm-quickstart.svg" alt="Quickstart flow: Empty folder and a plain-English idea -> 1. Install (Read and install this skill) -> 2. Initialize (/openfarm-initialize name idea) -> Validated repo, golden slice and a checked card queue -> Farm works the cards, you review and merge." width="100%">
+</p>
 
 ### 1. Install
 
@@ -173,16 +169,9 @@ openfarm keeps a small, bounded memory of what helped weaker models recover from
 
 The core reads one config file per repository and talks to the outside world only through six adapter interfaces. Each has built-in implementations, and any of them can be swapped for an external command that speaks a small JSON protocol (`{"openfarm": 1, ...}`) over stdin and stdout.
 
-```mermaid
-flowchart LR
-    CORE{{"openfarm core<br/>Python stdlib, one config file"}}
-    CORE --- CS["Card source<br/><code>files:</code> folder"]
-    CORE --- RN["Runner<br/><code>direct</code> (cargo)"]
-    CORE --- LP["Language pack<br/><code>rust</code>"]
-    CORE --- MB["Model backend<br/><code>openai-compatible</code>, <code>scripted</code>"]
-    CORE --- TL["Telemetry<br/><code>jsonl</code>"]
-    CORE --- MM["Micromanager<br/><code>off</code>, <code>claude-acp</code>, <code>scripted</code>"]
-```
+<p align="center">
+  <img src="docs/assets/openfarm-adapters.svg" alt="openfarm core (Python 3.11+ stdlib, one config file) connected to six adapter interfaces: Card source (files: folder), Runner (direct cargo), Language pack (rust), Model backend (openai-compatible, scripted), Telemetry (jsonl), and Micromanager (claude-acp, off, scripted). Every interface also accepts cmd:<argv> over stdio JSON." width="100%">
+</p>
 
 Every adapter also accepts `cmd:<argv>`. Card state lives on its own `openfarm-cards` branch so parallel cards never conflict. TypeScript is not implemented yet. Git is the one hard dependency, and nothing in the core names a particular project.
 
