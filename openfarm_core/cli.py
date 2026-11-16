@@ -549,6 +549,7 @@ def _run_card(ctx: Context, source: FileCardSource, card_id: str, run_id: str,
                     spec=cfg.pack_adapter, cwd=worktree,
                     python=cfg.runner_python)
     pack.configure(worktree)
+    owns_backend = backend is None
     backend = backend if backend is not None else open_backend(cfg, script)
     runner = ctx.runner(worktree, output_dir=card_dir / "gates" / "output")
     book = BriefBook(worktree, cfg.never_touch, cfg.forbidden_files)
@@ -581,6 +582,11 @@ def _run_card(ctx: Context, source: FileCardSource, card_id: str, run_id: str,
         if owns_mm:
             try:
                 mm.close()
+            except Exception:
+                pass
+        if owns_backend and hasattr(backend, "close"):
+            try:
+                backend.close()
             except Exception:
                 pass
         try:
@@ -743,6 +749,8 @@ def _backend_prices_spend(cfg, script: Path | None) -> bool:
     """Whether this configuration can report a cost at all."""
     if script is not None or cfg.model_adapter in ("scripted", "stub"):
         return False
+    if cfg.model_adapter == "claude-acp":
+        return True  # Claude reports its own cost per turn.
     return bool(getattr(cfg, "cost_per_1k_in", 0.0)
                 or getattr(cfg, "cost_per_1k_out", 0.0))
 
@@ -1294,6 +1302,21 @@ def build_parser() -> argparse.ArgumentParser:
     bench_list = bench_sub.add_parser("list", help="list bench tasks")
     bench_list.add_argument("--dir", default="bench",
                             help="directory of bench tasks")
+    bench_run = bench_sub.add_parser(
+        "run", help="run bench tasks in each arm and write a local report")
+    bench_run.add_argument("--dir", default="bench",
+                           help="directory of bench tasks")
+    bench_run.add_argument("--task", action="append", default=[],
+                           help="task id to run (repeatable; default: all)")
+    bench_run.add_argument("--arm", action="append", default=[],
+                           metavar="NAME=FILE",
+                           help="an arm (farm or solo) and its config file; repeatable")
+    bench_run.add_argument("--repeats", type=int, default=None,
+                           help="runs per task and arm (default 3; 1 with --dry-run)")
+    bench_run.add_argument("--out", default=None,
+                           help="report folder (default ~/.openfarm/bench/<time>)")
+    bench_run.add_argument("--dry-run", action="store_true",
+                           help="scripted answers from each task's script.json; costs nothing")
 
     init = sub.add_parser("init", help="scaffold a new openfarm Rust project")
     init.add_argument("name", help="project name or slug (e.g. calorie-log)")
@@ -1385,6 +1408,8 @@ def cmd_bench(args) -> int:
     action = getattr(args, "bench_command", None)
     if action == "list":
         return cmd_bench_list(args)
+    if action == "run":
+        return cmd_bench_run(args)
     raise UsageError("bench requires a subcommand")
 
 
@@ -1419,6 +1444,54 @@ def cmd_bench_list(args) -> int:
     else:
         for task in tasks:
             print(f"{task['id']}  {task['language']}  {task['category']}")
+    return EXIT_OK
+
+
+def cmd_bench_run(args) -> int:
+    from .bench import load_arm, run_bench
+    want_json = bool(getattr(args, "json", False))
+    tasks_dir = Path(args.dir)
+    if not tasks_dir.is_dir():
+        return _emit_bench_error(f"{tasks_dir}: no such directory", want_json)
+    try:
+        tasks = [load_task(child) for child in sorted(tasks_dir.iterdir())
+                 if child.is_dir() and (child / "task.toml").is_file()]
+        if args.task:
+            wanted = set(args.task)
+            unknown = sorted(wanted - {task.id for task in tasks})
+            if unknown:
+                return _emit_bench_error(f"unknown task(s): {unknown}", want_json)
+            tasks = [task for task in tasks if task.id in wanted]
+        arms: dict[str, str | None] = {}
+        for spec in args.arm:
+            name, sep, path = spec.partition("=")
+            if not sep or name not in ("farm", "solo"):
+                return _emit_bench_error(
+                    f"--arm takes farm=FILE or solo=FILE, not {spec!r}", want_json)
+            arms[name] = None if args.dry_run else load_arm(Path(path))
+        if not arms:
+            if not args.dry_run:
+                return _emit_bench_error(
+                    "name at least one arm: --arm farm=FILE and/or --arm solo=FILE "
+                    "(examples in bench/arms/), or pass --dry-run", want_json)
+            arms = {"farm": None}
+        repeats = args.repeats if args.repeats is not None else (1 if args.dry_run else 3)
+        if repeats < 1:
+            return _emit_bench_error("--repeats must be at least 1", want_json)
+        out = (Path(args.out) if args.out else
+               Path.home() / ".openfarm" / "bench"
+               / _time.strftime("%Y%m%dT%H%M%SZ", _time.gmtime()))
+        report = run_bench(tasks, arms, repeats, out, dry_run=args.dry_run,
+                           log=lambda message: print(message, file=sys.stderr))
+    except Invalid as exc:
+        return _emit_bench_error(exc.message, want_json)
+    payload = {"out": str(out), "summary": report["summary"],
+               "runs": len(report["records"])}
+    if want_json:
+        _emit_standalone(payload, True)
+    else:
+        print((out / "bench-report.md").read_text(encoding="utf-8"))
+        print(f"report: {out}")
     return EXIT_OK
 
 

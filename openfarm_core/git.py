@@ -182,6 +182,12 @@ class Git:
     def current_branch(self) -> str:
         return self._run(["rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip()
 
+    def branches(self, pattern: str) -> list[str]:
+        """Local branch names matching a `refs/heads/` glob such as `openfarm/CARD-1-*`."""
+        out = self._run(["for-each-ref", "--format=%(refname:short)",
+                         f"refs/heads/{pattern}"]).stdout
+        return sorted(line for line in out.splitlines() if line)
+
     def branch_exists(self, name: str) -> bool:
         result = self._run(["rev-parse", "--verify", "--quiet", f"refs/heads/{name}"],
                            check=False)

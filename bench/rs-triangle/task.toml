@@ -1,0 +1,5 @@
+id = "rs-triangle"
+language = "rust"
+category = "pattern"
+card = "card.md"
+hidden_tests = ["hidden/tests/hidden_triangle.rs"]

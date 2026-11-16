@@ -1,0 +1,6 @@
+{
+ "CARD-1/test_writer": "=== whole_file: tests/test_port.py\nimport unittest\n\nfrom forms.validators import ValidationError, validate_port\n\n\nclass PortTests(unittest.TestCase):\n    def test_validate_port_accepts_8080(self):\n        self.assertEqual(validate_port(\"8080\"), 8080)\n\n    def test_validate_port_refuses_zero(self):\n        with self.assertRaises(ValidationError):\n            validate_port(\"0\")\n\n=== append_stub: forms/validators.py\ntest_validate_port_accepts_8080\ndef validate_port(value: str) -> int:\n    raise NotImplementedError\n",
+ "CARD-1/implementer": "=== search_replace: forms/validators.py\n<<< SEARCH\ndef validate_port(value: str) -> int:\n    raise NotImplementedError\n>>> REPLACE\ndef validate_port(value: str) -> int:\n    \"\"\"A TCP port: ASCII digits only, 1 to 65535, trimmed.\"\"\"\n    cleaned = value.strip()\n    if not cleaned or not all(\"0\" <= ch <= \"9\" for ch in cleaned):\n        raise ValidationError(\"port must be digits only\")\n    port = int(cleaned)\n    if not 1 <= port <= 65535:\n        raise ValidationError(\"port must be 1 to 65535\")\n    return port\n",
+ "CARD-1/checker_pass1": "RESTATEMENT: validate_port checks a port",
+ "CARD-1/checker_pass2": "{}"
+}

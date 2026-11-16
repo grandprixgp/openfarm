@@ -1,16 +1,28 @@
 """`openfarm bench`: the efficacy suite, farm against frontier-solo on hidden tests.
 
-A skeleton for the v0.6 cards (CARD-008, CARD-009, CARD-010): each card appends its
-part here. See `.openfarm/PROJECT_SPEC.md`.
+A task (`bench/<task>/`) holds `task.toml`, the card, a starting project in `repo/`,
+hidden tests under `hidden/`, and `script.json` with scripted answers for the
+zero-cost dry run. An arm file sets only `[adapters]` model/micromanager, `[model]`
+and `[micromanager]`; `bench/arms/` has examples. Each run starts from a fresh copy
+of `repo/`, runs the card, then copies the hidden tests onto the result and runs the
+whole suite. Nothing leaves the machine but the arms' own model calls.
 """
 
 from __future__ import annotations
 
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
 from .errors import Invalid
+from .git import Git
 
 _ALLOWED_LANGUAGES = frozenset({"rust", "python"})
 _ALLOWED_CATEGORIES = frozenset(
@@ -27,6 +39,10 @@ class BenchTask:
     card: Path
     hidden_tests: tuple[Path, ...]
     root: Path
+    # The project the arms start from, and the scripted answers for a dry run.
+    # Both are optional for loading; `run_bench` needs `repo`.
+    repo: Path | None = None
+    script: Path | None = None
 
 
 def load_task(task_dir: Path) -> BenchTask:
@@ -87,6 +103,8 @@ def load_task(task_dir: Path) -> BenchTask:
         _resolve_task_member(root, item, "hidden_tests") for item in hidden_value
     )
 
+    repo_dir = root / "repo"
+    script_file = root / "script.json"
     return BenchTask(
         id=task_id,
         language=language,
@@ -94,6 +112,8 @@ def load_task(task_dir: Path) -> BenchTask:
         card=card,
         hidden_tests=hidden_tests,
         root=root,
+        repo=repo_dir if repo_dir.is_dir() else None,
+        script=script_file if script_file.is_file() else None,
     )
 
 
@@ -227,3 +247,237 @@ def _resolve_task_member(root: Path, raw: str, key: str) -> Path:
         raise Invalid("bad-bench-task", f"{key} path does not exist: {raw}")
 
     return target
+
+
+# -- running the bench ----------------------------------------------------------
+
+ARM_ADAPTER_KEYS = frozenset({"model", "micromanager"})
+_HEADER_RE = re.compile(r"^\[\s*([A-Za-z0-9_.\-]+)\s*\]\s*$")
+_CARD_ID_RE = re.compile(r'^id\s*=\s*"([^"]+)"', re.MULTILINE)
+
+
+def _sections(text: str) -> list[tuple[str, list[str]]]:
+    """A TOML text split at its `[table]` headers: ("", preamble) first."""
+    sections: list[tuple[str, list[str]]] = [("", [])]
+    for line in text.splitlines():
+        match = _HEADER_RE.match(line)
+        if match:
+            sections.append((match.group(1), [line]))
+        else:
+            sections[-1][1].append(line)
+    return sections
+
+
+def _arm_owns(table: str) -> bool:
+    return table in ("model", "micromanager") or table.startswith(
+        ("model.", "micromanager."))
+
+
+def load_arm(path: Path) -> str:
+    """An arm file's text, checked: only `[adapters]` model/micromanager, `[model]`
+    and `[micromanager]` (with their sub-tables) are allowed in it."""
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+        data = tomllib.loads(text)
+    except OSError as exc:
+        raise Invalid("bad-bench-arm", f"cannot read arm file {path}: {exc}") from exc
+    except tomllib.TOMLDecodeError as exc:
+        raise Invalid("bad-bench-arm", f"invalid TOML in arm file {path}: {exc}") from exc
+    extra = sorted(set(data) - {"adapters", "model", "micromanager"})
+    if extra:
+        raise Invalid("bad-bench-arm",
+                      f"{path}: an arm sets only [adapters], [model] and "
+                      f"[micromanager], not {extra}")
+    adapters = data.get("adapters", {})
+    stray = sorted(set(adapters) - ARM_ADAPTER_KEYS)
+    if stray:
+        raise Invalid("bad-bench-arm",
+                      f"{path}: an arm's [adapters] sets only model and "
+                      f"micromanager, not {stray}")
+    return text
+
+
+def arm_config_text(base: str, arm: str) -> str:
+    """`base` (a full config) with the arm's adapters, `[model]` and `[micromanager]`.
+
+    The arm's tables replace the base's whole; its `[adapters]` keys replace the
+    matching lines and leave the rest of the base's `[adapters]` alone.
+    """
+    arm_sections = _sections(arm)
+    arm_adapters = tomllib.loads(arm).get("adapters", {})
+    arm_tables = [(name, lines) for name, lines in arm_sections if _arm_owns(name)]
+    replaced = {name.split(".")[0] for name, _lines in arm_tables}
+
+    out: list[str] = []
+    for name, lines in _sections(base):
+        if _arm_owns(name) and name.split(".")[0] in replaced:
+            continue
+        if name == "adapters":
+            for line in lines:
+                key = line.split("=", 1)[0].strip()
+                if key in arm_adapters:
+                    line = f"{key} = {json.dumps(str(arm_adapters[key]))}"
+                out.append(line)
+            continue
+        out.extend(lines)
+    for _name, lines in arm_tables:
+        out.append("")
+        out.extend(lines)
+    text = "\n".join(out).strip("\n") + "\n"
+    tomllib.loads(text)  # a broken merge fails here, not in the run
+    return text
+
+
+def card_id_of(card_text: str) -> str:
+    match = _CARD_ID_RE.search(card_text)
+    if not match:
+        raise Invalid("bad-bench-task", "the task's card has no id")
+    return match.group(1)
+
+
+def _openfarm_cmd() -> list[str]:
+    return [sys.executable, "-m", "openfarm_core.cli"]
+
+
+def _openfarm_env() -> dict:
+    env = dict(os.environ)
+    root = str(Path(__file__).resolve().parent.parent)
+    env["PYTHONPATH"] = root + (os.pathsep + env["PYTHONPATH"]
+                                if env.get("PYTHONPATH") else "")
+    return env
+
+
+def _suite_cmd(language: str) -> list[str]:
+    if language == "rust":
+        return ["cargo", "test", "--quiet"]
+    return [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-t", "."]
+
+
+def _hidden_target(task: BenchTask, hidden: Path) -> Path:
+    """Where a hidden test lands in the repo: its path below `hidden/`."""
+    rel = hidden.relative_to(task.root)
+    parts = rel.parts[1:] if rel.parts and rel.parts[0] == "hidden" else rel.parts
+    if not parts:
+        raise Invalid("bad-bench-task", f"hidden test {rel} has no file name")
+    return Path(*parts)
+
+
+def run_once(task: BenchTask, arm: str, arm_text: str | None, repeat: int,
+             work: Path, *, dry_run: bool = False,
+             timeout_s: float = 3 * 3600.0) -> dict:
+    """Run one task once in one arm, in a fresh repo under `work`, and score it.
+
+    The hidden tests are copied in only after the arm has finished, onto the
+    branch the card produced, and the whole suite must pass for `passed`.
+    """
+    if task.repo is None:
+        raise Invalid("bad-bench-task", f"{task.id}: no repo/ folder to start from")
+    if dry_run and task.script is None:
+        raise Invalid("bad-bench-task", f"{task.id}: a dry run needs script.json")
+
+    run_dir = work / task.id / f"{arm}-{repeat}"
+    if run_dir.exists():
+        shutil.rmtree(run_dir)
+    repo = run_dir / "repo"
+    state = run_dir / "state"
+    shutil.copytree(task.repo, repo)
+    state.mkdir(parents=True)
+
+    card_text = task.card.read_text(encoding="utf-8")
+    card_id = card_id_of(card_text)
+    (repo / "cards").mkdir(exist_ok=True)
+    (repo / "cards" / f"{card_id}.md").write_text(card_text, encoding="utf-8")
+
+    # Late import: adopt imports git and errors, nothing from here.
+    from .adopt import adopt_config_text
+    base = adopt_config_text(repo, task.language, base_branch="main",
+                             state_dir=state, key_file=run_dir / "no.key")
+    if dry_run:
+        arm_text = ('[adapters]\nmodel = "scripted"\nmicromanager = "off"\n')
+    if arm_text is None:
+        raise Invalid("bad-bench-arm", f"no arm file for {arm}")
+    config = arm_config_text(base, arm_text)
+    (repo / ".openfarm").mkdir(exist_ok=True)
+    (repo / ".openfarm" / "config.toml").write_text(config, encoding="utf-8")
+
+    git = Git(repo)
+    git.init(branch="main")
+    git.commit_all("bench start")
+
+    cmd = [*_openfarm_cmd(), "--repo", str(repo), "--json", "run",
+           "--card", card_id, "--cards", "1"]
+    if dry_run:
+        cmd += ["--script", str(task.script)]
+    started = time.monotonic()
+    done = subprocess.run(cmd, cwd=repo, capture_output=True, text=True,
+                          env=_openfarm_env(), timeout=timeout_s, check=False)
+    seconds = round(time.monotonic() - started, 1)
+    (run_dir / "run.out.json").write_text(done.stdout, encoding="utf-8")
+    (run_dir / "run.err.log").write_text(done.stderr, encoding="utf-8")
+
+    record = {"task": task.id, "language": task.language,
+              "category": task.category, "arm": arm, "repeat": repeat,
+              "passed": False, "spend": 0.0, "tokens": 0, "seconds": seconds,
+              "diff_lines": 0, "final_state": "", "stop_code": "",
+              "run_dir": str(run_dir)}
+    try:
+        outcome = (json.loads(done.stdout).get("outcomes") or [{}])[0]
+    except ValueError:
+        record["stop_code"] = f"openfarm-exit-{done.returncode}"
+        return record
+
+    record["final_state"] = str(outcome.get("final_state", ""))
+    record["stop_code"] = str(outcome.get("stop_code", "") or "")
+    record["spend"] = round(float(outcome.get("spend", 0.0) or 0.0)
+                            + float(outcome.get("micromanager_spend", 0.0) or 0.0), 6)
+    record["tokens"] = sum(int(outcome.get(k, 0) or 0) for k in (
+        "tokens_in", "tokens_out", "micromanager_tokens_in", "micromanager_tokens_out"))
+    record["diff_lines"] = (int(outcome.get("lines_added", 0) or 0)
+                            + int(outcome.get("lines_removed", 0) or 0))
+    if record["final_state"] != "in-review":
+        return record
+
+    branch = git.branches(f"openfarm/{card_id}-*")
+    if not branch:
+        record["stop_code"] = "no-card-branch"
+        return record
+    git.checkout(branch[0])
+    for hidden in task.hidden_tests:
+        target = repo / _hidden_target(task, hidden)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(hidden, target)
+    scored = subprocess.run(_suite_cmd(task.language), cwd=repo, capture_output=True,
+                            text=True, timeout=1800, check=False)
+    (run_dir / "hidden.log").write_text(scored.stdout + scored.stderr, encoding="utf-8")
+    record["passed"] = scored.returncode == 0
+    return record
+
+
+def run_bench(tasks: list[BenchTask], arms: dict[str, str | None], repeats: int,
+              out: Path, *, dry_run: bool = False,
+              log=lambda message: None) -> dict:
+    """Every task in every arm `repeats` times; writes the report into `out`."""
+    out.mkdir(parents=True, exist_ok=True)
+    work = out / "runs"
+    records: list[dict] = []
+    with (out / "records.jsonl").open("a", encoding="utf-8") as sink:
+        for task in tasks:
+            for arm, arm_text in arms.items():
+                for repeat in range(1, repeats + 1):
+                    log(f"bench: {task.id} {arm} #{repeat}")
+                    record = run_once(task, arm, arm_text, repeat, work,
+                                      dry_run=dry_run)
+                    log(f"bench: {task.id} {arm} #{repeat} -> "
+                        f"{'pass' if record['passed'] else 'fail'} "
+                        f"({record['final_state'] or record['stop_code']})")
+                    records.append(record)
+                    sink.write(json.dumps(record) + "\n")
+                    sink.flush()
+    summary = score(records)
+    report = {"dry_run": dry_run, "repeats": repeats,
+              "summary": summary, "records": records}
+    (out / "bench-report.json").write_text(json.dumps(report, indent=2) + "\n",
+                                           encoding="utf-8")
+    (out / "bench-report.md").write_text(render_report(summary) + "\n",
+                                         encoding="utf-8")
+    return report

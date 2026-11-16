@@ -1,0 +1,6 @@
+{
+ "CARD-1/test_writer": "=== whole_file: tests/test_slug_ends.py\nimport unittest\n\nfrom textkit.slug import slugify\n\n\nclass SlugEndTests(unittest.TestCase):\n    def test_punctuation_at_the_ends_leaves_no_dash(self):\n        self.assertEqual(slugify(\"Hello, World!\"), \"hello-world\")\n",
+ "CARD-1/implementer": "=== search_replace: textkit/slug.py\n<<< SEARCH\n    lowered = text.lower()\n    return re.sub(r\"[^a-z0-9]+\", \"-\", lowered)\n>>> REPLACE\n    lowered = text.lower()\n    return re.sub(r\"[^a-z0-9]+\", \"-\", lowered).strip(\"-\")\n",
+ "CARD-1/checker_pass1": "RESTATEMENT: slugs have no dash at either end",
+ "CARD-1/checker_pass2": "{}"
+}

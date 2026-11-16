@@ -1,0 +1,5 @@
+id = "py-slug-ends"
+language = "python"
+category = "pinned-bugfix"
+card = "card.md"
+hidden_tests = ["hidden/tests/test_hidden_slug.py"]

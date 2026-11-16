@@ -1,0 +1,6 @@
+{
+ "CARD-1/test_writer": "=== whole_file: tests/overwrite.rs\nuse ringbuf::ring::Ring;\n\n#[test]\nfn a_full_ring_drops_the_oldest() {\n    let mut ring = Ring::new(2);\n    ring.push(1);\n    ring.push(2);\n    ring.push(3);\n    assert_eq!(ring.items(), &[2, 3]);\n}\n",
+ "CARD-1/implementer": "=== search_replace: src/ring.rs\n<<< SEARCH\n    /// Record a reading.\n    pub fn push(&mut self, value: i64) {\n        self.items.push(value);\n    }\n>>> REPLACE\n    /// Record a reading, dropping the oldest when the ring is full.\n    pub fn push(&mut self, value: i64) {\n        if self.capacity == 0 {\n            return;\n        }\n        if self.items.len() == self.capacity {\n            self.items.remove(0);\n        }\n        self.items.push(value);\n    }\n",
+ "CARD-1/checker_pass1": "RESTATEMENT: a full ring drops its oldest reading",
+ "CARD-1/checker_pass2": "{}"
+}

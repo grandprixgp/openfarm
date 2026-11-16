@@ -1,0 +1,5 @@
+id = "py-settings-refactor"
+language = "python"
+category = "refactor"
+card = "card.md"
+hidden_tests = ["hidden/tests/test_hidden_loader.py"]

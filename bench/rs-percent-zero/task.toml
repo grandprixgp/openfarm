@@ -1,0 +1,5 @@
+id = "rs-percent-zero"
+language = "rust"
+category = "pinned-bugfix"
+card = "card.md"
+hidden_tests = ["hidden/tests/hidden_percent.rs"]

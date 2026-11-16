@@ -1,0 +1,6 @@
+{
+ "CARD-1/test_writer": "=== whole_file: tests/test_full.py\nimport unittest\n\nfrom tally.bounded import Bounded, FullError\n\n\nclass FullTests(unittest.TestCase):\n    def test_a_full_bundle_refuses_a_push(self):\n        bundle = Bounded(1)\n        bundle.push(7)\n        with self.assertRaises(FullError):\n            bundle.push(8)\n",
+ "CARD-1/implementer": "=== search_replace: tally/bounded.py\n<<< SEARCH\n        \"\"\"Add a segment and return its index.\"\"\"\n        self.segments.append(value)\n>>> REPLACE\n        \"\"\"Add a segment and return its index, or raise `FullError` when full.\"\"\"\n        if len(self.segments) >= self.capacity:\n            raise FullError(f\"capacity {self.capacity} reached\")\n        self.segments.append(value)\n",
+ "CARD-1/checker_pass1": "RESTATEMENT: a full bundle refuses a push",
+ "CARD-1/checker_pass2": "{}"
+}
