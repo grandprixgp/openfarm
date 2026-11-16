@@ -14,15 +14,20 @@ telemetry = "jsonl"
 pack = ""
 
 [model]
-endpoint = "https://api.example.invalid/v1"
-allowed_endpoints = ["https://api.example.invalid/v1"]
+# Workers: Command Code's Provider API on the owner's GOAT plan credits.
+endpoint = "https://api.commandcode.ai/provider/v1"
+allowed_endpoints = ["https://api.commandcode.ai/provider/v1"]
 key_file = "/home/prix/.config/openfarm/openfarm.key"
-cost_per_1k_in = 0.0005
-cost_per_1k_out = 0.0015
-test_writer = { model = "lesser-coder", temperature = 0.2 }
-implementer = { model = "lesser-coder", temperature = 0.3, vary_seed = true }
-checker     = { model = "lesser-coder", temperature = 0.35, vary_seed = true }
-planner     = { model = "lesser-coder", temperature = 0.2 }
+# Zero retention and no training on every call; a model without a zero-retention
+# upstream fails with 422 instead of falling back. Never remove this.
+headers = { "x-cmd-zdr" = "1" }
+# DeepSeek V4.1 Flash at its peak rate ($0.30 / $1.20 per million), so caps err high.
+cost_per_1k_in = 0.0003
+cost_per_1k_out = 0.0012
+test_writer = { model = "deepseek/deepseek-v4.1-flash", temperature = 0.2 }
+implementer = { model = "deepseek/deepseek-v4.1-flash", temperature = 0.3, vary_seed = true }
+checker     = { model = "deepseek/deepseek-v4.1-flash", temperature = 0.35, vary_seed = true }
+planner     = { model = "deepseek/deepseek-v4.1-flash", temperature = 0.2 }
 
 [policy]
 never_touch = [

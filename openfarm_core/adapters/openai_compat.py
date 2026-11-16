@@ -16,6 +16,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+from .. import __version__
 from ..errors import Infra, Invalid, Refused
 
 _RETRYABLE_HTTP_CODES = frozenset({429, 502, 503, 504})
@@ -190,7 +191,10 @@ class OpenAICompatibleBackend:
 
         request = urllib.request.Request(
             url, data=json.dumps(payload).encode("utf-8"),
-            headers={**self.headers,
+            # Python's default User-Agent is blocked outright by some providers'
+            # firewalls (Command Code answers 403, Cloudflare error 1010).
+            headers={"User-Agent": f"openfarm/{__version__}",
+                     **self.headers,
                      "Content-Type": "application/json",
                      "Authorization": f"Bearer {self._key()}"},
             method="POST")

@@ -12,6 +12,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from openfarm_core import __version__
 from openfarm_core.adapters.openai_compat import OpenAICompatibleBackend, open_backend
 from openfarm_core.config import Config, ConfigError
 
@@ -68,6 +69,13 @@ class ModelHeadersTests(unittest.TestCase):
         self.assertEqual(sent["x-cmd-zdr"], "1")
         self.assertEqual(sent["authorization"], "Bearer secret-key")
         self.assertEqual(sent["content-type"], "application/json")
+
+    def test_calls_name_openfarm_not_python_as_the_client(self) -> None:
+        cfg = Config(_config(self.state), self.repo)
+        sent = self._sent_headers(open_backend(cfg))
+        self.assertEqual(sent["user-agent"], f"openfarm/{__version__}")
+        cfg = Config(_config(self.state, {"User-Agent": "mine/1"}), self.repo)
+        self.assertEqual(self._sent_headers(open_backend(cfg))["user-agent"], "mine/1")
 
     def test_a_header_cannot_replace_the_key_or_body_type(self) -> None:
         for name in ("Authorization", "authorization", "Content-Type", "Host"):

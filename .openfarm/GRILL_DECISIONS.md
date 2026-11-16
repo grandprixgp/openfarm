@@ -52,5 +52,6 @@
 
 22. Frontier: Claude ACP over the owner's existing claude.ai OAuth login, `active`. Ready (`oauth_ready: true`).
 23. **Workers: needs you.** Zero data retention and no training on requests. Scripted backend until chosen.
+    Answered 16 Nov 2026: Command Code's Provider API on the GOAT plan's credits, DeepSeek V4.1 Flash (`deepseek/deepseek-v4.1-flash`), with `x-cmd-zdr: 1` on every call through `[model] headers` (a model without a zero-retention upstream fails rather than falls back). The key is outside the repo at the config's `key_file`.
 24. `openfarm spec v0.6.md` beside the earlier specs (local, like them: specs are gitignored); version 0.6.0; README "Not yet tested" stays honest.
 25. **Waves:** 0 by hand (A1); 1 = two starter cards on openfarm itself (Python pack, CLI output); 2 = `adopt`, `bench`, batch grill; 3 = docs and test backfill.

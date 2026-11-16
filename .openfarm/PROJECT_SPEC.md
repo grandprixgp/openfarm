@@ -64,5 +64,6 @@ behind a small interface, pure functions for parsing, exact errors from
 - **Wave 2:** `openfarm adopt`, `openfarm bench`, batch grill mode.
 - **Wave 3:** docs and test backfill.
 
-Workers stay on the scripted backend until the owner picks a zero-retention,
-no-training endpoint.
+Workers are DeepSeek V4.1 Flash on Command Code's Provider API, with zero
+retention and no training forced on every call (`[model] headers`). Never
+drop that header.
