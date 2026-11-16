@@ -1332,13 +1332,15 @@ class CardRun:
             return
         missing = [name for name in self.card.test_names if name not in listed]
         if missing:
+            load_errors = [str(e) for e in listing.get("errors", []) or []][:5]
+            why = ("; could not load: " + " | ".join(load_errors)) if load_errors else ""
             self._record_gate(GateResult(
                 "named-tests-exist", FAIL,
-                "not reported by the test binary: " + ", ".join(missing[:10]),
-                {"missing": missing}))
+                "not reported by the test binary: " + ", ".join(missing[:10]) + why,
+                {"missing": missing, "load_errors": load_errors}))
             raise GateFailure(StopCode.TESTS_UNPROVABLE,
                               "the test binary does not list: "
-                              + ", ".join(missing[:10]))
+                              + ", ".join(missing[:10]) + why)
         self._record_gate(GateResult("named-tests-exist", PASS,
                                      f"{len(self.card.test_names)} named test(s) "
                                      f"listed"))

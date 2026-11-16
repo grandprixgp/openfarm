@@ -78,7 +78,11 @@ _LIST_SCRIPT = (
     "for case in walk(suite):\n"
     "    ident = case.id()\n"
     "    if type(case).__name__ == '_FailedTest':\n"
-    "        print('ERROR ' + ident.split('._FailedTest.', 1)[-1])\n"
+    "        exc = getattr(case, '_exception', None)\n"
+    "        lines = [l for l in str(exc or '').splitlines() if l.strip()]\n"
+    "        why = lines[-1].strip()[:300] if lines else ''\n"
+    "        print('ERROR ' + ident.split('._FailedTest.', 1)[-1]"
+    " + (': ' + why if why else ''))\n"
     "    else:\n"
     "        print(ident)\n"
 )
@@ -298,10 +302,20 @@ class PythonPack(Pack):
     # -- listing and parsing --------------------------------------------------
 
     def parse_list(self, stdout: str) -> dict:
+        """Test ids, plus `errors`: modules that could not load, and why.
+
+        A test file that fails to import lists none of its tests. Without the
+        reason the worker only hears "not listed" and guesses (CARD-014 imported a
+        name its package does not export, twice).
+        """
         tests = []
+        errors = []
         for raw in (stdout or "").splitlines():
             line = raw.strip()
-            if not line or line.startswith("ERROR "):
+            if line.startswith("ERROR "):
+                errors.append(line[len("ERROR "):])
+                continue
+            if not line:
                 continue
             if self.runner == "pytest":
                 if "::" not in line:
@@ -312,7 +326,7 @@ class PythonPack(Pack):
                     continue
                 binary, _, name = line.rpartition(".")
             tests.append({"name": name, "binary": binary})
-        return {"tests": tests}
+        return {"tests": tests, "errors": errors}
 
     def parse_tests(self, stdout: str, stderr: str = "") -> dict:
         text = f"{stdout or ''}\n{stderr or ''}"

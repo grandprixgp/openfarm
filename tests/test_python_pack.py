@@ -165,7 +165,24 @@ class ImportFailureTests(unittest.TestCase):
         pack = PythonPack(ruff=False)
         out, _ = _run(pack.commands("list")["argv"], root)
         self.assertIn("ERROR tests.test_broken", out)
-        self.assertEqual(pack.parse_list(out), {"tests": []})
+        listing = pack.parse_list(out)
+        self.assertEqual(listing["tests"], [])
+        self.assertEqual(len(listing["errors"]), 1)
+        self.assertTrue(listing["errors"][0].startswith("tests.test_broken: "))
+
+    def test_the_listing_says_why_a_module_did_not_load(self) -> None:
+        # CARD-014: a test file importing a name its package does not export.
+        root = _project({"tests/__init__.py": "",
+                         "tests/test_bad_import.py":
+                             "import unittest\nfrom json import NoSuchThing\n\n"
+                             "class T(unittest.TestCase):\n"
+                             "    def test_a(self):\n        pass\n"})
+        pack = PythonPack(ruff=False)
+        out, _ = _run(pack.commands("list")["argv"], root)
+        errors = pack.parse_list(out)["errors"]
+        self.assertEqual(len(errors), 1)
+        self.assertIn("tests.test_bad_import: ImportError", errors[0])
+        self.assertIn("NoSuchThing", errors[0])
 
 
 class PytestShapeTests(unittest.TestCase):
