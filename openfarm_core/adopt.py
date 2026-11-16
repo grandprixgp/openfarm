@@ -250,3 +250,22 @@ def adopt_config_text(
         f"editable_surfaces = {_toml_list(editable_surfaces)}",
     ]
     return "\n".join(lines) + "\n"
+
+
+def adopt_project(
+    root: Path,
+    *,
+    language: str | None = None,
+    state_dir: Path | None = None,
+    key_file: Path | None = None,
+) -> dict:
+    """Adopt the existing git repository at `root` without touching its source.
+
+    Raises `openfarm_core.errors.Refused` with code "not-a-git-repo" when
+    `root/.git` does not exist, "dirty-worktree" when the worktree is not clean,
+    or "already-adopted" when `root/.openfarm/config.toml` exists, in that order.
+    Writes `.openfarm/config.toml`, `.openfarm/PROJECT_SPEC.md` and
+    `cards/.gitkeep`, creates `state_dir` with mode 0o700, never commits, and
+    returns {"ok": True, "language": ..., "written": [...]}.
+    """
+    raise NotImplementedError
