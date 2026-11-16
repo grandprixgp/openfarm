@@ -29,7 +29,7 @@ _TABLE_KEYS = {
     "project": {"name", "lane", "base_branch", "state_dir"},
     "adapters": {"cards", "runner", "languages", "model",
                  "micromanager", "telemetry", "pack"},
-    "model": {"endpoint", "allowed_endpoints", "key_file", "test_writer",
+    "model": {"endpoint", "allowed_endpoints", "key_file", "headers", "test_writer",
               "implementer", "checker", "planner", "cost_per_1k_in",
               "cost_per_1k_out"},
     "policy": {"never_touch", "forbidden_files", "known_failing",
@@ -64,6 +64,29 @@ _TABLE_KEYS = {
                 "editable_surfaces"},
 }
 _ROLE_MODEL_KEYS = {"model", "temperature", "vary_seed"}
+_HEADER_NAME = re.compile(r"^[A-Za-z0-9!#$%&'*+.^_`|~-]+$")
+# openfarm sets these itself; a config may not replace the key or the body type.
+_RESERVED_HEADERS = {"authorization", "content-type", "content-length", "host"}
+
+
+def _model_headers(value) -> dict[str, str]:
+    """`[model] headers`: extra request headers, such as a zero-retention opt-in."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ConfigError("[model] headers must be a table of strings")
+    headers: dict[str, str] = {}
+    for name, raw in value.items():
+        if not isinstance(raw, str):
+            raise ConfigError(f"[model] headers.{name} must be a string")
+        if not _HEADER_NAME.match(name):
+            raise ConfigError(f"[model] headers: {name!r} is not a header name")
+        if name.lower() in _RESERVED_HEADERS:
+            raise ConfigError(f"[model] headers: openfarm sets {name} itself")
+        if "\r" in raw or "\n" in raw:
+            raise ConfigError(f"[model] headers.{name} holds a line break")
+        headers[name] = raw
+    return headers
 _EXTRA_GATE_KEYS = {"name", "run", "via", "paths", "on_fail"}
 
 _DURATION_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smhd])\s*$")
@@ -325,6 +348,7 @@ class Config:
             model.get("allowed_endpoints", []), "[model] allowed_endpoints")
         key_file = model.get("key_file")
         self.key_file = self._outside_repo(key_file, "[model] key_file") if key_file else None
+        self.model_headers = _model_headers(model.get("headers"))
         # Prices are what make a spend cap mean anything. Without them every call
         # reports a zero cost and no spend cap can fire, so the run record says so.
         self.cost_per_1k_in = _as_float(model.get("cost_per_1k_in"),
