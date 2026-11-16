@@ -323,7 +323,9 @@ def test_writer_brief(card: Card, book: BriefBook, pack,
     return Brief("test_writer", "\n".join(parts))
 
 
-_MAX_RETRY_FILE_CHARS = 32_768
+# Attempt 1 sends every touched file whole; a retry must too, or the worker writes
+# search blocks blind. At 32k, cli.py (66k) vanished from every retry (CARD-011).
+_MAX_RETRY_FILE_CHARS = 200_000
 
 
 def implementer_brief(card: Card, book: BriefBook, frozen_tests: dict[str, str],
@@ -369,6 +371,10 @@ def implementer_brief(card: Card, book: BriefBook, frozen_tests: dict[str, str],
                 text = target.read_text()
                 if len(text) <= _MAX_RETRY_FILE_CHARS:
                     current_sections.append(f"\n### {normalise(path)}\n{text}")
+                else:
+                    current_sections.append(
+                        f"\n### {normalise(path)} ({len(text)} characters, too long "
+                        "to repeat: copy search lines only from the first brief)")
         if current_sections:
             parts.append("\nCurrent files in touches:")
             parts.extend(current_sections)
