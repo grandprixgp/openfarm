@@ -32,7 +32,6 @@ from .acp_setup import (
 from .adopt import adopt_project
 from .bench import load_task
 from .adapters.files import FileCardSource, open_card_source
-
 from .adapters.jsonl import TelemetrySink, open_telemetry
 from .adapters.openai_compat import open_backend
 from .adapters.direct import open_runner
@@ -1297,7 +1296,6 @@ def build_parser() -> argparse.ArgumentParser:
                             help="directory of bench tasks")
 
     init = sub.add_parser("init", help="scaffold a new openfarm Rust project")
-
     init.add_argument("name", help="project name or slug (e.g. calorie-log)")
     init.add_argument("--dir", default=None,
                       help="target directory (default: <repo>/<project_slug> or current repo)")
@@ -1425,7 +1423,6 @@ def cmd_bench_list(args) -> int:
 
 
 def cmd_init(args) -> int:
-
     directory = Path(args.dir) if args.dir else None
     repo_base = Path(args.repo) if getattr(args, "repo", None) else Path.cwd()
     payload = initialize_project(
