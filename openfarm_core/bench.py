@@ -97,6 +97,78 @@ def load_task(task_dir: Path) -> BenchTask:
     )
 
 
+_REQUIRED_RECORD_KEYS = (
+    "task",
+    "category",
+    "arm",
+    "passed",
+    "spend",
+    "tokens",
+    "seconds",
+    "diff_lines",
+)
+_ALLOWED_ARMS = frozenset({"farm", "solo"})
+
+
+def score(records: list[dict]) -> dict:
+    for record in records:
+        _check_record(record)
+
+    arm_totals: dict[str, dict] = {}
+    category_totals: dict[str, dict] = {}
+
+    for record in records:
+        arm = record["arm"]
+        category = record["category"]
+        passed = bool(record["passed"])
+
+        arm_stats = arm_totals.setdefault(
+            arm, {"runs": 0, "passed": 0, "spend": 0.0}
+        )
+        arm_stats["runs"] += 1
+        if passed:
+            arm_stats["passed"] += 1
+        arm_stats["spend"] += record["spend"]
+
+        category_arms = category_totals.setdefault(category, {})
+        category_stats = category_arms.setdefault(arm, {"runs": 0, "passed": 0})
+        category_stats["runs"] += 1
+        if passed:
+            category_stats["passed"] += 1
+
+    arms: dict[str, dict] = {}
+    for arm, stats in arm_totals.items():
+        runs = stats["runs"]
+        passed = stats["passed"]
+        spend = round(stats["spend"], 4)
+        arms[arm] = {
+            "runs": runs,
+            "passed": passed,
+            "pass_rate": round(passed / runs, 4),
+            "spend": spend,
+            "cost_per_pass": round(spend / passed, 4) if passed else None,
+        }
+
+    categories: dict[str, dict[str, float]] = {}
+    for category, arm_stats_by_arm in category_totals.items():
+        categories[category] = {
+            arm: round(stats["passed"] / stats["runs"], 4)
+            for arm, stats in arm_stats_by_arm.items()
+        }
+
+    return {"arms": arms, "categories": categories}
+
+
+def _check_record(record: dict) -> None:
+    for key in _REQUIRED_RECORD_KEYS:
+        if key not in record:
+            raise Invalid("bad-bench-record", f"missing required key: {key}")
+
+    arm = record["arm"]
+    if not isinstance(arm, str) or arm not in _ALLOWED_ARMS:
+        raise Invalid("bad-bench-record", f"unknown arm: {arm!r}")
+
+
 def _resolve_task_member(root: Path, raw: str, key: str) -> Path:
     path = Path(raw)
     if path.is_absolute():
