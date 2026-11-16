@@ -608,7 +608,7 @@ class Config:
     def _parse_micromanager(self, mm: dict) -> MicromanagerConfig:
         if "timeout_s" in mm and "timeout" in mm:
             raise ConfigError("[micromanager] specify either timeout_s or timeout, not both")
-        raw_timeout = mm.get("timeout_s", mm.get("timeout", 180.0))
+        raw_timeout = mm.get("timeout_s", mm.get("timeout", 600.0))
         timeout_s = parse_duration(raw_timeout, "[micromanager] timeout_s")
         if timeout_s <= 0:
             raise ConfigError("[micromanager] timeout_s must be > 0")

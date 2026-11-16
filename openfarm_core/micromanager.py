@@ -1676,7 +1676,7 @@ def open_micromanager(
         _cfg_get(
             mm_cfg,
             "timeout_s",
-            _cfg_get(cfg, "micromanager_timeout_s", 180.0),
+            _cfg_get(cfg, "micromanager_timeout_s", 600.0),
         )
     )
 
