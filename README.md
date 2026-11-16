@@ -257,6 +257,9 @@ Model calls in these tests use a scripted backend and local HTTP test servers, a
 > - Live unattended multi-wave LLM execution of a generated app (for example all `calorie-log` cards) end to end.
 > - External `cmd:` adapters against live repository tools, beyond subprocess test harnesses.
 > - The TypeScript language pack, which is not implemented and refuses with `Invalid("no-typescript-pack")`.
+> - The Python pack (v0.6 branch) against pytest: pytest is not installed here, so its output parsing is tested on copied `-v` and `--collect-only -q` shapes only. `unittest` parsing is tested against real interpreter output.
+> - The Python pack's `ruff` lint and format path: `ruff` is not installed here, so only the no-ruff path (syntax check, formatting not checked) has run.
+> - openfarm working on itself with a live worker model. Two cards have run on a throwaway clone of openfarm to `in-review` with a scripted model, from a pinned copy, with every gate on the real 446-test suite.
 >
 > Because none of the live runs have happened, there are no efficacy numbers yet: no acceptance rate, review time, or cost comparison against a frontier-only baseline.
 
