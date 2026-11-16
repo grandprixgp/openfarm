@@ -9,7 +9,6 @@ where the card worktrees are.
 
 from __future__ import annotations
 
-import subprocess
 from pathlib import Path
 
 from . import __version__
@@ -24,18 +23,16 @@ def orchestrator_identity(core_root: Path | None = None) -> dict:
     commit = ""
     dirty = False
     if (root / ".git").exists():
+        # git.py is the only place that runs git; this goes through it too.
+        from .errors import AdapterError
+        from .git import Git
         try:
-            head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(root),
-                                  capture_output=True, text=True, timeout=10)
-            if head.returncode == 0:
-                commit = head.stdout.strip()
-            status = subprocess.run(
-                ["git", "status", "--porcelain", "--untracked-files=no", "--",
-                 "openfarm_core"], cwd=str(root), capture_output=True, text=True,
-                timeout=10)
-            dirty = status.returncode == 0 and bool(status.stdout.strip())
-        except (OSError, subprocess.SubprocessError):
-            commit = ""
+            checkout = Git(root)
+            commit = checkout.head()
+            dirty = any(path.startswith("openfarm_core/")
+                        for path in checkout.changed_files())
+        except (AdapterError, OSError):
+            commit, dirty = "", False
     return {"version": __version__, "path": str(root), "commit": commit,
             "dirty": dirty}
 
