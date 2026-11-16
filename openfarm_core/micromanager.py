@@ -993,7 +993,10 @@ class Micromanager:
                     "scaffold-test-path",
                     f"{edit.path}: scaffold_contract may only target production paths in card.touches",
                 )
-            body = _scaffold_body_to_validate(edit)
+            if norm_path.endswith((".py", ".pyi")):
+                body = _python_scaffold_addition(edit)
+            else:
+                body = _scaffold_body_to_validate(edit)
             if norm_path.endswith((".py", ".pyi")):
                 if not valid_python_scaffold(body):
                     raise Refused(
@@ -1401,6 +1404,23 @@ def _strip_rust_comments_and_strings(src: str) -> str:
         out.append(ch)
         i += 1
     return "".join(out)
+
+
+def _python_scaffold_addition(edit: Edit) -> str:
+    """What a Python scaffold edit adds: the replace minus the search it keeps.
+
+    The Rust helper below only trusts a search with balanced braces, which a
+    Python search ending in a dict's `}` is not, so it fell back to the whole
+    replace and judged existing code as if it were the scaffold (CARD-007).
+    """
+    if edit.format != FORMAT_SEARCH_REPLACE:
+        return edit.content or ""
+    search, replace = edit.search or "", edit.replace or ""
+    if search and replace.startswith(search):
+        return replace[len(search):]
+    if search and replace.endswith(search):
+        return replace[: len(replace) - len(search)]
+    return replace
 
 
 def _scaffold_body_to_validate(edit: Edit) -> str:

@@ -102,6 +102,16 @@ class ScaffoldContractTests(unittest.TestCase):
                                  "content": MODULE}])
         self.assertEqual([e.path for e in edits], ["openfarm_core/bench.py"])
 
+    def test_a_stub_appended_after_a_dict_is_accepted(self) -> None:
+        # The live CARD-007 scaffold: the search ends inside a returned dict.
+        search = '            "cards/.gitkeep",\n        ],\n    }\n'
+        stub = ('\n\ndef propose_known_failing(parsed: dict) -> list[str]:\n'
+                '    """Failed names."""\n    raise NotImplementedError\n')
+        edits = self._scaffold([{"format": "search_replace",
+                                 "path": "openfarm_core/bench.py",
+                                 "search": search, "replace": search + stub}])
+        self.assertEqual(len(edits), 1)
+
     def test_python_logic_is_refused_with_python_words(self) -> None:
         with self.assertRaises(Refused) as caught:
             self._scaffold([{"format": "whole_file", "path": "openfarm_core/bench.py",
