@@ -80,14 +80,18 @@ python = ""
 [runner.env]
 
 [budget]
-implementer_attempts = 3
-test_writer_attempts = 2
-model_build_calls_per_card = 10
+# Worker tokens count as free here (owner, 16 Nov): attempts and per-card limits
+# are high so they rarely decide a card. In v0.6, 21 stops were "attempts", none
+# were tokens or money.
+implementer_attempts = 5
+test_writer_attempts = 3
+model_build_calls_per_card = 20
 mutation_build_calls_per_card = 40
-tokens_per_card = 400_000
+tokens_per_card = 2_000_000
 wall_clock_per_card = "45m"
-frontier_cost_ratio = 0.30
-spend_per_night = 20.00
+# Money limits are off (0 means no cap) until there is enough data to set them.
+frontier_cost_ratio = 0
+spend_per_night = 0
 concurrent_builds = 2
 concurrent_cards = 3
 lease_ttl = "20m"
@@ -123,7 +127,9 @@ tool_policy = "none"
 timeout_s = 600.0
 max_calls_per_card = 4
 tokens_per_card = 120_000
-spend_per_night = 10.0
+# Off with the others (0 means no cap); Claude stays bounded by the call and
+# token caps above.
+spend_per_night = 0
 cost_per_1k_in = 0.003
 cost_per_1k_out = 0.015
 isolate_home = true

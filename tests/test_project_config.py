@@ -64,7 +64,7 @@ class ConfigFileTests(unittest.TestCase):
         # (`v0.6` while in development, `master` once merged).
         cfg = load_config(REPO)
         self.assertEqual(cfg.name, "openfarm")
-        self.assertIn(cfg.base_branch, ("master", "v0.6"))
+        self.assertIn(cfg.base_branch, ("master", "v0.6", "v0.7"))
         self.assertEqual(cfg.languages, ["python"])
         self.assertEqual(cfg.mutation, "off")
 
