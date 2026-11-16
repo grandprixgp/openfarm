@@ -64,6 +64,8 @@ def build_dossier(card_run, final_state: str,
         "run": card_run.run_id,
         "final_state": final_state,
         "stop_code": card_run.stop_code.value if card_run.stop_code else "",
+        "stop_detail": (getattr(card_run, "detail", "") or "")[-2000:]
+        if card_run.stop_code else "",
         "orchestrator": _orchestrator(),
         "1_risk": {
             "card_hash_at_claim": card_hash_at_claim,
@@ -268,6 +270,8 @@ def render_markdown(payload: dict) -> str:
         + (f" · stop code `{payload['stop_code']}`" if payload["stop_code"] else ""),
         "",
     ]
+    if payload.get("stop_detail"):
+        lines += [f"Why it stopped: {payload['stop_detail']}", ""]
     if payload.get("orchestrator"):
         from .selfhost import describe
         lines += [f"Judged by {describe(payload['orchestrator'])}", ""]

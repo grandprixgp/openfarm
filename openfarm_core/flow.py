@@ -2918,6 +2918,7 @@ class CardRun:
             "ended_at": self.ended_at,
             "final_state": final_state,
             "stop_code": self.stop_code.value if self.stop_code else "",
+            "detail": (self.detail or "")[-2000:] if self.stop_code else "",
             "attempts": len(self.attempts),
             "depth": self.depth,
             "planner_used": self.planner_used,
