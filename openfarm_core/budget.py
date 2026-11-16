@@ -195,9 +195,8 @@ class NightBudget:
         return self.spend + self.micromanager_spend
 
     def exhausted(self) -> str | None:
-        # A zero cap means "do not spend", which a scripted backend satisfies
-        # without being refused outright. It is enforced on the first real spend,
-        # in `note_spend`, not by refusing every card up front.
+        # A zero cap means no cap, as everywhere: `[budget] spend_per_night = 0`
+        # turns the money limit off (the card's own token and attempt caps stay).
         total = self.total_spend()
         if self.spend_cap > 0 and total >= self.spend_cap:
             return f"night spend {total:.4f} reached its cap of {self.spend_cap:.4f}"
