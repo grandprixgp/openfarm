@@ -101,6 +101,14 @@ class UnittestParsingTests(unittest.TestCase):
         parsed = self.pack.parse_tests(out, err)
         self.assertEqual([r["name"] for r in parsed["results"]], ["test_passes"])
 
+    def test_a_filter_that_selects_nothing_is_a_finished_empty_run(self) -> None:
+        argv = self.pack.commands("test", tests=["test_not_written_yet"])["argv"]
+        out, err = _run(argv, self.root)
+        parsed = self.pack.parse_tests(out, err)
+        self.assertEqual(parsed["results"], [])
+        self.assertEqual(parsed["missing_footers"], [])
+        self.assertEqual(parsed["footers"][0]["failed"], 0)
+
     def test_the_listing_matches_the_run(self) -> None:
         out, _ = _run(self.pack.commands("list")["argv"], self.root)
         listing = self.pack.parse_list(out)

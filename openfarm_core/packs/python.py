@@ -100,7 +100,10 @@ _UT_END_RE = re.compile(
     r"(?:^|\s)(?P<status>ok|FAIL|ERROR|expected failure|unexpected success)\s*$"
     r"|(?:^|\s)(?P<status2>skipped)\b")
 _UT_RAN_RE = re.compile(r"^Ran (?P<count>\d+) tests? in [\d.]+s\s*$")
-_UT_RESULT_RE = re.compile(r"^(?P<status>OK|FAILED)\b(?:\s*\((?P<detail>[^)]*)\))?")
+#: `OK`, `FAILED (failures=1)`, or, from Python 3.12 when a filter selects
+#: nothing, `NO TESTS RAN` (exit code 5). An empty run is a finished run.
+_UT_RESULT_RE = re.compile(
+    r"^(?P<status>OK|FAILED|NO TESTS RAN)\b(?:\s*\((?P<detail>[^)]*)\))?")
 
 _UT_STATUS = {"ok": "ok", "FAIL": "FAILED", "ERROR": "FAILED",
               "skipped": "ignored", "expected failure": "ignored",
@@ -564,7 +567,7 @@ def _parse_unittest(text: str) -> dict:
             failed = max(0, failed - len(compile_errors))
             footers.append({
                 "binary": "unittest",
-                "status": "ok" if result.group("status") == "OK" else "FAILED",
+                "status": "FAILED" if result.group("status") == "FAILED" else "ok",
                 "passed": max(0, ran - failed - counts.get("skipped", 0)
                               - counts.get("expected failures", 0)
                               - len(compile_errors)),
