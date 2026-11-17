@@ -472,9 +472,13 @@ def _confinement_report(cfg: Config | None, providers: dict[str, dict]) -> dict:
         transport = _provider_transport(cfg, name, info)
         held: dict[str, object] = {"mode": settings.mode, "transport": transport}
         for policy in ("none", "read-only"):
+            nested, nested_why = (True, "")
+            if usable and confine_lib.needs_nested(name, transport, policy, settings.mode):
+                nested, nested_why = confine_lib.nested_status()
             hold = confine_lib.decide(name, transport=transport, tool_policy=policy,
                                       mode=settings.mode, bwrap_usable=usable,
-                                      bwrap_reason=detail)
+                                      bwrap_reason=detail, nested_usable=nested,
+                                      nested_reason=nested_why)
             held[policy] = hold.describe()
             if hold.refused:
                 held[f"{policy}_refused"] = hold.refused

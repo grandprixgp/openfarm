@@ -57,8 +57,9 @@ _CODEX_STRICT_DISABLE: tuple[str, ...] = (
     "hooks",
 )
 # Read-only keeps the shell (Codex reads files through it) and turns off the rest.
-# Untested live: whether Codex reads with only these left on.
-_CODEX_READ_ONLY_KEEP = frozenset({"shell_tool", "unified_exec"})
+# The shell needs the code-mode host: with it off, Codex 0.166 answered every read
+# with "code-mode host is disabled" (lead's live check, 17 Nov).
+_CODEX_READ_ONLY_KEEP = frozenset({"shell_tool", "unified_exec", "code_mode_host"})
 
 # Folders every program needs, mounted read-only (a symlink is copied as one).
 _SYSTEM_DIRS: tuple[str, ...] = ("/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32")
@@ -206,6 +207,23 @@ def off_note(provider: str) -> str:
     )
 
 
+def codex_read_only_refusal(reason: str = "") -> str:
+    return (
+        "Codex with tool policy 'read-only' reads files through its shell, which it runs in "
+        "a sandbox of its own, and that sandbox cannot start inside openfarm's boundary here "
+        f"({reason or 'nested sandboxes are refused'}), so Codex could read nothing. Use "
+        'tool_policy = "none", or the Claude provider for a seat that reads files, or set '
+        f'{CONFINE_SETTING} = "off" to run Codex unconfined (it can then read whatever your '
+        "user can)."
+    )
+
+
+def needs_nested(provider: str, transport: str, tool_policy: str, mode: str) -> bool:
+    """Whether `decide` needs `nested_status` for this child."""
+    return (provider == "codex" and transport == "bridge" and tool_policy == "read-only"
+            and mode != "off")
+
+
 def decide(
     provider: str,
     *,
@@ -214,11 +232,18 @@ def decide(
     mode: str,
     bwrap_usable: bool,
     bwrap_reason: str = "",
+    nested_usable: bool = True,
+    nested_reason: str = "",
 ) -> Hold:
     """Pick flags and boundary for a child.
 
     `transport` is `bridge` (openfarm's own bridge starts one CLI child per
     prompt) or `server` (a standalone ACP server holds every session).
+
+    `nested_usable` says whether a sandbox can start inside the boundary
+    (`nested_status`). Codex runs its shell in a sandbox of its own, so its
+    `read-only` policy inside the boundary needs that; without it Codex can
+    read nothing and the session is refused rather than started blind.
     """
     if mode not in CONFINE_MODES:
         raise ConfineError(
@@ -233,6 +258,8 @@ def decide(
     if mode == "auto" and flags and tool_policy == "none":
         return Hold(provider, mode, flags=True, boundary=bwrap_usable)
     if bwrap_usable:
+        if flags and tool_policy == "read-only" and not nested_usable:
+            return Hold(provider, mode, flags=True, refused=codex_read_only_refusal(nested_reason))
         return Hold(provider, mode, flags=flags, boundary=True)
     if mode == "bwrap":
         why = f'{CONFINE_SETTING} = "bwrap" confines every provider'
@@ -289,6 +316,42 @@ def bwrap_status(bwrap: str | None = None, *, refresh: bool = False) -> tuple[bo
             result = (False, f"bwrap could not run: {exc}")
     with _STATUS_LOCK:
         _STATUS_CACHE[exe] = result
+    return result
+
+
+def nested_status(bwrap: str | None = None, *, refresh: bool = False) -> tuple[bool, str]:
+    """Whether a second sandbox can start inside the boundary (cached per path).
+
+    Codex wraps each shell command in a bubblewrap sandbox of its own. Where the
+    system forbids a sandboxed program from making new namespaces (Ubuntu's
+    AppArmor rule for unprivileged user namespaces does), that inner sandbox
+    fails and every command with it. Untested on a machine that allows it.
+    """
+    exe = bwrap if bwrap is not None else find_bwrap()
+    usable, why = bwrap_status(exe, refresh=refresh)
+    if not usable:
+        return False, why
+    key = f"nested:{exe}"
+    with _STATUS_LOCK:
+        if not refresh and key in _STATUS_CACHE:
+            return _STATUS_CACHE[key]
+    true_bin = next((p for p in ("/usr/bin/true", "/bin/true") if os.path.exists(p)), "")
+    inner = [exe, "--unshare-user", "--unshare-pid", "--ro-bind", "/", "/",
+             "--proc", "/proc", "--dev", "/dev", "--", true_bin]
+    argv = [exe, *_base_args(), "--tmpfs", "/tmp", "--", *inner]
+    try:
+        proc = subprocess.run(argv, check=False, capture_output=True, text=True, timeout=15,
+                              stdin=subprocess.DEVNULL)
+        if proc.returncode == 0:
+            result = (True, "a sandbox can start inside the boundary")
+        else:
+            first = (proc.stderr or proc.stdout or "").strip().splitlines()
+            detail = first[0][:200] if first else f"exit {proc.returncode}"
+            result = (False, f"a sandbox cannot start inside the boundary: {detail}")
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        result = (False, f"could not test a sandbox inside the boundary: {exc}")
+    with _STATUS_LOCK:
+        _STATUS_CACHE[key] = result
     return result
 
 
@@ -610,8 +673,12 @@ def bridge_plan(provider: str, tool_policy: str, meta) -> Hold:
             mode = CONFINE_DEFAULT
         return Hold(provider, mode, flags=meta["flags"], boundary=meta["boundary"])
     usable, reason = (False, "") if provider == "claude" else bwrap_status()
+    nested, nested_why = (True, "")
+    if usable and needs_nested(provider, "bridge", tool_policy, CONFINE_DEFAULT):
+        nested, nested_why = nested_status()
     return decide(provider, transport="bridge", tool_policy=tool_policy, mode=CONFINE_DEFAULT,
-                  bwrap_usable=usable, bwrap_reason=reason)
+                  bwrap_usable=usable, bwrap_reason=reason,
+                  nested_usable=nested, nested_reason=nested_why)
 
 
 def bridge_child_argv(child_argv: list[str], hold: Hold, meta, *, session_dir: str,

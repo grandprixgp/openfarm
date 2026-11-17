@@ -1163,6 +1163,9 @@ class ClaudeAcpAdapter:
         mode = self.confine.mode
         needs_check = not (mode == "off" or (mode == "auto" and self.provider == "claude"))
         usable, reason = confine_lib.bwrap_status() if needs_check else (False, "")
+        nested, nested_why = (True, "")
+        if usable and confine_lib.needs_nested(self.provider, self.transport, tool_policy, mode):
+            nested, nested_why = confine_lib.nested_status()
         return confine_lib.decide(
             self.provider,
             transport=self.transport,
@@ -1170,6 +1173,8 @@ class ClaudeAcpAdapter:
             mode=mode,
             bwrap_usable=usable,
             bwrap_reason=reason,
+            nested_usable=nested,
+            nested_reason=nested_why,
         )
 
     def _note_hold(self, hold: confine_lib.Hold) -> None:

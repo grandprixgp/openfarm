@@ -79,7 +79,9 @@ class CodexFlagsAndDecisionTests(unittest.TestCase):
         self.assertEqual(confine_lib.codex_tool_flags("none"), LIVE_STRICT)
         ro = confine_lib.codex_tool_flags("read-only")
         self.assertNotIn("shell_tool", ro)
-        self.assertIn("code_mode_host", ro)
+        # Codex's shell needs the code-mode host (seen live), so read-only keeps it.
+        self.assertNotIn("code_mode_host", ro)
+        self.assertIn("apps", ro)
         self.assertEqual(ro[-2:], ["-c", 'web_search="disabled"'])
 
     def test_decide_matrix(self) -> None:
@@ -432,7 +434,8 @@ class WiringTests(unittest.TestCase):
         codex = bin_dir / "codex"
         codex.write_text("#!/bin/sh\necho 'Not logged in'\nexit 1\n")
         codex.chmod(0o755)
-        with mock.patch.object(confine_lib, "bwrap_status", return_value=(True, "bwrap works")):
+        with mock.patch.object(confine_lib, "bwrap_status", return_value=(True, "bwrap works")), \
+                mock.patch.object(confine_lib, "nested_status", return_value=(True, "ok")):
             status = inspect_acp_status(
                 None, provider="all", home=self.tmp / "home", claude_bin="", acp_bin="",
                 agy_bin="", antigravity_acp_bin="", codex_bin=str(codex), codex_acp_bin="",

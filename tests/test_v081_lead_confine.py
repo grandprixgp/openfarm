@@ -68,5 +68,81 @@ class RealBoundaryGitTests(unittest.TestCase):
         self.assertIn("NEVER_TOUCH_CONTENT", plain.stdout)
 
 
+class CodexReadOnlyInsideTheBoundaryTests(unittest.TestCase):
+    """Codex runs its shell in its own sandbox; where that cannot nest, read-only is refused."""
+
+    def test_refused_when_a_sandbox_cannot_start_inside_the_boundary(self) -> None:
+        d = confine.decide
+        for mode in ("auto", "bwrap"):
+            h = d("codex", transport="bridge", tool_policy="read-only", mode=mode,
+                  bwrap_usable=True, nested_usable=False, nested_reason="no new namespaces")
+            self.assertTrue(h.refused, mode)
+            self.assertFalse(h.boundary)
+            self.assertIn("no new namespaces", h.refused)
+            self.assertIn('tool_policy = "none"', h.refused)
+            self.assertIn('[micromanager] confine = "off"', h.refused)
+            ok = d("codex", transport="bridge", tool_policy="read-only", mode=mode,
+                   bwrap_usable=True, nested_usable=True)
+            self.assertEqual(ok.describe(), "flags + boundary")
+
+    def test_nothing_else_is_refused_for_it(self) -> None:
+        d = confine.decide
+        for prov, transport, policy, mode in (
+                ("codex", "bridge", "none", "auto"), ("codex", "server", "read-only", "auto"),
+                ("antigravity", "bridge", "read-only", "auto"),
+                ("claude", "bridge", "read-only", "bwrap"),
+                ("codex", "bridge", "read-only", "off")):
+            h = d(prov, transport=transport, tool_policy=policy, mode=mode,
+                  bwrap_usable=True, nested_usable=False)
+            self.assertFalse(h.refused, (prov, transport, policy, mode))
+            self.assertEqual(confine.needs_nested(prov, transport, policy, mode), False)
+        self.assertTrue(confine.needs_nested("codex", "bridge", "read-only", "auto"))
+
+    def test_the_probe_reads_the_inner_sandbox_result(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="of-v081-lead-nest-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        self.addCleanup(confine._reset_status_cache)
+        # A fake bwrap: the outer call (it carries --die-with-parent) runs what follows
+        # the first "--"; the inner call fails or passes as the file name says.
+        for name, inner_exit in (("bwrap-nests", 0), ("bwrap-flat", 1)):
+            fake = tmp / name
+            fake.write_text(f"""#!/usr/bin/env python3
+import subprocess, sys
+args = sys.argv[1:]
+if "--die-with-parent" not in args:
+    if {inner_exit}:
+        sys.stderr.write("bwrap: No permissions to create a new namespace\\n")
+    sys.exit({inner_exit})
+rest = args[args.index("--") + 1:]
+sys.exit(subprocess.run(rest).returncode)
+""")
+            fake.chmod(0o755)
+        self.assertEqual(confine.nested_status(str(tmp / "bwrap-nests"))[0], True)
+        usable, why = confine.nested_status(str(tmp / "bwrap-flat"))
+        self.assertFalse(usable)
+        self.assertIn("No permissions to create a new namespace", why)
+        self.assertEqual(confine.nested_status("")[0], False)
+
+    def test_the_adapter_refuses_the_session_and_the_status_says_so(self) -> None:
+        import sys
+        from unittest import mock
+        from openfarm_core.adapters.acp import ClaudeAcpAdapter
+        from openfarm_core.errors import Refused
+        tmp = Path(tempfile.mkdtemp(prefix="of-v081-lead-ro-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        bridge = Path(confine.__file__).parent / "adapters" / "codex_native_acp.py"
+        with mock.patch.object(confine, "bwrap_status", return_value=(True, "works")), \
+                mock.patch.object(confine, "nested_status", return_value=(False, "no nesting")):
+            with ClaudeAcpAdapter([sys.executable, str(bridge), "--codex-bin", "/nonexistent/codex"],
+                                  cwd=tmp, provider="codex", auth_mode="api-key",
+                                  confine="auto") as acp:
+                summary = acp.confinement_summary()
+                self.assertEqual(summary["none"]["held_by"], "flags + boundary")
+                self.assertIn("no nesting", summary["read-only"]["refused"])
+                with self.assertRaises(Refused) as ctx:
+                    acp.new_session(cwd=tmp, tool_policy="read-only")
+                self.assertIn("no nesting", str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

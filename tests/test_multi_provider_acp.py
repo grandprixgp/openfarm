@@ -505,6 +505,11 @@ class NativeBridgesAndHandshakeTests(unittest.TestCase):
         fake_home = self.tmp / "home"
         (fake_home / ".codex").mkdir(parents=True)
         (fake_home / ".codex" / "auth.json").write_text('{"tokens":{"access_token":"cx"}}\n', encoding="utf-8")
+        # This test is about the argv; whether Codex's own sandbox can nest here is not.
+        from openfarm_core import confine as _confine
+        nests = mock.patch.object(_confine, "nested_status", return_value=(True, "test"))
+        nests.start()
+        self.addCleanup(nests.stop)
 
         with ClaudeAcpAdapter(
             [sys.executable, str(CODEX_NATIVE_ACP), "--codex-bin", str(mock_codex)],
