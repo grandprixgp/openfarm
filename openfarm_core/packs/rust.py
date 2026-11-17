@@ -227,6 +227,63 @@ class RustPack(Pack):
 
     # -- listing and parsing --------------------------------------------------
 
+    def test_writer_note(self, worktree: Path, test_paths: list[str]) -> str:
+        """How an integration test reaches the library, by the crate's real name.
+
+        A test writer shown only signatures does not know what the crate is
+        called, and falls back on `#[path = "../src/x.rs"] mod x;`. That builds a
+        second copy of the file inside the test, whose unused items then fail
+        the lint gate, which the implementer cannot fix: tests are frozen and
+        `#[allow]` is banned.
+        """
+        crates: dict[str, list[str]] = {}
+        for raw in test_paths:
+            path = str(raw).replace("\\", "/")
+            parts = path.split("/")
+            if "tests" not in parts[:-1]:
+                continue                      # a unit test inside `src/` is in the crate
+            root = Path(worktree).resolve()
+            package_dir = (root / "/".join(parts[:parts.index("tests")])).resolve()
+            if not package_dir.is_relative_to(root):
+                continue
+            name = _lib_crate_name(package_dir)
+            if name:
+                crates.setdefault(name, []).append(path)
+        if not crates:
+            return ""
+        lines = []
+        for name, paths in crates.items():
+            lines.append(
+                f"\nRust integration tests ({', '.join(paths)}): each file under `tests/` is "
+                f"its own crate. Reach the code under test through the library crate, "
+                f"which is named `{name}`: `use {name}::...;`. Never pull a source file in "
+                f"with `#[path = \"...\"] mod ...;` or `include!`: that compiles a second "
+                f"copy inside the test, and its unused items fail the lint gate.")
+        return "\n".join(lines)
+
+    def build_errors(self, stdout: str, stderr: str) -> str:
+        """rustc's own `error` lines with where each one is, the first few."""
+        found: list[str] = []
+        lines = (stderr or "").splitlines()
+        for index, line in enumerate(lines):
+            text = line.strip()
+            if not re.match(r"error(\[E\d{4}\])?:", text):
+                continue
+            if text.startswith(("error: could not compile", "error: aborting due to")):
+                continue
+            where = ""
+            for after in lines[index + 1:index + 4]:
+                spot = re.match(r"\s*--> (\S+)", after)
+                if spot:
+                    where = f" ({spot.group(1)})"
+                    break
+            entry = (text + where)[:300]
+            if entry not in found:
+                found.append(entry)
+            if len(found) >= 4:
+                break
+        return " | ".join(found)
+
     def parse_list(self, stdout: str) -> dict:
         tests = []
         for line in stdout.splitlines():
@@ -801,6 +858,24 @@ class RustPack(Pack):
 
     def mutation(self, files: list[str], tests: list[str] | None = None) -> dict:
         return self.commands("mutation", files=files)
+
+
+def _lib_crate_name(package_dir: Path) -> str:
+    """The name a package's library crate is imported by, or "" when it has none."""
+    import tomllib
+    try:
+        manifest = tomllib.loads((package_dir / "Cargo.toml").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    package = manifest.get("package")
+    lib = manifest.get("lib")
+    lib = lib if isinstance(lib, dict) else {}
+    lib_path = str(lib.get("path") or "src/lib.rs")
+    if not (package_dir / lib_path).is_file():
+        return ""                              # a binary-only package: nothing to import
+    name = str(lib.get("name") or (package.get("name") if isinstance(package, dict) else "") or "")
+    name = name.replace("-", "_")
+    return name if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) else ""
 
 
 def _summary_counts(text: str) -> dict | None:

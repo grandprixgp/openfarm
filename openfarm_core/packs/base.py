@@ -70,6 +70,22 @@ class Pack:
         """
         return ""
 
+    def test_writer_note(self, worktree: Path, test_paths: list[str]) -> str:
+        """What the test writer must know to write tests this project can build.
+
+        For instance how a test file reaches the code under test. "" (the
+        default) adds nothing to the brief.
+        """
+        return ""
+
+    def build_errors(self, stdout: str, stderr: str) -> str:
+        """The errors of a build that failed, a few lines, or "" when none are found.
+
+        The flow adds it where a gate would otherwise only say the tests were not
+        listed, so the role asked to try again sees why.
+        """
+        return ""
+
     def gate_evidence(self, gate: str) -> dict:
         """What a gate's record should say about how this pack ran it.
 

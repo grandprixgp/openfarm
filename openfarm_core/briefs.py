@@ -384,6 +384,11 @@ def test_writer_brief(card: Card, book: BriefBook, pack,
             "names it). Write the tests for pytest."
         )
 
+    if hasattr(pack, "test_writer_note") and getattr(book, "worktree", None) is not None:
+        note = pack.test_writer_note(book.worktree, test_paths)
+        if note:
+            parts.append(note)
+
     if conventions:
         parts.append("\nTest conventions (authoritative):\n" + conventions)
 
@@ -403,7 +408,9 @@ def test_writer_brief(card: Card, book: BriefBook, pack,
             "\nThis card declares new symbols. You may append stubs that fail when\n"
             "called (Rust: `todo!()`; Python: `raise NotImplementedError`; "
             "TypeScript: `throw new Error(\"not implemented\")`) with\n"
-            "`append_stub` in files in your touches, additions only.")
+            "`append_stub` in files in your touches, additions only."
+            "\nA symbol whose signature is already shown above is declared: do not "
+            "stub it again, a second declaration does not compile.")
         parts.append("\n" + STUB_FORMAT)
 
     parts.append("\n" + EDIT_FORMAT)

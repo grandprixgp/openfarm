@@ -2397,10 +2397,18 @@ class CardRun:
         if missing:
             load_errors = [str(e) for e in listing.get("errors", []) or []][:5]
             why = ("; could not load: " + " | ".join(load_errors)) if load_errors else ""
+            # A build that failed lists nothing: say what the compiler said, so
+            # the test writer's next try is not a guess.
+            build_errors = ""
+            if list_result.cls != PASS and hasattr(self.pack, "build_errors"):
+                build_errors = str(self.pack.build_errors(out, err) or "")
+            if build_errors:
+                why += "; the test build failed: " + build_errors
             self._record_gate(GateResult(
                 "named-tests-exist", FAIL,
                 "not reported by the test binary: " + ", ".join(missing[:10]) + why,
-                {"missing": missing, "load_errors": load_errors}))
+                {"missing": missing, "load_errors": load_errors,
+                 "build_errors": build_errors}))
             raise GateFailure(StopCode.TESTS_UNPROVABLE,
                               "the test binary does not list: "
                               + ", ".join(missing[:10]) + why)
