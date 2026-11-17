@@ -8,6 +8,7 @@ contextual next-step hints.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -129,6 +130,46 @@ def _fmt_usd(value: object, *, measured: bool = True) -> str:
         return str(value)
     text = f"${num:.4f}"
     return text if measured else f"{text} (unpriced)"
+
+
+def _as_int(value: object) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _as_float(value: object) -> float:
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def format_token_split(tokens: dict, *, style: Style | None = None, bar_width: int = 16) -> str:
+    """`12,180 total [████░] 91% worker (11,100) / 0% supervisor (0) / 9% coordinator (1,080)`.
+
+    The coordinator's part is shown only when it used tokens, so a run without a
+    model coordinator reads as it always did. Older splits have no coordinator.
+    """
+    st = style or Style(enabled=False)
+    tokens = tokens if isinstance(tokens, dict) else {}
+    total_tok = _as_int(tokens.get("total", 0))
+    worker_tok = _as_int(tokens.get("worker", 0))
+    sup_tok = _as_int(tokens.get("supervisor", 0))
+    coord_tok = _as_int(tokens.get("coordinator", 0))
+    w_share = _as_float(tokens.get("worker_share", 0.0))
+    s_share = _as_float(tokens.get("supervisor_share", 0.0))
+    c_share = _as_float(tokens.get("coordinator_share", 0.0))
+    bar = format_bar(w_share, width=bar_width, style=st)
+    text = (
+        f"{_fmt_int(total_tok)} total  {bar}  "
+        f"{w_share * 100:.0f}% worker ({_fmt_int(worker_tok)}) / "
+        f"{s_share * 100:.0f}% supervisor ({_fmt_int(sup_tok)})"
+    )
+    if coord_tok > 0:
+        text += f" / {c_share * 100:.0f}% coordinator ({_fmt_int(coord_tok)})"
+    return text
 
 
 def format_table(
@@ -485,8 +526,18 @@ def _format_check(payload: dict, style: Style) -> str:
     return "\n".join(lines)
 
 
+def _outcome_card(outcome: object) -> str:
+    """The card an outcome belongs to.
+
+    A real card record carries `card_id`; dry-run and skipped records carry `card`.
+    """
+    if not isinstance(outcome, dict):
+        return ""
+    return str(outcome.get("card_id") or outcome.get("card") or "")
+
+
 def _outcome_row(outcome: dict, style: Style) -> list[str]:
-    card = str(outcome.get("card", ""))
+    card = _outcome_card(outcome)
     if "skipped" in outcome:
         return [
             card,
@@ -553,12 +604,23 @@ def _format_run(payload: dict, style: Style) -> str:
     spend_cap = caps.get("spend", 0.0)
     cap_text = f"cards={caps.get('cards', '-')}, spend={'$' + f'{float(spend_cap):.2f}' if spend_cap else 'unlimited'}"
     measured = bool(payload.get("spend_measured", True))
-    lines.extend(_render_kv_section("Summary", [
+    tokens = payload.get("tokens") or {}
+    total_spend = _as_float(payload.get("spend", 0.0))
+    sup_spend = _as_float(payload.get("micromanager_spend", 0.0))
+    coord_spend = _as_float(payload.get("coordinator_spend", 0.0))
+    # Older run records have no `worker_spend`; their `spend` is the total.
+    worker_spend = (_as_float(payload["worker_spend"]) if "worker_spend" in payload
+                    else max(0.0, total_spend - sup_spend - coord_spend))
+    summary_pairs: list[tuple[str, object]] = [
         ("finished_at", payload.get("finished_at", "-")),
         ("caps", cap_text),
-        ("worker_spend", _fmt_usd(payload.get("spend", 0.0), measured=measured)),
-        ("supervisor_spend", _fmt_usd(payload.get("micromanager_spend", 0.0), measured=measured)),
-    ], style=style))
+        ("spend", _fmt_usd(total_spend, measured=measured)),
+        ("worker_spend", _fmt_usd(worker_spend, measured=measured)),
+        ("supervisor_spend", _fmt_usd(sup_spend, measured=measured)),
+    ]
+    if coord_spend or _as_int(tokens.get("coordinator", 0)):
+        summary_pairs.append(("coordinator_spend", _fmt_usd(coord_spend, measured=measured)))
+    lines.extend(_render_kv_section("Summary", summary_pairs, style=style))
 
     outcomes = payload.get("outcomes") or []
     lines.append(style.bold(f"Outcomes ({len(outcomes)})"))
@@ -573,33 +635,21 @@ def _format_run(payload: dict, style: Style) -> str:
     else:
         lines.append(f"  {style.dim('(no ready cards claimed)')}")
 
-    tokens = payload.get("tokens") or {}
-    total_tok = int(tokens.get("total", 0) or 0)
-    worker_tok = int(tokens.get("worker", 0) or 0)
-    sup_tok = int(tokens.get("supervisor", 0) or 0)
-    w_share = float(tokens.get("worker_share", 0.0) or 0.0)
-    s_share = float(tokens.get("supervisor_share", 0.0) or 0.0)
     lines.append(style.bold("Token Split"))
-    bar = format_bar(w_share, width=16, style=style)
-    lines.append(
-        f"  {_fmt_int(total_tok)} total  {bar}  "
-        f"{w_share * 100:.0f}% worker ({_fmt_int(worker_tok)}) / "
-        f"{s_share * 100:.0f}% supervisor ({_fmt_int(sup_tok)})"
-    )
-    by_member = tokens.get("by_member") or {}
-    if by_member:
-        m_rows = [
-            [name, _fmt_int(tok)]
-            for name, tok in sorted(by_member.items(), key=lambda kv: (-int(kv[1]), kv[0]))
-        ]
-        lines.append(format_table(["MEMBER", "TOKENS"], m_rows, style=style, right_align={1}))
-    by_effort = tokens.get("by_effort") or {}
-    if by_effort:
-        e_rows = [
-            [eff, _fmt_int(tok)]
-            for eff, tok in sorted(by_effort.items(), key=lambda kv: (-int(kv[1]), kv[0]))
-        ]
-        lines.append(format_table(["EFFORT", "TOKENS"], e_rows, style=style, right_align={1}))
+    lines.append("  " + format_token_split(tokens, style=style))
+    for title, key in (("MEMBER", "by_member"), ("EFFORT", "by_effort")):
+        table = tokens.get(key) or {}
+        if isinstance(table, dict) and table:
+            rows = [
+                [name, _fmt_int(tok)]
+                for name, tok in sorted(table.items(), key=lambda kv: (-_as_int(kv[1]), kv[0]))
+            ]
+            lines.append(format_table([title, "TOKENS"], rows, style=style, right_align={1}))
+    external = tokens.get("external_by_member") or {}
+    if isinstance(external, dict) and external:
+        lines.append(f"  {style.dim('outside seats (their own spend, not in the total):')}")
+        rows = [[name, _fmt_int(tok)] for name, tok in sorted(external.items())]
+        lines.append(format_table(["MEMBER", "TOKENS"], rows, style=style, right_align={1}))
 
     harness = payload.get("harness") or {}
     if harness.get("enabled"):
@@ -621,8 +671,9 @@ def _format_run(payload: dict, style: Style) -> str:
             lines.append(f"  {style.red(ICON_FAIL)} {prob}")
 
     next_tips: list[str] = []
-    in_review = [o["card"] for o in outcomes if o.get("final_state") in ("in-review", "in_review")]
-    blocked = [o["card"] for o in outcomes if o.get("final_state") == "blocked"]
+    in_review = [_outcome_card(o) for o in outcomes
+                 if o.get("final_state") in ("in-review", "in_review")]
+    blocked = [_outcome_card(o) for o in outcomes if o.get("final_state") == "blocked"]
     if in_review:
         sample = in_review[0]
         next_tips.extend([
@@ -633,7 +684,7 @@ def _format_run(payload: dict, style: Style) -> str:
     if blocked:
         next_tips.append(f"openfarm dossier {blocked[0]}  (or: openfarm supervise --triage-blocked)")
     if dry:
-        eligible_dry = [o["card"] for o in outcomes if o.get("eligible")]
+        eligible_dry = [_outcome_card(o) for o in outcomes if o.get("eligible")]
         if eligible_dry:
             next_tips.append(f"openfarm run --cards {len(eligible_dry)}")
     if not next_tips:
@@ -1454,7 +1505,7 @@ def _format_drive(payload: dict, style: Style) -> str:
         lines.append(style.bold(f"Wave Reviews ({len(reviews)})"))
         rev_rows = [
             [
-                r.get("card", ""),
+                _outcome_card(r),
                 format_state(r.get("verdict") or "-", style=style),
                 _fmt_int(r.get("review_tokens", 0)),
                 "yes" if r.get("recorded") else "no",
@@ -1471,7 +1522,7 @@ def _format_drive(payload: dict, style: Style) -> str:
 
     next_tips: list[str] = []
     in_review = [
-        o.get("card_id") or o.get("card")
+        _outcome_card(o)
         for o in outcomes
         if o.get("final_state") in ("in-review", "in_review")
     ]
@@ -1499,8 +1550,34 @@ def _format_fallback(payload: dict, style: Style) -> str:
 
 
 def format_human(kind: str, payload: dict, *, style: Style | None = None) -> str:
-    """Format a command payload for human readers when `--json` is False."""
+    """Format a command payload for human readers when `--json` is False.
+
+    A formatter bug must never turn a command that worked into a failure: the
+    work is already done and its exit code already decided. So any error here
+    falls back to the JSON the command would have printed with `--json`, with a
+    one-line note on stderr.
+    """
     st = style or Style(sys.stdout)
+    try:
+        return format_human_strict(kind, payload, style=st)
+    except Exception as exc:  # any formatter bug, by design
+        with contextlib.suppress(OSError, ValueError):
+            print(
+                f"openfarm: could not format the {kind or 'command'} result for "
+                f"people ({type(exc).__name__}: {exc}); showing it as JSON",
+                file=sys.stderr,
+            )
+        try:
+            return json.dumps(payload, indent=2, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            return str(payload)
+
+
+def format_human_strict(kind: str, payload: dict, *, style: Style | None = None) -> str:
+    """Like `format_human`, but a formatter error raises. For tests."""
+    st = style or Style(sys.stdout)
+    if not isinstance(payload, dict):
+        payload = {"value": payload}
     if kind == "status":
         return _format_status(payload, st)
     if kind == "check":

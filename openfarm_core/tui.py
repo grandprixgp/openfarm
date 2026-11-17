@@ -7,11 +7,9 @@ uses ``openfarm_core.git.Git``) and never reads or exposes ``key_file`` or
 
 from __future__ import annotations
 
-import argparse
 import contextlib
 import curses
 import dataclasses
-import importlib
 import io
 import json
 import os
@@ -19,6 +17,8 @@ import re
 import shlex
 import shutil
 import sys
+import threading
+import time
 import unicodedata
 from pathlib import Path
 from typing import Any
@@ -31,12 +31,12 @@ from .bench import load_task, render_report
 from .cards import Card, extract_fenced_fields
 from .config import CONFIG_PATH, Config, ConfigError, load_config
 from .dossier import render_markdown
-from .errors import AdapterError, ConfigError as _CfgErr, Infra, Invalid, Refused, UsageError
-from .git import Git
-from .globs import matches, normalise
+from .errors import Infra, Invalid, UsageError
+from .git import Git, _git_lock_for
 from .harness_global import GlobalLibrary, global_dir_for
-from .harness_memory import HarnessLibrary, sanitize_lesson_text
-from .state import StateDir, _safe_id, append_jsonl, read_json, utc_now, write_json
+from .harness_memory import HarnessLibrary
+from .state import StateDir, _safe_id, read_json
+from .swarm import cards_collide
 
 VIEWS = ("overview", "cards", "dossier", "board", "swarm", "harness", "ops")
 VIEW_LABELS = {
@@ -49,35 +49,6 @@ VIEW_LABELS = {
     "ops": "Ops",
 }
 
-VALID_MEMBER_KINDS = ("api", "acp", "code", "external", "scripted")
-VALID_ROLES = (
-    "coordinator",
-    "supervisor",
-    "planner",
-    "test-writer",
-    "implementer",
-    "checker",
-    "gates",
-    "monitor",
-)
-VALID_POST_KINDS = (
-    "brief",
-    "result",
-    "gate",
-    "defect",
-    "question",
-    "answer",
-    "handback",
-    "action",
-    "done",
-    "blocked",
-    "stall",
-    "roster",
-    "note",
-)
-EFFORT_STEPS = ("off", "low", "medium", "high", "xhigh", "max")
-
-
 @dataclasses.dataclass
 class TuiContext:
     """Resolved repository, config, and state handles (supports pre-config dirs)."""
@@ -88,13 +59,6 @@ class TuiContext:
     config_error: str
     cfg: Config | None
     state: StateDir | None
-
-
-def _optional_module(name: str):
-    try:
-        return importlib.import_module(name)
-    except ImportError:
-        return None
 
 
 def _load_tui_context(repo: Path | str, config_path: Path | str | None = None) -> TuiContext:
@@ -131,15 +95,6 @@ def _load_tui_context(repo: Path | str, config_path: Path | str | None = None) -
     )
 
 
-def _normalize_role(role: str) -> str:
-    text = str(role or "").strip().lower()
-    if text == "test_writer":
-        return "test-writer"
-    if text == "micromanager":
-        return "supervisor"
-    return text
-
-
 def _is_secret_file(ctx: TuiContext, candidate: Path) -> bool:
     if ctx.cfg is None:
         return False
@@ -156,119 +111,6 @@ def _is_secret_file(ctx: TuiContext, candidate: Path) -> bool:
                 return True
         except OSError:
             continue
-    return False
-
-
-def _globs_overlap(pat1: str, pat2: str) -> bool:
-    """Return True if two repo-relative globs could match a common path."""
-    globs_mod = _optional_module("openfarm_core.globs")
-    mod_fn = getattr(globs_mod, "globs_overlap", None) if globs_mod else None
-    if callable(mod_fn):
-        return bool(mod_fn(pat1, pat2))
-
-    p1 = normalise(pat1)
-    p2 = normalise(pat2)
-    if not p1 or not p2:
-        return False
-    if p1 == p2:
-        return True
-    if not any(ch in p1 for ch in "*?"):
-        return matches(p1, p2)
-    if not any(ch in p2 for ch in "*?"):
-        return matches(p2, p1)
-    return _nfa_globs_overlap(p1, p2)
-
-
-def _compile_glob_tokens(pattern: str) -> list[str]:
-    tokens: list[str] = []
-    idx = 0
-    length = len(pattern)
-    while idx < length:
-        if pattern.startswith("**/", idx):
-            tokens.append("**/")
-            idx += 3
-        elif pattern.startswith("/**", idx) and idx + 3 == length:
-            tokens.append("/**")
-            idx += 3
-        elif pattern.startswith("**", idx):
-            tokens.append("**")
-            idx += 2
-        else:
-            tokens.append(pattern[idx])
-            idx += 1
-    return tokens
-
-
-def _nfa_globs_overlap(pat1: str, pat2: str) -> bool:
-    """Exact BFS over the product of two glob token streams."""
-    t1 = _compile_glob_tokens(pat1)
-    t2 = _compile_glob_tokens(pat2)
-    n1, n2 = len(t1), len(t2)
-
-    def _expand(tokens: list[str], pos: int) -> list[int]:
-        out = [pos]
-        seen = {pos}
-        stack = [pos]
-        while stack:
-            cur = stack.pop()
-            if cur >= len(tokens):
-                continue
-            tok = tokens[cur]
-            if tok in ("**/", "/**", "**", "*"):
-                nxt = cur + 1
-                if nxt not in seen:
-                    seen.add(nxt)
-                    out.append(nxt)
-                    stack.append(nxt)
-        return out
-
-    def _step(tok: str, ch: str) -> bool:
-        if tok == "**/":
-            return True
-        if tok == "/**":
-            return True
-        if tok == "**":
-            return True
-        if tok == "*":
-            return ch != "/"
-        if tok == "?":
-            return ch != "/"
-        return tok == ch
-
-    def _alphabet(i: int, j: int) -> list[str]:
-        chars = {"a", "/"}
-        for tok in (t1[i] if i < n1 else "", t2[j] if j < n2 else ""):
-            if len(tok) == 1 and tok not in "*?":
-                chars.add(tok)
-        return sorted(chars)
-
-    queue: list[tuple[int, int]] = []
-    visited: set[tuple[int, int]] = set()
-    for s1 in _expand(t1, 0):
-        for s2 in _expand(t2, 0):
-            pair = (s1, s2)
-            if pair not in visited:
-                visited.add(pair)
-                queue.append(pair)
-
-    while queue:
-        i, j = queue.pop(0)
-        if i == n1 and j == n2:
-            return True
-        if i == n1 or j == n2:
-            continue
-        tok1, tok2 = t1[i], t2[j]
-        for ch in _alphabet(i, j):
-            if not (_step(tok1, ch) and _step(tok2, ch)):
-                continue
-            next_i = i if tok1 in ("**/", "/**", "**", "*") else i + 1
-            next_j = j if tok2 in ("**/", "/**", "**", "*") else j + 1
-            for ni in _expand(t1, next_i):
-                for nj in _expand(t2, next_j):
-                    pair = (ni, nj)
-                    if pair not in visited:
-                        visited.add(pair)
-                        queue.append(pair)
     return False
 
 
@@ -570,7 +412,8 @@ def _collect_overview(ctx: TuiContext, run_id: str | None = None) -> dict:
             counts[key] = counts.get(key, 0) + 1
             card_outcomes.append(
                 {
-                    "card": entry.get("card", ""),
+                    # Real card records carry `card_id`; dry-run and skipped ones `card`.
+                    "card": entry.get("card_id") or entry.get("card", ""),
                     "final_state": entry.get("final_state", ""),
                     "stop_code": entry.get("stop_code", ""),
                     "skipped": entry.get("skipped", ""),
@@ -584,6 +427,7 @@ def _collect_overview(ctx: TuiContext, run_id: str | None = None) -> dict:
             "dry_run": bool(raw_run.get("dry_run", False)),
             "spend": float(raw_run.get("spend", 0.0) or 0.0),
             "micromanager_spend": float(raw_run.get("micromanager_spend", 0.0) or 0.0),
+            "coordinator_spend": float(raw_run.get("coordinator_spend", 0.0) or 0.0),
             "counts": counts,
             "outcomes": card_outcomes,
             "tokens": tokens,
@@ -720,16 +564,43 @@ def _read_cards_readonly(ctx: TuiContext) -> tuple[list[Card], str]:
     return cards, source_mode
 
 
-def _cards_collide(a: Card, b: Card) -> bool:
-    if a.id == b.id:
-        return False
-    if b.id in a.deps or a.id in b.deps:
-        return True
-    for pat1 in a.touches:
-        for pat2 in b.touches:
-            if _globs_overlap(pat1, pat2):
-                return True
-    return False
+# The cards view's branch facts, per repository and card: the unmerged commit
+# count and the diff preview cost two git calls per card, so they are kept until
+# the card's state, its branch, the branch head or the base head moves, or until
+# they are older than `_CARD_GIT_MAX_AGE_S`. The view refreshes every second;
+# without this it ran about three git commands per card on every refresh.
+_CARD_GIT_CACHE: dict[str, dict[str, tuple[tuple, float, int, str]]] = {}
+_CARD_GIT_MAX_AGE_S = 60.0
+_CARD_GIT_LOCK = threading.Lock()
+
+
+def _openfarm_branch_heads(git: Git) -> dict[str, str]:
+    """Every `openfarm/*` branch and its head commit, in one git command."""
+    with _git_lock_for(git.cwd):
+        out = git._run(["for-each-ref", "--format=%(refname:short) %(objectname)",
+                        "refs/heads/openfarm/*"]).stdout
+    heads: dict[str, str] = {}
+    for line in out.splitlines():
+        name, _, sha = line.strip().partition(" ")
+        if name:
+            heads[name] = sha
+    return heads
+
+
+def _card_branch_facts(git: Git, repo_key: str, card: Card, branch: str, branch_head: str,
+                       base_ref: str, base_head: str) -> tuple[int, str]:
+    """`(unmerged commits, diff preview)` for a card's branch, cached."""
+    key = (card.state, branch, branch_head, base_ref, base_head)
+    now = time.monotonic()
+    with _CARD_GIT_LOCK:
+        hit = _CARD_GIT_CACHE.get(repo_key, {}).get(card.id)
+    if hit is not None and hit[0] == key and now - hit[1] < _CARD_GIT_MAX_AGE_S:
+        return hit[2], hit[3]
+    unmerged = git.count_commits(f"refs/heads/{branch}", base_ref)
+    diff_preview = git.diff(ref=f"{base_ref}...refs/heads/{branch}")[:6000]
+    with _CARD_GIT_LOCK:
+        _CARD_GIT_CACHE.setdefault(repo_key, {})[card.id] = (key, now, unmerged, diff_preview)
+    return unmerged, diff_preview
 
 
 def _collect_cards(ctx: TuiContext) -> dict:
@@ -737,13 +608,20 @@ def _collect_cards(ctx: TuiContext) -> dict:
         return {"configured": False, "source_mode": "unconfigured", "cards": []}
     cards, source_mode = _read_cards_readonly(ctx)
     git = Git(ctx.repo)
+    repo_key = str(ctx.repo)
     base_branch = ctx.cfg.base_branch
     has_head = False
     base_ref = "HEAD"
+    base_head = ""
+    branch_heads: dict[str, str] = {}
     try:
         has_head = git.ref_exists("HEAD")
         if git.ref_exists(f"refs/heads/{base_branch}"):
             base_ref = f"refs/heads/{base_branch}"
+        if has_head:
+            base_head = git.head(base_ref)
+            # One listing, with heads, for every card; not one per card.
+            branch_heads = _openfarm_branch_heads(git)
     except (Infra, OSError):
         has_head = False
 
@@ -753,18 +631,19 @@ def _collect_cards(ctx: TuiContext) -> dict:
         collides = [
             other.id
             for other in active_candidates
-            if other.id != card.id and _cards_collide(card, other)
+            if other.id != card.id and cards_collide(card, other)
         ]
         branches: list[str] = []
         unmerged = 0
         diff_preview = ""
         if has_head:
             try:
-                branches = git.branches(f"openfarm/{card.id}-*")
+                prefix = f"openfarm/{card.id}-"
+                branches = sorted(b for b in branch_heads if b.startswith(prefix))
                 if branches:
-                    br = branches[0]
-                    unmerged = git.count_commits(f"refs/heads/{br}", base_ref)
-                    diff_preview = git.diff(ref=f"{base_ref}...refs/heads/{br}")[:6000]
+                    unmerged, diff_preview = _card_branch_facts(
+                        git, repo_key, card, branches[0], branch_heads[branches[0]],
+                        base_ref, base_head)
             except (Infra, OSError):
                 branches = []
 
@@ -1803,12 +1682,19 @@ def _format_overview_lines(snap: dict, *, width: int = 96) -> list[str]:
             total_tok = int(tok.get("total", 0) or 0)
             w_tok = int(tok.get("worker", 0) or 0)
             s_tok = int(tok.get("supervisor", 0) or 0)
-            denom = total_tok or (w_tok + s_tok) or 1
+            c_tok = int(tok.get("coordinator", 0) or 0)
+            denom = total_tok or (w_tok + s_tok + c_tok) or 1
             w_share = float(tok.get("worker_share", w_tok / denom))
             s_share = float(tok.get("supervisor_share", s_tok / denom))
-            run_lines.append(f"Tokens: total={total_tok}   worker={w_tok}   supervisor={s_tok}")
+            c_share = float(tok.get("coordinator_share", c_tok / denom))
+            head = f"Tokens: total={total_tok}   worker={w_tok}   supervisor={s_tok}"
+            if c_tok:
+                head += f"   coordinator={c_tok}"
+            run_lines.append(head)
             run_lines.append(f"  worker     {_bar(w_share, 12)} ({w_tok})")
             run_lines.append(f"  supervisor {_bar(s_share, 12)} ({s_tok})")
+            if c_tok:
+                run_lines.append(f"  coordinator {_bar(c_share, 11)} ({c_tok})")
             if tok.get("by_member"):
                 run_lines.append("  by_member:")
                 for mk, mv in sorted(tok["by_member"].items()):
@@ -2099,9 +1985,13 @@ def _format_ops_lines(snap: dict, *, width: int = 96) -> list[str]:
         for arm_name, arm_stats in sorted(arms.items()):
             pr = float(arm_stats.get("pass_rate", 0.0) or 0.0)
             ws = float(arm_stats.get("worker_share", 0.0) or 0.0)
-            lb_lines.append(
+            arm_line = (
                 f"  {_pad_right(arm_name, 8)} pass {_bar(pr, 10)} ({arm_stats.get('passed', 0)}/{arm_stats.get('runs', 0)})  worker {_bar(ws, 8)}  tok={arm_stats.get('tokens', 0)}"
             )
+            if int(arm_stats.get("coordinator_tokens", 0) or 0) > 0:
+                cs = float(arm_stats.get("coordinator_share", 0.0) or 0.0)
+                arm_line += f"  coordinator {_bar(cs, 8)}"
+            lb_lines.append(arm_line)
         for ln in str(lb.get("markdown", "")).splitlines():
             lb_lines.append(ln)
         out.extend(_box_lines("Latest Bench Report", lb_lines, width=width))
@@ -2151,7 +2041,7 @@ def render_snapshot(
     return "\n".join(lines)
 
 
-# -- Evidence reader & checked fallback board/swarm actions ------------------
+# -- Evidence reader -----------------------------------------------------------
 
 
 def read_evidence_file(
@@ -2187,542 +2077,6 @@ def read_evidence_file(
     return {"ok": True, "path": str(candidate), "text": candidate.read_text(encoding="utf-8", errors="replace")}
 
 
-def _fallback_validate_expects(expects: dict | None, data: object) -> dict:
-    if not isinstance(data, dict):
-        raise Refused("invalid-answer", "answer payload must be a JSON object")
-    if not expects or not isinstance(expects, dict):
-        return data
-    required = expects.get("required") or ()
-    for key in required:
-        if key not in data:
-            raise Refused("invalid-answer", f"missing required field {key!r}")
-    allowed_verdicts = expects.get("verdicts") or expects.get("allowed_verdicts")
-    if allowed_verdicts and data.get("verdict") not in allowed_verdicts:
-        raise Refused(
-            "invalid-answer",
-            f"verdict {data.get('verdict')!r} not in {list(allowed_verdicts)}",
-        )
-    props = expects.get("properties") or expects.get("fields") or {}
-    if isinstance(props, dict):
-        for key, spec in props.items():
-            if key not in data:
-                continue
-            val = data[key]
-            if isinstance(spec, dict):
-                enum = spec.get("enum") or spec.get("choices")
-                if enum and val not in enum:
-                    raise Refused("invalid-answer", f"field {key!r}: {val!r} not in {list(enum)}")
-                expected_type = spec.get("type")
-                type_map = {
-                    "str": str,
-                    "string": str,
-                    "int": int,
-                    "integer": int,
-                    "float": (int, float),
-                    "number": (int, float),
-                    "bool": bool,
-                    "boolean": bool,
-                    "list": list,
-                    "array": list,
-                    "dict": dict,
-                    "object": dict,
-                }
-                if expected_type in type_map:
-                    py_type = type_map[expected_type]
-                    if expected_type in ("int", "integer", "float", "number") and isinstance(val, bool):
-                        raise Refused("invalid-answer", f"field {key!r} cannot be boolean")
-                    if not isinstance(val, py_type):
-                        raise Refused("invalid-answer", f"field {key!r} must be {expected_type}")
-    return data
-
-
-def _ensure_board_dir(state: StateDir, run_id: str) -> Path:
-    board_dir = state.run_dir(run_id) / "board"
-    board_dir.mkdir(parents=True, exist_ok=True)
-    (board_dir / "evidence").mkdir(parents=True, exist_ok=True)
-    if not (board_dir / "state.json").exists():
-        write_json(board_dir / "state.json", {"ended": False, "ended_at": "", "reason": ""})
-    if not (board_dir / "members.json").exists():
-        write_json(board_dir / "members.json", {})
-    return board_dir
-
-
-def _fallback_board_post(
-    ctx: TuiContext,
-    *,
-    run_id: str,
-    author: str,
-    to: list[str],
-    kind: str,
-    body: str,
-    card: str = "",
-    ref: int | None = None,
-) -> dict:
-    board_mod = _optional_module("openfarm_core.board")
-    board_dir = _ensure_board_dir(ctx.state, run_id)
-    if board_mod is not None and hasattr(board_mod, "Board"):
-        board = board_mod.Board(board_dir, state_dir=ctx.state.root)
-        board.ensure()
-        return board.post(author=author, to=to, kind=kind, body=body, card=card, ref=ref)
-
-    if kind not in VALID_POST_KINDS:
-        raise Refused("bad-post-kind", f"invalid post kind {kind!r}")
-    members = read_json(board_dir / "members.json", {}) or {}
-    author_rec = members.get(author) if isinstance(members, dict) else None
-    author_kind = str((author_rec or {}).get("kind", "external"))
-    if kind in ("done", "gate") and author_kind != "code":
-        raise Refused("reserved-kind", f"post kind {kind!r} is reserved for code members")
-
-    cleaned_body = body if author_kind == "code" else sanitize_lesson_text(body, max_len=8000)
-    existing = _read_board_posts_raw(board_dir)
-    next_seq = (int(existing[-1]["seq"]) + 1) if existing else 1
-    evidence: list[str] = []
-    if len(cleaned_body) > 8000:
-        ev_path = board_dir / "evidence" / f"post-{next_seq:04d}.txt"
-        ev_path.write_text(cleaned_body, encoding="utf-8")
-        evidence.append(str(ev_path))
-        cleaned_body = cleaned_body[:8000]
-    record = {
-        "seq": next_seq,
-        "at": utc_now(),
-        "from": author,
-        "to": list(dict.fromkeys([t for t in to if t])),
-        "kind": kind,
-        "card": card,
-        "attempt": 0,
-        "ref": ref,
-        "body": cleaned_body,
-        "evidence": evidence,
-    }
-    append_jsonl(board_dir / "board.jsonl", record)
-    return record
-
-
-def _fallback_board_answer(
-    ctx: TuiContext,
-    *,
-    run_id: str,
-    question_seq: int,
-    as_name: str,
-    data: object,
-    body: str = "",
-) -> dict:
-    board_mod = _optional_module("openfarm_core.board")
-    board_dir = _ensure_board_dir(ctx.state, run_id)
-    if board_mod is not None and hasattr(board_mod, "Board"):
-        board = board_mod.Board(board_dir, state_dir=ctx.state.root)
-        board.ensure()
-        return board.answer(question_seq, as_name=as_name, data=data, body=body)
-
-    posts = _read_board_posts_raw(board_dir)
-    question = next((p for p in posts if int(p.get("seq", 0)) == question_seq), None)
-    if question is None or question.get("kind") != "question":
-        raise Refused("bad-question", f"post #{question_seq} is not a question")
-    if any(p.get("kind") == "answer" and p.get("ref") == question_seq for p in posts):
-        raise Refused("already-answered", f"question #{question_seq} is already answered")
-
-    members = read_json(board_dir / "members.json", {}) or {}
-    member = members.get(as_name) if isinstance(members, dict) else None
-    member_role = _normalize_role((member or {}).get("role", ""))
-    to_norm = {_normalize_role(x) for x in (question.get("to") or [])}
-    if as_name not in (question.get("to") or []) and "all" not in to_norm and (not member_role or member_role not in to_norm):
-        raise Refused("not-addressee", f"{as_name!r} is not addressed on question #{question_seq}")
-
-    validated = _fallback_validate_expects(question.get("expects"), data)
-    ans_path = board_dir / "evidence" / f"answer-q{question_seq}.json"
-    write_json(ans_path, validated)
-    next_seq = (int(posts[-1]["seq"]) + 1) if posts else 1
-    record = {
-        "seq": next_seq,
-        "at": utc_now(),
-        "from": as_name,
-        "to": [str(question.get("from", "supervisor"))],
-        "kind": "answer",
-        "card": str(question.get("card", "")),
-        "attempt": int(question.get("attempt", 0) or 0),
-        "ref": question_seq,
-        "body": sanitize_lesson_text(body or json.dumps(validated, ensure_ascii=False), max_len=8000),
-        "evidence": [str(ans_path)],
-    }
-    append_jsonl(board_dir / "board.jsonl", record)
-    return record
-
-
-def _dispatch_fallback_board(ctx: TuiContext, tokens: list[str]) -> dict:
-    if not ctx.configured or ctx.state is None:
-        return _cmd_result(2, "", "repository is not configured")
-    parser = argparse.ArgumentParser(prog="openfarm board", add_help=False)
-    sub = parser.add_subparsers(dest="board_op")
-    p_read = sub.add_parser("read")
-    p_read.add_argument("--as", dest="as_name", default="*")
-    p_read.add_argument("--since", type=int, default=0)
-    p_read.add_argument("--limit", type=int, default=20)
-    p_read.add_argument("--seqs", default=None)
-    p_read.add_argument("--status", action="store_true")
-    p_read.add_argument("--run", default=None)
-
-    p_post = sub.add_parser("post")
-    p_post.add_argument("--as", dest="as_name", required=True)
-    p_post.add_argument("--to", required=True)
-    p_post.add_argument("--kind", default="note")
-    p_post.add_argument("--card", default="")
-    p_post.add_argument("--ref", type=int, default=None)
-    p_post.add_argument("--body", default=None)
-    p_post.add_argument("--file", default=None)
-    p_post.add_argument("--run", default=None)
-
-    p_ans = sub.add_parser("answer")
-    p_ans.add_argument("seq", type=int)
-    p_ans.add_argument("--as", dest="as_name", required=True)
-    p_ans.add_argument("--file", default=None)
-    p_ans.add_argument("--json-data", default=None)
-    p_ans.add_argument("--body", default="")
-    p_ans.add_argument("--run", default=None)
-
-    p_wait = sub.add_parser("wait")
-    p_wait.add_argument("--as", dest="as_name", required=True)
-    p_wait.add_argument("--since", type=int, default=0)
-    p_wait.add_argument("--timeout", default="0")
-    p_wait.add_argument("--run", default=None)
-
-    err_buf = io.StringIO()
-    try:
-        with contextlib.redirect_stderr(err_buf):
-            args = parser.parse_args(tokens)
-    except SystemExit:
-        return _cmd_result(2, "", err_buf.getvalue().strip() or "invalid board command")
-
-    run_id, _ = _resolve_run_id(ctx.state, getattr(args, "run", None))
-    if not run_id:
-        run_id = f"run-{utc_now().replace('-', '').replace(':', '')}"
-
-    try:
-        if args.board_op == "read":
-            board_data = _read_board_data(ctx, run_id)
-            if args.status:
-                payload = {
-                    "run_id": board_data["run_id"],
-                    "posts": board_data["total_posts"],
-                    "last_seq": board_data["last_seq"],
-                    "ended": board_data["ended"],
-                    "members": len(board_data["members"]),
-                    "unanswered_questions": len(board_data["unanswered_questions"]),
-                }
-            else:
-                posts = board_data["posts"]
-                if args.seqs:
-                    wanted = [int(s.strip()) for s in args.seqs.split(",") if s.strip()]
-                    by_seq = {p["seq"]: p for p in posts}
-                    posts = [by_seq[s] for s in wanted if s in by_seq]
-                else:
-                    posts = [p for p in posts if p["seq"] > args.since][: args.limit]
-                payload = {"run_id": board_data["run_id"], "posts": posts}
-            return _cmd_result(0, json.dumps(payload, indent=2, ensure_ascii=False), "", data=payload)
-
-        if args.board_op == "post":
-            if args.file:
-                res = read_evidence_file(ctx.repo, ctx.config_path, args.file, run_id=run_id)
-                if not res["ok"]:
-                    return _cmd_result(1, "", res["reason"], data={"refused": True, "reason": res["reason"]})
-                body = res["text"]
-            else:
-                body = args.body or ""
-            to_list = [x.strip() for x in args.to.split(",") if x.strip()]
-            rec = _fallback_board_post(
-                ctx,
-                run_id=run_id,
-                author=args.as_name,
-                to=to_list,
-                kind=args.kind,
-                body=body,
-                card=args.card,
-                ref=args.ref,
-            )
-            return _cmd_result(0, json.dumps(rec, indent=2, ensure_ascii=False), "", data=rec)
-
-        if args.board_op == "answer":
-            if args.file:
-                f = Path(args.file)
-                if _is_secret_file(ctx, f):
-                    return _cmd_result(1, "", "refused: cannot read secret key_file")
-                raw_json = f.read_text(encoding="utf-8")
-            elif args.json_data is not None:
-                raw_json = args.json_data
-            else:
-                return _cmd_result(2, "", "board answer requires --file or --json-data")
-            parsed = json.loads(raw_json)
-            rec = _fallback_board_answer(
-                ctx,
-                run_id=run_id,
-                question_seq=args.seq,
-                as_name=args.as_name,
-                data=parsed,
-                body=args.body,
-            )
-            return _cmd_result(0, json.dumps(rec, indent=2, ensure_ascii=False), "", data=rec)
-
-        if args.board_op == "wait":
-            board_data = _read_board_data(ctx, run_id)
-            posts = [p for p in board_data["posts"] if p["seq"] > args.since]
-            if posts:
-                payload = {"woke": True, "posts": posts, "last_seq": posts[-1]["seq"]}
-            elif board_data["ended"]:
-                payload = {"woke": False, "reason": "run-ended", "posts": []}
-            else:
-                payload = {"woke": False, "reason": "timeout", "posts": []}
-            return _cmd_result(0, json.dumps(payload, indent=2, ensure_ascii=False), "", data=payload)
-    except (Refused, Invalid, ValueError, OSError) as exc:
-        msg = getattr(exc, "message", str(exc))
-        return _cmd_result(1, json.dumps({"refused": True, "reason": msg}), msg, data={"refused": True, "reason": msg})
-
-    return _cmd_result(2, "", "unknown board subcommand")
-
-
-def _require_coordinator_seat(ctx: TuiContext, members: dict, caller: str) -> None:
-    if not caller:
-        raise Refused("not-coordinator", "caller (--as) is required and must hold the coordinator seat")
-    member = members.get(caller) if isinstance(members, dict) else None
-    if not isinstance(member, dict) or member.get("state") == "removed":
-        raise Refused("not-coordinator", f"{caller!r} is not an active member holding the coordinator seat")
-    if _normalize_role(member.get("role", "")) != "coordinator":
-        raise Refused("not-coordinator", f"{caller!r} has role {member.get('role')!r}, not coordinator")
-
-
-def _validate_tier_effort(cfg: Config, tier_name: str, effort: str) -> tuple[str, str]:
-    tiers = getattr(cfg, "tiers", None) or {}
-    if tiers:
-        if tier_name not in tiers:
-            raise Refused("bad-tier", f"unknown tier {tier_name!r}")
-        tier = tiers[tier_name]
-        allowed = tuple(getattr(tier, "efforts", ()) or ())
-        if effort and allowed and effort not in allowed:
-            raise Refused("bad-effort", f"effort {effort!r} is not allowed for tier {tier_name!r}")
-        return str(getattr(tier, "model", "")), effort
-    if tier_name and tier_name != "default":
-        raise Refused("bad-tier", f"unknown tier {tier_name!r}")
-    if effort and effort not in EFFORT_STEPS:
-        raise Refused("bad-effort", f"invalid effort {effort!r}")
-    impl = cfg.role_models.get("implementer") if cfg.role_models else None
-    return str(getattr(impl, "model", "") or ""), effort
-
-
-def _dispatch_fallback_swarm(ctx: TuiContext, tokens: list[str]) -> dict:
-    if not ctx.configured or ctx.cfg is None or ctx.state is None:
-        return _cmd_result(2, "", "repository is not configured")
-    parser = argparse.ArgumentParser(prog="openfarm swarm", add_help=False)
-    sub = parser.add_subparsers(dest="swarm_op")
-
-    p_st = sub.add_parser("status")
-    p_st.add_argument("--run", default=None)
-
-    sub.add_parser("tiers")
-
-    p_join = sub.add_parser("join")
-    p_join.add_argument("--name", required=True)
-    p_join.add_argument("--seat", required=True, choices=("coordinator", "supervisor"))
-    p_join.add_argument("--kind", default="agent", choices=("human", "agent"))
-    p_join.add_argument("--run", default=None)
-
-    p_start = sub.add_parser("start")
-    p_start.add_argument("card")
-    p_start.add_argument("--team", default="")
-    p_start.add_argument("--as", dest="as_name", default="")
-    p_start.add_argument("--run", default=None)
-
-    p_set = sub.add_parser("set")
-    p_set.add_argument("member")
-    p_set.add_argument("--tier", default="")
-    p_set.add_argument("--effort", default="")
-    p_set.add_argument("--as", dest="as_name", default="")
-    p_set.add_argument("--run", default=None)
-
-    p_hint = sub.add_parser("hint")
-    p_hint.add_argument("member")
-    p_hint.add_argument("--body", required=True)
-    p_hint.add_argument("--as", dest="as_name", default="")
-    p_hint.add_argument("--run", default=None)
-
-    p_block = sub.add_parser("block")
-    p_block.add_argument("card")
-    p_block.add_argument("--reason", required=True)
-    p_block.add_argument("--as", dest="as_name", default="")
-    p_block.add_argument("--run", default=None)
-
-    p_rm = sub.add_parser("remove")
-    p_rm.add_argument("member")
-    p_rm.add_argument("--as", dest="as_name", default="")
-    p_rm.add_argument("--run", default=None)
-
-    err_buf = io.StringIO()
-    try:
-        with contextlib.redirect_stderr(err_buf):
-            args = parser.parse_args(tokens)
-    except SystemExit:
-        return _cmd_result(2, "", err_buf.getvalue().strip() or "invalid swarm command")
-
-    if args.swarm_op == "tiers":
-        payload = {"tiers": _read_tiers_summary(ctx.cfg)}
-        return _cmd_result(0, json.dumps(payload, indent=2, ensure_ascii=False), "", data=payload)
-
-    run_id, _ = _resolve_run_id(ctx.state, getattr(args, "run", None))
-    if args.swarm_op == "status":
-        payload = _collect_swarm(ctx, run_id=run_id)
-        return _cmd_result(0, json.dumps(payload, indent=2, ensure_ascii=False), "", data=payload)
-
-    if not run_id:
-        run_id = f"run-{utc_now().replace('-', '').replace(':', '')}"
-    board_dir = _ensure_board_dir(ctx.state, run_id)
-    members = read_json(board_dir / "members.json", {}) or {}
-    swarm_cfg = _read_swarm_summary(ctx.cfg)
-
-    try:
-        if args.swarm_op == "join":
-            seat_val = swarm_cfg.get(args.seat, "")
-            if seat_val != "external":
-                raise Refused(
-                    "seat-not-external",
-                    f"[swarm] {args.seat} is {seat_val!r}, not 'external'",
-                )
-            members[args.name] = {
-                "name": args.name,
-                "kind": "external",
-                "role": args.seat,
-                "card": "",
-                "tier": "",
-                "effort": "",
-                "state": "active",
-                "added_by": "external",
-                "last_read_seq": 0,
-                "wait_since": "",
-                "tokens": {"in": 0, "out": 0},
-                "attempts": 0,
-                "owner_kind": args.kind,
-            }
-            write_json(board_dir / "members.json", members)
-            _fallback_board_post(
-                ctx,
-                run_id=run_id,
-                author=args.name,
-                to=["all"],
-                kind="roster",
-                body=f"{args.name} joined seat {args.seat} ({args.kind})",
-            )
-            payload = {"joined": True, "member": members[args.name], "run_id": run_id}
-            return _cmd_result(0, json.dumps(payload, indent=2, ensure_ascii=False), "", data=payload)
-
-        _require_coordinator_seat(ctx, members, getattr(args, "as_name", ""))
-
-        if args.swarm_op == "start":
-            cards, _ = _read_cards_readonly(ctx)
-            card = next((c for c in cards if c.id == args.card), None)
-            if card is None:
-                raise Refused("unknown-card", f"no card {args.card!r}")
-            if card.state != "ready":
-                raise Refused("not-ready", f"{card.id} is {card.state}, not ready")
-            running_cards = {
-                c.id: c for c in cards if c.state == "in_progress"
-            }
-            for running in running_cards.values():
-                if _cards_collide(card, running):
-                    raise Refused("card-collision", f"{card.id} collides with {running.id}")
-            team_spec: dict[str, dict[str, str]] = {}
-            if args.team:
-                for item in args.team.split(","):
-                    item = item.strip()
-                    if not item:
-                        continue
-                    role_part, sep, spec_part = item.partition("=")
-                    if not sep:
-                        raise Refused("bad-team", f"expected role=tier:effort, got {item!r}")
-                    tier_n, _, eff_n = spec_part.partition(":")
-                    model_n, eff_checked = _validate_tier_effort(
-                        ctx.cfg, tier_n.strip() or swarm_cfg["default_tier"], eff_n.strip()
-                    )
-                    team_spec[_normalize_role(role_part)] = {
-                        "tier": tier_n.strip() or swarm_cfg["default_tier"],
-                        "effort": eff_checked,
-                        "model": model_n,
-                    }
-            rec = _fallback_board_post(
-                ctx,
-                run_id=run_id,
-                author=args.as_name,
-                to=["all"],
-                kind="action",
-                card=card.id,
-                body=f"start {card.id} team={json.dumps(team_spec, sort_keys=True)}",
-            )
-            payload = {"action": "start", "card": card.id, "team": team_spec, "post": rec}
-            return _cmd_result(0, json.dumps(payload, indent=2, ensure_ascii=False), "", data=payload)
-
-        if args.swarm_op == "set":
-            target = members.get(args.member)
-            if not isinstance(target, dict) or target.get("state") == "removed":
-                raise Refused("unknown-member", f"member {args.member!r} not found")
-            new_tier = args.tier or str(target.get("tier") or swarm_cfg["default_tier"])
-            new_effort = args.effort or str(target.get("effort") or "")
-            model_n, eff_checked = _validate_tier_effort(ctx.cfg, new_tier, new_effort)
-            target["tier"] = new_tier
-            target["effort"] = eff_checked
-            if model_n:
-                target["model"] = model_n
-            write_json(board_dir / "members.json", members)
-            rec = _fallback_board_post(
-                ctx,
-                run_id=run_id,
-                author=args.as_name,
-                to=[args.member],
-                kind="action",
-                card=str(target.get("card", "")),
-                body=f"set {args.member} tier={new_tier} effort={eff_checked}",
-            )
-            payload = {"action": "set", "member": target, "post": rec}
-            return _cmd_result(0, json.dumps(payload, indent=2, ensure_ascii=False), "", data=payload)
-
-        if args.swarm_op == "hint":
-            target = members.get(args.member)
-            if not isinstance(target, dict) or target.get("state") == "removed":
-                raise Refused("unknown-member", f"member {args.member!r} not found")
-            rec = _fallback_board_post(
-                ctx,
-                run_id=run_id,
-                author=args.as_name,
-                to=[args.member],
-                kind="note",
-                card=str(target.get("card", "")),
-                body=args.body,
-            )
-            payload = {"action": "hint", "member": args.member, "post": rec}
-            return _cmd_result(0, json.dumps(payload, indent=2, ensure_ascii=False), "", data=payload)
-
-        if args.swarm_op == "block":
-            rec = _fallback_board_post(
-                ctx,
-                run_id=run_id,
-                author=args.as_name,
-                to=["all"],
-                kind="blocked",
-                card=args.card,
-                body=f"blocked {args.card}: {args.reason}",
-            )
-            payload = {"action": "block", "card": args.card, "reason": args.reason, "post": rec}
-            return _cmd_result(0, json.dumps(payload, indent=2, ensure_ascii=False), "", data=payload)
-
-        if args.swarm_op == "remove":
-            target = members.get(args.member)
-            if not isinstance(target, dict):
-                raise Refused("unknown-member", f"member {args.member!r} not found")
-            target["state"] = "removed"
-            write_json(board_dir / "members.json", members)
-            payload = {"action": "remove", "member": args.member, "state": "removed"}
-            return _cmd_result(0, json.dumps(payload, indent=2, ensure_ascii=False), "", data=payload)
-    except (Refused, Invalid, _CfgErr, ValueError) as exc:
-        msg = getattr(exc, "message", str(exc))
-        return _cmd_result(1, json.dumps({"refused": True, "reason": msg}), msg, data={"refused": True, "reason": msg})
-
-    return _cmd_result(2, "", "unknown swarm subcommand")
-
-
 def _cmd_result(exit_code: int, stdout: str, stderr: str, data: object = None) -> dict:
     combined = "\n".join(part for part in (stdout.strip(), stderr.strip()) if part).strip()
     if data is None and stdout.strip():
@@ -2740,40 +2094,32 @@ def _cmd_result(exit_code: int, stdout: str, stderr: str, data: object = None) -
     }
 
 
-def dispatch_cli_command(
-    repo: Path | str,
-    config_path: Path | str | None = None,
-    tokens: list[str] | str | None = None,
-) -> dict:
-    """Execute an ``openfarm`` CLI command in-process and capture its output."""
+def _split_command(tokens: list[str] | str | None) -> tuple[list[str], dict | None]:
+    """The command bar's text as argv tokens, or a refusal result."""
     if tokens is None:
-        return _cmd_result(2, "", "empty command")
+        return [], _cmd_result(2, "", "empty command")
     if isinstance(tokens, str):
         try:
             argv_tokens = shlex.split(tokens)
         except ValueError as exc:
-            return _cmd_result(2, "", f"parse error: {exc}")
+            return [], _cmd_result(2, "", f"parse error: {exc}")
     else:
         argv_tokens = [str(t) for t in tokens if str(t) != ""]
 
     if argv_tokens and argv_tokens[0] == "openfarm":
         argv_tokens = argv_tokens[1:]
     if not argv_tokens:
-        return _cmd_result(2, "", "empty command")
+        return [], _cmd_result(2, "", "empty command")
+    if argv_tokens[0] == "tui" and "--once" not in argv_tokens:
+        return [], _cmd_result(1, "", "cannot launch nested interactive tui from command bar")
+    return argv_tokens, None
 
+
+def _build_cli_argv(
+    repo: Path | str, config_path: Path | str | None, argv_tokens: list[str]
+) -> list[str]:
+    """The full `openfarm` argv for a command typed in the TUI."""
     cmd_name = argv_tokens[0]
-    if cmd_name == "tui" and "--once" not in argv_tokens:
-        return _cmd_result(1, "", "cannot launch nested interactive tui from command bar")
-
-    from . import cli
-
-    known_cli = set(getattr(cli, "COMMANDS", {})) | set(getattr(cli, "PRE_CONFIG_COMMANDS", {}))
-    ctx = _load_tui_context(repo, config_path)
-    if cmd_name == "board" and "board" not in known_cli:
-        return _dispatch_fallback_board(ctx, argv_tokens[1:])
-    if cmd_name == "swarm" and "swarm" not in known_cli:
-        return _dispatch_fallback_swarm(ctx, argv_tokens[1:])
-
     resolved_repo = Path(repo).resolve()
     full_argv: list[str] = []
     if "--repo" not in argv_tokens and not any(t.startswith("--repo=") for t in argv_tokens):
@@ -2798,12 +2144,55 @@ def dispatch_cli_command(
             full_argv.extend(["list", "--dir", str(resolved_repo / "bench")])
         elif argv_tokens[1] in ("list", "run"):
             full_argv.extend(["--dir", str(resolved_repo / "bench")])
+    return full_argv
 
+
+def is_long_command(argv_tokens: list[str] | str) -> bool:
+    """True for a command that can take long, which the TUI runs in the background.
+
+    `run`, `drive` and `supervise` can each take a night; `bench run`, `board
+    wait` and `check --baseline` (two suite runs) can take minutes. Everything
+    else answers at once and stays synchronous.
+    """
+    if isinstance(argv_tokens, str):
+        try:
+            argv_tokens = shlex.split(argv_tokens)
+        except ValueError:
+            return False
+    tokens = [t for t in argv_tokens if t]
+    if tokens and tokens[0] == "openfarm":
+        tokens = tokens[1:]
+    if not tokens:
+        return False
+    name, rest = tokens[0], tokens[1:]
+    sub = rest[0] if rest else ""
+    if name in ("run", "drive", "supervise"):
+        return True
+    if name in ("board", "swarm") and sub == "wait":
+        return True
+    if name == "bench" and sub == "run":
+        return True
+    return name == "check" and "--baseline" in rest
+
+
+def dispatch_cli_command(
+    repo: Path | str,
+    config_path: Path | str | None = None,
+    tokens: list[str] | str | None = None,
+) -> dict:
+    """Execute an ``openfarm`` CLI command in-process and capture its output."""
+    argv_tokens, refused = _split_command(tokens)
+    if refused is not None:
+        return refused
+
+    from . import cli
+
+    full_argv = _build_cli_argv(repo, config_path, argv_tokens)
     out_buf = io.StringIO()
     err_buf = io.StringIO()
     exit_code = 0
     try:
-        with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+        with _capture_streams(out_buf, err_buf):
             exit_code = int(cli.main(full_argv))
     except SystemExit as exc:
         code = exc.code
@@ -2812,6 +2201,354 @@ def dispatch_cli_command(
         err_buf.write(f"error: {exc}\n")
         exit_code = 3
     return _cmd_result(exit_code, out_buf.getvalue(), err_buf.getvalue())
+
+
+# -- Long commands, off the screen thread ------------------------------------
+
+
+class _OutputRouter(io.TextIOBase):
+    """Stands in for `sys.stdout` / `sys.stderr` while the TUI runs commands.
+
+    A command run in-process prints with `print()`, and a long one runs on its
+    own thread (and its cards on more threads) while the screen thread keeps
+    drawing. Swapping `sys.stdout` per command, as `redirect_stdout` does, is
+    global and cannot nest across threads, so instead one router stays installed
+    and sends each write where it belongs: to the capture the writing thread set
+    (a synchronous command on the screen thread, or the background command's own
+    thread), else from any other thread to the background command, else to the
+    stream the router replaced.
+    """
+
+    def __init__(self, original) -> None:
+        super().__init__()
+        self.original = original
+        self._local = threading.local()
+        self._lock = threading.Lock()
+        self.job_sink = None
+
+    @contextlib.contextmanager
+    def capture(self, sink):
+        prev = getattr(self._local, "sink", None)
+        self._local.sink = sink
+        try:
+            yield sink
+        finally:
+            self._local.sink = prev
+
+    def _target(self):
+        sink = getattr(self._local, "sink", None)
+        if sink is not None:
+            return sink
+        if threading.current_thread() is not threading.main_thread():
+            with self._lock:
+                if self.job_sink is not None:
+                    return self.job_sink
+        return self.original
+
+    def write(self, text) -> int:
+        target = self._target()
+        if target is None:
+            return len(text)
+        return target.write(text)
+
+    def flush(self) -> None:
+        target = self._target()
+        flush = getattr(target, "flush", None)
+        if callable(flush):
+            with contextlib.suppress(OSError, ValueError):
+                flush()
+
+    def isatty(self) -> bool:
+        return False
+
+    def writable(self) -> bool:
+        return True
+
+    @property
+    def encoding(self) -> str:
+        return getattr(self.original, "encoding", None) or "utf-8"
+
+
+_ROUTER_LOCK = threading.Lock()
+
+
+def _install_routers() -> tuple[_OutputRouter, _OutputRouter]:
+    """Install (once) the stdout/stderr routers; returns them."""
+    with _ROUTER_LOCK:
+        out, err = sys.stdout, sys.stderr
+        if not isinstance(out, _OutputRouter):
+            out = _OutputRouter(out)
+            sys.stdout = out
+        if not isinstance(err, _OutputRouter):
+            err = _OutputRouter(err)
+            sys.stderr = err
+        return out, err
+
+
+def _uninstall_routers() -> None:
+    """Put the original streams back once nothing routes through them."""
+    with _ROUTER_LOCK:
+        for name in ("stdout", "stderr"):
+            current = getattr(sys, name)
+            if isinstance(current, _OutputRouter) and current.job_sink is None:
+                setattr(sys, name, current.original)
+
+
+@contextlib.contextmanager
+def _capture_streams(out_buf, err_buf):
+    """Capture this thread's command output, routers or not."""
+    if isinstance(sys.stdout, _OutputRouter) and isinstance(sys.stderr, _OutputRouter):
+        with sys.stdout.capture(out_buf), sys.stderr.capture(err_buf):
+            yield
+        return
+    with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+        yield
+
+
+class _LineSink:
+    """A write target that keeps the whole text and a bounded tail of lines."""
+
+    def __init__(self, job: "BackgroundCommand", which: str) -> None:
+        self.job = job
+        self.which = which
+
+    def write(self, text) -> int:
+        self.job._append(self.which, str(text))
+        return len(text)
+
+    def flush(self) -> None:
+        return None
+
+
+_KILL_REASON_PREFIX = "tui: stopping "
+
+
+def _raise_in_thread(thread: threading.Thread, exc_type=KeyboardInterrupt) -> bool:
+    """Raise `exc_type` in `thread` at its next Python step, as Ctrl-C would.
+
+    The command unwinds through its `finally` blocks like any interrupted
+    command. A thread blocked inside one long C call (a child process it waits
+    on) sees it when that call returns.
+    """
+    import ctypes
+
+    ident = thread.ident
+    if ident is None or not thread.is_alive():
+        return False
+    hit = ctypes.pythonapi.PyThreadState_SetAsyncExc(
+        ctypes.c_ulong(ident), ctypes.py_object(exc_type))
+    if hit > 1:  # never expected; undo rather than interrupt the wrong threads
+        ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(ident), None)
+        return False
+    return hit == 1
+
+
+class BackgroundCommand:
+    """One long command, run on its own thread while the TUI keeps drawing.
+
+    It runs the same `cli.main` the command bar runs for short commands, with
+    its output captured (see `_OutputRouter`), and it never touches curses. A
+    `run` is stopped with the kill switch, which the run checks between steps:
+    in-flight cards end blocked `killed`, the run writes its record and
+    releases its lock, and the kill switch is removed again once the run has
+    ended, if this TUI set it. Anything else, or a run asked twice, is
+    interrupted as Ctrl-C would interrupt it, and unwinds the same way.
+    """
+
+    def __init__(self, line: str, argv_tokens: list[str], full_argv: list[str], *,
+                 repo: Path, state: StateDir | None = None, kill_switch: Path | None = None,
+                 max_lines: int = 4000) -> None:
+        self.line = line
+        self.argv_tokens = list(argv_tokens)
+        self.full_argv = list(full_argv)
+        self.repo = Path(repo)
+        self.state = state
+        self.kill_switch = kill_switch
+        self.is_run = bool(argv_tokens) and argv_tokens[0] == "run"
+        self.max_lines = max_lines
+        self.thread: threading.Thread | None = None
+        self.started_at = 0.0
+        self.ended_at = 0.0
+        self.exit_code: int | None = None
+        self.error = ""
+        self.stop_requested = ""   # "", "kill-switch", "interrupt"
+        self._kill_switch_set = False
+        self._lock = threading.Lock()
+        self._stdout: list[str] = []
+        self._stderr: list[str] = []
+        self._tail: list[str] = []
+        self._partial = ""
+        self._done = threading.Event()
+        self._routers: tuple[_OutputRouter, _OutputRouter] | None = None
+
+    # -- life cycle -----------------------------------------------------------
+
+    def start(self) -> "BackgroundCommand":
+        self.started_at = time.monotonic()
+        out_router, err_router = self._routers = _install_routers()
+        sink = _LineSink(self, "stderr")
+        with out_router._lock:
+            out_router.job_sink = sink
+        with err_router._lock:
+            err_router.job_sink = sink
+        # Not a daemon: if the TUI ends first, the process still waits for the
+        # command to unwind, so a run never dies holding its lock.
+        self.thread = threading.Thread(target=self._main, name=f"tui-bg: {self.line}",
+                                       daemon=False)
+        self.thread.start()
+        return self
+
+    def _main(self) -> None:
+        from . import cli
+
+        code = 3
+        try:
+            out_router, err_router = self._routers
+            with out_router.capture(_LineSink(self, "stdout")), \
+                    err_router.capture(_LineSink(self, "stderr")):
+                try:
+                    code = int(cli.main(self.full_argv))
+                except SystemExit as exc:
+                    raw = exc.code
+                    code = int(raw) if isinstance(raw, int) else (0 if raw is None else 2)
+                except KeyboardInterrupt:
+                    self._append("stderr", "openfarm: interrupted\n")
+                    code = 3
+        except Exception as exc:  # the TUI must outlive any command error
+            self.error = f"{type(exc).__name__}: {exc}"
+            code = 3
+        finally:
+            with self._lock:
+                self.exit_code = code
+                self.ended_at = time.monotonic()
+            for router in self._routers or ():
+                with router._lock:
+                    router.job_sink = None
+            self._clear_own_kill_switch()
+            self._done.set()
+
+    def _append(self, which: str, text: str) -> None:
+        with self._lock:
+            (self._stdout if which == "stdout" else self._stderr).append(text)
+            pieces = (self._partial + text).split("\n")
+            self._partial = pieces.pop()
+            self._tail.extend(pieces)
+            if len(self._tail) > self.max_lines:
+                del self._tail[: len(self._tail) - self.max_lines]
+
+    # -- state ----------------------------------------------------------------
+
+    @property
+    def running(self) -> bool:
+        return not self._done.is_set()
+
+    @property
+    def state_label(self) -> str:
+        if self.running:
+            return "stopping" if self.stop_requested else "running"
+        if self.error:
+            return "failed"
+        return "finished" if self.exit_code == 0 else "failed"
+
+    def elapsed_s(self) -> float:
+        end = self.ended_at if not self.running else time.monotonic()
+        return max(0.0, end - self.started_at) if self.started_at else 0.0
+
+    def status_text(self) -> str:
+        """One line for the status area."""
+        label = self.state_label
+        took = f"{self.elapsed_s():.0f}s"
+        if label == "running":
+            return f"▶ {self.line} running {took}"
+        if label == "stopping":
+            how = ("kill switch set, cards stop at their next step"
+                   if self.stop_requested == "kill-switch" else "interrupted")
+            return f"■ stopping {self.line} ({how}) {took}"
+        if self.error:
+            return f"✗ {self.line} failed: {self.error}"
+        if self.exit_code == 0:
+            return f"✓ {self.line} finished (exit 0) in {took}"
+        last = self.last_error_line()
+        return f"✗ {self.line} failed (exit {self.exit_code})" + (f": {last}" if last else "")
+
+    def last_error_line(self) -> str:
+        with self._lock:
+            lines = [ln.strip() for ln in "".join(self._stderr).splitlines() if ln.strip()]
+        return lines[-1] if lines else ""
+
+    def output_lines(self) -> list[str]:
+        with self._lock:
+            return list(self._tail) + ([self._partial] if self._partial else [])
+
+    def result(self) -> dict:
+        """The command's result, in the same shape as a synchronous command's."""
+        with self._lock:
+            stdout, stderr = "".join(self._stdout), "".join(self._stderr)
+            code = self.exit_code
+        if self.error:
+            stderr = (stderr + "\n" + self.error).strip()
+        res = _cmd_result(code if code is not None else 3, stdout, stderr)
+        res.update({"background": True, "running": self.running, "state": self.state_label,
+                    "line": self.line})
+        if self.running:
+            res["exit_code"] = None
+            res["ok"] = False
+        return res
+
+    def wait(self, timeout: float | None = None) -> bool:
+        """Block until the command ends. Not for the screen thread while drawing."""
+        return self._done.wait(timeout)
+
+    # -- stopping -------------------------------------------------------------
+
+    def request_stop(self, *, force: bool = False) -> str:
+        """Ask the command to stop cleanly; `force` interrupts even a run."""
+        if not self.running or self.thread is None:
+            return self.stop_requested
+        if self.is_run and not force and not self.stop_requested:
+            if self._set_kill_switch():
+                self.stop_requested = "kill-switch"
+                return self.stop_requested
+        if _raise_in_thread(self.thread):
+            self.stop_requested = "interrupt"
+        return self.stop_requested
+
+    def shutdown(self, *, grace_s: float = 60.0) -> str:
+        """Stop and wait: the kill switch first for a run, then an interrupt."""
+        if not self.running:
+            return "ended"
+        self.request_stop()
+        if self.wait(grace_s):
+            return "stopped"
+        self.request_stop(force=True)
+        while not self.wait(grace_s):
+            # Keep asking: a thread inside a long call sees it when the call returns.
+            self.request_stop(force=True)
+        return "interrupted"
+
+    def _set_kill_switch(self) -> bool:
+        if self.state is None:
+            return False
+        path = self.state.kill_switch(self.kill_switch)
+        if path.exists():
+            # Someone else armed it already: the run will stop, and it is not ours to clear.
+            return True
+        try:
+            self.state.request_kill(self.kill_switch, f"{_KILL_REASON_PREFIX}{self.line}")
+        except OSError:
+            return False
+        self._kill_switch_set = True
+        return True
+
+    def _clear_own_kill_switch(self) -> None:
+        if not self._kill_switch_set or self.state is None:
+            return
+        path = self.state.kill_switch(self.kill_switch)
+        info = read_json(path, {}) if path.exists() else {}
+        if isinstance(info, dict) and str(info.get("reason", "")).startswith(_KILL_REASON_PREFIX):
+            with contextlib.suppress(OSError):
+                path.unlink()
+        self._kill_switch_set = False
 
 
 # -- Headless & curses interactive controller --------------------------------
@@ -2853,6 +2590,11 @@ class TuiController:
         self.modal_scroll = 0
         self.status_message = ""
         self.last_command_result: dict | None = None
+        # The one long command running off the screen thread, if any, and the
+        # last one that ended (kept so `o` can still show its output).
+        self.job: BackgroundCommand | None = None
+        self._job_reported = True
+        self.quit_pending = False
         self.snapshot: dict = {}
         self.refresh()
 
@@ -2982,6 +2724,8 @@ class TuiController:
             self.selected_index = 0
 
     def execute_command(self, line: str) -> dict:
+        if is_long_command(line):
+            return self.start_background(line)
         res = dispatch_cli_command(self.repo, self.config_path, line)
         self.last_command_result = res
         title = f": {line} (exit {res['exit_code']})"
@@ -2990,6 +2734,111 @@ class TuiController:
         self.status_message = f"cmd exit={res['exit_code']}"
         self.refresh()
         return res
+
+    # -- Long commands in the background --------------------------------------
+
+    def job_running(self) -> bool:
+        return self.job is not None and self.job.running
+
+    def start_background(self, line: str) -> dict:
+        """Start a long command off the screen thread; refuse a second one."""
+        if self.job_running():
+            msg = (f"refused: `{self.job.line}` is still running; wait for it to end, "
+                   f"or quit (q) to stop it, before starting `{line}`")
+            self.status_message = msg
+            res = _cmd_result(1, "", msg)
+            res.update({"background": True, "refused": True})
+            self.last_command_result = res
+            return res
+        argv_tokens, refused = _split_command(line)
+        if refused is not None:
+            self.last_command_result = refused
+            self.status_message = f"cmd exit={refused['exit_code']}"
+            self.open_modal(f": {line} (exit {refused['exit_code']})",
+                            (refused["output"] or "(no output)").splitlines())
+            return refused
+        ctx = _load_tui_context(self.repo, self.config_path)
+        job = BackgroundCommand(
+            line, argv_tokens, _build_cli_argv(self.repo, self.config_path, argv_tokens),
+            repo=self.repo, state=ctx.state,
+            kill_switch=(ctx.cfg.kill_switch if ctx.cfg is not None else None),
+        )
+        self.job = job.start()
+        self._job_reported = False
+        self.status_message = (f"started `{line}` in the background; "
+                               f"o shows its output, q asks before stopping it")
+        res = job.result()
+        self.last_command_result = res
+        return res
+
+    def poll_job(self) -> dict | None:
+        """Report a background command that has ended; call once per screen tick."""
+        job = self.job
+        if job is None or job.running or self._job_reported:
+            return None
+        self._job_reported = True
+        _uninstall_routers()
+        res = job.result()
+        self.last_command_result = res
+        self.status_message = job.status_text()
+        if not self.quit_pending and not self.help_open and not self.modal_lines:
+            title = f": {job.line} ({job.state_label}, exit {res['exit_code']})"
+            self.open_modal(title, (res["output"] or "(no output)").splitlines())
+        self.refresh()
+        return res
+
+    def wait_for_job(self, timeout: float | None = None) -> dict | None:
+        """Headless helper: wait for the background command, then report it."""
+        if self.job is None:
+            return None
+        self.job.wait(timeout)
+        return self.poll_job() or self.job.result()
+
+    def job_status_text(self) -> str:
+        return self.job.status_text() if self.job is not None else ""
+
+    def show_job_output(self) -> None:
+        if self.job is None:
+            self.status_message = "no background command yet"
+            return
+        lines = self.job.output_lines() or ["(no output yet)"]
+        self.open_modal(f"Output: {self.job.line} ({self.job.state_label})", lines)
+        self.modal_scroll = max(0, len(lines) - 1)
+
+    def quit_question(self, *, force: bool = False) -> str:
+        """What a person is asked before quitting stops the running command."""
+        job = self.job
+        if job is None or not job.running:
+            return ""
+        if force or job.stop_requested:
+            return (f"`{job.line}` is still stopping. Interrupt it now (like Ctrl-C)? "
+                    f"It still unwinds and releases its lock. [y/N] ")
+        if job.is_run:
+            return (f"`{job.line}` is still running. Quit and stop it? The kill switch is "
+                    f"set: running cards stop at their next step, the run writes its "
+                    f"record and releases its lock, and the kill switch is cleared once "
+                    f"it has ended. [y/N] ")
+        return (f"`{job.line}` is still running. Quit and stop it? It is interrupted "
+                f"(like Ctrl-C) and unwinds cleanly. [y/N] ")
+
+    def stop_job(self, *, force: bool = False) -> str:
+        """Begin stopping the background command and quit once it has ended."""
+        job = self.job
+        if job is None or not job.running:
+            return ""
+        how = job.request_stop(force=force)
+        self.quit_pending = True
+        self.status_message = job.status_text()
+        return how
+
+    def ready_to_quit(self) -> bool:
+        return self.quit_pending and not self.job_running()
+
+    def shutdown(self, *, grace_s: float = 60.0) -> str:
+        """Last-resort stop when the TUI ends with a command still running."""
+        if not self.job_running():
+            return ""
+        return self.job.shutdown(grace_s=grace_s)
 
     def open_modal(self, title: str, lines: list[str]) -> None:
         self.modal_title = title
@@ -3335,6 +3184,9 @@ class TuiController:
 
         if code == ord("q"):
             return False
+        if code == ord("o"):
+            self.show_job_output()
+            return True
         if code == ord("?"):
             self.help_open = True
             self.help_scroll = 0
@@ -3428,9 +3280,16 @@ def _help_lines() -> list[str]:
         "  [ / ]        Scroll detail inspector pane (or cycle card in dossier)",
         "  /            Live filter items or lines (Esc clears active filter)",
         "  r            Refresh snapshot",
-        "  :            Command bar (run any `openfarm ...` command in-process)",
+        "  :            Command bar (run any `openfarm ...` command)",
+        "  o            Output of the background command (running or last)",
         "  ?            Toggle this help overlay",
-        "  q / Esc      Close help/modal, clear filter, or quit",
+        "  q / Esc      Close help/modal, clear filter, or quit (asks first if a command runs)",
+        "",
+        "Long commands (run, drive, supervise, bench run, board wait, check --baseline)",
+        "run in the background: the views keep refreshing and the status line shows",
+        "running / finished (exit code) / failed. One at a time; a second is refused.",
+        "Quitting while one runs asks first: a run is stopped with the kill switch",
+        "(cleared again once it has ended), anything else with an interrupt.",
         "",
         "View shortcuts:",
         "  Overview:    [p]ause  [u]resume  [x]stop  [n]run",
@@ -4174,6 +4033,24 @@ def _prompt_line(
             curses.curs_set(0)
 
 
+def _confirm(stdscr, question: str, *, theme: dict[str, int] | None = None) -> bool:
+    """A yes/no question on the bottom line; only `y` or `Y` says yes."""
+    if theme is None:
+        theme = _init_curses_theme()
+    stdscr.timeout(-1)
+    while True:
+        max_y, max_x = stdscr.getmaxyx()
+        y = max(0, max_y - 1)
+        attr = theme.get("header", curses.A_REVERSE)
+        _safe_addstr(stdscr, y, 0, " " * max(1, max_x - 1), attr)
+        _safe_addstr(stdscr, y, 0, _truncate(question, max(1, max_x - 2)), attr)
+        stdscr.refresh()
+        ch = stdscr.getch()
+        if ch == curses.ERR or ch == getattr(curses, "KEY_RESIZE", 410):
+            continue
+        return ch in (ord("y"), ord("Y"))
+
+
 def _render_curses_frame(
     stdscr,
     ctrl: TuiController,
@@ -4202,6 +4079,9 @@ def _render_curses_frame(
         ribbon_segs.extend([("  ", ""), (" ⚡ BREAKER ", "err")])
     if sb.get("swarm_enabled"):
         ribbon_segs.extend([("  ", ""), (" ⇄ SWARM ", "accent")])
+    if ctrl.job is not None and ctrl.job.running:
+        job_label = "■ stopping" if ctrl.job.stop_requested else "▶"
+        ribbon_segs.extend([("  ", ""), (f" {job_label} {ctrl.job.line} ", "warn" if ctrl.job.stop_requested else "accent")])
     uq = int(sb.get("unanswered_questions", 0) or 0)
     if uq > 0:
         q_txt = f" ? {uq} question " if uq == 1 else f" ? {uq} questions "
@@ -4278,7 +4158,10 @@ def _render_curses_frame(
         ("?", "Help"),
         ("q", "Quit"),
     ]
-    status_txt = f" {ctrl.status_message} " if ctrl.status_message else ""
+    status_line = ctrl.status_message
+    if ctrl.job is not None and ctrl.job.running:
+        status_line = ctrl.job_status_text()
+    status_txt = f" {status_line} " if status_line else ""
     status_w = _display_width(status_txt)
     caps_budget = max(10, avail_w - status_w)
     cur_x = 0
@@ -4317,7 +4200,10 @@ def _handle_view_hotkey(stdscr, ctrl: TuiController, ch: int, *, theme: dict[str
         if ch == ord("x"):
             reason = _prompt_line(stdscr, "stop (kill switch) reason: ", theme=theme)
             if reason is not None:
-                ctrl.action_stop(reason=reason)
+                if _confirm(stdscr, kill_switch_question(ctrl), theme=theme):
+                    ctrl.action_stop(reason=reason)
+                else:
+                    ctrl.status_message = "kill switch not armed"
             return True
         if ch == ord("n"):
             spec = _prompt_line(stdscr, "run args (e.g. --dry-run --cards 1): ", theme=theme)
@@ -4520,6 +4406,27 @@ def _handle_view_hotkey(stdscr, ctrl: TuiController, ch: int, *, theme: dict[str
     return False
 
 
+def kill_switch_question(ctrl: TuiController) -> str:
+    """The confirmation `x` asks for, naming what arming the kill switch does."""
+    sb = ctrl.snapshot.get("status_bar") or {}
+    run_id = str(sb.get("active_run_id") or "")
+    target = f"run {run_id}" if run_id else "the next run"
+    return (f"Arm the kill switch? {target}: running cards stop at their next step "
+            f"(blocked `killed`) and no run starts until `resume --clear-kill`. [y/N] ")
+
+
+def _ask_quit(stdscr, ctrl: TuiController, theme: dict[str, int]) -> bool:
+    """`q` (or Ctrl-C) pressed: return True when the TUI may end now."""
+    if not ctrl.job_running():
+        return True
+    force = bool(ctrl.job.stop_requested)
+    if _confirm(stdscr, ctrl.quit_question(force=force), theme=theme):
+        ctrl.stop_job(force=force)
+    else:
+        ctrl.status_message = f"still running: {ctrl.job.line}"
+    return False
+
+
 def _curses_main(stdscr, ctrl: TuiController) -> int:
     with contextlib.suppress(curses.error, AttributeError):
         curses.set_escdelay(25)
@@ -4529,11 +4436,25 @@ def _curses_main(stdscr, ctrl: TuiController) -> int:
     theme = _init_curses_theme()
     timeout_ms = max(50, int(ctrl.refresh_s * 1000))
     while True:
-        _render_curses_frame(stdscr, ctrl, theme=theme)
-        stdscr.timeout(timeout_ms)
-        ch = stdscr.getch()
+        try:
+            ctrl.poll_job()
+            if ctrl.ready_to_quit():
+                return 0
+            _render_curses_frame(stdscr, ctrl, theme=theme)
+            # While a command runs, wake at least twice a second so its state shows.
+            tick = min(timeout_ms, 500) if ctrl.job_running() else timeout_ms
+            stdscr.timeout(tick)
+            ch = stdscr.getch()
+        except KeyboardInterrupt:
+            if _ask_quit(stdscr, ctrl, theme):
+                return 0
+            continue
         if ch == curses.ERR:
             ctrl.refresh()
+            continue
+        if ch == ord("q") and not ctrl.help_open and not ctrl.modal_lines:
+            if _ask_quit(stdscr, ctrl, theme):
+                return 0
             continue
         if ch == getattr(curses, "KEY_RESIZE", 410):
             with contextlib.suppress(curses.error):
@@ -4595,4 +4516,13 @@ def run_tui(
         view=view,
         refresh_s=refresh_s,
     )
-    return int(curses.wrapper(lambda stdscr: _curses_main(stdscr, ctrl)))
+    try:
+        return int(curses.wrapper(lambda stdscr: _curses_main(stdscr, ctrl)))
+    finally:
+        # The screen is gone (a crash, or a quit that skipped the question): a
+        # command still running is stopped the clean way before the TUI exits.
+        if ctrl.job_running():
+            line = ctrl.job.line
+            print(f"openfarm tui: stopping `{line}` before exiting...", file=sys.stderr)
+            how = ctrl.shutdown()
+            print(f"openfarm tui: `{line}` {how}", file=sys.stderr)

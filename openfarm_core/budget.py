@@ -203,13 +203,19 @@ class Budget:
 
 
 class NightBudget:
-    """The per-night cap and the kill switch, across all cards."""
+    """The per-night cap and the kill switch, across all cards.
+
+    Three kinds of spend count against the cap: the workers', the supervisor's
+    (`micromanager_spend`) and, in a swarm run with a model coordinator, the
+    coordinator's own calls.
+    """
 
     def __init__(self, spend_cap: float, cards_cap: int | None = None) -> None:
         self.spend_cap = spend_cap
         self.cards_cap = cards_cap
         self.spend = 0.0
         self.micromanager_spend = 0.0
+        self.coordinator_spend = 0.0
         self.cards_claimed = 0
         self._lock = threading.Lock()
 
@@ -225,15 +231,19 @@ class NightBudget:
         with self._lock:
             self.micromanager_spend += amount
 
+    def note_coordinator(self, amount: float) -> None:
+        with self._lock:
+            self.coordinator_spend += amount
+
     def total_spend(self) -> float:
         with self._lock:
-            return self.spend + self.micromanager_spend
+            return self.spend + self.micromanager_spend + self.coordinator_spend
 
     def exhausted(self) -> str | None:
         # A zero cap means no cap, as everywhere: `[budget] spend_per_night = 0`
         # turns the money limit off (the card's own token and attempt caps stay).
         with self._lock:
-            total = self.spend + self.micromanager_spend
+            total = self.spend + self.micromanager_spend + self.coordinator_spend
             if self.spend_cap > 0 and total >= self.spend_cap:
                 return f"night spend {total:.4f} reached its cap of {self.spend_cap:.4f}"
             if self.cards_cap is not None and self.cards_claimed >= self.cards_cap:
@@ -241,20 +251,40 @@ class NightBudget:
             return None
 
 
-def token_split(worker: int, supervisor: int) -> dict:
-    """Who used a run's tokens: the worker model or the supervisor (Claude).
+def token_split(worker: int, supervisor: int, coordinator: int = 0) -> dict:
+    """Who used a run's tokens: the worker model, the supervisor, the coordinator.
 
     Reports compare runs by tokens, not by dollars: on a subscription the
-    supervisor's API list price says nothing about what it costs.
+    supervisor's API list price says nothing about what it costs. The
+    coordinator is a model only in a swarm run with `coordinator = "tier:..."`
+    or an ACP coordinator; otherwise its part is zero and the worker and
+    supervisor shares are what they were before it was counted.
     """
-    worker, supervisor = max(0, int(worker)), max(0, int(supervisor))
-    total = worker + supervisor
-    return {"worker": worker, "supervisor": supervisor, "total": total,
-            "worker_share": round(worker / total, 4) if total else 0.0,
-            "supervisor_share": round(supervisor / total, 4) if total else 0.0}
+    worker = max(0, int(worker or 0))
+    supervisor = max(0, int(supervisor or 0))
+    coordinator = max(0, int(coordinator or 0))
+    total = worker + supervisor + coordinator
+
+    def share(part: int) -> float:
+        return round(part / total, 4) if total else 0.0
+
+    return {"worker": worker, "supervisor": supervisor, "coordinator": coordinator,
+            "total": total,
+            "worker_share": share(worker),
+            "supervisor_share": share(supervisor),
+            "coordinator_share": share(coordinator)}
 
 
 def describe_split(split: dict) -> str:
-    """`"68,212 tokens: 54% worker, 46% supervisor"`."""
-    return (f"{split['total']:,} tokens: {split['worker_share'] * 100:.0f}% worker, "
-            f"{split['supervisor_share'] * 100:.0f}% supervisor")
+    """`"68,212 tokens: 54% worker, 46% supervisor"`, plus the coordinator when it spent.
+
+    Reads older splits too, which have no coordinator part.
+    """
+    total = int(split.get("total", 0) or 0)
+    text = (f"{total:,} tokens: "
+            f"{float(split.get('worker_share', 0.0) or 0.0) * 100:.0f}% worker, "
+            f"{float(split.get('supervisor_share', 0.0) or 0.0) * 100:.0f}% supervisor")
+    if int(split.get("coordinator", 0) or 0) > 0:
+        text += (f", {float(split.get('coordinator_share', 0.0) or 0.0) * 100:.0f}% "
+                 f"coordinator")
+    return text

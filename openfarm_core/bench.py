@@ -143,7 +143,8 @@ def score(records: list[dict]) -> dict:
         passed = bool(record["passed"])
 
         arm_stats = arm_totals.setdefault(
-            arm, {"runs": 0, "passed": 0, "spend": 0.0, "tokens": 0, "worker_tokens": 0}
+            arm, {"runs": 0, "passed": 0, "spend": 0.0, "tokens": 0, "worker_tokens": 0,
+                  "coordinator_tokens": 0}
         )
         arm_stats["runs"] += 1
         if passed:
@@ -152,6 +153,7 @@ def score(records: list[dict]) -> dict:
         arm_stats["tokens"] += int(record["tokens"])
         # Older records have no split; count all their tokens as the worker's.
         arm_stats["worker_tokens"] += int(record.get("worker_tokens", record["tokens"]))
+        arm_stats["coordinator_tokens"] += int(record.get("coordinator_tokens", 0) or 0)
 
         category_arms = category_totals.setdefault(category, {})
         category_stats = category_arms.setdefault(arm, {"runs": 0, "passed": 0})
@@ -176,6 +178,12 @@ def score(records: list[dict]) -> dict:
             "spend": spend,
             "cost_per_pass": round(spend / passed, 4) if passed else None,
         }
+        # Only an arm whose coordinator is a model has a coordinator part; other
+        # arms' summaries keep the shape older readers know.
+        if stats["coordinator_tokens"]:
+            arms[arm]["coordinator_tokens"] = stats["coordinator_tokens"]
+            arms[arm]["coordinator_share"] = (
+                round(stats["coordinator_tokens"] / tokens, 4) if tokens else 0.0)
 
     categories: dict[str, dict[str, float]] = {}
     for category, arm_stats_by_arm in category_totals.items():
@@ -196,19 +204,26 @@ def render_report(summary: dict) -> str:
             return "—"
         return f"{value:,}"
 
-    lines = [
-        "# openfarm bench report",
-        "",
-        "| Arm | Runs | Passed | Pass rate | Tokens | Tokens per pass | Worker share |",
-        "| --- | --- | --- | --- | --- | --- | --- |",
-    ]
+    # The coordinator column appears only when some arm's coordinator used
+    # tokens (a swarm arm with a model coordinator), so other reports read as before.
+    with_coord = any(int(stats.get("coordinator_tokens", 0) or 0) > 0
+                     for stats in summary.get("arms", {}).values())
+    header = "| Arm | Runs | Passed | Pass rate | Tokens | Tokens per pass | Worker share |"
+    rule = "| --- | --- | --- | --- | --- | --- | --- |"
+    if with_coord:
+        header += " Coordinator share |"
+        rule += " --- |"
+    lines = ["# openfarm bench report", "", header, rule]
     for arm in sorted(summary.get("arms", {})):
         stats = summary["arms"][arm]
-        lines.append(
+        row = (
             f"| {arm} | {stats['runs']} | {stats['passed']} | "
             f"{percent(stats['pass_rate'])} | {count(stats['tokens'])} | "
             f"{count(stats['tokens_per_pass'])} | {percent(stats['worker_share'])} |"
         )
+        if with_coord:
+            row += f" {percent(float(stats.get('coordinator_share', 0.0) or 0.0))} |"
+        lines.append(row)
 
     lines += [
         "",
@@ -472,20 +487,27 @@ def run_once(task: BenchTask, arm: str, arm_text: str | None, repeat: int,
               "diff_lines": 0, "final_state": "", "stop_code": "",
               "run_dir": str(run_dir)}
     try:
-        outcome = (json.loads(done.stdout).get("outcomes") or [{}])[0]
-    except ValueError:
+        run_payload = json.loads(done.stdout)
+        outcome = (run_payload.get("outcomes") or [{}])[0]
+    except (ValueError, AttributeError):
         record["stop_code"] = f"openfarm-exit-{done.returncode}"
         return record
+    run_tokens = run_payload.get("tokens") or {}
 
     record["final_state"] = str(outcome.get("final_state", ""))
     record["stop_code"] = str(outcome.get("stop_code", "") or "")
+    # A model coordinator's calls belong to the run, not to the card, so they
+    # come from the run's own token split and spend (zero without one).
     record["spend"] = round(float(outcome.get("spend", 0.0) or 0.0)
-                            + float(outcome.get("micromanager_spend", 0.0) or 0.0), 6)
+                            + float(outcome.get("micromanager_spend", 0.0) or 0.0)
+                            + float(run_payload.get("coordinator_spend", 0.0) or 0.0), 6)
     record["worker_tokens"] = sum(int(outcome.get(k, 0) or 0)
                                   for k in ("tokens_in", "tokens_out"))
     record["supervisor_tokens"] = sum(int(outcome.get(k, 0) or 0) for k in (
         "micromanager_tokens_in", "micromanager_tokens_out"))
-    record["tokens"] = record["worker_tokens"] + record["supervisor_tokens"]
+    record["coordinator_tokens"] = int(run_tokens.get("coordinator", 0) or 0)
+    record["tokens"] = (record["worker_tokens"] + record["supervisor_tokens"]
+                        + record["coordinator_tokens"])
     record["diff_lines"] = (int(outcome.get("lines_added", 0) or 0)
                             + int(outcome.get("lines_removed", 0) or 0))
     if record["final_state"] != "in-review":
