@@ -348,14 +348,15 @@ def agy_prompt_too_large(full_prompt: str) -> str:
 
     The same limit and wording as the Antigravity bridge (`agy_native_acp`).
     """
+    limit = AGY_MAX_ARG_BYTES
     size = len(full_prompt.encode("utf-8"))
-    if size + 1 <= AGY_MAX_ARG_BYTES:
+    if size + 1 <= limit:
         return ""
     return (
         f"the prompt is {size} bytes, but agy takes it as one command-line "
-        f"argument (-p) and Linux caps one argument at {AGY_MAX_ARG_BYTES} bytes "
+        f"argument (-p) and Linux caps one argument at {limit} bytes "
         f"(MAX_ARG_STRLEN, including its NUL); shorten the prompt below "
-        f"{AGY_MAX_ARG_BYTES - 1} bytes"
+        f"{limit - 1} bytes"
     )
 
 
@@ -668,6 +669,16 @@ class DriverAgent:
 
         if self.hold.refused:
             raise Refused("acp-confine-unavailable", self.hold.refused)
+        if self.provider == "antigravity":
+            # agy takes the prompt as one argv word (-p); Linux refuses a word over
+            # MAX_ARG_STRLEN. Refused before the spawn, like the bridge does, so
+            # the turn fails and its work follows `on_external_timeout`.
+            too_large = agy_prompt_too_large(
+                f"{system_prompt}\n\n{prompt}" if (system_prompt and prompt)
+                else (system_prompt or prompt)
+            )
+            if too_large:
+                raise Refused("agy-prompt-too-large", too_large)
         argv = self.build_argv(system_prompt=system_prompt, prompt=prompt)
         if self.provider == "claude":
             stdin_text = prompt
