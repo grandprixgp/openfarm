@@ -368,9 +368,18 @@ def test_writer_brief(card: Card, book: BriefBook, pack,
             "relative imports; do not import `vitest` or `jest`)."
         )
     elif pack_name == "python" and pack_runner == "unittest":
+        # What the project is set up for, never what is installed: the runner is
+        # unittest because nothing configures pytest, which says nothing about
+        # whether pytest happens to be on the machine.
         parts.append(
-            "\nTest runner: Python stdlib `unittest` (`unittest.TestCase` subclasses; "
-            "`pytest` is not installed)."
+            "\nTest runner: this project is set up for Python's stdlib `unittest` "
+            "(it does not configure pytest). Write the tests for `unittest`: "
+            "`unittest.TestCase` subclasses, no pytest imports or fixtures."
+        )
+    elif pack_name == "python" and pack_runner == "pytest":
+        parts.append(
+            "\nTest runner: this project is set up for `pytest` (its configuration "
+            "names it). Write the tests for pytest."
         )
 
     if conventions:
