@@ -8,8 +8,8 @@ that the farm can rely on, so their children are held here instead:
   live against codex-cli 0.166.0 (no file read, no web fetch);
 - everything flags cannot cover runs inside a bubblewrap (`bwrap`) boundary. The
   boundary is an allow-list: the system folders a program needs, the program's
-  own install tree, the session folder read-only with `never_touch` and
-  `forbidden_files` hidden, the isolated home read-write and a private `/tmp`.
+  own install tree, the session folder read-only with `never_touch`,
+  `forbidden_files` and every `.git` hidden, the isolated home read-write and a private `/tmp`.
   Nothing else of the file system is there: not the real home, not the state
   folder, not the worker key file, not other cards' worktrees. The network stays.
 
@@ -415,18 +415,24 @@ def scan_masks(
     hide_globs,
     *,
     max_entries: int = MAX_SCAN_ENTRIES,
+    hide_git: bool = False,
 ) -> tuple[list[Path], list[Path]]:
     """Files and folders inside `session_dir` matching `hide_globs`, to hide.
 
-    A folder that matches is hidden whole and not walked; `.git` folders are not
-    walked unless they match. A symlink that matches hides the in-folder file it
-    points at (one pointing outside points at nothing visible).
+    A folder that matches is hidden whole and not walked; `.git` folders are never
+    walked. A symlink that matches hides the in-folder file it points at (one
+    pointing outside points at nothing visible).
+
+    With `hide_git`, every `.git` entry (a repository's folder, or a worktree's
+    or submodule's pointer file) is hidden too: the history holds every committed
+    version of every file, the hidden ones included, and a child with a shell
+    could read them back with `git show`.
     """
     root = Path(session_dir).resolve()
     globs = [normalise(str(g)) for g in (hide_globs or ()) if normalise(str(g))]
     files: list[Path] = []
     dirs: list[Path] = []
-    if not globs:
+    if not globs and not hide_git:
         return files, dirs
     seen = 0
     stack = [root]
@@ -446,7 +452,9 @@ def scan_masks(
                 )
             full = Path(entry.path)
             rel = full.relative_to(root).as_posix()
-            hit = matches_any(rel, globs)
+            hit = bool(globs) and matches_any(rel, globs)
+            if hide_git and entry.name == ".git":
+                hit = True
             try:
                 if entry.is_symlink():
                     if hit:
@@ -529,7 +537,7 @@ def boundary_argv(
     args.extend(["--ro-bind", str(session), str(session)])
     bound.append(session)
 
-    files, dirs = scan_masks(session, hide_globs)
+    files, dirs = scan_masks(session, hide_globs, hide_git=True)
     for hp in hidden_abs:
         if not hp.exists() or not any(_within(hp, b) for b in bound):
             continue
