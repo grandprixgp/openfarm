@@ -570,7 +570,8 @@ def _collect_overview(ctx: TuiContext, run_id: str | None = None) -> dict:
             counts[key] = counts.get(key, 0) + 1
             card_outcomes.append(
                 {
-                    "card": entry.get("card", ""),
+                    # Real card records carry `card_id`; dry-run and skipped ones `card`.
+                    "card": entry.get("card_id") or entry.get("card", ""),
                     "final_state": entry.get("final_state", ""),
                     "stop_code": entry.get("stop_code", ""),
                     "skipped": entry.get("skipped", ""),
@@ -584,6 +585,7 @@ def _collect_overview(ctx: TuiContext, run_id: str | None = None) -> dict:
             "dry_run": bool(raw_run.get("dry_run", False)),
             "spend": float(raw_run.get("spend", 0.0) or 0.0),
             "micromanager_spend": float(raw_run.get("micromanager_spend", 0.0) or 0.0),
+            "coordinator_spend": float(raw_run.get("coordinator_spend", 0.0) or 0.0),
             "counts": counts,
             "outcomes": card_outcomes,
             "tokens": tokens,
@@ -1803,12 +1805,19 @@ def _format_overview_lines(snap: dict, *, width: int = 96) -> list[str]:
             total_tok = int(tok.get("total", 0) or 0)
             w_tok = int(tok.get("worker", 0) or 0)
             s_tok = int(tok.get("supervisor", 0) or 0)
-            denom = total_tok or (w_tok + s_tok) or 1
+            c_tok = int(tok.get("coordinator", 0) or 0)
+            denom = total_tok or (w_tok + s_tok + c_tok) or 1
             w_share = float(tok.get("worker_share", w_tok / denom))
             s_share = float(tok.get("supervisor_share", s_tok / denom))
-            run_lines.append(f"Tokens: total={total_tok}   worker={w_tok}   supervisor={s_tok}")
+            c_share = float(tok.get("coordinator_share", c_tok / denom))
+            head = f"Tokens: total={total_tok}   worker={w_tok}   supervisor={s_tok}"
+            if c_tok:
+                head += f"   coordinator={c_tok}"
+            run_lines.append(head)
             run_lines.append(f"  worker     {_bar(w_share, 12)} ({w_tok})")
             run_lines.append(f"  supervisor {_bar(s_share, 12)} ({s_tok})")
+            if c_tok:
+                run_lines.append(f"  coordinator {_bar(c_share, 11)} ({c_tok})")
             if tok.get("by_member"):
                 run_lines.append("  by_member:")
                 for mk, mv in sorted(tok["by_member"].items()):
@@ -2099,9 +2108,13 @@ def _format_ops_lines(snap: dict, *, width: int = 96) -> list[str]:
         for arm_name, arm_stats in sorted(arms.items()):
             pr = float(arm_stats.get("pass_rate", 0.0) or 0.0)
             ws = float(arm_stats.get("worker_share", 0.0) or 0.0)
-            lb_lines.append(
+            arm_line = (
                 f"  {_pad_right(arm_name, 8)} pass {_bar(pr, 10)} ({arm_stats.get('passed', 0)}/{arm_stats.get('runs', 0)})  worker {_bar(ws, 8)}  tok={arm_stats.get('tokens', 0)}"
             )
+            if int(arm_stats.get("coordinator_tokens", 0) or 0) > 0:
+                cs = float(arm_stats.get("coordinator_share", 0.0) or 0.0)
+                arm_line += f"  coordinator {_bar(cs, 8)}"
+            lb_lines.append(arm_line)
         for ln in str(lb.get("markdown", "")).splitlines():
             lb_lines.append(ln)
         out.extend(_box_lines("Latest Bench Report", lb_lines, width=width))

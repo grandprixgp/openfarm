@@ -18,6 +18,7 @@ import concurrent.futures
 import contextlib
 import datetime as _dt
 import difflib
+import functools
 import inspect
 import io
 import json
@@ -516,6 +517,8 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
                 provider=normalize_acp_provider(coord_spec),
                 effort=str(getattr(swarm_cfg, "coordinator_effort", "") or ""),
             )
+    if coord_backend is not None:
+        coord_backend = _MeteredCoordinatorBackend(coord_backend, night)
     build_limiter = (
         BuildLimiter(getattr(cfg, "concurrent_builds", 2))
         if swarm_parallel
@@ -663,20 +666,10 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
             for o in outcomes),
         sum(int(o.get("micromanager_tokens_in", 0) or 0)
             + int(o.get("micromanager_tokens_out", 0) or 0) for o in outcomes),
+        coord_backend.tokens if coord_backend is not None else 0,
     )
     if board is not None:
-        by_member: dict[str, int] = {}
-        by_effort: dict[str, int] = {}
-        for m in board.list_members(include_removed=True):
-            mtokens = int(m.get("tokens_in", 0) or 0) + int(m.get("tokens_out", 0) or 0)
-            if mtokens > 0 or m.get("role") in (
-                "planner", "test-writer", "implementer", "checker"
-            ):
-                by_member[m["name"]] = mtokens
-            for eff_key, eff_tok in (m.get("tokens_by_effort") or {}).items():
-                by_effort[eff_key] = by_effort.get(eff_key, 0) + int(eff_tok or 0)
-        tokens_payload["by_member"] = by_member
-        tokens_payload["by_effort"] = by_effort
+        tokens_payload.update(_member_token_breakdown(board, tokens_payload))
 
     record = {"run_id": run_id, "started_at": utc_now(),
               "finished_at": utc_now(), "caps": {"spend": night.spend_cap,
@@ -684,7 +677,9 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
               "tokens": tokens_payload,
               # Dollars at API list prices: what the spend caps count, not a cost.
               "spend": round(night.total_spend(), 6),
+              "worker_spend": round(night.spend, 6),
               "micromanager_spend": round(night.micromanager_spend, 6),
+              "coordinator_spend": round(night.coordinator_spend, 6),
               "spend_measured": _backend_prices_spend(cfg, script_path),
               "notes": notes,
               "outcomes": outcomes,
@@ -1027,6 +1022,104 @@ def _backend_prices_spend(cfg, script: Path | None) -> bool:
         return True  # ACP providers report cost per turn or support fallback pricing.
     return bool(getattr(cfg, "cost_per_1k_in", 0.0)
                 or getattr(cfg, "cost_per_1k_out", 0.0))
+
+
+class _MeteredCoordinatorBackend:
+    """The coordinator's backend, counted: its tokens and its spend.
+
+    A model coordinator's calls are the run's spend like any card's, so each
+    call's cost goes to the night budget as it happens (the spend cap sees it
+    before the next card starts), and its tokens become the coordinator's part
+    of the run's token split. Everything else passes through to the backend.
+    """
+
+    def __init__(self, inner, night: NightBudget) -> None:
+        self._inner = inner
+        self._night = night
+        self._lock = threading.Lock()
+        self.calls = 0
+        self.tokens_in = 0
+        self.tokens_out = 0
+        self.spend = 0.0
+        inner_complete = inner.complete
+
+        @functools.wraps(inner_complete)
+        def complete(*args, **kwargs):
+            comp = inner_complete(*args, **kwargs)
+            self._note(comp)
+            return comp
+
+        # `functools.wraps` keeps the inner signature visible to the callers that
+        # inspect it to choose which optional arguments to pass.
+        self.complete = complete
+
+    def _note(self, comp) -> None:
+        tok_in = int(getattr(comp, "tokens_in", 0) or 0)
+        tok_out = int(getattr(comp, "tokens_out", 0) or 0)
+        try:
+            cost = float(getattr(comp, "cost", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            cost = 0.0
+        with self._lock:
+            self.calls += 1
+            self.tokens_in += tok_in
+            self.tokens_out += tok_out
+            self.spend += cost
+        if cost:
+            self._night.note_coordinator(cost)
+
+    @property
+    def tokens(self) -> int:
+        with self._lock:
+            return self.tokens_in + self.tokens_out
+
+    def __getattr__(self, name: str):
+        return getattr(self._inner, name)
+
+
+_WORKER_ROLES = ("planner", "test-writer", "implementer", "checker")
+
+
+def _member_token_breakdown(board: Board, split: dict) -> dict:
+    """`by_member` and `by_effort` for a swarm run, adding up to `split["total"]`.
+
+    The board records usage per member as calls happen, but not every token the
+    run counts lands on a member: a supervisor that is not a tier (the config's
+    micromanager, an ACP supervisor) keeps its usage in the card records only.
+    Such tokens are listed as `<part> (not on the board)` and under the effort
+    `unrecorded`, so both maps still add up to the total. Members held by an
+    outside agent (`kind = "external"`, as `swarm join` and `openfarm drive`
+    make them) spend on their own account, not through this run's backends; any
+    usage they report goes to `external_by_member` and is not in the total.
+    """
+    by_member: dict[str, int] = {}
+    by_effort: dict[str, int] = {}
+    external: dict[str, int] = {}
+    recorded = {"worker": 0, "supervisor": 0, "coordinator": 0}
+    for m in board.list_members(include_removed=True):
+        mtokens = int(m.get("tokens_in", 0) or 0) + int(m.get("tokens_out", 0) or 0)
+        role = str(m.get("role") or "")
+        if str(m.get("kind") or "") == "external":
+            if mtokens > 0:
+                external[m["name"]] = mtokens
+            continue
+        if mtokens > 0 or role in _WORKER_ROLES:
+            by_member[m["name"]] = mtokens
+        part = ("worker" if role in _WORKER_ROLES else
+                role if role in ("supervisor", "coordinator") else "")
+        if part:
+            recorded[part] += mtokens
+        for eff_key, eff_tok in (m.get("tokens_by_effort") or {}).items():
+            by_effort[eff_key] = by_effort.get(eff_key, 0) + int(eff_tok or 0)
+    for part in ("worker", "supervisor", "coordinator"):
+        missing = int(split.get(part, 0) or 0) - recorded[part]
+        if missing > 0:
+            by_member[f"{part} (not on the board)"] = missing
+            by_effort["unrecorded"] = by_effort.get("unrecorded", 0) + missing
+    result = {"by_member": by_member, "by_effort": by_effort}
+    if external:
+        result["external_by_member"] = external
+    return result
 
 
 def _update_breaker(ctx: Context, consecutive: list[tuple[str, str, str]]) -> None:
