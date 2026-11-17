@@ -3855,6 +3855,14 @@ class CardRun:
                 files[rel] = (full.read_bytes()
                               if full.is_file() and not full.is_symlink() else None)
             ignored = set(listing("--others", "--ignored", "--exclude-standard"))
+            # Ignored links (a TypeScript worktree's linked `node_modules`): git
+            # never restores them, and a run can remove or re-point one.
+            links = {}
+            for rel in ignored:
+                full = self.worktree / rel
+                if full.is_symlink():
+                    with contextlib.suppress(OSError):
+                        links[rel] = os.readlink(full)
             dirs = {""}
             for rel in list(ignored) + listing() + list(files):
                 parent = Path(rel).parent
@@ -3863,7 +3871,7 @@ class CardRun:
                     parent = parent.parent
             return {"head": self.git.head(), "branch": self.git.current_branch(),
                     "files": files, "ignored": ignored, "dirs": dirs,
-                    "status": self.git.status_lines()}
+                    "links": links, "status": self.git.status_lines()}
 
         def restore(before: dict) -> None:
             if self.git.current_branch() != before["branch"] and before["branch"]:
@@ -3887,8 +3895,28 @@ class CardRun:
                     with contextlib.suppress(OSError):
                         (self.worktree / parent).rmdir()
                     parent = parent.parent
+            # Ignored entries the run removed: the pack sets its own up again
+            # (a removed `node_modules` comes back with its marker and links).
+            if any(not os.path.lexists(self.worktree / rel)
+                   for rel in before["ignored"]):
+                self._prepare_checkout(self.worktree)
+            # Every ignored link exactly as it was, never followed: a link
+            # removed, re-pointed or replaced is made again.
+            for rel, link_to in sorted(before["links"].items()):
+                full = self.worktree / rel
+                with contextlib.suppress(OSError):
+                    if full.is_symlink() and os.readlink(full) == link_to:
+                        continue
+                    if full.is_symlink() or full.is_file():
+                        full.unlink()
+                    elif full.is_dir():
+                        shutil.rmtree(full)
+                    full.parent.mkdir(parents=True, exist_ok=True)
+                    os.symlink(link_to, full)
+            after_ignored = set(listing("--others", "--ignored", "--exclude-standard"))
             if (self.git.head() != before["head"]
-                    or self.git.status_lines() != before["status"]):
+                    or self.git.status_lines() != before["status"]
+                    or after_ignored != before["ignored"]):
                 self.log(f"{self.card.id}: the worktree did not come back exactly "
                          "as it was after a counter-test")
 
