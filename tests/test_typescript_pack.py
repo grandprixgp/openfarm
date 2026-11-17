@@ -32,7 +32,6 @@ from openfarm_core.packs.typescript import (
 )
 
 OPENFARM = Path(__file__).resolve().parent.parent / "openfarm"
-ENABLED = os.environ.get("OPENFARM_E2E") == "1"
 
 
 def _project(files: dict[str, str], cleanup_owner: unittest.TestCase | None = None) -> Path:
@@ -731,7 +730,8 @@ test("full bundle refuses a push", () => {
 """
 
 
-@unittest.skipUnless(ENABLED, "real node --test E2E; set OPENFARM_E2E=1")
+@unittest.skipUnless(shutil.which("node") and shutil.which("git"),
+                     "real node --test end to end with a scripted model; needs node and git")
 class TypeScriptE2ETests(unittest.TestCase):
     def _build_repo(self) -> tuple[Path, Path, Path]:
         base = Path(tempfile.mkdtemp(prefix="openfarm-ts-e2e-", dir=os.environ.get("TMPDIR")))
@@ -884,7 +884,7 @@ class TypeScriptE2ETests(unittest.TestCase):
                 "tests": [{"name": "adds slug", "file": "tests/slug.test.ts", "asserts": "x == 1"}],
             },
         )
-        pack = TypeScriptPack(worktree=root)
+        pack = TypeScriptPack()
         pack.configure(root)
         brief = test_writer_brief(card, BriefBook(root, [], []), pack).body
         self.assertIn("node:test", brief)
