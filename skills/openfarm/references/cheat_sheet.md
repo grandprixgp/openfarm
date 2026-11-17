@@ -24,7 +24,7 @@ Exit codes: `0` ok/eligible | `1` refused/ineligible | `2` usage/config | `3` in
 | `harness` | `openfarm harness [status\|index\|show\|promote\|demote\|reset] [TARGET] [--reason TEXT] [--yes]`; `status`, `promote <gid>` and `demote <gid>` take `--global` for the global library |
 | `board` | `openfarm board (read \| post \| answer \| wait) [--run ID] [--as MEMBER] ...` |
 | `swarm` | `openfarm swarm (status \| tiers \| join \| start \| set \| hint \| block \| remove) [--run ID] ...` |
-| `drive` | `openfarm drive [--agent claude\|antigravity\|agy\|codex] [--seat both\|coordinator\|supervisor] [--run ID] [--cards N] [--card ID]... [--spend AMT] [--driver-name NAME] [--driver-bin PATH] [--model M] [--effort E] [--max-turns N] [--wave] [--record-verdict] [--script PATH]` |
+| `drive` | `openfarm drive [--agent claude\|antigravity\|agy\|codex] [--seat both\|coordinator\|supervisor] [--run ID] [--cards N] [--card ID]... [--spend AMT] [--driver-name NAME] [--driver-bin PATH] [--model M] [--effort E] [--max-turns N] [--turn-timeout SECONDS] [--wave] [--record-verdict] [--script PATH]` |
 
 ## 9 Card Categories & Rules
 
