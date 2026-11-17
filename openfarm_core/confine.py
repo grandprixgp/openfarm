@@ -224,6 +224,57 @@ def needs_nested(provider: str, transport: str, tool_policy: str, mode: str) -> 
             and mode != "off")
 
 
+def flags_only_note(provider: str, bwrap_reason: str = "") -> str:
+    """The note for a child held by its tool flags alone (no boundary could be built)."""
+    why = f" ({bwrap_reason})" if bwrap_reason else ""
+    return (
+        f"the {provider} child is held by its tool flags alone: bubblewrap is not usable "
+        f"here{why}, so there is no OS boundary and a tool the flags miss could read "
+        "whatever your user can read"
+    )
+
+
+def hold_note(hold: Hold, bwrap_reason: str = "") -> str:
+    """What a run's notes say about a child that is not confined, or '' when it is.
+
+    `off` gives `off_note`; a child held by flags alone (Codex when bwrap is
+    unusable) gives `flags_only_note`. Claude under `auto` follows its own rules
+    and a refused child never starts, so neither gives a note.
+    """
+    if hold.refused:
+        return ""
+    if hold.mode == "off":
+        return hold.note or off_note(hold.provider)
+    if hold.flags and not hold.boundary:
+        return flags_only_note(hold.provider, bwrap_reason)
+    return ""
+
+
+def hold_for(provider: str, settings=None, *, transport: str,
+             tool_policy: str = "none") -> Hold:
+    """`decide` for a child under `settings`, asking bwrap only when the rule needs it.
+
+    The hold carries its note (`hold_note`) when the child is not confined. This
+    is the adapter's own rule (`ClaudeAcpAdapter._decide_hold`), for callers that
+    hold no adapter: the driver, and the run's notes and shared supervisor.
+    """
+    held = as_settings(settings)
+    mode = held.mode
+    needs_check = not (mode == "off" or (mode == "auto" and provider == "claude"))
+    usable, reason = bwrap_status() if needs_check else (False, "")
+    nested, nested_why = (True, "")
+    if usable and needs_nested(provider, transport, tool_policy, mode):
+        nested, nested_why = nested_status()
+    hold = decide(provider, transport=transport, tool_policy=tool_policy, mode=mode,
+                  bwrap_usable=usable, bwrap_reason=reason,
+                  nested_usable=nested, nested_reason=nested_why)
+    if not hold.note:
+        note = hold_note(hold, reason)
+        if note:
+            hold = dataclasses.replace(hold, note=note)
+    return hold
+
+
 def decide(
     provider: str,
     *,

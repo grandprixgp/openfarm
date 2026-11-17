@@ -459,8 +459,12 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
                 "and pass a positive --spend to lower it")
         cap = (min(args.spend, cfg.spend_per_night) if cfg.spend_per_night > 0
                else args.spend)
-    night = NightBudget(cap, cards_cap=args.cards)
     night_mm_budget = _build_night_mm_budget(cfg)
+    # `openfarm drive` runs this in its own process and hands in a night budget
+    # its own turns are added to, so one total stops both (see driver.py).
+    make_night = getattr(ctx, "make_night_budget", None)
+    night = (make_night(cap, args.cards, night_mm_budget) if callable(make_night)
+             else NightBudget(cap, cards_cap=args.cards))
     deadline = _deadline(args)
     outcomes: list[dict] = []
     consecutive: list[tuple[str, str, str]] = []
@@ -609,24 +613,36 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
             rec_lock = threading.Lock()
 
             def _run_swarm_card(cid: str, *, on_handback=None, on_struggling=None) -> dict:
-                return _run_card(
-                    ctx,
-                    source,
-                    cid,
-                    run_id,
-                    telemetry,
-                    run_dir,
-                    script_path,
-                    mm_script=mm_script_path,
-                    harness_library=harness_lib,
-                    mm_budget=night_mm_budget,
-                    board=board,
-                    build_limiter=build_limiter,
-                    mm_backend=shared_mm_backend,
-                    on_handback=on_handback,
-                    on_struggling=on_struggling,
-                    mm_seat=mm_seat,
-                )
+                # A night that counts running cards (a driven run's) meters the
+                # card's worker calls as they land; any other night sees the
+                # card's spend when it ends, as before.
+                metered = None
+                if callable(getattr(night, "metered_backend", None)):
+                    metered = night.metered_backend(cid, open_backend(cfg, script_path))
+                try:
+                    return _run_card(
+                        ctx,
+                        source,
+                        cid,
+                        run_id,
+                        telemetry,
+                        run_dir,
+                        script_path,
+                        backend=metered,
+                        mm_script=mm_script_path,
+                        harness_library=harness_lib,
+                        mm_budget=night_mm_budget,
+                        board=board,
+                        build_limiter=build_limiter,
+                        mm_backend=shared_mm_backend,
+                        on_handback=on_handback,
+                        on_struggling=on_struggling,
+                        mm_seat=mm_seat,
+                    )
+                finally:
+                    if metered is not None and hasattr(metered, "close"):
+                        with contextlib.suppress(Exception):
+                            metered.close()
 
             def _record_swarm_outcome(cid: str, outcome: dict) -> bool:
                 nonlocal consecutive
@@ -643,10 +659,15 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
                             infra_stop = True
                     elif final_state != "released":
                         consecutive = []
-                    night.note_spend(outcome.get("spend", 0.0) or 0.0)
-                    night.note_micromanager(
-                        outcome.get("micromanager_spend", 0.0) or 0.0
-                    )
+                    finish = getattr(night, "finish_card", None)
+                    if callable(finish):
+                        finish(cid, outcome.get("spend", 0.0) or 0.0,
+                               outcome.get("micromanager_spend", 0.0) or 0.0)
+                    else:
+                        night.note_spend(outcome.get("spend", 0.0) or 0.0)
+                        night.note_micromanager(
+                            outcome.get("micromanager_spend", 0.0) or 0.0
+                        )
                     _update_breaker(ctx, consecutive)
                     return infra_stop
 
@@ -692,6 +713,67 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
             f"concurrent_cards is {cfg.concurrent_cards} but cards run one at a "
             f"time: the per-card state is ready for a pool, the loop is not")
 
+    def _confinement_notes() -> list[str]:
+        """One note per ACP provider this run used whose child is not confined.
+
+        `[micromanager] confine = "off"`, or Codex held by its tool flags alone
+        because bwrap is unusable. Worked out from the same settings and rules
+        the adapters use (`confine.hold_for`), so it holds for every card's
+        adapter, the ones already closed included.
+        """
+        from . import confine as confine_lib
+        seats: list[tuple[str, object, str, object]] = []
+        if script_path is None and is_acp_adapter(cfg.model_adapter):
+            from .adapters.claude_worker import open_acp_worker
+            wb = open_acp_worker(cfg)
+            seats.append((wb.provider, wb.command, "none", wb.confine))
+        if swarm_parallel and script_path is None and is_acp_adapter(coord_spec):
+            from .adapters.claude_worker import open_acp_worker
+            cb = open_acp_worker(cfg, provider=normalize_acp_provider(coord_spec))
+            seats.append((cb.provider, cb.command, "none", cb.confine))
+        sup = mm_seat.proto if mm_seat is not None else None
+        sup_spec = swarm_sup if (swarm_cfg is not None and swarm_cfg.enabled) else "config"
+        if sup is None and mm_script_path is None and (
+            is_acp_adapter(sup_spec)
+            or (sup_spec == "config" and is_acp_adapter(cfg.micromanager_adapter))
+        ):
+            probe_mm = None
+            try:
+                probe_mm = open_micromanager(cfg, ctx.state.root, ctx.repo, worktree=ctx.repo)
+                if isinstance(getattr(probe_mm, "backend", None), ClaudeAcpMicromanager):
+                    sup = probe_mm.backend
+            except (AdapterError, OSError):
+                sup = None
+            finally:
+                if probe_mm is not None:
+                    with contextlib.suppress(Exception):
+                        probe_mm.close()
+        if sup is not None:
+            seats.append((sup.provider, sup.command, sup.tool_policy,
+                          getattr(sup, "confine", None)))
+        out: list[str] = []
+        for provider, command, policy, settings in seats:
+            try:
+                _transport, hold = _SharedAcpSupervisor.hold_of(
+                    command, provider, policy, settings)
+            except (AdapterError, confine_lib.ConfineError):
+                continue
+            if hold.note and not hold.refused and hold.note not in out:
+                out.append(hold.note)
+        return out
+
+    if not args.dry_run:
+        # The cards are done by now: a note that cannot be worked out is said, and
+        # never costs the run its record.
+        try:
+            held_notes = _confinement_notes()
+        except Exception as exc:
+            held_notes = [f"could not work out how this run's ACP children were held: "
+                          f"{type(exc).__name__}: {' '.join(str(exc).split())[:200]}"]
+        for note in held_notes:
+            if note not in notes:
+                notes.append(note)
+
     tokens_payload = token_split(
         sum(int(o.get("tokens_in", 0) or 0) + int(o.get("tokens_out", 0) or 0)
             for o in outcomes),
@@ -711,6 +793,8 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
               "worker_spend": round(night.spend, 6),
               "micromanager_spend": round(night.micromanager_spend, 6),
               "coordinator_spend": round(night.coordinator_spend, 6),
+              **({"driver_spend": round(float(night.driver_spend), 6)}
+                 if hasattr(night, "driver_spend") else {}),
               "spend_measured": _backend_prices_spend(cfg, script_path),
               "notes": notes,
               "outcomes": outcomes,
@@ -787,12 +871,56 @@ class _SharedAcpSupervisor:
     prompt at a time, so the cards' calls take turns on one lock. A process that
     dies (a timed-out turn kills it) is replaced once for everyone, and every
     card opens a fresh session on the new one.
+
+    A standalone ACP server held in a boundary (`codex-acp`, `agy acp`, ...)
+    can see only the one folder it was started in, so a session at another
+    card's worktree would be outside it. Then each card gets its own server,
+    started in its own worktree, and nothing is shared but the budget.
+    openfarm's own bridges confine each prompt's child at the session's folder,
+    and Claude under `auto` is not confined, so both keep the one process.
     """
 
     def __init__(self, proto: ClaudeAcpMicromanager) -> None:
         self.proto = proto
         self.lock = threading.RLock()
         self.adapter = None
+        self.per_card = self._confined_server()
+
+    def _adapter_for(self, cwd: Path) -> ClaudeAcpAdapter:
+        p = self.proto
+        return ClaudeAcpAdapter(
+            command=p.command, cwd=cwd, provider=p.provider,
+            isolate_home=p.isolate_home, auth_file=p.auth_file, auth_mode=p.auth_mode,
+            never_touch=p.never_touch, forbidden_files=p.forbidden_files,
+            allowed_root=cwd, confine=p.confine,
+        )
+
+    @staticmethod
+    def hold_of(command, provider: str, tool_policy: str, settings):
+        """`(transport, hold)`: how an adapter for `command` would hold its child.
+
+        The adapter's own rule, worked out without building one. A standalone
+        server's process is held as for tool policy `none`.
+        """
+        from . import confine as confine_lib
+        from .adapters.acp import _bridge_provider, resolve_acp_command
+
+        argv = resolve_acp_command(command, provider=provider)
+        transport = "bridge" if _bridge_provider(argv) else "server"
+        if settings is None:
+            settings = getattr(command, "confine", None)
+        return transport, confine_lib.hold_for(
+            normalize_acp_provider(provider), settings, transport=transport,
+            tool_policy=tool_policy if transport == "bridge" else "none")
+
+    def _confined_server(self) -> bool:
+        """Whether the supervisor is a standalone ACP server inside a boundary."""
+        p = self.proto
+        try:
+            transport, hold = self.hold_of(p.command, p.provider, "none", p.confine)
+        except AdapterError:
+            return False
+        return transport == "server" and hold.boundary
 
     def live_adapter(self):
         """The one live adapter, started or replaced as needed (call under `lock`)."""
@@ -802,25 +930,23 @@ class _SharedAcpSupervisor:
                 self.adapter.close()
             self.adapter = None
         if self.adapter is None:
-            p = self.proto
-            self.adapter = ClaudeAcpAdapter(
-                command=p.command, cwd=p.cwd, provider=p.provider,
-                isolate_home=p.isolate_home, auth_file=p.auth_file, auth_mode=p.auth_mode,
-                never_touch=p.never_touch, forbidden_files=p.forbidden_files,
-                allowed_root=p.cwd,
-            )
+            self.adapter = self._adapter_for(self.proto.cwd)
         return self.adapter
 
-    def for_card(self, worktree: Path, card_dir: Path) -> "_CardAcpSupervisor":
+    def for_card(self, worktree: Path, card_dir: Path) -> ClaudeAcpMicromanager:
         p = self.proto
-        return _CardAcpSupervisor(
-            self, command=p.command, cwd=worktree, provider=p.provider, model=p.model,
+        kwargs = dict(
+            command=p.command, cwd=worktree, provider=p.provider, model=p.model,
             effort=p.effort, tool_policy=p.tool_policy, timeout_s=p.timeout_s,
             isolate_home=p.isolate_home, auth_file=p.auth_file, auth_mode=p.auth_mode,
             never_touch=p.never_touch, forbidden_files=p.forbidden_files,
             cost_per_1k_in=p.cost_per_1k_in, cost_per_1k_out=p.cost_per_1k_out,
-            state_dir=p.state_dir, card_dir=card_dir,
+            state_dir=p.state_dir, card_dir=card_dir, confine=p.confine,
         )
+        if self.per_card:
+            # Its own confined server, rooted at its worktree; closed with the card.
+            return ClaudeAcpMicromanager(**kwargs)
+        return _CardAcpSupervisor(self, **kwargs)
 
     def close(self) -> None:
         with self.lock:

@@ -318,11 +318,23 @@ def swarm_join(
 
     board.ensure()
     same_name = board.get_member(clean_name)
-    # A join may only re-confirm the same outside member in the same seat. Any
-    # other owner of the name (a worker, a code member, a member in the other
-    # seat, a removed member) keeps its record: the join would otherwise hand
-    # that name a seat and overwrite its tier and role.
-    if same_name is not None and (
+    # A seat holder that left its seat itself (a drive that ended marks its
+    # members `left_seat`) may take it back under the same name, role and owner
+    # kind, if nobody else holds it now. A member removed by anyone else (the
+    # coordinator's `remove`) stays out.
+    rejoin = bool(
+        same_name is not None
+        and same_name.get("state") == "removed"
+        and same_name.get("left_seat")
+        and same_name.get("kind") == "external"
+        and normalize_role(str(same_name.get("role", ""))) == clean_seat
+        and str(same_name.get("owner_kind") or "") == owner_kind
+    )
+    # Otherwise a join may only re-confirm the same outside member in the same
+    # seat. Any other owner of the name (a worker, a code member, a member in the
+    # other seat, a removed member) keeps its record: the join would otherwise
+    # hand that name a seat and overwrite its tier and role.
+    if same_name is not None and not rejoin and (
         same_name.get("kind") != "external"
         or normalize_role(str(same_name.get("role", ""))) != clean_seat
         or same_name.get("state") == "removed"
@@ -363,7 +375,8 @@ def swarm_join(
         author="system",
         to=["all"],
         kind="roster",
-        body=f"{clean_name} joined seat {clean_seat} ({owner_kind})",
+        body=(f"{clean_name} rejoined seat {clean_seat} ({owner_kind})" if rejoin
+              else f"{clean_name} joined seat {clean_seat} ({owner_kind})"),
         trusted=True,
     )
     return member

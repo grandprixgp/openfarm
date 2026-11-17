@@ -675,9 +675,19 @@ class ClaudeAcpMicromanager(_ThreadLocalUsageMixin):
         card_dir: Path | str | None = None,
         cancel_check: Callable[[], bool] | None = None,
         adapter: ClaudeAcpAdapter | None = None,
+        confine=None,
     ) -> None:
         self._init_usage()
         self.command = command
+        # How the provider's child is held; passed to every adapter this opens.
+        # Without it, the settings a command list carries (`acp_command`) apply.
+        from . import confine as confine_lib
+
+        try:
+            self.confine = confine_lib.as_settings(
+                confine if confine is not None else getattr(command, "confine", None))
+        except confine_lib.ConfineError as exc:
+            raise Invalid(exc.code, exc.message) from exc
         self.provider = infer_acp_provider(command, provider)
         self.name = acp_adapter_for_provider(self.provider)
         self.cwd = Path(cwd or state_dir or Path.cwd())
@@ -726,6 +736,7 @@ class ClaudeAcpMicromanager(_ThreadLocalUsageMixin):
                 never_touch=self.never_touch,
                 forbidden_files=self.forbidden_files,
                 allowed_root=self.cwd,
+                confine=self.confine,
             )
         if not self._adapter._initialized:
             self._adapter.initialize(timeout_s=min(30.0, self.timeout_s))

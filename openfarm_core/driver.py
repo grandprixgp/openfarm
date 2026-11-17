@@ -22,13 +22,17 @@ import tempfile
 import threading
 from pathlib import Path
 
+from . import confine as confine_lib
+from . import logins
 from .adapters.acp import (
     _AUTH_ERROR_RE,
+    _DEFAULT_FORBIDDEN_FILES,
     _unregister_isolated_home,
     _sanitised_env,
     normalize_acp_provider,
     strip_control_sequences,
 )
+from .adapters.agy_native_acp import MAX_ARG_BYTES as AGY_MAX_ARG_BYTES
 from .adapters.files import FileCardSource
 from .board import (
     Board,
@@ -40,12 +44,13 @@ from .board import (
     validate_expected_answer,
 )
 from .briefs import _sanitize_text
+from .budget import NightBudget
 from .cards import Card
 from .config import Config
 from .coordinator import _clean_json_payload
 from .errors import AdapterError, Infra, Invalid, Refused, UsageError
 from .git import Git
-from .globs import matches_any
+from .globs import matches_any, normalise
 from .micromanager import SEAT_TIMEOUT_PREFIX
 from .state import StateDir, _safe_id, read_json, utc_now, write_json
 from .swarm import (
@@ -79,83 +84,6 @@ class DriverResponse:
     cost_usd: float = 0.0
     estimated_usage: bool = False
     raw_argv: list[str] = dataclasses.field(default_factory=list)
-
-
-def _cred_relpath_for(provider: str) -> tuple[str, ...]:
-    if provider == "antigravity":
-        return (".gemini", "antigravity-cli", "antigravity-oauth-token")
-    if provider == "codex":
-        return (".codex", "auth.json")
-    return (".claude", ".credentials.json")
-
-
-def _sync_refreshed_oauth(
-    provider: str,
-    isolated_home: Path | None,
-    orig_home: str,
-    initial_bytes: bytes | None,
-) -> None:
-    """Atomically persist refreshed OAuth credentials back to host HOME."""
-    if isolated_home is None or not orig_home:
-        return
-    rel = _cred_relpath_for(provider)
-    iso_creds = isolated_home.joinpath(*rel)
-    if not iso_creds.is_file():
-        return
-    try:
-        raw = iso_creds.read_bytes()
-    except OSError:
-        return
-    if not raw or raw == initial_bytes:
-        return
-
-    if provider == "claude":
-        try:
-            parsed = json.loads(raw.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
-            return
-        if not isinstance(parsed, dict) or not isinstance(parsed.get("claudeAiOauth"), dict):
-            return
-        prefix = ".credentials-"
-    elif provider == "antigravity":
-        try:
-            decoded = raw.decode("utf-8")
-        except UnicodeDecodeError:
-            return
-        if not decoded.strip() or "\x00" in decoded:
-            return
-        prefix = ".antigravity-oauth-token-"
-    else:
-        try:
-            parsed = json.loads(raw.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
-            return
-        if not isinstance(parsed, dict):
-            return
-        prefix = ".auth-"
-
-    target = Path(orig_home).joinpath(*rel)
-    if not target.parent.is_dir():
-        return
-    try:
-        fd, tmp_name = tempfile.mkstemp(prefix=prefix, dir=str(target.parent))
-        tmp_path = Path(tmp_name)
-        try:
-            os.chmod(tmp_path, 0o600)
-            try:
-                view = memoryview(raw)
-                written = 0
-                while written < len(raw):
-                    written += os.write(fd, view[written:])
-            finally:
-                os.close(fd)
-            os.replace(tmp_path, target)
-            os.chmod(target, 0o600)
-        except Exception:
-            tmp_path.unlink(missing_ok=True)
-            raise
-    except OSError:
-        return
 
 
 def _extract_codex_message_text(item: dict) -> str:
@@ -388,8 +316,43 @@ def _end_process_group(proc, *, grace_s: float = 2.0) -> None:
         proc.communicate(timeout=max(grace_s, 2.0))
 
 
+def driver_hold(provider: str, settings=None) -> confine_lib.Hold:
+    """How the driver's CLI child is held, by `[micromanager] confine`.
+
+    The driver starts one CLI child per turn, as openfarm's own bridges do, and
+    its turns need no tools: tool policy `none`, transport `bridge`. So Codex
+    gets the strict flag set (and the boundary when bwrap works), Antigravity
+    needs the boundary, Claude is left to its own rules under `auto` and
+    confined under `bwrap`, and `off` confines nothing.
+    """
+    return confine_lib.hold_for(provider, settings, transport="bridge", tool_policy="none")
+
+
+def agy_prompt_too_large(full_prompt: str) -> str:
+    """Why an Antigravity prompt cannot go into one argv word, or '' when it fits.
+
+    The same limit and wording as the Antigravity bridge (`agy_native_acp`).
+    """
+    limit = AGY_MAX_ARG_BYTES
+    size = len(full_prompt.encode("utf-8"))
+    if size + 1 <= limit:
+        return ""
+    return (
+        f"the prompt is {size} bytes, but agy takes it as one command-line "
+        f"argument (-p) and Linux caps one argument at {limit} bytes "
+        f"(MAX_ARG_STRLEN, including its NUL); shorten the prompt below "
+        f"{limit - 1} bytes"
+    )
+
+
 class DriverAgent:
-    """Headless read-only driver wrapper for `claude`, `agy`, or `codex`."""
+    """Headless read-only driver wrapper for `claude`, `agy`, or `codex`.
+
+    Each turn's child is held by the same rules as openfarm's bridges
+    (`driver_hold`): the boundary's session folder is an empty private folder
+    of the driver's own, since a turn's prompt carries all it needs. Claude
+    under `auto` keeps the folder it was given (`cwd`), as before.
+    """
 
     def __init__(
         self,
@@ -404,6 +367,7 @@ class DriverAgent:
         timeout_s: float = DEFAULT_TURN_TIMEOUT_S,
         env: dict[str, str] | None = None,
         script: object = None,
+        confine=None,
     ) -> None:
         self.provider = normalize_acp_provider(agent)
         self.cwd = Path(cwd or Path.cwd()).resolve()
@@ -414,6 +378,14 @@ class DriverAgent:
         self.forbidden_files = list(forbidden_files or ())
         self.timeout_s = float(timeout_s or DEFAULT_TURN_TIMEOUT_S)
         self.extra_env = dict(env) if env is not None else None
+        try:
+            self.confine = confine_lib.as_settings(confine)
+        except confine_lib.ConfineError as exc:
+            raise Invalid(exc.code, exc.message) from exc
+        self.notes: list[str] = []
+        self.last_sync: logins.SyncResult | None = None
+        self._hold: confine_lib.Hold | None = None
+        self._own_dir: Path | None = None
         self._script = script
         self._turn_counter = 0
         self._script_list_idx = 0
@@ -425,7 +397,43 @@ class DriverAgent:
         self.close()
 
     def close(self) -> None:
-        return
+        if self._own_dir is not None:
+            shutil.rmtree(self._own_dir, ignore_errors=True)
+            self._own_dir = None
+
+    def _note(self, text: str) -> None:
+        if text and text not in self.notes:
+            self.notes.append(text)
+
+    @property
+    def hold(self) -> confine_lib.Hold:
+        """How this driver's children are held (decided once per driver)."""
+        if self._hold is None:
+            self._hold = driver_hold(self.provider, self.confine)
+            self._note(self._hold.note)
+        return self._hold
+
+    @property
+    def child_dir(self) -> Path:
+        """The child's working folder, and the boundary's session folder.
+
+        An empty private folder made on first use, removed on close. Only Claude
+        outside a boundary keeps `cwd`, its folder before confinement existed.
+        """
+        if self.provider == "claude" and not self.hold.boundary:
+            return self.cwd
+        if self._own_dir is None:
+            self._own_dir = Path(tempfile.mkdtemp(prefix="openfarm-drive-empty-")).resolve()
+            self._own_dir.chmod(0o700)
+        return self._own_dir
+
+    def _hide_globs(self) -> list[str]:
+        out: list[str] = []
+        for pat in (*_DEFAULT_FORBIDDEN_FILES, *self.forbidden_files, *self.never_touch):
+            norm = normalise(str(pat or ""))
+            if norm and norm not in out:
+                out.append(norm)
+        return out
 
     def resolve_bin(self) -> str:
         """Resolve CLI binary path for the configured driver provider."""
@@ -435,7 +443,10 @@ class DriverAgent:
         return shutil.which(default_name) or default_name
 
     def build_argv(self, *, system_prompt: str = "", prompt: str = "") -> list[str]:
-        """Build read-only / no-write headless CLI invocation argv."""
+        """Build read-only / no-write headless CLI invocation argv.
+
+        The boundary, when the child is held so, wraps this in `child_argv`.
+        """
         bin_path = self.resolve_bin()
         if self.provider == "claude":
             # Never pass `--bare`: `--bare` disables Claude OAuth credentials.
@@ -492,15 +503,63 @@ class DriverAgent:
             "--ignore-rules",
             "-s",
             "read-only",
-            "-C",
-            str(self.cwd),
         ]
+        if self.hold.flags:
+            argv.extend(confine_lib.codex_tool_flags("none"))
+        argv.extend(["-C", str(self.child_dir)])
         if self.model:
             argv.extend(["-m", self.model])
         if self.effort:
             argv.extend(["-c", f"model_reasoning_effort={json.dumps(self.effort)}"])
         argv.append("-")
         return argv
+
+    def child_argv(
+        self,
+        argv: list[str],
+        *,
+        home_dir: Path | None,
+        env: dict[str, str] | None = None,
+    ) -> list[str]:
+        """`argv`, inside the boundary when the child is held so.
+
+        A child that may not start (`hold.refused`), or whose boundary cannot be
+        built, is refused (`acp-confine-unavailable`) before anything runs.
+        """
+        hold = self.hold
+        if hold.refused:
+            raise Refused("acp-confine-unavailable", hold.refused)
+        if not hold.boundary:
+            return list(argv)
+        try:
+            return confine_lib.boundary_argv(
+                argv,
+                session_dir=self.child_dir,
+                home_dir=home_dir,
+                hide_globs=self._hide_globs(),
+                hide_paths=self.confine.hide_paths,
+                read_roots=self.confine.read_roots,
+                env=env,
+            )
+        except confine_lib.ConfineError as exc:
+            raise Refused("acp-confine-unavailable", exc.message) from exc
+
+    def _sync_back(self, isolated_home: Path, target: Path, initial: bytes | None) -> None:
+        """Copy a refreshed login back to `target` through `logins.sync_back` only.
+
+        A refused copy leaves the real login alone and is noted with its reason,
+        never its content.
+        """
+        result = logins.sync_back(
+            self.provider, isolated_home=isolated_home, target=target, initial=initial)
+        self.last_sync = result
+        if result.status == "refused":
+            note = (
+                f"the refreshed {self.provider} login was not copied back to "
+                f"{target}: {result.reason}"
+            )
+            self._note(note)
+            print(f"openfarm drive: {note}", file=sys.stderr)
 
     def _next_scripted_entry(self, turn_key: str) -> object:
         script = self._script
@@ -593,6 +652,18 @@ class DriverAgent:
         if self._script is not None:
             return self._complete_scripted(prompt, turn_key=turn_key)
 
+        if self.hold.refused:
+            raise Refused("acp-confine-unavailable", self.hold.refused)
+        if self.provider == "antigravity":
+            # agy takes the prompt as one argv word (-p); Linux refuses a word over
+            # MAX_ARG_STRLEN. Refused before the spawn, like the bridge does, so
+            # the turn fails and its work follows `on_external_timeout`.
+            too_large = agy_prompt_too_large(
+                f"{system_prompt}\n\n{prompt}" if (system_prompt and prompt)
+                else (system_prompt or prompt)
+            )
+            if too_large:
+                raise Refused("agy-prompt-too-large", too_large)
         argv = self.build_argv(system_prompt=system_prompt, prompt=prompt)
         if self.provider == "claude":
             stdin_text = prompt
@@ -605,7 +676,12 @@ class DriverAgent:
             )
             sub_input = "" if self.provider == "antigravity" else stdin_text
 
+        # The login is read from where the provider keeps it (CLAUDE_CONFIG_DIR /
+        # CODEX_HOME first, $HOME second), and a refreshed one goes back there.
         orig_home = (self.extra_env or {}).get("HOME") or os.environ.get("HOME", "")
+        place = logins.login_place(
+            self.provider, env=logins.login_env_layer(None, self.extra_env))
+        cred_source = place.credential if (orig_home or place.from_env) else None
         env, isolated_home = _sanitised_env(
             extra_env=self.extra_env,
             isolate_home=True,
@@ -616,18 +692,18 @@ class DriverAgent:
         )
         initial_bytes: bytes | None = None
         if isolated_home is not None:
-            iso_creds = isolated_home.joinpath(*_cred_relpath_for(self.provider))
-            if iso_creds.is_file():
-                with contextlib.suppress(OSError):
-                    initial_bytes = iso_creds.read_bytes()
+            iso_rel = logins.isolated_place(self.provider, isolated_home).credential.relative_to(
+                isolated_home).parts
+            initial_bytes, _why = logins.read_isolated(isolated_home, iso_rel)
 
         try:
+            spawn_argv = self.child_argv(argv, home_dir=isolated_home, env=env)
             try:
                 # Its own session, so the whole group (the CLI and anything it
                 # started) can be ended before the isolated HOME is deleted.
                 proc = _POPEN(
-                    argv,
-                    cwd=str(self.cwd),
+                    spawn_argv,
+                    cwd=str(self.child_dir),
                     env=env,
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
@@ -656,10 +732,8 @@ class DriverAgent:
             # The CLI has exited: whatever it left running in its group goes too.
             _end_process_group(proc, grace_s=0.0)
 
-            if isolated_home is not None:
-                _sync_refreshed_oauth(
-                    self.provider, isolated_home, orig_home, initial_bytes
-                )
+            if isolated_home is not None and cred_source is not None:
+                self._sync_back(isolated_home, cred_source, initial_bytes)
         finally:
             if isolated_home is not None:
                 shutil.rmtree(isolated_home, ignore_errors=True)
@@ -1433,6 +1507,99 @@ class _ManagedCardSourceProxy:
         return {"cards": selected}
 
 
+class _MeteredWorkerBackend:
+    """A card's worker backend that tells the night each call's cost as it lands.
+
+    Everything else goes to the backend it wraps; the card's own budget still
+    counts the cost from the completion, as before.
+    """
+
+    def __init__(self, inner, on_cost) -> None:
+        self._inner = inner
+        self._on_cost = on_cost
+
+    def complete(self, *args, **kwargs):
+        completion = self._inner.complete(*args, **kwargs)
+        try:
+            cost = float(getattr(completion, "cost", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            cost = 0.0
+        if cost > 0:
+            self._on_cost(cost)
+        return completion
+
+    def __getattr__(self, name: str):
+        return getattr(self._inner, name)
+
+
+class _DrivenNightBudget(NightBudget):
+    """The night budget of a run `openfarm drive` drives in this process.
+
+    One spend total for the driven run: the driver's turns are noted as each one
+    ends, and a running card's worker calls as each one lands, so the run's
+    claim checks (`exhausted`) and the driver's own cap check (`live_total`) both
+    see everything spent so far, the cards still in flight included. When a card
+    ends, its live tally gives way to what its record says. `total_spend` and
+    the parts (`spend`, `micromanager_spend`, `coordinator_spend`,
+    `driver_spend`) are what `run.json` records.
+    """
+
+    def __init__(self, spend_cap: float, cards_cap: int | None = None,
+                 mm_budget=None) -> None:
+        super().__init__(spend_cap, cards_cap=cards_cap)
+        self.driver_spend = 0.0
+        self._mm_budget = mm_budget
+        self._live: dict[str, float] = {}
+
+    def note_driver(self, amount: float) -> None:
+        if amount:
+            with self._lock:
+                self.driver_spend += float(amount)
+
+    def note_live(self, card_id: str, amount: float) -> None:
+        with self._lock:
+            self._live[card_id] = self._live.get(card_id, 0.0) + float(amount)
+
+    def metered_backend(self, card_id: str, backend):
+        """`backend`, with each call's cost noted against `card_id` as it lands."""
+        with self._lock:
+            self._live.pop(card_id, None)
+        return _MeteredWorkerBackend(backend, lambda cost: self.note_live(card_id, cost))
+
+    def finish_card(self, card_id: str, spend: float, micromanager_spend: float) -> None:
+        """Swap a card's live tally for what its record says, in one step."""
+        with self._lock:
+            self._live.pop(card_id, None)
+            self.spend += float(spend or 0.0)
+            self.micromanager_spend += float(micromanager_spend or 0.0)
+
+    def total_spend(self) -> float:
+        with self._lock:
+            return (self.spend + self.micromanager_spend + self.coordinator_spend
+                    + self.driver_spend)
+
+    def live_total(self) -> float:
+        """Everything spent so far, the cards in flight and the supervisor's live spend too."""
+        mm_live = 0.0
+        if self._mm_budget is not None:
+            with contextlib.suppress(TypeError, ValueError):
+                mm_live = float(getattr(self._mm_budget, "spend", 0.0) or 0.0)
+        with self._lock:
+            return (self.spend + sum(self._live.values())
+                    + max(self.micromanager_spend, mm_live)
+                    + self.coordinator_spend + self.driver_spend)
+
+    def exhausted(self) -> str | None:
+        if self.spend_cap > 0:
+            used = self.live_total()
+            if used >= self.spend_cap:
+                with self._lock:
+                    driver = self.driver_spend
+                return (f"night spend {used:.4f} (driver {driver:.4f}) reached its cap "
+                        f"of {self.spend_cap:.4f}")
+        return super().exhausted()
+
+
 class _ManagedRunContext:
     """In-process Context proxy capturing `cmd_run` output without touching stdout."""
 
@@ -1449,6 +1616,13 @@ class _ManagedRunContext:
         self.json = True
         self._card_ids = list(card_ids)
         self.captured_payload: dict | None = None
+        self.night: _DrivenNightBudget | None = None
+
+    def make_night_budget(self, spend_cap: float, cards_cap: int | None,
+                          mm_budget=None) -> _DrivenNightBudget:
+        """The run's night budget, kept here so the driver can add its own spend."""
+        self.night = _DrivenNightBudget(spend_cap, cards_cap=cards_cap, mm_budget=mm_budget)
+        return self.night
 
     def emit(self, payload: dict, *, kind: str | None = None) -> None:
         self.captured_payload = dict(payload)
@@ -1768,13 +1942,15 @@ def _review_wave(
 
 
 def _wave_spend_stop(
-    counters: dict, state: StateDir, run_id: str, cap: float, stopped: list[str]
+    counters: dict, state: StateDir, run_id: str, cap: float, stopped: list[str],
+    used_now=None,
 ) -> str:
     if stopped:
         return stopped[0]
     if cap <= 0:
         return ""
-    used = float(counters.get("cost_usd", 0.0) or 0.0) + _run_spend_so_far(state, run_id)
+    used = (used_now() if used_now is not None else
+            float(counters.get("cost_usd", 0.0) or 0.0) + _run_spend_so_far(state, run_id))
     if used >= cap:
         stopped.append(
             f"night spend {used:.4f} (driver {counters['cost_usd']:.4f}) reached its cap of {cap:.4f}"
@@ -1937,9 +2113,13 @@ def _add_driver_to_run_record(state: StateDir, run_id: str, report: dict) -> boo
     record = read_json(run_file)
     if not isinstance(record, dict):
         return False
+    # A driven run's own `spend` already holds the driver's turns up to when the
+    # run wrote it (its `driver_spend`); swap that part for the driver's whole.
+    counted = float(record.get("driver_spend", 0.0) or 0.0)
     record["driver"] = dict(report)
     record["driver_spend"] = report["spend"]
-    record["spend"] = round(float(record.get("spend", 0.0) or 0.0) + float(report["spend"]), 6)
+    record["spend"] = round(
+        float(record.get("spend", 0.0) or 0.0) - counted + float(report["spend"]), 6)
     notes = [str(n) for n in (record.get("notes") or [])]
     for note in report.get("notes") or []:
         if note not in notes:
@@ -2017,6 +2197,33 @@ def drive_run(
 
     selected_cards = [_safe_id(cid, "card id") for cid in (card_ids or ()) if str(cid).strip()]
     worker_script_path, driver_script = _load_script_bundle(script)
+
+    # The driver's CLI children are held by the bridges' rules. A child that may
+    # not start is refused here, before a run starts or a seat is joined.
+    try:
+        confine_settings = confine_lib.settings_from_config(cfg)
+    except confine_lib.ConfineError as exc:
+        raise Invalid(exc.code, exc.message) from exc
+    if driver_script is None:
+        hold = driver_hold(provider, confine_settings)
+        if hold.refused:
+            return {
+                "ok": False,
+                "refused": True,
+                "reason": hold.refused,
+                "code": "acp-confine-unavailable",
+                "agent": provider,
+                "seat": clean_seat,
+                "run_id": str(run_id or ""),
+                "confine": hold.as_dict(),
+                "driver_turns": 0,
+                "driver_tokens_in": 0,
+                "driver_tokens_out": 0,
+                "actions_taken": [],
+                "answers_sent": [],
+                "outcomes": [],
+                "reviews": [],
+            }
 
     managed = run_id is None
     if managed:
@@ -2128,6 +2335,29 @@ def drive_run(
         driver_errors: list[dict] = []
         spend_stopped: list[str] = []
         spend_cap = _effective_spend_cap(active_cfg, spend)
+        noted_to_night = [0.0]
+
+        def _night():
+            """The driven run's night budget; None when attached to another process's run."""
+            return getattr(run_ctx, "night", None) if run_ctx is not None else None
+
+        def _sync_night() -> None:
+            """Add the driver's spend not yet in the run's night budget to it."""
+            night = _night()
+            if night is None:
+                return
+            due = float(counters.get("cost_usd", 0.0) or 0.0) - noted_to_night[0]
+            if due > 0:
+                night.note_driver(due)
+                noted_to_night[0] += due
+
+        def _used_now() -> float:
+            """The night's spend so far, the driver's own and the running cards' included."""
+            night = _night()
+            if night is not None:
+                _sync_night()
+                return night.live_total()
+            return counters["cost_usd"] + _run_spend_so_far(state, resolved_rid)
         timeout_policy = str(
             getattr(active_cfg.swarm, "on_external_timeout", "fallback") or "fallback"
         )
@@ -2142,7 +2372,9 @@ def drive_run(
             forbidden_files=active_cfg.forbidden_files,
             timeout_s=turn_timeout,
             script=driver_script,
+            confine=confine_settings,
         ) as drv:
+            driver_confine = drv.hold.as_dict() if driver_script is None else {}
             if not board.is_ended():
                 if clean_seat in ("both", "coordinator"):
                     swarm_join(
@@ -2175,6 +2407,7 @@ def drive_run(
                         return None
                     shares = _turn_shares(clean_seat, sup_work=sup_work, coord_work=coord_work)
                     _count_turn(counters, turn_resp, shares=shares)
+                    _sync_night()
                     _record_driver_member_usage(
                         board,
                         {"coordinator": coord_name, "supervisor": sup_name},
@@ -2188,7 +2421,7 @@ def drive_run(
                     """Why the driver may take no more turns for spend, or ''."""
                     if spend_cap <= 0:
                         return ""
-                    used = counters["cost_usd"] + _run_spend_so_far(state, resolved_rid)
+                    used = _used_now()
                     if used >= spend_cap:
                         return (
                             f"night spend {used:.4f} (driver {counters['cost_usd']:.4f}) "
@@ -2530,16 +2763,33 @@ def drive_run(
                     counters=counters,
                     max_turns=max_turns,
                     spend_stop=lambda: _wave_spend_stop(
-                        counters, state, resolved_rid, spend_cap, spend_stopped
+                        counters, state, resolved_rid, spend_cap, spend_stopped,
+                        used_now=_used_now,
                     ),
                 )
         has_infra = any(o.get("stop_code") == "infra" for o in outcomes) or (
             bool(run_rc) and run_rc[0] != 0
         )
         report = _driver_spend_report(counters, provider)
+        # How the CLI child was held (`off`, flags alone) and refused credential
+        # copies go with the spend notes, into the payload and `run.json`.
+        for note in drv.notes:
+            if note not in report["notes"]:
+                report["notes"].append(note)
         run_record_updated = (
             _add_driver_to_run_record(state, resolved_rid, report) if managed else False
         )
+        run_spend = None
+        if run_record_updated:
+            rec = read_json(state.runs / resolved_rid / "run.json")
+            if isinstance(rec, dict):
+                run_spend = float(rec.get("spend", 0.0) or 0.0)
+        if not managed:
+            report["notes"].append(
+                f"attached to run {resolved_rid}, which another process owns: the driver's "
+                f"cost ({report['spend']:.4f}) is not counted against that run's caps "
+                f"(--spend, spend_per_night); only the driver's own turns stop at the cap"
+            )
         return {
             "ok": not has_infra,
             "agent": provider,
@@ -2556,12 +2806,17 @@ def drive_run(
             "spend_cap": spend_cap,
             "spend_stopped": spend_stopped[0] if spend_stopped else "",
             "run_record_updated": run_record_updated,
+            # The run's one total (run.json's `spend`), the driver's share included;
+            # None when attached, where the driver's cost stays outside the run.
+            "run_spend": round(run_spend, 6) if run_spend is not None else None,
+            "driver_counted_in_run": bool(managed),
             "notes": report["notes"],
             "actions_taken": actions_taken,
             "answers_sent": answers_sent,
             "timeouts": timeouts,
             "driver_errors": driver_errors,
             "on_external_timeout": timeout_policy,
+            "confine": driver_confine,
             "outcomes": outcomes,
             "reviews": reviews,
         }
@@ -2649,7 +2904,8 @@ def _end_drive(
             if member is None or member.get("state") == "removed":
                 continue
             seat = str(member.get("role") or "")
-            board.update_member(name, state="removed")
+            # `left_seat`: it left by itself, so the same driver may join again.
+            board.update_member(name, state="removed", left_seat=True)
             board.post(
                 author="system",
                 to=["all"],

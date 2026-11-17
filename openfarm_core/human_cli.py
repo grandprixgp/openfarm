@@ -1502,6 +1502,10 @@ def _format_drive(payload: dict, style: Style) -> str:
             payload.get("driver_spend", 0.0),
             measured=bool(payload.get("driver_spend_measured", False)),
         )))
+    if payload.get("run_spend") is not None:
+        pairs.append(("run_spend", _fmt_usd(payload["run_spend"]) + " (driver included)"))
+    elif payload.get("driver_counted_in_run") is False:
+        pairs.append(("run_spend", "not counted: the run belongs to another process"))
     for part, vals in (payload.get("driver_by_part") or {}).items():
         part_txt = (
             f"{_fmt_int(vals.get('tokens_in', 0))} in / {_fmt_int(vals.get('tokens_out', 0))} out, "
