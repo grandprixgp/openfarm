@@ -413,6 +413,18 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
             board.upsert_member(
                 "coordinator", kind="code", role="coordinator", added_by="system"
             )
+        if swarm_cfg.supervisor.startswith("tier:"):
+            sup_tier = cfg.tiers[swarm_cfg.supervisor[5:]]
+            from .swarm import worker_kind_for_config
+            board.upsert_member(
+                "supervisor",
+                kind=worker_kind_for_config(cfg),
+                role="supervisor",
+                tier=sup_tier.name,
+                model=sup_tier.model,
+                effort=swarm_cfg.supervisor_effort,
+                added_by="system",
+            )
 
     try:
         for card_id in identifiers:
@@ -615,6 +627,7 @@ def _run_card(ctx: Context, source: FileCardSource, card_id: str, run_id: str,
     mm = (micromanager if micromanager is not None else open_micromanager(
         cfg, card_dir, ctx.repo, script=mm_script,
         worktree=worktree, card_dir=card_dir,
+        board=board, worker_backend=backend,
     ))
     if mm_budget is not None and hasattr(mm, "budget"):
         mm.budget = mm_budget
@@ -778,7 +791,18 @@ def _handshake(ctx: Context, source, args, telemetry_raw=None) -> dict:
 
     mm_script_raw = getattr(args, "mm_script", None)
     mm_cfg = getattr(ctx.cfg, "micromanager", None)
-    if (mm_cfg and getattr(mm_cfg, "mode", "off") != "off") or mm_script_raw:
+    swarm_cfg = getattr(ctx.cfg, "swarm", None)
+    swarm_sup = (
+        swarm_cfg.supervisor
+        if (swarm_cfg is not None and swarm_cfg.enabled)
+        else "config"
+    )
+    should_check_mm = bool(mm_script_raw) or (
+        swarm_sup == "config"
+        and mm_cfg is not None
+        and getattr(mm_cfg, "mode", "off") != "off"
+    )
+    if should_check_mm:
         mm_script = Path(mm_script_raw) if mm_script_raw else None
         mm = None
         try:
@@ -797,6 +821,8 @@ def _handshake(ctx: Context, source, args, telemetry_raw=None) -> dict:
                     mm.close()
                 except Exception:
                     pass
+    elif swarm_sup != "config":
+        names["micromanager"] = swarm_sup
 
     return {"refused": False, "reason": "", "adapters": names}
 

@@ -2017,6 +2017,42 @@ class HarnessLibrary:
             # probe_baseline captures true pre-card performance.
             metrics_before_capture = self.ledger.compute_metrics()
 
+            candidates: list[dict] = []
+            rejected_proposals: list[dict] = []
+            will_capture = (
+                self.harness_cfg.enabled
+                and contrast["outcome_kind"] in self.harness_cfg.capture_on
+            )
+            if (
+                will_capture
+                and reflect
+                and self.harness_cfg.allow_micromanager_reflection
+                and micromanager is not None
+                and getattr(micromanager, "enabled", False)
+            ):
+                try:
+                    refl = micromanager.reflect_harness(
+                        card_meta,
+                        contrast,
+                        overlay,
+                        self.format_index(),
+                        metrics_before_capture,
+                        cfg=self._cfg,
+                    )
+                except (AdapterError, ValueError) as exc:
+                    refl = {}
+                    rejected_proposals.append({
+                        "reason": f"reflect_harness error ({type(exc).__name__}): {exc}",
+                        "raw": {},
+                    })
+                if isinstance(refl, dict):
+                    for item in refl.get("lessons") or ():
+                        if isinstance(item, dict):
+                            candidates.append({**item, "source": item.get("source") or "micromanager"})
+                    for rej in refl.get("rejected") or ():
+                        if isinstance(rej, dict):
+                            rejected_proposals.append(rej)
+
             surfaces_applied = self._update_applied_stats(cues_list, contrast)
             self.ledger.record_card_outcome(
                 contrast,
@@ -2030,38 +2066,8 @@ class HarnessLibrary:
 
             lessons_added: list[str] = []
             buffered_candidates: list[str] = []
-            rejected_proposals: list[dict] = []
 
-            if self.harness_cfg.enabled and contrast["outcome_kind"] in self.harness_cfg.capture_on:
-                candidates: list[dict] = []
-                if (
-                    reflect
-                    and self.harness_cfg.allow_micromanager_reflection
-                    and micromanager is not None
-                    and getattr(micromanager, "enabled", False)
-                ):
-                    try:
-                        refl = micromanager.reflect_harness(
-                            card_meta,
-                            contrast,
-                            overlay,
-                            self.format_index(),
-                            metrics_before_capture,
-                            cfg=self._cfg,
-                        )
-                    except (AdapterError, ValueError) as exc:
-                        refl = {}
-                        rejected_proposals.append({
-                            "reason": f"reflect_harness error ({type(exc).__name__}): {exc}",
-                            "raw": {},
-                        })
-                    if isinstance(refl, dict):
-                        for item in refl.get("lessons") or ():
-                            if isinstance(item, dict):
-                                candidates.append({**item, "source": item.get("source") or "micromanager"})
-                        for rej in refl.get("rejected") or ():
-                            if isinstance(rej, dict):
-                                rejected_proposals.append(rej)
+            if will_capture:
 
                 if not candidates:
                     candidates = self._deterministic_extract(card_meta, contrast, failure)

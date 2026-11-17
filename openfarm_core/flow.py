@@ -51,6 +51,7 @@ _HARNESS_ISOLATED_STOP_CODES = frozenset({
     StopCode.STALE_CONFLICT,
     StopCode.CARD_CHANGED,
     StopCode.LEASE_EXPIRED,
+    StopCode.SEAT_SILENT,
 })
 #: succeeded and the flow should checkpoint and continue to the next step.
 _STEP_ADVANCED = "__STEP_ADVANCED__"
@@ -113,16 +114,40 @@ class CardRun:
         self.target_dir = self.card_layout / "target"
         self.target_dir.mkdir(parents=True, exist_ok=True)
 
+        self.board = board
+        self.swarm = swarm if swarm is not None else getattr(cfg, "swarm", None)
+        self.team_sets: list[dict] = []
+        self.handbacks: list[dict] = []
+        self.effort_tokens: dict[str, int] = {}
+        self._member_stats: dict[str, dict] = {}
+        self._board_members_ready = False
+
         self._owns_micromanager = micromanager is None
+        cancel_fn = lambda: bool(
+            self.state.kill_requested(getattr(self.cfg, "kill_switch", None))
+        )
         if micromanager is None:
             self.micromanager = open_micromanager(
                 cfg, self.card_layout, self.worktree,
                 worktree=self.worktree, card_dir=self.card_layout,
+                board=board, worker_backend=backend,
+                card_budget=self.budget, heartbeat_fn=self._heartbeat,
+                cancel_check=cancel_fn,
             )
         else:
             self.micromanager = micromanager
             if hasattr(self.micromanager, "card_dir"):
                 self.micromanager.card_dir = self.card_layout
+        mm_backend = getattr(self.micromanager, "backend", None)
+        if mm_backend is not None:
+            if hasattr(mm_backend, "board") and getattr(mm_backend, "board", None) is None:
+                mm_backend.board = board
+            if hasattr(mm_backend, "budget") and getattr(mm_backend, "budget", None) is None:
+                mm_backend.budget = self.budget
+            if hasattr(mm_backend, "heartbeat_fn") and getattr(mm_backend, "heartbeat_fn", None) is None:
+                mm_backend.heartbeat_fn = self._heartbeat
+            if hasattr(mm_backend, "cancel_check") and getattr(mm_backend, "cancel_check", None) is None:
+                mm_backend.cancel_check = cancel_fn
         if hasattr(self.micromanager, "harness_context"):
             self.micromanager.harness_context = {}
         mm_budget = getattr(self.micromanager, "budget", None)
@@ -200,13 +225,6 @@ class CardRun:
         self.unformatted: list[str] = []
         self.existing_tests_changed: list[str] = []
         self.ended_at = ""
-        self.board = board
-        self.swarm = swarm if swarm is not None else getattr(cfg, "swarm", None)
-        self.team_sets: list[dict] = []
-        self.handbacks: list[dict] = []
-        self.effort_tokens: dict[str, int] = {}
-        self._member_stats: dict[str, dict] = {}
-        self._board_members_ready = False
 
         harness_cfg = getattr(cfg, "harness", None)
         harness_enabled = bool(getattr(harness_cfg, "enabled", False))
@@ -660,7 +678,9 @@ class CardRun:
     def _consume_member_hints(self, member_name: str) -> list[str]:
         if self.board is None:
             return []
-        unread = self.board.read(as_name=member_name, for_model=True, advance_cursor=True)
+        unread = self.board.read(
+            as_name=member_name, limit=None, for_model=True, advance_cursor=True
+        )
         return [
             str(post.get("body", "")).strip()
             for post in unread
@@ -3212,6 +3232,8 @@ class CardRun:
                     "efficiency_score": eff,
                 },
             ))
+        except GateFailure:
+            raise
         except Exception as exc:  # noqa: BLE001 — never abort _finish() on harness errors
             self.harness_revision = pre_revision
             self.harness_summary = {
@@ -3241,6 +3263,10 @@ class CardRun:
             self.ended_at = utc_now()
         try:
             self._record_harness_outcome(final_state)
+        except GateFailure as exc:
+            self.stop_code = exc.code
+            self.detail = exc.detail
+            final_state = "blocked"
         except Exception as exc:  # noqa: BLE001 — guarantee finish completes cleanly
             self.log(f"{self.card.id}: harness outcome error ignored in _finish: {exc}")
         mm_budget = getattr(self.micromanager, "budget", None)

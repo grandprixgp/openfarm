@@ -221,6 +221,14 @@ def validate_expected_answer(expects: dict, data: object) -> dict:
         if key not in data or data[key] is None:
             raise Refused("invalid-answer", f"missing required field {key!r}")
 
+    for group in expects.get("any_required") or ():
+        group_keys = [str(k) for k in group]
+        if group_keys and not any(k in data and data[k] is not None for k in group_keys):
+            raise Refused(
+                "invalid-answer",
+                f"answer must include at least one of {group_keys!r}",
+            )
+
     verdicts = expects.get("verdicts")
     if verdicts is None:
         verdicts = expects.get("allowed_verdicts")

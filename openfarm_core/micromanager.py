@@ -20,9 +20,12 @@ structured operations while keeping all authority in deterministic Python code:
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
+import inspect
 import json
 import re
+import time
 from pathlib import Path
 from typing import Callable
 
@@ -36,7 +39,7 @@ from .edits import (
     FORMAT_WHOLE_FILE,
     parse_edits,
 )
-from .errors import Infra, Invalid, Refused, Unsupported
+from .errors import GateFailure, Infra, Invalid, Refused, StopCode, Unsupported
 from .globs import escapes, matches_any, normalise
 from .harness_memory import (
     EDITABLE_SURFACES,
@@ -731,6 +734,445 @@ class ClaudeAcpMicromanager:
         self._session_id = None
         if self._adapter is not None:
             self._adapter.close()
+
+
+SUPERVISOR_OP_EXPECTS: dict[str, dict] = {
+    "shape_and_plan": {
+        "op": "shape_and_plan",
+        "required": ["verdict"],
+        "verdict": ["ready", "split", "ineligible"],
+        "properties": {
+            "verdict": {"type": "str", "enum": ["ready", "split", "ineligible"]},
+            "clarified_notes": {"type": "str"},
+            "extra_context_files": {"type": "list", "items": "str"},
+            "steps": {"type": "list", "items": "dict"},
+            "findings": {"type": "list", "items": "dict"},
+        },
+    },
+    "scaffold_contract": {
+        "op": "scaffold_contract",
+        "any_required": [["edits", "edit_blocks"]],
+        "properties": {
+            "edits": {"type": "list", "items": "dict"},
+            "edit_blocks": {"type": "str"},
+        },
+    },
+    "coach": {
+        "op": "coach",
+        "required": ["root_cause", "guidance"],
+        "properties": {
+            "root_cause": {"type": "str"},
+            "guidance": {"type": "str"},
+            "abort": {"type": "bool"},
+            "abort_reason": {"type": "str"},
+        },
+    },
+    "adjudicate_checker": {
+        "op": "adjudicate_checker",
+        "required": ["verdict", "rationale"],
+        "verdict": ["uphold", "dismiss_false_reject"],
+        "properties": {
+            "verdict": {"type": "str", "enum": ["uphold", "dismiss_false_reject"]},
+            "rationale": {"type": "str"},
+            "fix_hint": {"type": "str"},
+        },
+    },
+    "pre_review": {
+        "op": "pre_review",
+        "required": ["verdict"],
+        "verdict": ["approve", "bounce", "block"],
+        "properties": {
+            "verdict": {"type": "str", "enum": ["approve", "bounce", "block"]},
+            "reviewer_brief": {"type": "str"},
+            "missed_clause": {"type": "str"},
+            "findings": {"type": "list", "items": "dict"},
+        },
+    },
+    "triage_blocked": {
+        "op": "triage_blocked",
+        "required": ["summary", "recommendations"],
+        "properties": {
+            "summary": {"type": "str"},
+            "recommendations": {"type": "list", "items": "dict"},
+            "findings": {"type": "list", "items": "dict"},
+        },
+    },
+    "prepare_queue": {
+        "op": "prepare_queue",
+        "required": ["summary", "recommendations"],
+        "properties": {
+            "summary": {"type": "str"},
+            "recommendations": {"type": "list", "items": "dict"},
+            "findings": {"type": "list", "items": "dict"},
+        },
+    },
+    "reflect_harness": {
+        "op": "reflect_harness",
+        "any_required": [["lessons", "adaptations", "summary"]],
+        "properties": {
+            "summary": {"type": "str"},
+            "lessons": {"type": "list", "items": "dict"},
+            "adaptations": {"type": "list", "items": "dict"},
+        },
+    },
+}
+
+
+def expects_for_supervisor_op(op: str) -> dict:
+    """Return a copy of the expected JSON answer shape for a supervisor op."""
+    return dict(SUPERVISOR_OP_EXPECTS.get(op, {"op": op}))
+
+
+def _call_tier_complete(backend, **kwargs):
+    base = {
+        "role": kwargs["role"],
+        "model": kwargs["model"],
+        "temperature": kwargs["temperature"],
+        "messages": kwargs["messages"],
+        "max_tokens": kwargs["max_tokens"],
+        "response_format": kwargs["response_format"],
+    }
+    extras = {
+        "card_id": kwargs.get("card_id", ""),
+        "attempt": kwargs.get("attempt", 1),
+        "effort": kwargs.get("effort", ""),
+        "effort_param": kwargs.get("effort_param", ""),
+    }
+    try:
+        sig = inspect.signature(backend.complete)
+        params = sig.parameters
+        has_varkw = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+        )
+        chosen = {k: v for k, v in extras.items() if has_varkw or k in params}
+    except (ValueError, TypeError):
+        chosen = None
+
+    if chosen is not None:
+        try:
+            return backend.complete(**base, **chosen)
+        except TypeError:
+            chosen = None  # fall back to explicit subsets below
+
+    for subset in (
+        ("card_id", "attempt", "effort", "effort_param"),
+        ("effort", "effort_param"),
+        ("card_id", "attempt"),
+    ):
+        try:
+            return backend.complete(**base, **{k: extras[k] for k in subset})
+        except TypeError:
+            continue
+    return backend.complete(**base)
+
+
+class TierMicromanagerBackend:
+    """Supervisor seat backed by a configured model tier on the worker backend."""
+
+    enabled = True
+
+    def __init__(
+        self,
+        backend,
+        tier,
+        *,
+        effort: str = "",
+        card_dir: Path | str | None = None,
+        state_dir: Path | str | None = None,
+        board=None,
+        member_name: str = "supervisor",
+        max_tokens: int = 4096,
+        temperature: float = 0.2,
+        owns_backend: bool = False,
+    ) -> None:
+        self.backend = backend
+        self.tier = tier
+        self.effort = str(effort or "")
+        self.name = f"tier:{tier.name}"
+        self.card_dir = Path(card_dir) if card_dir is not None else None
+        self.state_dir = Path(state_dir) if state_dir is not None else None
+        self.board = board
+        self.member_name = member_name
+        self.max_tokens = int(max_tokens or 4096)
+        self.temperature = float(temperature)
+        self._owns_backend = owns_backend
+        self._seq = 0
+        self.last_usage: dict = {"tokens_in": 0, "tokens_out": 0, "spend": 0.0}
+
+    def hello(self) -> dict:
+        if hasattr(self.backend, "hello"):
+            self.backend.hello()
+        return {"name": self.name, "versions": [1], "ops": ["hello", "assist"]}
+
+    def assist(self, op: str, payload: dict) -> dict:
+        self.last_usage = {"tokens_in": 0, "tokens_out": 0, "spend": 0.0}
+        raw_card_dir = payload.get("_card_dir")
+        artifact_root = (
+            Path(raw_card_dir)
+            if raw_card_dir is not None
+            else (self.card_dir if self.card_dir is not None else self.state_dir)
+        )
+        clean_payload = {k: v for k, v in payload.items() if k != "_card_dir"}
+        card_id = str(
+            clean_payload.get("card_id")
+            or (clean_payload.get("card") or {}).get("id", "")
+        )
+        prompt_text = _build_op_prompt(op, clean_payload)
+        messages = [
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "user", "content": prompt_text},
+        ]
+        effort_param = self.tier.effort_param if self.effort else ""
+        comp = _call_tier_complete(
+            self.backend,
+            role=f"supervisor:{op}",
+            model=self.tier.model,
+            temperature=self.temperature,
+            messages=messages,
+            max_tokens=self.max_tokens,
+            response_format="json",
+            card_id=card_id,
+            attempt=1,
+            effort=self.effort,
+            effort_param=effort_param,
+        )
+        tok_in = int(getattr(comp, "tokens_in", 0) or 0)
+        tok_out = int(getattr(comp, "tokens_out", 0) or 0)
+        cost = float(getattr(comp, "cost", 0.0) or 0.0)
+        self.last_usage = {"tokens_in": tok_in, "tokens_out": tok_out, "spend": cost}
+        parsed = parse_json_answer(str(getattr(comp, "content", "") or ""))
+
+        self._seq += 1
+        artifact_path = None
+        if artifact_root is not None:
+            artifact_path = (
+                artifact_root / "micromanager" / f"{self._seq:02d}-{op}.json"
+            )
+            write_json(
+                artifact_path,
+                {
+                    "seq": self._seq,
+                    "at": utc_now(),
+                    "op": op,
+                    "tier": self.tier.name,
+                    "model": self.tier.model,
+                    "effort": self.effort,
+                    "tokens_in": tok_in,
+                    "tokens_out": tok_out,
+                    "spend": cost,
+                    "result": parsed,
+                },
+            )
+
+        if self.board is not None:
+            self.board.ensure()
+            if self.board.get_member("gates") is None:
+                self.board.upsert_member(
+                    "gates", kind="code", role="gates", added_by="system"
+                )
+            sup_kind = "scripted" if getattr(self.backend, "name", "") == "scripted" else "api"
+            existing = self.board.get_member(self.member_name)
+            if existing is None:
+                existing = self.board.upsert_member(
+                    self.member_name,
+                    kind=sup_kind,
+                    role="supervisor",
+                    tier=self.tier.name,
+                    model=self.tier.model,
+                    effort=self.effort,
+                    added_by="system",
+                )
+            new_in = int(existing.get("tokens_in", 0) or 0) + tok_in
+            new_out = int(existing.get("tokens_out", 0) or 0) + tok_out
+            new_calls = int(existing.get("calls", 0) or 0) + 1
+            eff_key = self.effort or "none"
+            by_eff = dict(existing.get("tokens_by_effort") or {})
+            by_eff[eff_key] = int(by_eff.get(eff_key, 0) or 0) + tok_in + tok_out
+            self.board.update_member(
+                self.member_name,
+                tokens_in=new_in,
+                tokens_out=new_out,
+                tokens=new_in + new_out,
+                calls=new_calls,
+                tokens_by_effort=by_eff,
+            )
+            ev: list[str] = []
+            if artifact_path is not None:
+                resolved_art = artifact_path.resolve()
+                allowed = [self.board.board_dir.resolve()]
+                if self.board.state_dir is not None:
+                    allowed.append(self.board.state_dir.resolve())
+                if any(resolved_art.is_relative_to(r) for r in allowed):
+                    ev = [str(artifact_path)]
+            q = self.board.post(
+                author="gates",
+                to=[self.member_name],
+                kind="question",
+                body=f"supervisor {op}",
+                card=card_id,
+                expects=expects_for_supervisor_op(op),
+                trusted=True,
+            )
+            self.board.post(
+                author=self.member_name,
+                to=["gates"],
+                kind="answer",
+                body=f"supervisor {op} answered ({tok_in} in / {tok_out} out)",
+                card=card_id,
+                ref=q["seq"],
+                evidence=ev,
+            )
+
+        return parsed
+
+    def close(self) -> None:
+        if self._owns_backend and hasattr(self.backend, "close"):
+            self.backend.close()
+
+
+class ExternalMicromanagerBackend:
+    """Supervisor seat held outside openfarm over the shared board."""
+
+    name = "external"
+    enabled = True
+
+    def __init__(
+        self,
+        board=None,
+        *,
+        timeout_s: float = 1800.0,
+        on_timeout: str = "fallback",
+        member_name: str = "supervisor",
+        card_dir: Path | str | None = None,
+        state_dir: Path | str | None = None,
+        budget=None,
+        heartbeat_fn: Callable[[], None] | None = None,
+        cancel_check: Callable[[], bool] | None = None,
+        poll_interval_s: float | None = None,
+    ) -> None:
+        self.board = board
+        self.timeout_s = float(timeout_s)
+        self.on_timeout = str(on_timeout or "fallback")
+        self.member_name = member_name
+        self.card_dir = Path(card_dir) if card_dir is not None else None
+        self.state_dir = Path(state_dir) if state_dir is not None else None
+        self.budget = budget
+        self.heartbeat_fn = heartbeat_fn
+        self.cancel_check = cancel_check
+        self.poll_interval_s = (
+            float(poll_interval_s)
+            if poll_interval_s is not None
+            else min(10.0, max(0.05, self.timeout_s / 4.0))
+        )
+        self._seq = 0
+        self.last_usage: dict = {"tokens_in": 0, "tokens_out": 0, "spend": 0.0}
+
+    def hello(self) -> dict:
+        return {"name": self.name, "versions": [1], "ops": ["hello", "assist"]}
+
+    def assist(self, op: str, payload: dict) -> dict:
+        self.last_usage = {"tokens_in": 0, "tokens_out": 0, "spend": 0.0}
+        if self.board is None:
+            raise Infra("no-board", "external supervisor requires an active board")
+        self.board.ensure()
+        if self.board.get_member("gates") is None:
+            self.board.upsert_member("gates", kind="code", role="gates", added_by="system")
+
+        clean_payload = {k: v for k, v in payload.items() if k != "_card_dir"}
+        card_id = str(
+            clean_payload.get("card_id")
+            or (clean_payload.get("card") or {}).get("id", "")
+        )
+        prompt_text = _build_op_prompt(op, clean_payload)
+        expects = expects_for_supervisor_op(op)
+
+        self._seq += 1
+        q_file = self.board.evidence_dir / (
+            f"question-{card_id or 'run'}-{op}-{self._seq}.json"
+        )
+        write_json(
+            q_file,
+            {
+                "op": op,
+                "card_id": card_id,
+                "prompt": prompt_text,
+                "expects": expects,
+                "payload": clean_payload,
+            },
+        )
+        q = self.board.post(
+            author="gates",
+            to=[self.member_name],
+            kind="question",
+            body=f"supervisor {op} requested" + (f" for {card_id}" if card_id else ""),
+            card=card_id,
+            evidence=[str(q_file)],
+            expects=expects,
+            trusted=True,
+        )
+
+        cursor = int(q["seq"])
+        pause_ctx = (
+            self.budget.pause_clock()
+            if self.budget is not None and hasattr(self.budget, "pause_clock")
+            else contextlib.nullcontext()
+        )
+        with pause_ctx:
+            deadline = time.monotonic() + max(0.0, self.timeout_s)
+            while True:
+                if self.cancel_check is not None and self.cancel_check():
+                    raise GateFailure(
+                        StopCode.KILLED,
+                        "stopped by kill switch while waiting for external supervisor",
+                    )
+                remaining = deadline - time.monotonic()
+                step_s = (
+                    0.0
+                    if self.timeout_s <= 0
+                    else max(0.0, min(self.poll_interval_s, remaining))
+                )
+                res = self.board.wait("gates", since=cursor, timeout_s=step_s)
+                if res.get("woke"):
+                    posts = res.get("posts") or []
+                    if posts:
+                        cursor = max(cursor, *(int(p["seq"]) for p in posts))
+                    ans = next(
+                        (
+                            p
+                            for p in posts
+                            if p.get("kind") == "answer" and p.get("ref") == q["seq"]
+                        ),
+                        None,
+                    )
+                    if ans is not None:
+                        ev = ans.get("evidence") or []
+                        if ev:
+                            try:
+                                data = json.loads(
+                                    Path(ev[0]).read_text(encoding="utf-8")
+                                )
+                                if isinstance(data, dict):
+                                    return data
+                            except (OSError, ValueError):
+                                data = None  # fall back to answer body below
+                        return parse_json_answer(str(ans.get("body", "") or ""))
+                if self.heartbeat_fn is not None:
+                    self.heartbeat_fn()
+                if res.get("reason") == "run-ended" or time.monotonic() >= deadline:
+                    break
+
+        if self.on_timeout == "block":
+            raise GateFailure(
+                StopCode.SEAT_SILENT,
+                f"external supervisor did not answer question #{q['seq']} ({op})",
+            )
+        raise Infra(
+            "acp-timeout",
+            f"external supervisor timed out on question #{q['seq']} ({op})",
+        )
+
+    def close(self) -> None:
+        pass
 
 
 # -- High-level validated Micromanager facade ---------------------------------
@@ -1578,6 +2020,12 @@ def open_micromanager(
     worktree: Path | str | None = None,
     card_dir: Path | str | None = None,
     budget: MicromanagerBudget | None = None,
+    *,
+    board=None,
+    worker_backend=None,
+    card_budget=None,
+    heartbeat_fn: Callable[[], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> Micromanager:
     """Create a configured Micromanager from config (or script override)."""
     repo_path = Path(repo)
@@ -1655,6 +2103,72 @@ def open_micromanager(
             mode="active" if mode == "off" else mode,
             feature_flags=feature_flags,
         )
+
+    swarm_cfg = _cfg_get(cfg, "swarm", None)
+    if swarm_cfg is not None and bool(_cfg_get(swarm_cfg, "enabled", False)):
+        swarm_sup = str(_cfg_get(swarm_cfg, "supervisor", "config") or "config")
+        if swarm_sup == "off":
+            return Micromanager(
+                NullMicromanager(),
+                budget=budget,
+                never_touch=never_touch,
+                forbidden_files=forbidden_files,
+                card_dir=card_dir,
+                mode="off",
+                feature_flags=feature_flags,
+            )
+        if swarm_sup == "external":
+            ext_wait_s = float(_cfg_get(swarm_cfg, "external_wait_s", 1800.0))
+            on_timeout = str(_cfg_get(swarm_cfg, "on_external_timeout", "fallback"))
+            return Micromanager(
+                ExternalMicromanagerBackend(
+                    board=board,
+                    timeout_s=ext_wait_s,
+                    on_timeout=on_timeout,
+                    card_dir=card_dir,
+                    state_dir=state_path,
+                    budget=card_budget,
+                    heartbeat_fn=heartbeat_fn,
+                    cancel_check=cancel_check,
+                ),
+                budget=budget,
+                never_touch=never_touch,
+                forbidden_files=forbidden_files,
+                card_dir=card_dir,
+                mode="active" if mode == "off" else mode,
+                feature_flags=feature_flags,
+            )
+        if swarm_sup.startswith("tier:"):
+            tier_name = swarm_sup[5:]
+            tiers = _cfg_get(cfg, "tiers", {}) or {}
+            tier_cfg = tiers.get(tier_name)
+            if tier_cfg is None:
+                raise Invalid("unknown-tier", f"unknown supervisor tier {tier_name!r}")
+            owns_wb = worker_backend is None
+            wb = worker_backend
+            if wb is None:
+                from .adapters.openai_compat import open_backend
+                wb = open_backend(cfg)
+            sup_effort = str(_cfg_get(swarm_cfg, "supervisor_effort", "") or "")
+            max_tokens = int(_cfg_get(cfg, "model_max_tokens", 4096) or 4096)
+            return Micromanager(
+                TierMicromanagerBackend(
+                    wb,
+                    tier_cfg,
+                    effort=sup_effort,
+                    card_dir=card_dir,
+                    state_dir=state_path,
+                    board=board,
+                    max_tokens=max_tokens,
+                    owns_backend=owns_wb,
+                ),
+                budget=budget,
+                never_touch=never_touch,
+                forbidden_files=forbidden_files,
+                card_dir=card_dir,
+                mode="active" if mode == "off" else mode,
+                feature_flags=feature_flags,
+            )
 
     enabled_flag = _cfg_get(mm_cfg, "enabled", None) if mm_cfg is not None else None
     spec = _cfg_get(mm_cfg, "adapter", None) if mm_cfg is not None else None

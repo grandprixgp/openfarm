@@ -12,6 +12,8 @@ The split matters and is not an accident:
 
 from __future__ import annotations
 
+import contextlib
+import threading
 import time
 
 from .errors import GateFailure, StopCode
@@ -58,17 +60,45 @@ class Budget:
 
         self._started = time.monotonic()
         self._stopped: float | None = None
+        self._paused_total_s = 0.0
+        self._pause_started: float | None = None
+        self._pause_depth = 0
+        self._clock_lock = threading.Lock()
 
     # -- clocks ---------------------------------------------------------------
 
     def stop_clock(self) -> None:
-        if self._stopped is None:
-            self._stopped = time.monotonic()
+        with self._clock_lock:
+            if self._stopped is None:
+                self._stopped = time.monotonic()
+
+    @contextlib.contextmanager
+    def pause_clock(self):
+        """Pause the card's wall clock while waiting on an external seat."""
+        with self._clock_lock:
+            self._pause_depth += 1
+            if self._pause_depth == 1 and self._stopped is None:
+                self._pause_started = time.monotonic()
+        try:
+            yield
+        finally:
+            with self._clock_lock:
+                self._pause_depth -= 1
+                if self._pause_depth == 0 and self._pause_started is not None:
+                    now = self._stopped if self._stopped is not None else time.monotonic()
+                    self._paused_total_s += max(0.0, now - self._pause_started)
+                    self._pause_started = None
 
     @property
     def wall_clock_s(self) -> float:
-        end = self._stopped if self._stopped is not None else time.monotonic()
-        return end - self._started
+        with self._clock_lock:
+            end = self._stopped if self._stopped is not None else time.monotonic()
+            extra = (
+                (end - self._pause_started)
+                if self._pause_started is not None and end > self._pause_started
+                else 0.0
+            )
+            return max(0.0, (end - self._started) - self._paused_total_s - extra)
 
     def wall_clock_left_s(self) -> float:
         return max(0.0, self.wall_clock_cap_s - self.wall_clock_s)
