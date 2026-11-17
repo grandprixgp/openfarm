@@ -281,6 +281,15 @@ def _check_typescript(card: Card, cfg, root: Path | None,
     The same decision the pack makes from the base checkout, so `check` refuses
     what a run would only find out after spending its calls.
     """
+    mode = getattr(cfg, "mutation", "off")
+    if mode != "off" and (mode == "required"
+                          or card.category in getattr(cfg, "mutation_required_for", [])):
+        result.fail("typescript-no-mutation",
+                    f"[gates] mutation_required_for includes {card.category!r}, but the "
+                    "TypeScript pack has no mutation tool, so this card would spend its "
+                    "calls and then be blocked at the mutation gate. Take "
+                    f"{card.category!r} out of mutation_required_for, or set [gates] "
+                    'mutation = "off"')
     if root is None or not root.is_dir():
         return
     from ..packs.typescript import resolve_tooling, settings_from_config

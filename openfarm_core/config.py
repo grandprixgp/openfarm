@@ -595,6 +595,11 @@ class Config:
         self.mutation_required_for = _as_str_list(
             gates.get("mutation_required_for", ["test-backfill"]),
             "[gates] mutation_required_for")
+        if self.mutation == "required" and _uses_typescript(self.languages):
+            raise ConfigError(
+                '[gates] mutation = "required" cannot be served: the TypeScript pack '
+                'has no mutation tool, so every card would be blocked at its end. Set '
+                '[gates] mutation = "off" (or "report", with mutation_required_for = [])')
         self.mutation_min_kill_rate = _as_float(
             gates.get("mutation_min_kill_rate"),
             "[gates] mutation_min_kill_rate", 0.8)
