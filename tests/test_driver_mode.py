@@ -22,7 +22,7 @@ if str(ROOT) not in sys.path:
 from openfarm_core.bootstrap import INSTALL_TARGETS, install_skill_bundle
 from openfarm_core.cli import EXIT_OK, EXIT_REFUSED, EXIT_USAGE, main as cli_main
 from openfarm_core.config import load_config
-from openfarm_core.driver import DriverAgent, _minimal_valid_answer_for_question, drive_run
+from openfarm_core.driver import DriverAgent, drive_run
 from openfarm_core.git import Git
 from openfarm_core.human_cli import Style, error_hint, format_human
 from openfarm_core.packs.python import PythonPack
@@ -632,7 +632,10 @@ class DriverModeEndToEndTests(unittest.TestCase):
         p_ref = json.loads(out_ref)
         self.assertEqual(p_ref["outcomes"][0]["final_state"], "in-review")
 
-        # 3. Always malformed JSON -> 1 correction turn then deterministic fallback finishes run!
+        # 3. Always malformed JSON -> 1 correction turn, then the run's own timeout rule
+        # (`on_external_timeout = "fallback"` by default) for what the driver could not
+        # answer: code starts the card, the supervisor's ops are skipped, and nothing is
+        # recorded as a supervisor answer.
         toy_fb = build_python_toy()
         self.addCleanup(toy_fb.cleanup)
         toy_fb.write_card(
@@ -662,7 +665,9 @@ class DriverModeEndToEndTests(unittest.TestCase):
         self.assertTrue(p2["ok"])
         self.assertEqual(p2["outcomes"][0]["final_state"], "in-review")
         self.assertTrue(any(a.get("fallback") for a in p2["actions_taken"]))
-        self.assertTrue(any(a.get("fallback") for a in p2["answers_sent"]))
+        self.assertEqual(p2["answers_sent"], [])
+        self.assertTrue(p2["timeouts"])
+        self.assertTrue(all(t["policy"] == "fallback" for t in p2["timeouts"]))
 
     def test_wave_review_records_verdict_without_reading_never_touch_or_merging(self) -> None:
         # Add a never_touch file with a sentinel string and verify it is never exposed to driver prompts
@@ -798,10 +803,6 @@ class DriverModeEndToEndTests(unittest.TestCase):
         )
         self.assertEqual(rc_sp, EXIT_USAGE)
 
-        # Minimal valid expects helper builds valid answers
-        for op in ("shape_and_plan", "scaffold_contract", "coach", "adjudicate_checker", "pre_review", "reflect_harness"):
-            ans = _minimal_valid_answer_for_question({"expects": {"op": op}})
-            self.assertIsInstance(ans, dict)
 
     def test_drive_cleans_up_run_lock_on_driver_error(self) -> None:
         self._add_card_1()
@@ -815,17 +816,22 @@ class DriverModeEndToEndTests(unittest.TestCase):
             encoding="utf-8",
         )
         fail_script.chmod(0o755)
-        with self.assertRaises(Exception):
-            drive_run(
-                self.toy.root,
-                load_config(self.toy.root),
-                StateDir(self.toy.state_dir),
-                agent="claude",
-                seat="both",
-                cards=1,
-                driver_bin=str(fail_script),
-                script=sp,
-            )
+        # A failed turn falls back for that turn only: the drive goes on, the
+        # failures are reported, and nothing is answered in the supervisor's name.
+        res = drive_run(
+            self.toy.root,
+            load_config(self.toy.root),
+            StateDir(self.toy.state_dir),
+            agent="claude",
+            seat="both",
+            cards=1,
+            driver_bin=str(fail_script),
+            script=sp,
+        )
+        self.assertTrue(res["driver_errors"])
+        self.assertTrue(all(e["code"] == "driver-cli-failed" for e in res["driver_errors"]))
+        self.assertIn("weekly quota hit", res["driver_errors"][0]["message"])
+        self.assertEqual(res["answers_sent"], [])
         self.assertFalse((self.toy.state_dir / "run.lock").exists())
         cfg = load_config(self.toy.root)
         self.assertFalse(Path(cfg.kill_switch).exists())
