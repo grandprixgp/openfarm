@@ -391,6 +391,8 @@ def _collect_overview(ctx: TuiContext, run_id: str | None = None) -> dict:
     cfg = ctx.cfg
     state = ctx.state
     holder = state.lock_holder() or {}
+    if holder and state.stale_lock_holder() is not None:
+        holder = {**holder, "stale": True}
     pause_info = read_json(state.paused, {}) if state.is_paused() else {}
     kill_path = state.kill_switch(cfg.kill_switch)
     kill_info = read_json(kill_path, {}) if kill_path.exists() else {}
@@ -450,7 +452,11 @@ def _collect_overview(ctx: TuiContext, run_id: str | None = None) -> dict:
         "base_branch": cfg.base_branch,
         "state_dir": str(cfg.state_dir),
         "run": holder,
-        "active_run_id": str(holder.get("run_id", "") or ""),
+        # A lock whose process is gone is not a live run.
+        "active_run_id": ("" if holder.get("stale")
+                          else str(holder.get("run_id", "") or "")),
+        "stale_run_id": (str(holder.get("run_id", "") or "")
+                         if holder.get("stale") else ""),
         "paused": state.is_paused(),
         "pause_reason": str((pause_info or {}).get("reason", "")),
         "kill_switch": state.kill_requested(cfg.kill_switch),
@@ -1639,13 +1645,16 @@ def _format_overview_lines(snap: dict, *, width: int = 96) -> list[str]:
     sw = d["swarm"]
     br = d["breaker"]
     run_icon = "●" if d["active_run_id"] else "○"
+    stale_run = d.get("stale_run_id") or ""
+    live_none = (f"(none; stale lock from {stale_run}, the next run takes it over)"
+                 if stale_run else "(none)")
     pause_icon = "⏸ yes" if d["paused"] else "✓ no"
     kill_icon = "✗ ACTIVE" if d["kill_switch"] else "✓ clear"
     brk_icon = "⚡ TRIPPED" if br.get("tripped") else "✓ ok"
     proj_lines = [
         f"Project: {d['project']}  lane={d['lane']}  base={d['base_branch']}",
         f"State dir: {d['state_dir']}",
-        f"Live run: {run_icon} {d['active_run_id'] or '(none)'}   Paused: {pause_icon}   Kill: {kill_icon}   Breaker: {brk_icon}",
+        f"Live run: {run_icon} {d['active_run_id'] or live_none}   Paused: {pause_icon}   Kill: {kill_icon}   Breaker: {brk_icon}",
         f"Caps: spend_per_night={d['spend_cap']}   concurrent_cards={d['concurrent_cards']}   concurrent_builds={d['concurrent_builds']}",
         f"Model: adapter={d['model']['adapter']}   endpoint={d['model']['endpoint'] or '—'}   key_file_present={d['model']['key_file_present']}",
     ]

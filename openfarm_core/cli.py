@@ -1255,6 +1255,10 @@ def _update_breaker(ctx: Context, consecutive: list[tuple[str, str, str]]) -> No
 def cmd_status(ctx: Context, args) -> int:
     """Read-only: the live run, the caps, and the farm's own state."""
     holder = ctx.state.lock_holder()
+    if holder and ctx.state.stale_lock_holder() is not None:
+        # The process that took the lock is gone (a crash, a kill -9). Say so
+        # instead of showing a run that is not there; the next run takes it over.
+        holder = {**holder, "stale": True}
     harness_lib = _open_harness_library(ctx, require_enabled=True)
     payload = {
         "run": holder or {},
@@ -1453,10 +1457,12 @@ def cmd_verdict(ctx: Context, args) -> int:
         _emit_ctx(ctx, {"card": card_id, "error": "no run for this card"}, "verdict")
         return EXIT_REFUSED
     card_dir = candidates[-1].parent
+    # `by` tells this apart from a driver's own first look (`driver/<agent>`,
+    # written by `drive --wave --record-verdict`), which this replaces.
     payload = {"card": card_id, "verdict": args.verdict,
                "review_tokens": args.review_tokens,
                "minutes": args.minutes, "note": args.note or "",
-               "at": utc_now()}
+               "at": utc_now(), "by": "reviewer"}
     write_json(card_dir / "verdict.json", payload)
     _emit_ctx(ctx, payload, "verdict")
     return EXIT_OK

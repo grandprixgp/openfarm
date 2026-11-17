@@ -388,6 +388,13 @@ def _format_status(payload: dict, style: Style) -> str:
     elif paused:
         banner = style.yellow(f"{ICON_PAUSED} PAUSED")
         next_tips = ["openfarm resume  (allow new card claims)"]
+    elif run.get("run_id") and run.get("stale"):
+        banner = style.yellow(f"{ICON_PAUSED} STALE LOCK {run['run_id']}") + "  " + style.dim(
+            f"pid {run.get('pid')} is no longer running")
+        next_tips = [
+            "openfarm run --cards 3  (takes the lock over)",
+            f"openfarm board read --run {run['run_id']}",
+        ]
     elif run.get("run_id"):
         started = run.get("started_at") or ""
         banner = style.cyan(f"{ICON_DOT} ACTIVE RUN {run['run_id']}") + (

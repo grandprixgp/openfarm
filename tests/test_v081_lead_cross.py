@@ -117,5 +117,69 @@ class CheckBaselineNamedRowsTests(unittest.TestCase):
         self.assertFalse(payload["eligible"])
 
 
+
+class StaleLockShownTests(unittest.TestCase):
+    """A lock whose process is gone is shown as stale, not as a live run."""
+
+    def _toy_with_dead_lock(self):
+        import json as _json
+        import subprocess
+        import sys
+        from tests.test_v081b_packs_gates import build_python_toy
+        toy = build_python_toy()
+        self.addCleanup(toy.cleanup)
+        from openfarm_core.state import StateDir, _this_host
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        state = StateDir(toy.state_dir)
+        state.run_lock.write_text(_json.dumps(
+            {"run_id": "run-gone", "started_at": "2026-11-17T00:00:00Z",
+             "pid": dead.pid, "host": _this_host()}))
+        return toy
+
+    def test_status_says_stale_and_the_human_banner_is_not_active(self) -> None:
+        import json as _json
+        from tests.test_v081b_packs_gates import run_cli
+        from openfarm_core.human_cli import Style, _format_status
+        toy = self._toy_with_dead_lock()
+        payload = _json.loads(run_cli(toy.root, "status").stdout)
+        self.assertEqual(payload["run"]["run_id"], "run-gone")
+        self.assertTrue(payload["run"]["stale"])
+        text = _format_status(payload, Style(enabled=False))
+        self.assertIn("STALE LOCK run-gone", text)
+        self.assertNotIn("ACTIVE RUN", text)
+
+    def test_a_live_holder_is_still_an_active_run(self) -> None:
+        import json as _json
+        import os
+        from tests.test_v081b_packs_gates import run_cli
+        from openfarm_core.state import StateDir, _this_host
+        toy = self._toy_with_dead_lock()
+        StateDir(toy.state_dir).run_lock.write_text(_json.dumps(
+            {"run_id": "run-live", "started_at": "2026-11-17T00:00:00Z",
+             "pid": os.getpid(), "host": _this_host()}))
+        payload = _json.loads(run_cli(toy.root, "status").stdout)
+        self.assertEqual(payload["run"]["run_id"], "run-live")
+        self.assertNotIn("stale", payload["run"])
+
+
+class ReviewerVerdictTests(unittest.TestCase):
+    def test_openfarm_verdict_says_who_decided_and_replaces_a_driver_s(self) -> None:
+        import json as _json
+        from tests.test_v081b_packs_gates import build_python_toy, run_cli
+        toy = build_python_toy()
+        self.addCleanup(toy.cleanup)
+        card_dir = toy.state_dir / "cards" / "CARD-1" / "run-1"
+        card_dir.mkdir(parents=True)
+        (card_dir / "card-record.json").write_text("{}")
+        (card_dir / "verdict.json").write_text(_json.dumps(
+            {"card": "CARD-1", "verdict": "clean", "by": "driver/codex"}))
+        result = run_cli(toy.root, "verdict", "CARD-1", "bounced",
+                         "--review-tokens", "10", "--minutes", "1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        saved = _json.loads((card_dir / "verdict.json").read_text())
+        self.assertEqual((saved["verdict"], saved["by"]), ("bounced", "reviewer"))
+
+
 if __name__ == "__main__":
     unittest.main()

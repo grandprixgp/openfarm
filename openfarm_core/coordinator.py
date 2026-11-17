@@ -881,7 +881,6 @@ class ModelCoordinator:
                         rt.cfg,
                         caller="coordinator",
                         member_name=mname,
-                        finished_cards=set(rt.finished.keys()),
                         cards_by_id=rt.card_map,
                         source=rt.source,
                     )
