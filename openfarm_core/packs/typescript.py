@@ -38,8 +38,34 @@ _TS_EXTS = (".ts", ".mts", ".cts", ".tsx")
 _JS_EXTS = (".js", ".mjs", ".cjs", ".jsx")
 _CODE_EXTS = _TS_EXTS + _JS_EXTS
 
-_TEST_FILE_PATTERN = r"(?:\.(?:test|spec)|_test)\.(?:ts|mts|cts|tsx|js|mjs|cjs|jsx)$"
+#: What a test file is, for eligibility, `classify_paths`, discovery and the list
+#: script alike: named `*.test.*`, `*.spec.*` or `*_test.*` with an extension node
+#: runs. A file that a card may name as a test is one node is given and lists.
+_RUNNABLE_EXTS = (".ts", ".mts", ".cts", ".js", ".mjs", ".cjs")
+_TEST_FILE_PATTERN = r"(?:\.(?:test|spec)|_test)\.(?:ts|mts|cts|js|mjs|cjs)$"
 _TEST_FILE_RE = re.compile(_TEST_FILE_PATTERN)
+#: Test-named `.tsx`/`.jsx`: node --test cannot run them, so never a test file.
+_UNRUNNABLE_TEST_RE = re.compile(r"(?:\.(?:test|spec)|_test)\.(?:tsx|jsx)$")
+_TEST_DIRS = ("tests", "test", "__tests__")
+
+
+def is_test_file(path: str) -> bool:
+    """The one rule for a TypeScript/JavaScript test file (see `_TEST_FILE_PATTERN`)."""
+    name = str(path).replace("\\", "/").rsplit("/", 1)[-1]
+    return bool(_TEST_FILE_RE.search(name))
+
+
+def test_file_problem(path: str) -> str:
+    """Why `path` cannot hold a card's named test, or "" when it can."""
+    if is_test_file(path):
+        return ""
+    name = str(path).replace("\\", "/").rsplit("/", 1)[-1]
+    if _UNRUNNABLE_TEST_RE.search(name):
+        return (f"{path!r} is a .tsx/.jsx file, which node --test cannot run; "
+                "put the test in a .test.ts or .test.js file")
+    return (f"{path!r} is not a test file: node --test is given, and the list reads, "
+            "only files named *.test.*, *.spec.* or *_test.* ending in "
+            + ", ".join(_RUNNABLE_EXTS))
 _NODE_TEST_GLOBS = (
     "tests/**/*.test.{ts,mts,js,mjs}",
     "src/**/*.test.{ts,mts,js,mjs}",
@@ -716,7 +742,7 @@ class TypeScriptPack(Pack):
         skip = set(_SKIP_DIRS)
         for cur, dirs, filenames in _walk_sorted(base, skip):
             for fname in filenames:
-                if _TEST_FILE_RE.search(fname):
+                if is_test_file(fname):
                     rel = (cur / fname).relative_to(self.worktree).as_posix()
                     found.append(rel)
         return sorted(found)
@@ -839,10 +865,12 @@ class TypeScriptPack(Pack):
             if not base.endswith(_CODE_EXTS):
                 out[path] = "other"
                 continue
-            in_test_dir = any(seg in ("tests", "test", "__tests__")
-                              for seg in parts[:-1])
-            is_test_name = bool(_TEST_FILE_RE.search(base))
-            out[path] = (_TEST_KIND if (in_test_dir or is_test_name)
+            # A test file (the shared rule), a test-named .tsx/.jsx that node cannot
+            # run, or a helper inside a test folder: all the test writer's, frozen
+            # after phase A, never production the implementer may rewrite.
+            in_test_dir = any(seg in _TEST_DIRS for seg in parts[:-1])
+            is_test = is_test_file(base) or bool(_UNRUNNABLE_TEST_RE.search(base))
+            out[path] = (_TEST_KIND if (in_test_dir or is_test)
                          else _PRODUCTION_KIND)
         return out
 
@@ -1359,7 +1387,8 @@ def _looks_like_file_row(row: dict) -> bool:
         return False
     if not name.endswith(_CODE_EXTS):
         return False
-    return bool(_TEST_FILE_RE.search(name)) or "exitCode" in row["yaml"]
+    return (is_test_file(name) or bool(_UNRUNNABLE_TEST_RE.search(name))
+            or "exitCode" in row["yaml"])
 
 
 # -- lexical scanner & signature extraction -----------------------------------

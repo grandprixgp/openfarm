@@ -249,12 +249,14 @@ def check_eligibility(card: Card, cfg, deps_done: bool = True,
                     f"tests go in tests/test_<subject>.py")
     if _uses_typescript(cfg):
         _check_typescript(card, cfg, root, result)
+        from ..packs.typescript import test_file_problem
+
         for test in card.tests:
-            if test.file and not _is_typescript_test_file(test.file):
+            problem = test_file_problem(normalise(test.file)) if test.file else ""
+            if problem:
                 result.fail(
                     "typescript-tests-in-test-files",
-                    f"test {test.name!r} is declared in {test.file!r}; TypeScript card "
-                    f"tests must be *.test.* / *.spec.* or under tests/ or __tests__/")
+                    f"test {test.name!r} is declared in {problem}")
     allow_multi_new_symbols = type_changes or (
         getattr(cfg, "micromanager_adapter", "off") != "off"
         and getattr(getattr(cfg, "micromanager", None), "scaffold_contracts", False)
@@ -408,22 +410,6 @@ def _is_python_test_file(path: str) -> bool:
     name = text.rsplit("/", 1)[-1]
     return _is_integration_test_file(text) and name.startswith("test_") \
         and name.endswith(".py")
-
-
-_TS_TEST_EXTS = (".ts", ".mts", ".cts", ".tsx", ".js", ".mjs", ".cjs", ".jsx")
-
-
-def _is_typescript_test_file(path: str) -> bool:
-    """`*.test.*`, `*.spec.*`, or under `tests/` / `__tests__/` with TS/JS extension."""
-    text = normalise(path)
-    name = text.rsplit("/", 1)[-1]
-    if not name.endswith(_TS_TEST_EXTS):
-        return False
-    if (text.startswith(("tests/", "__tests__/"))
-            or "/tests/" in text or "/__tests__/" in text):
-        return True
-    stem = name.rsplit(".", 1)[0]
-    return stem.endswith((".test", ".spec", "_test"))
 
 
 def is_eligible(card: Card, cfg, **kwargs) -> bool:

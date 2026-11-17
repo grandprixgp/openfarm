@@ -589,13 +589,16 @@ class WiringTests(unittest.TestCase):
                 },
             )
 
-        bad = check_eligibility(card("src/helper.ts"), cfg)
-        self.assertIn("typescript-tests-in-test-files", [f["rule"] for f in bad.failures])
+        for bad_test in ("src/helper.ts", "src/__tests__/a.ts", "tests/a.test.tsx"):
+            # Never given to node --test, so a test named there could never be proven.
+            bad = check_eligibility(card(bad_test), cfg)
+            self.assertIn("typescript-tests-in-test-files",
+                          [f["rule"] for f in bad.failures], bad_test)
         for valid_test in (
             "tests/a.test.ts",
             "src/a.test.ts",
             "src/a.spec.mts",
-            "src/__tests__/a.ts",
+            "src/__tests__/a.test.ts",
         ):
             good = check_eligibility(card(valid_test), cfg)
             self.assertNotIn(
