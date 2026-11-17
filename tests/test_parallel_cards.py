@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -33,6 +34,7 @@ from openfarm_core.micromanager import (
 )
 from openfarm_core.state import StateDir, append_jsonl, read_json, write_json
 from tests.test_python_e2e import build_python_toy
+from tests.toy import CONFIG as RUST_TOY_CONFIG, ToyRepo, _run as _git_run, cargo_available
 
 
 def _run_cli(repo: Path, *args: str) -> tuple[int, dict, str]:
@@ -496,6 +498,389 @@ class BuildLimiterAndLocksTests(unittest.TestCase):
         self.assertEqual(shared_budget.usage_for("CARD-1")["tokens_in"], 100)
         self.assertEqual(shared_budget.usage_for("CARD-2")["tokens_in"], 200)
         self.assertEqual(shared_budget.usage_for("CARD-3")["tokens_in"], 300)
+
+
+def _setup_three_module_rust_toy(
+    *, concurrent_cards: int, concurrent_builds: int
+) -> tuple[ToyRepo, dict[str, str]]:
+    """Create a 3-module Rust crate with Cargo.lock and 3 independent cards."""
+    base = Path(tempfile.mkdtemp(prefix="openfarm-rust-par-"))
+    root = base / "repo"
+    state_dir = base / "repo-state"
+    root.mkdir(parents=True, exist_ok=True)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    toy = ToyRepo(root, state_dir, base=base)
+
+    toy.write(
+        "Cargo.toml",
+        '[package]\nname = "parallel_toy"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\n',
+    )
+    toy.write(
+        "src/lib.rs",
+        "//! A three-module Rust crate for parallel cargo gate tests.\n\n"
+        "pub mod alpha;\npub mod beta;\npub mod gamma;\n",
+    )
+    toy.write(
+        "src/alpha.rs",
+        "//! Alpha arithmetic module.\n\n"
+        "/// Double `value`.\n"
+        "pub fn alpha_val(value: i32) -> i32 {\n"
+        "    value\n"
+        "}\n",
+    )
+    toy.write(
+        "src/beta.rs",
+        "//! Beta arithmetic module.\n\n"
+        "/// Triple `value`.\n"
+        "pub fn beta_val(value: i32) -> i32 {\n"
+        "    value\n"
+        "}\n",
+    )
+    toy.write(
+        "src/gamma.rs",
+        "//! Gamma arithmetic module.\n\n"
+        "/// Increment `value` by one.\n"
+        "pub fn gamma_val(value: i32) -> i32 {\n"
+        "    value\n"
+        "}\n",
+    )
+    toy.write(
+        "tests/existing.rs",
+        "use parallel_toy::alpha::alpha_val;\n\n"
+        "#[test]\n"
+        "fn existing_smoke_zero_stays_zero() {\n"
+        "    assert_eq!(alpha_val(0), 0);\n"
+        "}\n",
+    )
+    toy.write(".gitignore", "/target\n")
+
+    cfg_text = RUST_TOY_CONFIG.format(state_dir=state_dir)
+    cfg_text = cfg_text.replace('name = "toy"', 'name = "parallel_toy"')
+    cfg_text = cfg_text.replace(
+        "concurrent_builds = 1", f"concurrent_builds = {concurrent_builds}"
+    )
+    cfg_text = cfg_text.replace(
+        "concurrent_cards = 1", f"concurrent_cards = {concurrent_cards}"
+    )
+    cfg_text = cfg_text.replace('mutation = "report"', 'mutation = "off"')
+    cfg_text += (
+        '\n[swarm]\nenabled = true\ncoordinator = "code"\nsupervisor = "off"\n'
+    )
+    toy.write(".openfarm/config.toml", cfg_text)
+
+    lock_res = getattr(DirectRunner(root), "exec")(
+        "build", ["cargo", "generate-lockfile"], cwd=root
+    )
+    if lock_res.exit_code != 0:
+        raise RuntimeError(f"cargo generate-lockfile failed:\n{lock_res.stderr}")
+
+    _git_run(["git", "init", "-q", "-b", "main"], root)
+    toy.commit("initial three-module rust crate")
+
+    toy.write_card(
+        "CARD-1",
+        title="Double alpha value",
+        category="pinned-bugfix",
+        unit="parallel_toy",
+        touches=["src/alpha.rs"],
+        tests=[{
+            "name": "alpha_doubles_nonzero",
+            "file": "tests/alpha_tests.rs",
+            "asserts": "alpha_val(3) == 6",
+        }],
+        done_text="`alpha_val(value)` returns `value * 2`.",
+    )
+    toy.write_card(
+        "CARD-2",
+        title="Triple beta value",
+        category="pinned-bugfix",
+        unit="parallel_toy",
+        touches=["src/beta.rs"],
+        tests=[{
+            "name": "beta_triples_nonzero",
+            "file": "tests/beta_tests.rs",
+            "asserts": "beta_val(3) == 9",
+        }],
+        done_text="`beta_val(value)` returns `value * 3`.",
+    )
+    toy.write_card(
+        "CARD-3",
+        title="Increment gamma value",
+        category="pinned-bugfix",
+        unit="parallel_toy",
+        touches=["src/gamma.rs"],
+        tests=[{
+            "name": "gamma_increments_nonzero",
+            "file": "tests/gamma_tests.rs",
+            "asserts": "gamma_val(3) == 4",
+        }],
+        done_text="`gamma_val(value)` returns `value + 1`.",
+    )
+    toy.commit("add 3 independent rust cards")
+
+    script = {
+        "CARD-1/test_writer": (
+            "=== whole_file: tests/alpha_tests.rs\n"
+            "use parallel_toy::alpha::alpha_val;\n\n"
+            "#[test]\n"
+            "fn alpha_doubles_nonzero() {\n"
+            "    assert_eq!(alpha_val(3), 6);\n"
+            "}\n"
+        ),
+        "CARD-1/implementer": (
+            "=== whole_file: src/alpha.rs\n"
+            "//! Alpha arithmetic module.\n\n"
+            "/// Double `value`.\n"
+            "pub fn alpha_val(value: i32) -> i32 {\n"
+            "    value * 2\n"
+            "}\n"
+        ),
+        "CARD-1/checker_pass1": "RESTATEMENT: alpha_val doubles input i32",
+        "CARD-1/checker_pass2": "{}",
+        "CARD-2/test_writer": (
+            "=== whole_file: tests/beta_tests.rs\n"
+            "use parallel_toy::beta::beta_val;\n\n"
+            "#[test]\n"
+            "fn beta_triples_nonzero() {\n"
+            "    assert_eq!(beta_val(3), 9);\n"
+            "}\n"
+        ),
+        "CARD-2/implementer": (
+            "=== whole_file: src/beta.rs\n"
+            "//! Beta arithmetic module.\n\n"
+            "/// Triple `value`.\n"
+            "pub fn beta_val(value: i32) -> i32 {\n"
+            "    value * 3\n"
+            "}\n"
+        ),
+        "CARD-2/checker_pass1": "RESTATEMENT: beta_val triples input i32",
+        "CARD-2/checker_pass2": "{}",
+        "CARD-3/test_writer": (
+            "=== whole_file: tests/gamma_tests.rs\n"
+            "use parallel_toy::gamma::gamma_val;\n\n"
+            "#[test]\n"
+            "fn gamma_increments_nonzero() {\n"
+            "    assert_eq!(gamma_val(3), 4);\n"
+            "}\n"
+        ),
+        "CARD-3/implementer": (
+            "=== whole_file: src/gamma.rs\n"
+            "//! Gamma arithmetic module.\n\n"
+            "/// Increment `value` by one.\n"
+            "pub fn gamma_val(value: i32) -> i32 {\n"
+            "    value + 1\n"
+            "}\n"
+        ),
+        "CARD-3/checker_pass1": "RESTATEMENT: gamma_val increments input i32",
+        "CARD-3/checker_pass2": "{}",
+    }
+    return toy, script
+
+
+@unittest.skipUnless(
+    os.environ.get("OPENFARM_E2E") == "1", "set OPENFARM_E2E=1"
+)
+class ParallelRustCargoE2ETests(unittest.TestCase):
+    """Real cargo gate verification across serial vs parallel cards."""
+
+    def _verify_branch_cargo_gates(self, repo: Path, branch: str) -> None:
+        wt_parent = Path(tempfile.mkdtemp(prefix="openfarm-rust-check-"))
+        self.addCleanup(shutil.rmtree, wt_parent, True)
+        wt = wt_parent / "wt"
+        git = Git(repo)
+        git.worktree_add(wt, branch)
+        try:
+            runner = DirectRunner(wt)
+            run_exec = getattr(runner, "exec")
+            test_res = run_exec("test", ["cargo", "test", "--locked"], cwd=wt)
+            self.assertEqual(
+                test_res.exit_code, 0, test_res.stdout + test_res.stderr
+            )
+            clippy_res = run_exec(
+                "lint",
+                ["cargo", "clippy", "--locked", "--all-targets", "--", "-D", "warnings"],
+                cwd=wt,
+            )
+            self.assertEqual(
+                clippy_res.exit_code, 0, clippy_res.stdout + clippy_res.stderr
+            )
+            rs_files = [
+                str(p)
+                for p in sorted(list((wt / "src").glob("*.rs")) + list((wt / "tests").glob("*.rs")))
+            ]
+            fmt_res = run_exec(
+                "extra",
+                ["rustfmt", "--edition", "2021", "--check", *rs_files],
+                cwd=wt,
+            )
+            self.assertEqual(
+                fmt_res.exit_code, 0, fmt_res.stdout + fmt_res.stderr
+            )
+        finally:
+            git.worktree_remove(wt)
+
+    def test_serial_vs_three_way_parallel_rust_cargo_gates(self) -> None:
+        self.assertTrue(cargo_available(), "cargo is required when OPENFARM_E2E=1")
+
+        serial_toy, serial_script = _setup_three_module_rust_toy(
+            concurrent_cards=1, concurrent_builds=1
+        )
+        self.addCleanup(serial_toy.cleanup)
+        s_script_dir = Path(tempfile.mkdtemp(prefix="openfarm-rust-script-"))
+        self.addCleanup(shutil.rmtree, s_script_dir, True)
+        s_script_path = s_script_dir / "script.json"
+        s_script_path.write_text(json.dumps(serial_script), encoding="utf-8")
+
+        par_toy, par_script = _setup_three_module_rust_toy(
+            concurrent_cards=3, concurrent_builds=2
+        )
+        self.addCleanup(par_toy.cleanup)
+        p_script_dir = Path(tempfile.mkdtemp(prefix="openfarm-rust-script-"))
+        self.addCleanup(shutil.rmtree, p_script_dir, True)
+        p_script_path = p_script_dir / "script.json"
+        p_script_path.write_text(json.dumps(par_script), encoding="utf-8")
+
+        code_s, out_s, err_s = _run_cli(
+            serial_toy.root, "run", "--cards", "3", "--script", str(s_script_path)
+        )
+        self.assertEqual(code_s, EXIT_OK, err_s)
+
+        from openfarm_core import cli as cli_mod
+        from openfarm_core import flow as flow_mod
+
+        created_limiters: list[BuildLimiter] = []
+        orig_limiter_cls = cli_mod.BuildLimiter
+
+        def tracked_limiter(limit: int) -> BuildLimiter:
+            lim = orig_limiter_cls(limit)
+            created_limiters.append(lim)
+            return lim
+
+        lock = threading.Lock()
+        active_impl: set[str] = set()
+        concurrent_pairs: set[tuple[str, str]] = set()
+        barrier = threading.Barrier(3, timeout=30.0)
+        orig_phase_b = flow_mod.CardRun._step_phase_b
+
+        def tracked_phase_b(self_run, *args, **kwargs):
+            with lock:
+                for other in active_impl:
+                    concurrent_pairs.add(tuple(sorted((self_run.card.id, other))))
+                active_impl.add(self_run.card.id)
+            barrier.wait()
+            try:
+                return orig_phase_b(self_run, *args, **kwargs)
+            finally:
+                with lock:
+                    active_impl.discard(self_run.card.id)
+
+        cli_mod.BuildLimiter = tracked_limiter
+        self.addCleanup(setattr, cli_mod, "BuildLimiter", orig_limiter_cls)
+        flow_mod.CardRun._step_phase_b = tracked_phase_b
+        self.addCleanup(setattr, flow_mod.CardRun, "_step_phase_b", orig_phase_b)
+
+        code_p, out_p, err_p = _run_cli(
+            par_toy.root, "run", "--cards", "3", "--script", str(p_script_path)
+        )
+        self.assertEqual(code_p, EXIT_OK, err_p)
+        self.assertEqual(len(created_limiters), 1)
+        self.assertEqual(created_limiters[0].limit, 2)
+        self.assertGreaterEqual(created_limiters[0].max_active, 1)
+        self.assertLessEqual(created_limiters[0].max_active, 2)
+        self.assertEqual(created_limiters[0].active, 0)
+        self.assertEqual(
+            concurrent_pairs,
+            {("CARD-1", "CARD-2"), ("CARD-1", "CARD-3"), ("CARD-2", "CARD-3")},
+        )
+
+        s_by_id = {o["card_id"]: o for o in out_s["outcomes"]}
+        p_by_id = {o["card_id"]: o for o in out_p["outcomes"]}
+        self.assertEqual(set(s_by_id.keys()), {"CARD-1", "CARD-2", "CARD-3"})
+        self.assertEqual(set(p_by_id.keys()), {"CARD-1", "CARD-2", "CARD-3"})
+
+        branch_names = par_toy.git.branches("openfarm/*")
+
+        for cid in ("CARD-1", "CARD-2", "CARD-3"):
+            self.assertEqual(s_by_id[cid]["final_state"], "in-review")
+            self.assertEqual(p_by_id[cid]["final_state"], "in-review")
+            s_dossier = read_json(
+                Path(s_by_id[cid]["dossier_path"]).with_suffix(".json")
+            )
+            p_dossier = read_json(
+                Path(p_by_id[cid]["dossier_path"]).with_suffix(".json")
+            )
+            self.assertEqual(s_dossier["1_risk"]["unformatted"], [])
+            self.assertEqual(p_dossier["1_risk"]["unformatted"], [])
+            self.assertTrue(p_dossier["2_gates"])
+            self.assertTrue(
+                all(g["result"] == "pass" for g in p_dossier["2_gates"]),
+                p_dossier["2_gates"],
+            )
+            self.assertEqual(
+                [(g["name"], g["result"]) for g in s_dossier["2_gates"]],
+                [(g["name"], g["result"]) for g in p_dossier["2_gates"]],
+            )
+            self.assertEqual(s_dossier["9_diffs"], p_dossier["9_diffs"])
+
+            matching = [b for b in branch_names if b.startswith(f"openfarm/{cid}-")]
+            self.assertEqual(len(matching), 1, branch_names)
+            self._verify_branch_cargo_gates(par_toy.root, matching[0])
+
+    def test_overlapping_touches_rust_cards_never_run_concurrently(self) -> None:
+        self.assertTrue(cargo_available(), "cargo is required when OPENFARM_E2E=1")
+        toy, script = _setup_three_module_rust_toy(
+            concurrent_cards=3, concurrent_builds=2
+        )
+        self.addCleanup(toy.cleanup)
+
+        c2_path = toy.root / "cards" / "CARD-2.md"
+        c2_raw = c2_path.read_text(encoding="utf-8")
+        c2_path.write_text(
+            c2_raw.replace('touches = ["src/beta.rs"]', 'touches = ["src/*.rs"]'),
+            encoding="utf-8",
+        )
+        toy.commit("CARD-2 glob touches overlapping CARD-1 and CARD-3")
+
+        script_dir = Path(tempfile.mkdtemp(prefix="openfarm-rust-script-"))
+        self.addCleanup(shutil.rmtree, script_dir, True)
+        script_path = script_dir / "script.json"
+        script_path.write_text(json.dumps(script), encoding="utf-8")
+
+        from openfarm_core import flow as flow_mod
+
+        lock = threading.Lock()
+        active_impl: set[str] = set()
+        concurrent_pairs: set[tuple[str, str]] = set()
+        barrier = threading.Barrier(2, timeout=30.0)
+        orig_phase_b = flow_mod.CardRun._step_phase_b
+
+        def tracked_phase_b(self_run, *args, **kwargs):
+            with lock:
+                for other in active_impl:
+                    concurrent_pairs.add(tuple(sorted((self_run.card.id, other))))
+                active_impl.add(self_run.card.id)
+            if self_run.card.id in ("CARD-1", "CARD-3"):
+                barrier.wait()
+            try:
+                return orig_phase_b(self_run, *args, **kwargs)
+            finally:
+                with lock:
+                    active_impl.discard(self_run.card.id)
+
+        flow_mod.CardRun._step_phase_b = tracked_phase_b
+        self.addCleanup(setattr, flow_mod.CardRun, "_step_phase_b", orig_phase_b)
+
+        code, out, err = _run_cli(
+            toy.root, "run", "--cards", "3", "--script", str(script_path)
+        )
+        self.assertEqual(code, EXIT_OK, err)
+        self.assertEqual(
+            {o["card_id"]: o["final_state"] for o in out["outcomes"]},
+            {"CARD-1": "in-review", "CARD-2": "in-review", "CARD-3": "in-review"},
+        )
+        self.assertNotIn(("CARD-1", "CARD-2"), concurrent_pairs)
+        self.assertNotIn(("CARD-2", "CARD-3"), concurrent_pairs)
+        self.assertIn(("CARD-1", "CARD-3"), concurrent_pairs)
 
 
 if __name__ == "__main__":
