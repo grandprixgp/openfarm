@@ -119,6 +119,17 @@ def _install_bin_shim(bin_dir: Path, *, dry_run: bool) -> str:
     return str(shim_path)
 
 
+def _login_dir(provider: str, home: Path | None) -> Path:
+    """Claude's and Codex's own folder: `$CLAUDE_CONFIG_DIR` / `$CODEX_HOME` when set.
+
+    An explicit `home` (tests, `--home`) means that home's `.claude` / `.codex`.
+    """
+    from .logins import login_place
+
+    place = login_place(provider, home=Path(home).expanduser().resolve() if home is not None else None)
+    return place.config_dir.expanduser().resolve()
+
+
 def install_skill_bundle(
     target: str = "all",
     dest: Path | None = None,
@@ -149,7 +160,9 @@ def install_skill_bundle(
             claude_root = (
                 explicit_dest
                 if explicit_dest is not None and target == "claude"
-                else (explicit_dest or base_home) / ".claude"
+                else explicit_dest / ".claude"
+                if explicit_dest is not None
+                else _login_dir("claude", home)
             )
             entry["skills"] = _copy_tree(skills_src, claude_root / "skills", dry_run=dry_run)
             entry["commands"] = _copy_tree(
@@ -171,7 +184,9 @@ def install_skill_bundle(
             codex_root = (
                 explicit_dest
                 if explicit_dest is not None and target == "codex"
-                else (explicit_dest or base_home) / ".codex"
+                else explicit_dest / ".codex"
+                if explicit_dest is not None
+                else _login_dir("codex", home)
             )
             entry["skills"] = _copy_tree(
                 skills_src, codex_root / "skills", dry_run=dry_run

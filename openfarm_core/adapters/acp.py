@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Callable
 
 from .. import confine as confine_lib
+from .. import logins
 from ..errors import AdapterError, Infra, Invalid, Refused
 from ..globs import escapes, matches_any, normalise
 
@@ -400,11 +401,20 @@ def _sanitised_env(
     forbidden_files: list[str] | tuple[str, ...] = (),
     provider: str = "claude",
 ) -> tuple[dict[str, str], Path | None]:
-    """Build a sanitised subprocess environment and optional isolated HOME dir."""
+    """Build a sanitised subprocess environment and optional isolated HOME dir.
+
+    The login copied into the isolated home is read from where the provider keeps
+    it (`logins.login_place`: `CLAUDE_CONFIG_DIR` / `CODEX_HOME` first, `$HOME`
+    second), and the child's `CLAUDE_CONFIG_DIR` / `CODEX_HOME` point inside the
+    isolated home, never at the real folders.
+    """
     prov = normalize_acp_provider(provider or "claude")
     source = os.environ if base_env is None else base_env
     orig_home = (extra_env or {}).get("HOME") or source.get("HOME", "")
     allow_oauth = auth_file is None and auth_mode in ("oauth", "auto")
+    login_env = logins.login_env_layer(base_env, extra_env)
+    src_place = logins.login_place(prov, env=login_env)
+    has_login_source = bool(orig_home or src_place.from_env)
 
     def _keep_var(key: str, val: object) -> bool:
         if key in _STRIPPED_ENV_EXACT or key.startswith("ANTIGRAVITY_"):
@@ -452,6 +462,11 @@ def _sanitised_env(
         isolated_home = Path(tempfile.mkdtemp(prefix="openfarm-acp-home-"))
         os.chmod(isolated_home, 0o700)
         _register_isolated_home(isolated_home)
+        # The real login folders are never handed on; the provider's own variable
+        # is set below to the copy inside the isolated home.
+        env.pop("CLAUDE_CONFIG_DIR", None)
+        env.pop("CODEX_HOME", None)
+        env.update(logins.isolated_login_env(prov, isolated_home))
         try:
             if prov == "claude":
                 claude_dir = isolated_home / ".claude"
@@ -488,18 +503,14 @@ def _sanitised_env(
                     os.chmod(helper_path, 0o700)
                     settings["apiKeyHelper"] = str(helper_path)
                 else:
-                    if orig_home and allow_oauth:
-                        creds_src = Path(orig_home) / ".claude" / ".credentials.json"
+                    if has_login_source and allow_oauth:
                         try:
-                            if creds_src.is_file():
-                                creds_dst = claude_dir / ".credentials.json"
-                                shutil.copyfile(creds_src, creds_dst)
-                                os.chmod(creds_dst, 0o600)
+                            logins.copy_in(src_place.credential, claude_dir / ".credentials.json")
                         except OSError:
                             pass
-                        claude_json_src = Path(orig_home) / ".claude.json"
+                        claude_json_src = src_place.meta
                         try:
-                            if claude_json_src.is_file():
+                            if claude_json_src is not None and claude_json_src.is_file():
                                 raw_meta = json.loads(
                                     claude_json_src.read_text(encoding="utf-8")
                                 )
@@ -511,11 +522,16 @@ def _sanitised_env(
                                         if k in raw_meta:
                                             slim_meta[k] = raw_meta[k]
                                     slim_meta["hasCompletedOnboarding"] = True
-                                    claude_json_dst = isolated_home / ".claude.json"
-                                    claude_json_dst.write_text(
-                                        json.dumps(slim_meta) + "\n", encoding="utf-8"
-                                    )
-                                    os.chmod(claude_json_dst, 0o600)
+                                    # $HOME/.claude.json, and the same file inside
+                                    # the folder CLAUDE_CONFIG_DIR names.
+                                    for claude_json_dst in (
+                                        isolated_home / ".claude.json",
+                                        claude_dir / ".claude.json",
+                                    ):
+                                        claude_json_dst.write_text(
+                                            json.dumps(slim_meta) + "\n", encoding="utf-8"
+                                        )
+                                        os.chmod(claude_json_dst, 0o600)
                         except (OSError, ValueError):
                             pass
 
@@ -531,27 +547,18 @@ def _sanitised_env(
                 ag_dir = gemini_dir / "antigravity-cli"
                 ag_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
                 os.chmod(ag_dir, 0o700)
-                if orig_home and allow_oauth:
-                    tok_src = Path(orig_home) / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
+                if has_login_source and allow_oauth:
                     try:
-                        if tok_src.is_file():
-                            tok_dst = ag_dir / "antigravity-oauth-token"
-                            shutil.copyfile(tok_src, tok_dst)
-                            os.chmod(tok_dst, 0o600)
+                        logins.copy_in(src_place.credential, ag_dir / "antigravity-oauth-token")
                     except OSError:
                         pass
             elif prov == "codex":
                 codex_dir = isolated_home / ".codex"
                 codex_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
                 os.chmod(codex_dir, 0o700)
-                env["CODEX_HOME"] = str(codex_dir)
-                if orig_home and allow_oauth:
-                    auth_src = Path(orig_home) / ".codex" / "auth.json"
+                if has_login_source and allow_oauth:
                     try:
-                        if auth_src.is_file():
-                            auth_dst = codex_dir / "auth.json"
-                            shutil.copyfile(auth_src, auth_dst)
-                            os.chmod(auth_dst, 0o600)
+                        logins.copy_in(src_place.credential, codex_dir / "auth.json")
                     except OSError:
                         pass
 
@@ -742,6 +749,7 @@ class ClaudeAcpAdapter:
 
         self.cwd = Path(cwd or Path.cwd())
         self.allowed_root = Path(allowed_root or self.cwd).resolve()
+        self._cred_source: Path | None = None
         self.isolate_home = bool(isolate_home)
         self.auth_file = Path(auth_file) if auth_file is not None else None
         self.auth_mode = str(auth_mode)
@@ -818,6 +826,11 @@ class ClaudeAcpAdapter:
         hold = self._decide_hold("none")
         if self.transport == "server" and hold.refused:
             raise Refused("acp-confine-unavailable", hold.refused)
+        login_place = logins.login_place(
+            self.provider, env=logins.login_env_layer(None, self.extra_env))
+        self._cred_source = login_place.credential
+        if not (self._orig_home or login_place.from_env):
+            self._cred_source = None
         env, isolated_home = _sanitised_env(
             extra_env=self.extra_env,
             isolate_home=self.isolate_home,
@@ -1148,7 +1161,7 @@ class ClaudeAcpAdapter:
             self._isolated_home is None
             or self.auth_file is not None
             or self.auth_mode not in ("oauth", "auto")
-            or not self._orig_home
+            or self._cred_source is None
         ):
             return
         iso_creds = self._isolated_cred_path(self._isolated_home)
@@ -1188,7 +1201,9 @@ class ClaudeAcpAdapter:
                 return
             prefix = ".auth-"
 
-        target = Path(self._orig_home).joinpath(*self._cred_relpath())
+        # Back to the file the login was copied from ($CLAUDE_CONFIG_DIR /
+        # $CODEX_HOME first, $HOME second).
+        target = self._cred_source
         target_dir = target.parent
         if not target_dir.is_dir():
             return

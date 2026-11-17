@@ -17,6 +17,7 @@ import tomllib
 from pathlib import Path
 
 from . import confine as confine_lib
+from . import logins
 from .adapters.acp import (
     ACP_PROVIDERS,
     ClaudeAcpAdapter,
@@ -39,15 +40,18 @@ def _safe_claude_auth_status(
     *,
     home: Path,
     timeout_s: float = 5.0,
+    config_dir: Path | None = None,
 ) -> dict:
     """Query `claude auth status` while stripping personal email/org fields."""
     env = {
         k: v
         for k, v in os.environ.items()
-        if k not in ("CLAUDECODE", "ANTHROPIC_AUTH_TOKEN", "AI_AGENT")
+        if k not in ("CLAUDECODE", "ANTHROPIC_AUTH_TOKEN", "AI_AGENT", "CLAUDE_CONFIG_DIR")
         and not k.startswith("CLAUDE_CODE_")
     }
     env["HOME"] = str(home)
+    if config_dir is not None:
+        env["CLAUDE_CONFIG_DIR"] = str(config_dir)
     try:
         proc = subprocess.run(
             [claude_bin, "auth", "status"],
@@ -92,6 +96,7 @@ def _safe_codex_auth_status(
     *,
     home: Path,
     timeout_s: float = 5.0,
+    codex_home: Path | None = None,
 ) -> dict:
     """Query `codex login status` without leaking email/account identifiers."""
     env = {
@@ -100,7 +105,7 @@ def _safe_codex_auth_status(
         if k not in ("OPENAI_API_KEY", "CODEX_HOME")
     }
     env["HOME"] = str(home)
-    env["CODEX_HOME"] = str(home / ".codex")
+    env["CODEX_HOME"] = str(codex_home if codex_home is not None else home / ".codex")
     try:
         proc = subprocess.run(
             [codex_bin, "login", "status"],
@@ -147,6 +152,7 @@ def _inspect_single_provider(
     *,
     resolved_home: Path,
     source_env: dict[str, str] | os._Environ[str],
+    place: logins.LoginPlace | None = None,
     claude_bin: str | None = None,
     acp_bin: str | None = None,
     agy_bin: str | None = None,
@@ -157,12 +163,14 @@ def _inspect_single_provider(
     if provider == "claude":
         resolved_claude = claude_bin if claude_bin is not None else (shutil.which("claude") or "")
         resolved_acp = acp_bin if acp_bin is not None else (shutil.which("claude-agent-acp") or "")
-        creds_file = resolved_home / ".claude" / ".credentials.json"
+        place = place or logins.login_place("claude", env={}, home=resolved_home)
+        creds_file = place.credential
         creds_present = creds_file.is_file()
         creds_mode = oct(stat.S_IMODE(creds_file.stat().st_mode)) if creds_present else None
         oauth_token_env = bool(str(source_env.get("CLAUDE_CODE_OAUTH_TOKEN") or "").strip())
         cli_status = (
-            _safe_claude_auth_status(resolved_claude, home=resolved_home)
+            _safe_claude_auth_status(resolved_claude, home=resolved_home,
+                                     config_dir=place.config_dir if place.from_env else None)
             if resolved_claude
             else {"available": False, "loggedIn": False}
         )
@@ -192,6 +200,7 @@ def _inspect_single_provider(
             "oauth_token_env": oauth_token_env,
             "credentials_file_present": creds_present,
             "credentials_mode": creds_mode,
+            "credentials_from": place.from_env or "HOME",
             "cli_auth": cli_status,
         }
 
@@ -202,7 +211,8 @@ def _inspect_single_provider(
             if antigravity_acp_bin is not None
             else (shutil.which("antigravity-acp") or "")
         )
-        token_file = resolved_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
+        place = place or logins.login_place("antigravity", env={}, home=resolved_home)
+        token_file = place.credential
         token_present = token_file.is_file()
         token_nonempty = False
         token_mode = None
@@ -253,7 +263,8 @@ def _inspect_single_provider(
     resolved_acp = (
         codex_acp_bin if codex_acp_bin is not None else (shutil.which("codex-acp") or "")
     )
-    auth_file = resolved_home / ".codex" / "auth.json"
+    place = place or logins.login_place("codex", env={}, home=resolved_home)
+    auth_file = place.credential
     auth_present = auth_file.is_file()
     auth_nonempty = False
     auth_mode = None
@@ -266,7 +277,7 @@ def _inspect_single_provider(
             auth_present = False
     api_key_env = bool(str(source_env.get("OPENAI_API_KEY") or "").strip())
     cli_status = (
-        _safe_codex_auth_status(resolved_codex, home=resolved_home)
+        _safe_codex_auth_status(resolved_codex, home=resolved_home, codex_home=place.config_dir)
         if resolved_codex
         else {"available": False, "loggedIn": False}
     )
@@ -295,6 +306,7 @@ def _inspect_single_provider(
         "api_key_env": api_key_env,
         "credentials_file_present": auth_present,
         "credentials_mode": auth_mode,
+        "credentials_from": place.from_env or "HOME",
         "cli_auth": cli_status,
     }
 
@@ -317,6 +329,9 @@ def inspect_acp_status(
         Path(home).expanduser().resolve() if home is not None else Path.home().resolve()
     )
     source_env = os.environ if env is None else env
+    # Where each login lives: the environment first, $HOME second; an explicit
+    # `home` without an explicit `env` looks in that home only.
+    login_env = None if (env is None and home is None) else (dict(env) if env is not None else None)
 
     cfg: Config | None = None
     repo_provider = "claude"
@@ -346,6 +361,9 @@ def inspect_acp_status(
             item,
             resolved_home=resolved_home,
             source_env=source_env,
+            place=logins.login_place(
+                item, env=login_env,
+                home=resolved_home if home is not None else None),
             claude_bin=claude_bin,
             acp_bin=acp_bin,
             agy_bin=agy_bin,
@@ -501,7 +519,11 @@ def run_acp_login(
         Path(home).expanduser().resolve() if home is not None else None
     )
     if resolved_home is not None:
+        # An explicit home decides where the login goes, not this process's
+        # CLAUDE_CONFIG_DIR / CODEX_HOME.
         env["HOME"] = str(resolved_home)
+        env.pop("CLAUDE_CONFIG_DIR", None)
+        env.pop("CODEX_HOME", None)
 
     if prov == "antigravity":
         resolved_agy = agy_bin if agy_bin is not None else shutil.which("agy")
