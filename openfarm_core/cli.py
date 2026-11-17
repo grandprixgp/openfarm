@@ -14,10 +14,13 @@ Every command takes `--json` and then prints its result as one JSON object on st
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
+import contextlib
 import datetime as _dt
 import json
 import re
 import sys
+import threading
 import time as _time
 from pathlib import Path
 
@@ -35,7 +38,7 @@ from .board import Board, VALID_POST_KINDS, board_dir_for
 from .adapters.files import FileCardSource, open_card_source
 from .adapters.jsonl import TelemetrySink, open_telemetry
 from .adapters.openai_compat import open_backend
-from .adapters.direct import open_runner
+from .adapters.direct import BuildLimiter, open_runner
 from .bootstrap import (
     INSTALL_TARGETS,
     MUTATION_MODES,
@@ -60,9 +63,10 @@ from .harness_memory import HarnessLibrary
 from .harness_scope import project_markers
 from .micromanager import MicromanagerBudget, open_micromanager
 from .packs.base import pack_for
-from .state import (StateDir, _safe_id, read_json, utc_now, utc_after,
-                    write_json)
+from .state import (StateDir, _safe_id, baseline_lock_for, read_json, utc_now,
+                    utc_after, write_json)
 from .swarm import (
+    cards_collide,
     parse_team_spec,
     swarm_block,
     swarm_hint,
@@ -106,8 +110,11 @@ class Context:
             source.worktree = worktree
         return source
 
-    def runner(self, worktree: Path, output_dir: Path | None = None):
-        return open_runner(self.cfg, worktree, output_dir)
+    def runner(self, worktree: Path, output_dir: Path | None = None,
+               limiter: BuildLimiter | None = None, budget=None):
+        return open_runner(
+            self.cfg, worktree, output_dir, limiter=limiter, budget=budget
+        )
 
 
 def _check_id(value: str, what: str = "card id") -> str:
@@ -240,6 +247,13 @@ def _baseline_check(ctx: Context, source: FileCardSource, card: Card) -> dict:
             base_commit or "unknown", unit or "workspace",
             ctx.cfg.known_failing_hash(), ctx.cfg.env_hash(unit),
         )
+        cache_lock = (
+            baseline_lock_for(cache_path) if ctx.cfg.baseline_cache else None
+        )
+        lock_held = False
+        if cache_lock is not None:
+            cache_lock.acquire()
+            lock_held = True
         cached = read_json(cache_path) if ctx.cfg.baseline_cache else None
         if not (isinstance(cached, dict)
                 and cached.get("known_failing_hash") == ctx.cfg.known_failing_hash()
@@ -278,6 +292,9 @@ def _baseline_check(ctx: Context, source: FileCardSource, card: Card) -> dict:
                     "env_hash": ctx.cfg.env_hash(unit),
                     "agreed": True, "list": listing, "at": utc_now(),
                 })
+        if lock_held and cache_lock is not None:
+            cache_lock.release()
+            lock_held = False
 
         if not card.test_names:
             return {"ok": True, "class": "pass", "named": {},
@@ -312,6 +329,8 @@ def _baseline_check(ctx: Context, source: FileCardSource, card: Card) -> dict:
             "passing_on_base": passing,
         }
     finally:
+        if lock_held and cache_lock is not None:
+            cache_lock.release()
         git.worktree_remove(worktree)
 
 
@@ -426,61 +445,213 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
                 added_by="system",
             )
 
-    try:
-        for card_id in identifiers:
-            if ctx.state.kill_requested(cfg.kill_switch):
-                # Cards in flight were stopped by CardRun itself, which blocks them with
-                # `killed`. A card not yet claimed is simply left alone.
-                outcomes.append({"card": card_id,
-                                 "skipped": "the kill switch was set"})
-                break
-            # A pause stops new claims, and cards already in flight finish their attempt:
-            # that is the spec's rule, and it is checked here rather than only at entry so
-            # `openfarm pause` means something during a night.
-            if ctx.state.is_paused():
-                outcomes.append({"card": card_id,
-                                 "skipped": "the queue was paused"})
-                continue
-            # `_deadline` answers in `time.monotonic()`, so it must be compared to the
-            # same clock. Comparing it to `time.time()` would skip every card at once.
-            if deadline is not None and _time.monotonic() >= deadline:
-                outcomes.append({"card": card_id,
-                                 "skipped": "the run's time ran out"})
-                continue
-            reason = night.exhausted()
-            if reason:
-                outcomes.append({"card": card_id, "skipped": reason})
-                continue
-            ctx.state.check_disk_space(getattr(cfg, "min_free_mb", 0))
-            if args.dry_run:
-                outcomes.append(_dry_run(ctx, source, card_id))
-                continue
+    swarm_parallel = bool(
+        swarm_cfg is not None and swarm_cfg.enabled and not args.dry_run
+    )
+    shared_mm_backend = None
+    if (
+        swarm_parallel
+        and mm_script_path is None
+        and getattr(cfg, "concurrent_cards", 1) > 1
+        and swarm_cfg.supervisor == "config"
+        and cfg.micromanager_adapter.lower() in ("claude-acp", "acp", "claude")
+        and getattr(getattr(cfg, "micromanager", None), "mode", "active") != "off"
+    ):
+        shared_mm = open_micromanager(
+            cfg, ctx.state.root, ctx.repo, worktree=ctx.repo, budget=night_mm_budget
+        )
+        shared_mm_backend = getattr(shared_mm, "backend", None)
+    build_limiter = (
+        BuildLimiter(getattr(cfg, "concurrent_builds", 2))
+        if swarm_parallel
+        else None
+    )
 
-            outcome = _run_card(ctx, source, card_id, run_id, telemetry,
-                                run_dir, script_path, mm_script=mm_script_path,
-                                harness_library=harness_lib,
-                                mm_budget=night_mm_budget, board=board)
-            outcomes.append(outcome)
-            final_state = outcome.get("final_state")
-            if final_state == "blocked":
-                code = outcome.get("stop_code", "")
-                consecutive.append((card_id, code, outcome.get("detail", "")))
-                if code == StopCode.INFRA.value:
-                    ctx.state.pause(
-                        f"infra error on {card_id}: {outcome.get('detail', '')}")
-                    night.note_card()
-                    night.note_spend(outcome.get("spend", 0.0) or 0.0)
-                    night.note_micromanager(
-                        outcome.get("micromanager_spend", 0.0) or 0.0)
-                    _update_breaker(ctx, consecutive)
+    try:
+        if not swarm_parallel:
+            for card_id in identifiers:
+                if ctx.state.kill_requested(cfg.kill_switch):
+                    # Cards in flight were stopped by CardRun itself, which blocks them with
+                    # `killed`. A card not yet claimed is simply left alone.
+                    outcomes.append({"card": card_id,
+                                     "skipped": "the kill switch was set"})
                     break
-            elif final_state != "released":
-                consecutive = []
-            night.note_card()
-            night.note_spend(outcome.get("spend", 0.0) or 0.0)
-            night.note_micromanager(outcome.get("micromanager_spend", 0.0) or 0.0)
-            _update_breaker(ctx, consecutive)
+                # A pause stops new claims, and cards already in flight finish their attempt:
+                # that is the spec's rule, and it is checked here rather than only at entry so
+                # `openfarm pause` means something during a night.
+                if ctx.state.is_paused():
+                    outcomes.append({"card": card_id,
+                                     "skipped": "the queue was paused"})
+                    continue
+                # `_deadline` answers in `time.monotonic()`, so it must be compared to the
+                # same clock. Comparing it to `time.time()` would skip every card at once.
+                if deadline is not None and _time.monotonic() >= deadline:
+                    outcomes.append({"card": card_id,
+                                     "skipped": "the run's time ran out"})
+                    continue
+                reason = night.exhausted()
+                if reason:
+                    outcomes.append({"card": card_id, "skipped": reason})
+                    continue
+                ctx.state.check_disk_space(getattr(cfg, "min_free_mb", 0))
+                if args.dry_run:
+                    outcomes.append(_dry_run(ctx, source, card_id))
+                    continue
+
+                outcome = _run_card(ctx, source, card_id, run_id, telemetry,
+                                    run_dir, script_path, mm_script=mm_script_path,
+                                    harness_library=harness_lib,
+                                    mm_budget=night_mm_budget, board=board)
+                outcomes.append(outcome)
+                final_state = outcome.get("final_state")
+                if final_state == "blocked":
+                    code = outcome.get("stop_code", "")
+                    consecutive.append((card_id, code, outcome.get("detail", "")))
+                    if code == StopCode.INFRA.value:
+                        ctx.state.pause(
+                            f"infra error on {card_id}: {outcome.get('detail', '')}")
+                        night.note_card()
+                        night.note_spend(outcome.get("spend", 0.0) or 0.0)
+                        night.note_micromanager(
+                            outcome.get("micromanager_spend", 0.0) or 0.0)
+                        _update_breaker(ctx, consecutive)
+                        break
+                elif final_state != "released":
+                    consecutive = []
+                night.note_card()
+                night.note_spend(outcome.get("spend", 0.0) or 0.0)
+                night.note_micromanager(outcome.get("micromanager_spend", 0.0) or 0.0)
+                _update_breaker(ctx, consecutive)
+        else:
+            max_workers = max(1, int(getattr(cfg, "concurrent_cards", 1) or 1))
+            card_map: dict[str, Card] = {}
+            for cid in identifiers:
+                try:
+                    card_map[cid] = Card.from_dict(source.read(cid)["card"])
+                except AdapterError:
+                    card_map[cid] = Card(id=cid, title="", state="ready", done_text="")
+
+            pending = list(identifiers)
+            in_flight: dict[concurrent.futures.Future, str] = {}
+            outcomes_by_card: dict[str, dict] = {}
+            stop_launching = False
+
+            def _can_launch(cid: str) -> bool:
+                cand = card_map.get(cid)
+                for active_cid in in_flight.values():
+                    active_card = card_map.get(active_cid)
+                    if cand is not None and active_card is not None:
+                        if cards_collide(cand, active_card):
+                            return False
+                return True
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+                while pending or in_flight:
+                    if not stop_launching:
+                        remaining_next: list[str] = []
+                        for idx, cid in enumerate(pending):
+                            if len(in_flight) >= max_workers:
+                                remaining_next.extend(pending[idx:])
+                                break
+                            if ctx.state.kill_requested(cfg.kill_switch):
+                                outcomes_by_card[cid] = {
+                                    "card": cid, "skipped": "the kill switch was set"
+                                }
+                                for rest_cid in pending[idx + 1:]:
+                                    outcomes_by_card[rest_cid] = {
+                                        "card": rest_cid, "skipped": "the kill switch was set"
+                                    }
+                                stop_launching = True
+                                remaining_next = []
+                                break
+                            if ctx.state.is_paused():
+                                outcomes_by_card[cid] = {
+                                    "card": cid, "skipped": "the queue was paused"
+                                }
+                                continue
+                            if deadline is not None and _time.monotonic() >= deadline:
+                                outcomes_by_card[cid] = {
+                                    "card": cid, "skipped": "the run's time ran out"
+                                }
+                                continue
+                            reason = night.exhausted()
+                            if reason or (
+                                night.cards_cap is not None
+                                and (night.cards_claimed + len(in_flight)) >= night.cards_cap
+                            ):
+                                skip_msg = (
+                                    reason or f"{night.cards_cap} cards claimed, the run's cap"
+                                )
+                                outcomes_by_card[cid] = {"card": cid, "skipped": skip_msg}
+                                continue
+                            if not _can_launch(cid):
+                                remaining_next.append(cid)
+                                continue
+                            ctx.state.check_disk_space(getattr(cfg, "min_free_mb", 0))
+                            fut = pool.submit(
+                                _run_card,
+                                ctx,
+                                source,
+                                cid,
+                                run_id,
+                                telemetry,
+                                run_dir,
+                                script_path,
+                                mm_script=mm_script_path,
+                                harness_library=harness_lib,
+                                mm_budget=night_mm_budget,
+                                board=board,
+                                build_limiter=build_limiter,
+                                mm_backend=shared_mm_backend,
+                            )
+                            in_flight[fut] = cid
+                        pending = remaining_next
+                    else:
+                        for cid in pending:
+                            outcomes_by_card.setdefault(
+                                cid, {"card": cid, "skipped": "run stopped"}
+                            )
+                        pending = []
+
+                    if not in_flight:
+                        if pending:
+                            break
+                        continue
+
+                    done_futs, _ = concurrent.futures.wait(
+                        in_flight.keys(), return_when=concurrent.futures.FIRST_COMPLETED
+                    )
+                    for fut in done_futs:
+                        cid = in_flight.pop(fut)
+                        outcome = fut.result()
+                        outcomes_by_card[cid] = outcome
+                        final_state = outcome.get("final_state")
+                        if final_state == "blocked":
+                            code = outcome.get("stop_code", "")
+                            consecutive.append((cid, code, outcome.get("detail", "")))
+                            if code == StopCode.INFRA.value:
+                                ctx.state.pause(
+                                    f"infra error on {cid}: {outcome.get('detail', '')}"
+                                )
+                                stop_launching = True
+                        elif final_state != "released":
+                            consecutive = []
+                        night.note_card()
+                        night.note_spend(outcome.get("spend", 0.0) or 0.0)
+                        night.note_micromanager(
+                            outcome.get("micromanager_spend", 0.0) or 0.0
+                        )
+                        _update_breaker(ctx, consecutive)
+
+            outcomes = [
+                outcomes_by_card[cid] for cid in identifiers if cid in outcomes_by_card
+            ]
     finally:
+        if shared_mm_backend is not None and hasattr(shared_mm_backend, "close"):
+            try:
+                shared_mm_backend.close()
+            except Exception as exc:
+                print(f"micromanager close error ignored: {exc}", file=sys.stderr)
         if board is not None:
             board.end_run("finished")
 
@@ -489,7 +660,7 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
         notes.append(
             "the backend reports no prices, so every spend is zero and the spend "
             "caps cannot fire: set [model] cost_per_1k_in and cost_per_1k_out")
-    if cfg.concurrent_cards > 1:
+    if cfg.concurrent_cards > 1 and not swarm_parallel:
         notes.append(
             f"concurrent_cards is {cfg.concurrent_cards} but cards run one at a "
             f"time: the per-card state is ready for a pool, the loop is not")
@@ -591,7 +762,9 @@ def _run_card(ctx: Context, source: FileCardSource, card_id: str, run_id: str,
               micromanager=None,
               harness_library: HarnessLibrary | None = None,
               mm_budget: MicromanagerBudget | None = None,
-              board: Board | None = None) -> dict:
+              board: Board | None = None,
+              build_limiter: BuildLimiter | None = None,
+              mm_backend=None) -> dict:
     """Claim one card and drive it. `backend` overrides the configured one."""
     cfg = ctx.cfg
     holder = f"openfarm:{run_id}"
@@ -619,15 +792,17 @@ def _run_card(ctx: Context, source: FileCardSource, card_id: str, run_id: str,
     owns_backend = backend is None
     backend = backend if backend is not None else open_backend(cfg, script)
     runner = ctx.runner(worktree, output_dir=card_dir / "gates" / "output")
+    if build_limiter is not None and hasattr(runner, "limiter") and runner.limiter is None:
+        runner.limiter = build_limiter
     book = BriefBook(worktree, cfg.never_touch, cfg.forbidden_files)
     book.pack = pack
     conventions = _load_test_conventions(cfg, worktree)
 
-    owns_mm = micromanager is None
+    owns_mm = micromanager is None and mm_backend is None
     mm = (micromanager if micromanager is not None else open_micromanager(
         cfg, card_dir, ctx.repo, script=mm_script,
-        worktree=worktree, card_dir=card_dir,
-        board=board, worker_backend=backend,
+        worktree=worktree, card_dir=card_dir, budget=mm_budget,
+        board=board, worker_backend=backend, backend_override=mm_backend,
     ))
     if mm_budget is not None and hasattr(mm, "budget"):
         mm.budget = mm_budget

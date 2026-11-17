@@ -7,10 +7,12 @@ core never guesses it from output.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import shlex
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -82,21 +84,74 @@ class RunResult:
         return f"RunResult({self.kind!r}, {self.cls}, exit={self.exit_code})"
 
 
+class BuildLimiter:
+    """Semaphore capping concurrent runner builds across parallel cards."""
+
+    def __init__(self, limit: int) -> None:
+        cap = int(limit or 0)
+        self.limit = cap
+        self._sem = threading.Semaphore(cap) if cap > 0 else None
+        self._lock = threading.Lock()
+        self.active = 0
+        self.max_active = 0
+
+    @contextlib.contextmanager
+    def slot(self, budget=None):
+        if self._sem is not None:
+            pause_cm = (
+                budget.pause_clock()
+                if budget is not None and hasattr(budget, "pause_clock")
+                else contextlib.nullcontext()
+            )
+            with pause_cm:
+                self._sem.acquire()
+        try:
+            with self._lock:
+                self.active += 1
+                if self.active > self.max_active:
+                    self.max_active = self.active
+            yield
+        finally:
+            with self._lock:
+                self.active = max(0, self.active - 1)
+            if self._sem is not None:
+                self._sem.release()
+
+
+def _with_limiter(method):
+    """Acquire `self.limiter.slot(self.budget)` around a runner method when set."""
+
+    def wrapper(self, *args, **kwargs):
+        limiter = getattr(self, "limiter", None)
+        if limiter is not None:
+            with limiter.slot(getattr(self, "budget", None)):
+                return method(self, *args, **kwargs)
+        return method(self, *args, **kwargs)
+
+    return wrapper
+
+
 class DirectRunner:
     """`cargo` or `npm`/`pnpm` run directly, with its own infra classification."""
 
     name = "direct"
 
     def __init__(self, repo: Path, timeout_s: float = 1800.0,
-                 output_dir: Path | None = None) -> None:
+                 output_dir: Path | None = None,
+                 limiter: BuildLimiter | None = None,
+                 budget=None) -> None:
         self.repo = Path(repo)
         self.timeout_s = timeout_s
         self.output_dir = Path(output_dir) if output_dir else None
+        self.limiter = limiter
+        self.budget = budget
         self._call = 0
+        self._save_lock = threading.Lock()
 
     def hello(self) -> dict:
         return {"name": self.name, "versions": [1], "ops": ["hello", "exec"]}
 
+    @_with_limiter
     def exec(self, kind: str, argv: list[str], cwd: Path | None = None,
              target_dir: Path | None = None, unit: str = "",
              env: dict[str, str] | None = None,
@@ -163,13 +218,14 @@ class DirectRunner:
               stderr: str) -> tuple[Path | None, Path | None]:
         if self.output_dir is None:
             return None, None
-        self._call += 1
-        stem = f"{self._call:03d}-{kind}"
-        out_path = self.output_dir / f"{stem}.stdout.txt"
-        err_path = self.output_dir / f"{stem}.stderr.txt"
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(stdout)
-        err_path.write_text(stderr)
+        with self._save_lock:
+            self._call += 1
+            stem = f"{self._call:03d}-{kind}"
+            out_path = self.output_dir / f"{stem}.stdout.txt"
+            err_path = self.output_dir / f"{stem}.stderr.txt"
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(stdout)
+            err_path.write_text(stderr)
         return out_path, err_path
 
 
@@ -178,16 +234,20 @@ class CmdRunner:
 
     name = "cmd"
 
-    def __init__(self, spec: str, repo: Path, timeout_s: float = 3600.0) -> None:
+    def __init__(self, spec: str, repo: Path, timeout_s: float = 3600.0,
+                 limiter: BuildLimiter | None = None, budget=None) -> None:
         from ..protocol import CmdAdapter
         self.adapter = CmdAdapter(spec, repo, timeout_s=timeout_s)
         self.repo = Path(repo)
         self.timeout_s = timeout_s
+        self.limiter = limiter
+        self.budget = budget
 
     def hello(self) -> dict:
         result = self.adapter.hello("runner", {"exec"})
         return result
 
+    @_with_limiter
     def exec(self, kind: str, argv: list[str], cwd: Path | None = None,
              target_dir: Path | None = None, unit: str = "",
              env: dict[str, str] | None = None,
@@ -231,11 +291,13 @@ def _decode_output(data) -> str:
     return str(data)
 
 
-def open_runner(cfg, worktree: Path, output_dir: Path | None = None):
+def open_runner(cfg, worktree: Path, output_dir: Path | None = None,
+                limiter: BuildLimiter | None = None, budget=None):
     """The runner the config names."""
     spec = cfg.runner_adapter
     if spec == "direct":
-        return DirectRunner(worktree, output_dir=output_dir)
+        return DirectRunner(worktree, output_dir=output_dir,
+                            limiter=limiter, budget=budget)
     if spec.startswith("cmd:"):
-        return CmdRunner(spec, worktree)
+        return CmdRunner(spec, worktree, limiter=limiter, budget=budget)
     raise Invalid("bad-runner", f"{spec!r} is not a runner adapter")

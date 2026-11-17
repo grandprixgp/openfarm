@@ -592,6 +592,43 @@ class Board:
             self._save_members_unlocked(members)
             return dict(member)
 
+    def add_member_usage(
+        self,
+        name: str,
+        *,
+        tokens_in: int = 0,
+        tokens_out: int = 0,
+        calls: int = 0,
+        attempts: int = 0,
+        effort: str = "",
+    ) -> dict:
+        """Atomically increment member usage counters under the board lock."""
+        with self._locked():
+            members = self._load_members_unlocked()
+            if name not in members:
+                raise Refused("unknown-member", f"unknown board member {name!r}")
+            member = dict(members[name])
+            new_in = int(member.get("tokens_in", 0) or 0) + int(tokens_in or 0)
+            new_out = int(member.get("tokens_out", 0) or 0) + int(tokens_out or 0)
+            new_calls = int(member.get("calls", 0) or 0) + int(calls or 0)
+            new_attempts = max(
+                0, int(member.get("attempts", 0) or 0) + int(attempts or 0)
+            )
+            by_eff = dict(member.get("tokens_by_effort") or {})
+            eff_key = str(effort or "none")
+            by_eff[eff_key] = (
+                int(by_eff.get(eff_key, 0) or 0) + int(tokens_in or 0) + int(tokens_out or 0)
+            )
+            member["tokens_in"] = new_in
+            member["tokens_out"] = new_out
+            member["tokens"] = new_in + new_out
+            member["calls"] = new_calls
+            member["attempts"] = new_attempts
+            member["tokens_by_effort"] = by_eff
+            members[name] = member
+            self._save_members_unlocked(members)
+            return dict(member)
+
     def list_members(self, include_removed: bool = False) -> list[dict]:
         if not self.board_dir.exists():
             return []

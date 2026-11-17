@@ -16,6 +16,7 @@ import math
 import os
 import re
 import tempfile
+import threading
 import unicodedata
 from pathlib import Path
 from typing import NamedTuple
@@ -25,6 +26,19 @@ from .globs import escapes, matches_any, normalise
 from .harness_global import GlobalLibrary, should_promote, should_veto
 from .harness_scope import global_eligibility, scope_of
 from .state import _safe_id, append_jsonl, read_json, utc_now
+
+_HARNESS_LOCKS_GUARD = threading.Lock()
+_HARNESS_LOCKS: dict[Path, threading.RLock] = {}
+
+
+def _harness_thread_lock(root: Path) -> threading.RLock:
+    key = Path(root).resolve()
+    with _HARNESS_LOCKS_GUARD:
+        lock = _HARNESS_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _HARNESS_LOCKS[key] = lock
+        return lock
 
 EDITABLE_SURFACES: tuple[str, ...] = (
     "test_writer_guidance",
@@ -1135,7 +1149,7 @@ class HarnessLibrary:
         self.revisions_dir = self.harness_dir / "revisions"
         self.entries_dir = self.harness_dir / "entries"
         self._lock_path = self.harness_dir / ".lock"
-        self._lock_depth = 0
+        self._local = threading.local()
         self.ledger = HarnessLedger(
             self.harness_dir,
             window_size=max(3, int(self.harness_cfg.probe_window) * 2),
@@ -1144,23 +1158,26 @@ class HarnessLibrary:
 
     @contextlib.contextmanager
     def _locked(self):
-        """Acquire an advisory flock around read-modify-write harness mutations (reentrant)."""
-        if self._lock_depth > 0:
-            self._lock_depth += 1
-            try:
-                yield
-            finally:
-                self._lock_depth -= 1
-            return
-        self.harness_dir.mkdir(parents=True, exist_ok=True)
-        with open(self._lock_path, "a+", encoding="utf-8") as lock_handle:
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
-            self._lock_depth += 1
-            try:
-                yield
-            finally:
-                self._lock_depth -= 1
-                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        """Acquire a per-root thread RLock outside advisory flock (reentrant)."""
+        tlock = _harness_thread_lock(self.harness_dir)
+        with tlock:
+            depth = int(getattr(self._local, "depth", 0) or 0)
+            if depth > 0:
+                self._local.depth = depth + 1
+                try:
+                    yield
+                finally:
+                    self._local.depth = depth
+                return
+            self.harness_dir.mkdir(parents=True, exist_ok=True)
+            with self._lock_path.open("a+", encoding="utf-8") as lock_handle:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+                self._local.depth = 1
+                try:
+                    yield
+                finally:
+                    self._local.depth = 0
+                    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
 
     @staticmethod
     def _resolve_harness_cfg(config):

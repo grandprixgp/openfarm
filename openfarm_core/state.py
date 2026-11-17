@@ -10,11 +10,51 @@ import datetime as _dt
 import json
 import os
 import shutil
+import tempfile
+import threading
 from pathlib import Path
 
 from .errors import Infra, Invalid
 
 SCHEMA_VERSION = 1
+
+_APPEND_LOCKS_GUARD = threading.Lock()
+_APPEND_LOCKS: dict[Path, threading.Lock] = {}
+_BREAKER_LOCKS_GUARD = threading.Lock()
+_BREAKER_LOCKS: dict[Path, threading.Lock] = {}
+_BASELINE_LOCKS_GUARD = threading.Lock()
+_BASELINE_LOCKS: dict[Path, threading.RLock] = {}
+
+
+def _append_lock_for(path: Path) -> threading.Lock:
+    key = Path(path).resolve()
+    with _APPEND_LOCKS_GUARD:
+        lock = _APPEND_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _APPEND_LOCKS[key] = lock
+        return lock
+
+
+def _breaker_lock_for(root: Path) -> threading.Lock:
+    key = Path(root).resolve()
+    with _BREAKER_LOCKS_GUARD:
+        lock = _BREAKER_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _BREAKER_LOCKS[key] = lock
+        return lock
+
+
+def baseline_lock_for(path: Path) -> threading.RLock:
+    """Return the per-cache-path reentrant lock guarding baseline cache RMW."""
+    key = Path(path).resolve()
+    with _BASELINE_LOCKS_GUARD:
+        lock = _BASELINE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _BASELINE_LOCKS[key] = lock
+        return lock
 
 
 def utc_now() -> str:
@@ -170,16 +210,21 @@ class StateDir:
     # -- breaker --------------------------------------------------------------
 
     def read_breaker(self) -> dict:
-        try:
-            return json.loads(self.breaker.read_text())
-        except (OSError, ValueError):
-            return {"tripped": False, "cards": [], "reason": ""}
+        with _breaker_lock_for(self.root):
+            try:
+                return json.loads(self.breaker.read_text())
+            except (OSError, ValueError):
+                return {"tripped": False, "cards": [], "reason": ""}
 
     def write_breaker(self, tripped: bool, cards: list[str],
                       reason: str = "") -> None:
-        self.breaker.write_text(json.dumps(
-            {"tripped": tripped, "cards": cards, "reason": reason,
-             "at": utc_now()}, indent=2))
+        with _breaker_lock_for(self.root):
+            write_json(self.breaker, {
+                "tripped": tripped,
+                "cards": cards,
+                "reason": reason,
+                "at": utc_now(),
+            })
 
     # -- baseline cache -------------------------------------------------------
 
@@ -225,9 +270,20 @@ def _safe(name: str) -> str:
 def write_json(path: Path, payload) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
-    tmp.replace(path)
+    text = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+        os.replace(tmp_path, path)
+    except BaseException:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+        raise
     return path
 
 
@@ -240,6 +296,9 @@ def read_json(path: Path, default=None):
 
 def append_jsonl(path: Path, record: dict) -> None:
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    line = json.dumps(record, ensure_ascii=False) + "\n"
+    with _append_lock_for(path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(line)
+            handle.flush()

@@ -6,6 +6,7 @@ implementer while attempts remain, with only the diff and the failure output.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import shutil
 from pathlib import Path
@@ -38,7 +39,7 @@ from .roles import (Plan, Roles, parse_answer_edits, build_checker_pass1_brief,
                     build_planner_brief, build_test_writer_brief,
                     parse_counter_tests, parse_handback, parse_plan,
                     parse_restatement, wants_planner)
-from .state import append_jsonl, utc_now, utc_after, write_json
+from .state import append_jsonl, baseline_lock_for, utc_now, utc_after, write_json
 from .swarm import WORKER_ROLES, swarm_set, worker_kind_for_config, worker_member_name
 
 _HARNESS_ISOLATED_STOP_CODES = frozenset({
@@ -152,18 +153,23 @@ class CardRun:
                 mm_backend.heartbeat_fn = self._heartbeat
             if hasattr(mm_backend, "cancel_check") and getattr(mm_backend, "cancel_check", None) is None:
                 mm_backend.cancel_check = cancel_fn
+        if hasattr(self.runner, "budget") and getattr(self.runner, "budget", None) is None:
+            self.runner.budget = self.budget
         if hasattr(self.micromanager, "harness_context"):
             self.micromanager.harness_context = {}
         mm_budget = getattr(self.micromanager, "budget", None)
-        self._mm_start = {
-            "calls": int(getattr(mm_budget, "calls", 0) or 0),
-            "tokens_in": int(getattr(mm_budget, "tokens_in", 0) or 0),
-            "tokens_out": int(getattr(mm_budget, "tokens_out", 0) or 0),
-            "spend": float(getattr(mm_budget, "spend", 0.0) or 0.0),
-            "false_rejects_dismissed": int(
-                getattr(mm_budget, "false_rejects_dismissed", 0) or 0
-            ),
-        }
+        if mm_budget is not None and hasattr(mm_budget, "usage_for"):
+            self._mm_start = dict(mm_budget.usage_for(self.card.id))
+        else:
+            self._mm_start = {
+                "calls": int(getattr(mm_budget, "calls", 0) or 0),
+                "tokens_in": int(getattr(mm_budget, "tokens_in", 0) or 0),
+                "tokens_out": int(getattr(mm_budget, "tokens_out", 0) or 0),
+                "spend": float(getattr(mm_budget, "spend", 0.0) or 0.0),
+                "false_rejects_dismissed": int(
+                    getattr(mm_budget, "false_rejects_dismissed", 0) or 0
+                ),
+            }
 
         if hasattr(self.book, "allowed_extra_reads") and getattr(self.card, "context_files", None):
             self.book.allowed_extra_reads.update(
@@ -383,21 +389,33 @@ class CardRun:
                 "false_rejects_dismissed": 0,
             }
         start = getattr(self, "_mm_start", None) or {}
+        if hasattr(mm_budget, "usage_for"):
+            cur = mm_budget.usage_for(self.card.id)
+        else:
+            cur = {
+                "calls": int(getattr(mm_budget, "calls", 0) or 0),
+                "tokens_in": int(getattr(mm_budget, "tokens_in", 0) or 0),
+                "tokens_out": int(getattr(mm_budget, "tokens_out", 0) or 0),
+                "spend": float(getattr(mm_budget, "spend", 0.0) or 0.0),
+                "false_rejects_dismissed": int(
+                    getattr(mm_budget, "false_rejects_dismissed", 0) or 0
+                ),
+            }
         return {
-            "calls": max(0, int(getattr(mm_budget, "calls", 0) or 0) - int(start.get("calls", 0))),
+            "calls": max(0, int(cur.get("calls", 0)) - int(start.get("calls", 0))),
             "tokens_in": max(
-                0, int(getattr(mm_budget, "tokens_in", 0) or 0) - int(start.get("tokens_in", 0))
+                0, int(cur.get("tokens_in", 0)) - int(start.get("tokens_in", 0))
             ),
             "tokens_out": max(
-                0, int(getattr(mm_budget, "tokens_out", 0) or 0) - int(start.get("tokens_out", 0))
+                0, int(cur.get("tokens_out", 0)) - int(start.get("tokens_out", 0))
             ),
             "spend": round(
-                max(0.0, float(getattr(mm_budget, "spend", 0.0) or 0.0) - float(start.get("spend", 0.0))),
+                max(0.0, float(cur.get("spend", 0.0)) - float(start.get("spend", 0.0))),
                 6,
             ),
             "false_rejects_dismissed": max(
                 0,
-                int(getattr(mm_budget, "false_rejects_dismissed", 0) or 0)
+                int(cur.get("false_rejects_dismissed", 0))
                 - int(start.get("false_rejects_dismissed", 0)),
             ),
         }
@@ -1476,81 +1494,87 @@ class CardRun:
     def _step_baseline(self) -> None:
         self.phase = "baseline"
         unit = self._effective_unit()
-        cached = None
-        if self.cfg.baseline_cache:
-            cached = self._read_baseline_cache(unit)
-        if cached is not None:
-            gate = GateResult("baseline", PASS, "cached: two runs agreed",
-                              {"cached": True})
-            self._record_gate(gate)
-            self.base_test_list = cached.get("list", {"tests": []})
-            return
+        lock_cm = (
+            baseline_lock_for(self._cache_file(unit))
+            if self.cfg.baseline_cache
+            else contextlib.nullcontext()
+        )
+        with lock_cm:
+            cached = None
+            if self.cfg.baseline_cache:
+                cached = self._read_baseline_cache(unit)
+            if cached is not None:
+                gate = GateResult("baseline", PASS, "cached: two runs agreed",
+                                  {"cached": True})
+                self._record_gate(gate)
+                self.base_test_list = cached.get("list", {"tests": []})
+                return
 
-        runs = []
-        for index in (1, 2):
-            result = self._run(runner_kind("test"),
-                               self.pack.commands("test", unit=unit)["argv"],
-                               counted="fixed")
-            out, err = self._output(result)
-            parsed = self.pack.parse_tests(out, err)
-            runs.append((result, parsed))
+            runs = []
+            for index in (1, 2):
+                result = self._run(runner_kind("test"),
+                                   self.pack.commands("test", unit=unit)["argv"],
+                                   counted="fixed")
+                out, err = self._output(result)
+                parsed = self.pack.parse_tests(out, err)
+                runs.append((result, parsed))
 
-        first, second = runs
-        sg_first = suite_green(first[1], self.cfg.known_failing,
-                               run_cls=first[0].cls, exit_code=first[0].exit_code)
-        sg_second = suite_green(second[1], self.cfg.known_failing,
-                                run_cls=second[0].cls, exit_code=second[0].exit_code)
+            first, second = runs
+            sg_first = suite_green(first[1], self.cfg.known_failing,
+                                   run_cls=first[0].cls, exit_code=first[0].exit_code)
+            sg_second = suite_green(second[1], self.cfg.known_failing,
+                                    run_cls=second[0].cls, exit_code=second[0].exit_code)
 
-        # A baseline that does not compile is not green, and not "no failures"
-        # either. Check compile errors before INFRA/missing_footers so compile
-        # failures stay a card/repo baseline error cleanly.
-        compile_broken = (first[1].get("compile_errors")
-                          or second[1].get("compile_errors"))
-        if compile_broken:
-            detail = ("the base does not build: "
-                      + str(compile_broken[:3]))
-            self._record_gate(GateResult("baseline", FAIL, detail,
-                                         {"compile_errors": compile_broken}))
-            raise GateFailure(StopCode.DIRTY_BASELINE, detail)
+            # A baseline that does not compile is not green, and not "no failures"
+            # either. Check compile errors before INFRA/missing_footers so compile
+            # failures stay a card/repo baseline error cleanly.
+            compile_broken = (first[1].get("compile_errors")
+                              or second[1].get("compile_errors"))
+            if compile_broken:
+                detail = ("the base does not build: "
+                          + str(compile_broken[:3]))
+                self._record_gate(GateResult("baseline", FAIL, detail,
+                                             {"compile_errors": compile_broken}))
+                raise GateFailure(StopCode.DIRTY_BASELINE, detail)
 
-        if (first[0].cls == INFRA or second[0].cls == INFRA
-                or sg_first.result == INFRA or sg_second.result == INFRA):
-            self._record_gate(GateResult("baseline", INFRA,
-                                         "a baseline run did not finish"))
-            raise Infra("baseline-infra",
-                        "a baseline run did not finish, so nothing can be judged")
+            if (first[0].cls == INFRA or second[0].cls == INFRA
+                    or sg_first.result == INFRA or sg_second.result == INFRA):
+                self._record_gate(GateResult("baseline", INFRA,
+                                             "a baseline run did not finish"))
+                raise Infra("baseline-infra",
+                            "a baseline run did not finish, so nothing can be judged")
 
-        red_first = _red(parsed=first[1], known=self.cfg.known_failing)
-        red_second = _red(parsed=second[1], known=self.cfg.known_failing)
-        disagree = [name for name in red_first if name not in red_second]
-        disagree += [name for name in red_second if name not in red_first]
+            red_first = _red(parsed=first[1], known=self.cfg.known_failing)
+            red_second = _red(parsed=second[1], known=self.cfg.known_failing)
+            disagree = [name for name in red_first if name not in red_second]
+            disagree += [name for name in red_second if name not in red_first]
 
-        if red_first or red_second or not sg_first.ok or not sg_second.ok:
-            if red_first or red_second:
-                detail = ("red on base: "
-                          + ", ".join(sorted(set(red_first + red_second))[:10]))
-                if disagree:
-                    detail += f"; the two runs disagreed on {len(disagree)} test(s)"
-            else:
-                detail = sg_first.detail or sg_second.detail or "baseline failed"
-            self._record_gate(GateResult("baseline", FAIL, detail,
-                                         {"red": red_first + red_second,
-                                          "disagreed": disagree,
-                                          "first": sg_first.evidence,
-                                          "second": sg_second.evidence}))
-            raise GateFailure(StopCode.DIRTY_BASELINE, detail)
+            if red_first or red_second or not sg_first.ok or not sg_second.ok:
+                if red_first or red_second:
+                    detail = ("red on base: "
+                              + ", ".join(sorted(set(red_first + red_second))[:10]))
+                    if disagree:
+                        detail += f"; the two runs disagreed on {len(disagree)} test(s)"
+                else:
+                    detail = sg_first.detail or sg_second.detail or "baseline failed"
+                self._record_gate(GateResult("baseline", FAIL, detail,
+                                             {"red": red_first + red_second,
+                                              "disagreed": disagree,
+                                              "first": sg_first.evidence,
+                                              "second": sg_second.evidence}))
+                raise GateFailure(StopCode.DIRTY_BASELINE, detail)
 
-        list_result = self._run(runner_kind("list"),
-                                self.pack.commands("list", unit=unit)["argv"],
-                                counted="fixed")
-        out, err = self._output(list_result)
-        self.base_test_list = self.pack.parse_list(out)
-        self._record_gate(GateResult(
-            "baseline", PASS,
-            f"two runs green and agreed; {len(self.base_test_list['tests'])} "
-            f"existing test(s)",
-            {"cached": False, "existing_tests": len(self.base_test_list["tests"])}))
-        self._write_baseline_cache(unit, self.base_test_list)
+            list_result = self._run(runner_kind("list"),
+                                    self.pack.commands("list", unit=unit)["argv"],
+                                    counted="fixed")
+            out, err = self._output(list_result)
+            self.base_test_list = self.pack.parse_list(out)
+            self._record_gate(GateResult(
+                "baseline", PASS,
+                f"two runs green and agreed; {len(self.base_test_list['tests'])} "
+                f"existing test(s)",
+                {"cached": False, "existing_tests": len(self.base_test_list["tests"])}))
+            self._write_baseline_cache(unit, self.base_test_list)
 
     def _cache_file(self, unit: str) -> Path:
         return self.state.cache_path(

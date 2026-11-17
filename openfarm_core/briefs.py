@@ -209,6 +209,29 @@ def _safe_existing_target(book: BriefBook, path: str) -> Path | None:
     return target if target.exists() and target.is_file() else None
 
 
+def _expand_touch_paths(book: BriefBook, patterns: list[str]) -> list[str]:
+    """Expand glob patterns in `touches` to safe existing files, keeping literals."""
+    expanded: list[str] = []
+    seen: set[str] = set()
+    root = book.worktree.resolve()
+    for raw in patterns:
+        norm = normalise(raw)
+        if not norm or escapes(norm) or norm.startswith("/"):
+            continue
+        if "*" in norm or "?" in norm:
+            for candidate in sorted(root.glob(norm)):
+                if not candidate.is_file():
+                    continue
+                rel = normalise(candidate.relative_to(root).as_posix())
+                if rel not in seen and not book.is_hidden(rel):
+                    seen.add(rel)
+                    expanded.append(rel)
+        elif norm not in seen:
+            seen.add(norm)
+            expanded.append(norm)
+    return expanded
+
+
 def _merged_context_files(card: Card, extra: list[str] | None) -> list[str]:
     card_ctx = getattr(card, "context_files", None)
     if card_ctx is None:
@@ -220,7 +243,7 @@ def _merged_context_files(card: Card, extra: list[str] | None) -> list[str]:
 def planner_brief(card: Card, book: BriefBook, harness_guidance: str = "") -> Brief:
     parts = [ROLE_HEADERS["planner"], "", _card_section(card), "",
              "Files in your touches, by signature:"]
-    for path in card.touches:
+    for path in _expand_touch_paths(book, card.touches):
         if book.is_hidden(path):
             continue
         # A new file (a test-backfill card's test file, say) has no signatures yet.
@@ -287,8 +310,11 @@ def test_writer_brief(card: Card, book: BriefBook, pack,
                 parts.append(f"\n### {normalise(path)} (does not exist yet)")
     else:
         parts.append("\nProduction files in touches, by signature only:")
-        for path in prod_touches:
+        for path in _expand_touch_paths(book, prod_touches):
             if book.is_hidden(path):
+                continue
+            if _safe_existing_target(book, path) is None:
+                parts.append(f"\n### {normalise(path)} (does not exist yet)")
                 continue
             parts.append(f"\n### {path}\n{book.signatures(path, pack)}")
 
@@ -354,7 +380,7 @@ def implementer_brief(card: Card, book: BriefBook, frozen_tests: dict[str, str],
 
     if attempt == 1:
         parts.append("Full text of files in your touches:")
-        for path in card.touches:
+        for path in _expand_touch_paths(book, card.touches):
             if book.is_hidden(path):
                 continue
             target = _safe_existing_target(book, path)
@@ -377,7 +403,7 @@ def implementer_brief(card: Card, book: BriefBook, frozen_tests: dict[str, str],
             parts.append("\nA counter-test also failed on this diff:\n"
                          + fence(counter_tests, "counter-test"))
         current_sections: list[str] = []
-        for path in card.touches:
+        for path in _expand_touch_paths(book, card.touches):
             if book.is_hidden(path):
                 continue
             target = _safe_existing_target(book, path)

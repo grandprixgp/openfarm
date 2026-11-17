@@ -7,6 +7,7 @@ record. Telemetry trouble never stops a card.
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 from ..state import append_jsonl, write_json
@@ -26,6 +27,7 @@ class JsonlTelemetry:
         self.run_dir = Path(run_dir)
         (self.run_dir / "telemetry").mkdir(parents=True, exist_ok=True)
         self.problems: list[str] = []
+        self._lock = threading.Lock()
 
     def hello(self) -> dict:
         return {"name": self.name, "versions": [1], "ops": ["hello", "write", "flush"]}
@@ -34,14 +36,16 @@ class JsonlTelemetry:
         if stream not in (STREAM_ATTEMPT, STREAM_CARD, STREAM_RUN):
             raise ValueError(f"{stream!r} is not a telemetry stream")
         path = self.run_dir / "telemetry" / f"{stream}s.jsonl"
-        try:
-            append_jsonl(path, record)
-        except OSError as exc:
-            self.problems.append(f"{path}: {exc}")
+        with self._lock:
+            try:
+                append_jsonl(path, record)
+            except OSError as exc:
+                self.problems.append(f"{path}: {exc}")
         return {"written": True}
 
     def flush(self) -> dict:
-        return {"flushed": True, "problems": list(self.problems)}
+        with self._lock:
+            return {"flushed": True, "problems": list(self.problems)}
 
 
 class MemoryTelemetry:
@@ -51,22 +55,26 @@ class MemoryTelemetry:
 
     def __init__(self) -> None:
         self.records: dict[str, list[dict]] = {"attempt": [], "card": [], "run": []}
+        self._lock = threading.Lock()
 
     def hello(self) -> dict:
         return {"name": self.name, "versions": [1], "ops": ["hello", "write", "flush"]}
 
     def write(self, stream: str, record: dict) -> dict:
-        self.records.setdefault(stream, []).append(record)
+        with self._lock:
+            self.records.setdefault(stream, []).append(record)
         return {"written": True}
 
     def flush(self) -> dict:
         return {"flushed": True}
 
     def attempts(self) -> list[dict]:
-        return self.records.get("attempt", [])
+        with self._lock:
+            return list(self.records.get("attempt", []))
 
     def cards(self) -> list[dict]:
-        return self.records.get("card", [])
+        with self._lock:
+            return list(self.records.get("card", []))
 
 
 #: Fields every attempt record carries. A reader ignores what it doesn't know.
@@ -144,6 +152,7 @@ class TelemetrySink:
     def __init__(self, inner) -> None:
         self.inner = inner
         self.problems: list[str] = []
+        self._lock = threading.Lock()
 
     def _sync_problems(self) -> None:
         for problem in getattr(self.inner, "problems", ()) or ():
@@ -151,22 +160,24 @@ class TelemetrySink:
                 self.problems.append(problem)
 
     def write(self, stream: str, record: dict) -> None:
-        try:
-            self.inner.write(stream, record)
-        except Exception as exc:  # noqa: BLE001 - telemetry must never stop a card
-            msg = f"{stream}: {exc}"
-            if msg not in self.problems:
-                self.problems.append(msg)
-        self._sync_problems()
+        with self._lock:
+            try:
+                self.inner.write(stream, record)
+            except Exception as exc:  # telemetry must never stop a card
+                msg = f"{stream}: {exc}"
+                if msg not in self.problems:
+                    self.problems.append(msg)
+            self._sync_problems()
 
     def flush(self) -> None:
-        try:
-            self.inner.flush()
-        except Exception as exc:  # noqa: BLE001
-            msg = f"flush: {exc}"
-            if msg not in self.problems:
-                self.problems.append(msg)
-        self._sync_problems()
+        with self._lock:
+            try:
+                self.inner.flush()
+            except Exception as exc:  # telemetry flush errors must never raise
+                msg = f"flush: {exc}"
+                if msg not in self.problems:
+                    self.problems.append(msg)
+            self._sync_problems()
 
 
 def open_telemetry(cfg, run_dir: Path):

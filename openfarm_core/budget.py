@@ -211,28 +211,34 @@ class NightBudget:
         self.spend = 0.0
         self.micromanager_spend = 0.0
         self.cards_claimed = 0
+        self._lock = threading.Lock()
 
     def note_card(self) -> None:
-        self.cards_claimed += 1
+        with self._lock:
+            self.cards_claimed += 1
 
     def note_spend(self, amount: float) -> None:
-        self.spend += amount
+        with self._lock:
+            self.spend += amount
 
     def note_micromanager(self, amount: float) -> None:
-        self.micromanager_spend += amount
+        with self._lock:
+            self.micromanager_spend += amount
 
     def total_spend(self) -> float:
-        return self.spend + self.micromanager_spend
+        with self._lock:
+            return self.spend + self.micromanager_spend
 
     def exhausted(self) -> str | None:
         # A zero cap means no cap, as everywhere: `[budget] spend_per_night = 0`
         # turns the money limit off (the card's own token and attempt caps stay).
-        total = self.total_spend()
-        if self.spend_cap > 0 and total >= self.spend_cap:
-            return f"night spend {total:.4f} reached its cap of {self.spend_cap:.4f}"
-        if self.cards_cap is not None and self.cards_claimed >= self.cards_cap:
-            return f"{self.cards_claimed} cards claimed, the run's cap"
-        return None
+        with self._lock:
+            total = self.spend + self.micromanager_spend
+            if self.spend_cap > 0 and total >= self.spend_cap:
+                return f"night spend {total:.4f} reached its cap of {self.spend_cap:.4f}"
+            if self.cards_cap is not None and self.cards_claimed >= self.cards_cap:
+                return f"{self.cards_claimed} cards claimed, the run's cap"
+            return None
 
 
 def token_split(worker: int, supervisor: int) -> dict:

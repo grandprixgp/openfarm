@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import re
 import shutil
+import threading
 import tomllib
 from pathlib import Path
 
@@ -33,6 +34,19 @@ from ..cards import (CARD_FIELDS, OPTIONAL_CARD_FIELDS, Card,
 from ..errors import Infra, Invalid, Refused, Unsupported
 from ..git import Git
 from ..state import utc_after, utc_now
+
+_SOURCE_LOCKS_GUARD = threading.Lock()
+_SOURCE_LOCKS: dict[tuple[Path, str], threading.RLock] = {}
+
+
+def _source_lock_for(repo: Path, branch: str) -> threading.RLock:
+    key = (Path(repo).resolve(), str(branch or ""))
+    with _SOURCE_LOCKS_GUARD:
+        lock = _SOURCE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _SOURCE_LOCKS[key] = lock
+        return lock
 
 #: The header is a TOML block between two `+++` lines. Delimiters must be alone on
 #: their line, so a note or a dossier's diff containing `+++ b/some/file.rs` is safe.
@@ -132,6 +146,7 @@ class FileCardSource:
         self.worktree = Path(worktree) if worktree else None
         self.fields_block = fields_block
         self.git = Git(self.repo)
+        self._lock = _source_lock_for(self.repo, self.branch)
 
     # -- setup ---------------------------------------------------------------
 
@@ -148,36 +163,37 @@ class FileCardSource:
         in, so a repository can commit its cards beside its code and let the farm's
         branch take over from there.
         """
-        if self.worktree is None:
-            raise Invalid("no-worktree", "the file card source needs a worktree path")
-        created = False
-        if not self.git.branch_exists(self.branch):
-            start = (self.base_branch if self.git.ref_exists(
-                f"refs/heads/{self.base_branch}") else "HEAD")
-            self.git.create_branch(self.branch, start)
-            created = True
-        if not self.worktree.exists():
-            self.git.worktree_add(self.worktree, self.branch)
-        else:
-            checker = Git(self.worktree)
-            if checker.current_branch() != self.branch:
-                # A worktree on the wrong branch may be holding an old head of the
-                # cards branch, and git will not move a branch a worktree has out.
-                self.git.worktree_remove(self.worktree)
+        with self._lock:
+            if self.worktree is None:
+                raise Invalid("no-worktree", "the file card source needs a worktree path")
+            created = False
+            if not self.git.branch_exists(self.branch):
+                start = (self.base_branch if self.git.ref_exists(
+                    f"refs/heads/{self.base_branch}") else "HEAD")
+                self.git.create_branch(self.branch, start)
+                created = True
+            if not self.worktree.exists():
                 self.git.worktree_add(self.worktree, self.branch)
             else:
-                # The cards branch may have moved since this worktree was made,
-                # because another lane or a person edits cards. A stale worktree
-                # would show a card as missing, so it is fast-forwarded first.
-                head = checker.head()
-                target = self.git.head(f"refs/heads/{self.branch}")
-                if head != target:
-                    checker.reset_hard(target)
+                checker = Git(self.worktree)
+                if checker.current_branch() != self.branch:
+                    # A worktree on the wrong branch may be holding an old head of the
+                    # cards branch, and git will not move a branch a worktree has out.
+                    self.git.worktree_remove(self.worktree)
+                    self.git.worktree_add(self.worktree, self.branch)
+                else:
+                    # The cards branch may have moved since this worktree was made,
+                    # because another lane or a person edits cards. A stale worktree
+                    # would show a card as missing, so it is fast-forwarded first.
+                    head = checker.head()
+                    target = self.git.head(f"refs/heads/{self.branch}")
+                    if head != target:
+                        checker.reset_hard(target)
 
-        (self.worktree / self.folder).mkdir(parents=True, exist_ok=True)
-        if created:
-            self._seed_from_base()
-        return self.worktree
+            (self.worktree / self.folder).mkdir(parents=True, exist_ok=True)
+            if created:
+                self._seed_from_base()
+            return self.worktree
 
     def _seed_from_base(self) -> None:
         """Copy card files the base branch already holds onto the cards branch."""
@@ -246,130 +262,139 @@ class FileCardSource:
         )
 
     def read(self, card_id: str) -> dict:
-        header, body, path = self._read_raw(card_id)
-        return {"card": self._card_from(header, body, path).as_dict()}
+        with self._lock:
+            header, body, path = self._read_raw(card_id)
+            return {"card": self._card_from(header, body, path).as_dict()}
 
     def hash(self, card_id: str) -> dict:
-        header, body, path = self._read_raw(card_id)
-        return {"hash": self._card_from(header, body, path).hash()}
+        with self._lock:
+            header, body, path = self._read_raw(card_id)
+            return {"hash": self._card_from(header, body, path).hash()}
 
     def all_cards(self) -> list[Card]:
-        if not self.cards_dir.exists():
-            return []
-        out = []
-        for path in sorted(self.cards_dir.glob("*.md")):
-            try:
-                header, body = parse_card_file(path.read_text())
-                if not header.get("id"):
-                    header["id"] = path.stem
-                out.append(self._card_from(header, body, path))
-            except Invalid:
-                continue
-        return out
+        with self._lock:
+            if not self.cards_dir.exists():
+                return []
+            out = []
+            for path in sorted(self.cards_dir.glob("*.md")):
+                try:
+                    header, body = parse_card_file(path.read_text())
+                    if not header.get("id"):
+                        header["id"] = path.stem
+                    out.append(self._card_from(header, body, path))
+                except Invalid:
+                    continue
+            return out
 
     def next(self, lane: str = "", limit: int = 10) -> dict:
-        ready: list[str] = []
-        by_id = {card.id: card for card in self.all_cards()}
-        done_ids = {cid for cid, card in by_id.items()
-                    if card.state in DONE_STATES}
-        for card_id, card in by_id.items():
-            if card.state != READY or _holder(card.raw):
-                continue
-            if lane and _lane(card.raw) and _lane(card.raw) != lane:
-                continue
-            if any(dep not in done_ids for dep in card.deps):
-                continue
-            ready.append(card_id)
-        return {"cards": ready[:limit]}
+        with self._lock:
+            ready: list[str] = []
+            by_id = {card.id: card for card in self.all_cards()}
+            done_ids = {cid for cid, card in by_id.items()
+                        if card.state in DONE_STATES}
+            for card_id, card in by_id.items():
+                if card.state != READY or _holder(card.raw):
+                    continue
+                if lane and _lane(card.raw) and _lane(card.raw) != lane:
+                    continue
+                if any(dep not in done_ids for dep in card.deps):
+                    continue
+                ready.append(card_id)
+            return {"cards": ready[:limit]}
 
     def stale(self, lane: str = "") -> dict:
-        now = utc_now()
-        out = []
-        for card in self.all_cards():
-            holder = _holder(card.raw)
-            expires = _lease_expiry(card.raw)
-            if holder and expires and expires < now:
-                out.append({"id": card.id, "holder": holder,
-                            "expires_at": expires})
-        return {"cards": out}
+        with self._lock:
+            now = utc_now()
+            out = []
+            for card in self.all_cards():
+                holder = _holder(card.raw)
+                expires = _lease_expiry(card.raw)
+                if holder and expires and expires < now:
+                    out.append({"id": card.id, "holder": holder,
+                                "expires_at": expires})
+            return {"cards": out}
 
     # -- writing -------------------------------------------------------------
 
     def _write(self, card_id: str, header: dict, body: str, message: str) -> str:
-        path = self._path(card_id)
-        text = render_card_file(header, body)
-        # Read the card back before committing it. A card whose header does not parse
-        # is unrecoverable through the adapter: every later `read`, `release` and
-        # `move` fails on it, and the only way out is a person editing the branch. A
-        # note carrying a Markdown dossier once did exactly that.
-        try:
-            parse_card_file(text)
-        except Invalid as exc:
-            raise Invalid(
-                "unwritable-card",
-                f"the card {card_id} would not read back ({exc.message}); nothing "
-                f"was written") from exc
-        path.write_text(text)
-        git = Git(self.worktree)
-        git.commit_all(message)
-        return git.head()
+        with self._lock:
+            path = self._path(card_id)
+            text = render_card_file(header, body)
+            # Read the card back before committing it. A card whose header does not parse
+            # is unrecoverable through the adapter: every later `read`, `release` and
+            # `move` fails on it, and the only way out is a person editing the branch. A
+            # note carrying a Markdown dossier once did exactly that.
+            try:
+                parse_card_file(text)
+            except Invalid as exc:
+                raise Invalid(
+                    "unwritable-card",
+                    f"the card {card_id} would not read back ({exc.message}); nothing "
+                    f"was written") from exc
+            path.write_text(text)
+            git = Git(self.worktree)
+            git.commit_all(message)
+            return git.head()
 
     def claim(self, card_id: str, holder: str,
               lease_ttl_s: float = 1200) -> dict:
-        header, body, _ = self._read_raw(card_id)
-        current = _holder(header)
-        if current and current != holder:
-            expires = _lease_expiry(header)
-            if not expires or expires > utc_now():
-                raise Refused("already-claimed",
-                              f"{card_id} is held by {current}")
-        if header.get("state") != READY:
-            raise Refused("not-ready", f"{card_id} is {header.get('state')}")
-        for dep in header.get("depends", []) or []:
-            dep_header, _, _ = self._read_raw(str(dep))
-            if dep_header.get("state") not in DONE_STATES:
-                raise Refused("not-ready", f"{card_id} waits on {dep}")
+        with self._lock:
+            header, body, _ = self._read_raw(card_id)
+            current = _holder(header)
+            if current and current != holder:
+                expires = _lease_expiry(header)
+                if not expires or expires > utc_now():
+                    raise Refused("already-claimed",
+                                  f"{card_id} is held by {current}")
+            if header.get("state") != READY:
+                raise Refused("not-ready", f"{card_id} is {header.get('state')}")
+            for dep in header.get("depends", []) or []:
+                dep_header, _, _ = self._read_raw(str(dep))
+                if dep_header.get("state") not in DONE_STATES:
+                    raise Refused("not-ready", f"{card_id} waits on {dep}")
 
-        lease_id = f"L-{hash_value((card_id, holder, utc_now()))[:10]}"
-        header["state"] = "in_progress"
-        header["holder"] = holder
-        header["lease_id"] = lease_id
-        header["lease_expires_at"] = utc_after(lease_ttl_s)
-        header["claimed_at"] = utc_now()
-        self._write(card_id, header, body,
-                    f"{card_id}: claimed by {holder}")
-        return {"lease_id": lease_id, "expires_at": header["lease_expires_at"]}
+            lease_id = f"L-{hash_value((card_id, holder, utc_now()))[:10]}"
+            header["state"] = "in_progress"
+            header["holder"] = holder
+            header["lease_id"] = lease_id
+            header["lease_expires_at"] = utc_after(lease_ttl_s)
+            header["claimed_at"] = utc_now()
+            self._write(card_id, header, body,
+                        f"{card_id}: claimed by {holder}")
+            return {"lease_id": lease_id, "expires_at": header["lease_expires_at"]}
 
     def heartbeat(self, card_id: str, lease_id: str,
                   lease_ttl_s: float = 1200) -> dict:
-        header, body, _ = self._read_raw(card_id)
-        if header.get("lease_id") != lease_id:
-            raise Refused("stale-lease", f"{card_id} is not held on {lease_id}")
-        header["lease_expires_at"] = utc_after(lease_ttl_s)
-        self._write(card_id, header, body, f"{card_id}: heartbeat")
-        return {"expires_at": header["lease_expires_at"]}
+        with self._lock:
+            header, body, _ = self._read_raw(card_id)
+            if header.get("lease_id") != lease_id:
+                raise Refused("stale-lease", f"{card_id} is not held on {lease_id}")
+            header["lease_expires_at"] = utc_after(lease_ttl_s)
+            self._write(card_id, header, body, f"{card_id}: heartbeat")
+            return {"expires_at": header["lease_expires_at"]}
 
     def move(self, card_id: str, lease_id: str, to: str, note_md: str = "",
              stop_code: str = "") -> dict:
-        if to not in ("in-review", "blocked"):
-            raise Refused("bad-state",
-                          f"the farm moves a card to in-review or blocked, not {to}")
-        header, body, _ = self._read_raw(card_id)
-        if lease_id and header.get("lease_id") != lease_id:
-            raise Refused("stale-lease", f"{card_id} is not held on {lease_id}")
-        header["state"] = "in_review" if to == "in-review" else "blocked"
-        header["holder"] = ""
-        header["lease_id"] = ""
-        header["lease_expires_at"] = ""
-        header["moved_at"] = utc_now()
-        if stop_code:
-            header["stop_code"] = stop_code
-        if note_md:
-            header["note"] = note_md
-        self._write(card_id, header, body,
-                    f"{card_id}: {header['state']}"
-                    + (f" ({stop_code})" if stop_code else ""))
-        return {"state": header["state"]}
+        with self._lock:
+            if to not in ("in-review", "blocked"):
+                raise Refused("bad-state",
+                              f"the farm moves a card to in-review or blocked, not {to}")
+            header, body, _ = self._read_raw(card_id)
+            if lease_id and header.get("lease_id") != lease_id:
+                raise Refused("stale-lease", f"{card_id} is not held on {lease_id}")
+            header["state"] = "in_review" if to == "in-review" else "blocked"
+            header["holder"] = ""
+            header["lease_id"] = ""
+            header["lease_expires_at"] = ""
+            header["moved_at"] = utc_now()
+            if stop_code:
+                header["stop_code"] = stop_code
+            if note_md:
+                header["note"] = note_md
+            self._write(card_id, header, body,
+                        f"{card_id}: {header['state']}"
+                        + (f" ({stop_code})" if stop_code else ""))
+            return {"state": header["state"]}
 
     def mark_done(self, card_id: str, note: str = "") -> dict:
         """The reviewer's move: a card in review whose work is merged is done.
@@ -377,98 +402,103 @@ class FileCardSource:
         Cards that depend on it can be claimed from then on. The farm itself never
         makes this move; only `openfarm done` does, after checking the merge.
         """
-        header, body, _ = self._read_raw(card_id)
-        if header.get("state") != "in_review":
-            raise Refused("not-in-review",
-                          f"{card_id} is {header.get('state')}, not in review")
-        header["state"] = "done"
-        header["done_at"] = utc_now()
-        if note:
-            header["note"] = note
-        self._write(card_id, header, body, f"{card_id}: done")
-        return {"state": "done"}
+        with self._lock:
+            header, body, _ = self._read_raw(card_id)
+            if header.get("state") != "in_review":
+                raise Refused("not-in-review",
+                              f"{card_id} is {header.get('state')}, not in review")
+            header["state"] = "done"
+            header["done_at"] = utc_now()
+            if note:
+                header["note"] = note
+            self._write(card_id, header, body, f"{card_id}: done")
+            return {"state": "done"}
 
     def release(self, card_id: str, lease_id: str = "", reason: str = "",
                 stop_code: str = "") -> dict:
-        header, body, _ = self._read_raw(card_id)
-        if lease_id and header.get("lease_id") not in ("", lease_id):
-            raise Refused("stale-lease", f"{card_id} is not held on {lease_id}")
-        # A person may free a card whose lease has gone stale, but not one a live run
-        # is holding: the run would keep working and its own move would then fail.
-        if not lease_id:
-            expires = _lease_expiry(header)
-            holder = _holder(header)
-            if holder and expires and expires > utc_now():
-                raise Refused(
-                    "held",
-                    f"{card_id} is held by {holder} on a lease until {expires}; "
-                    f"release it once that has expired")
-        if header.get("state") in ("done", "dropped"):
-            raise Refused("not-held",
-                          f"{card_id} is {header.get('state')}, not in progress")
-        header["state"] = READY
-        header["holder"] = ""
-        header["lease_id"] = ""
-        header["lease_expires_at"] = ""
-        header["released_at"] = utc_now()
-        if stop_code:
-            header["stop_code"] = stop_code
-        if reason:
-            header["release_reason"] = reason
-        self._write(card_id, header, body,
-                    f"{card_id}: released" + (f" ({reason})" if reason else ""))
-        return {"state": READY}
+        with self._lock:
+            header, body, _ = self._read_raw(card_id)
+            if lease_id and header.get("lease_id") not in ("", lease_id):
+                raise Refused("stale-lease", f"{card_id} is not held on {lease_id}")
+            # A person may free a card whose lease has gone stale, but not one a live run
+            # is holding: the run would keep working and its own move would then fail.
+            if not lease_id:
+                expires = _lease_expiry(header)
+                holder = _holder(header)
+                if holder and expires and expires > utc_now():
+                    raise Refused(
+                        "held",
+                        f"{card_id} is held by {holder} on a lease until {expires}; "
+                        f"release it once that has expired")
+            if header.get("state") in ("done", "dropped"):
+                raise Refused("not-held",
+                              f"{card_id} is {header.get('state')}, not in progress")
+            header["state"] = READY
+            header["holder"] = ""
+            header["lease_id"] = ""
+            header["lease_expires_at"] = ""
+            header["released_at"] = utc_now()
+            if stop_code:
+                header["stop_code"] = stop_code
+            if reason:
+                header["release_reason"] = reason
+            self._write(card_id, header, body,
+                        f"{card_id}: released" + (f" ({reason})" if reason else ""))
+            return {"state": READY}
 
     def finding(self, from_card: str, title: str, body_md: str = "") -> dict:
-        existing = {card.id for card in self.all_cards()}
-        index = 1
-        while f"FIND-{index}" in existing:
-            index += 1
-        card_id = f"FIND-{index}"
-        header = {
-            "id": card_id,
-            "title": title,
-            "state": "backlog",
-            "touches": [],
-            "depends": [],
-            "from_card": from_card,
-            "created_at": utc_now(),
-        }
-        self._write(card_id, header, body_md, f"{card_id}: finding from {from_card}")
-        return {"id": card_id}
+        with self._lock:
+            existing = {card.id for card in self.all_cards()}
+            index = 1
+            while f"FIND-{index}" in existing:
+                index += 1
+            card_id = f"FIND-{index}"
+            header = {
+                "id": card_id,
+                "title": title,
+                "state": "backlog",
+                "touches": [],
+                "depends": [],
+                "from_card": from_card,
+                "created_at": utc_now(),
+            }
+            self._write(card_id, header, body_md, f"{card_id}: finding from {from_card}")
+            return {"id": card_id}
 
     # -- test helpers --------------------------------------------------------
 
     def add_card(self, card: Card, commit: bool = True) -> Path:
         """Write a card straight in, for fixtures and the toy repository."""
-        path = self._path(card.id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        header = {
-            "id": card.id,
-            "title": card.title,
-            "state": card.state,
-            "touches": list(card.touches),
-            "depends": list(card.deps),
-        }
-        for key in (*CARD_FIELDS, *OPTIONAL_CARD_FIELDS):
-            if key == "tests":
-                continue
-            if key in card.fields:
-                header[key] = card.fields[key]
-        if "tests" in card.fields:
-            header["tests"] = [
-                {"name": t.name, "file": t.file, "asserts": t.asserts}
-                for t in card.tests]
-        path.write_text(render_card_file(header, card.done_text))
-        if commit:
-            Git(self.worktree).commit_all(f"{card.id}: add")
-        return path
+        with self._lock:
+            path = self._path(card.id)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            header = {
+                "id": card.id,
+                "title": card.title,
+                "state": card.state,
+                "touches": list(card.touches),
+                "depends": list(card.deps),
+            }
+            for key in (*CARD_FIELDS, *OPTIONAL_CARD_FIELDS):
+                if key == "tests":
+                    continue
+                if key in card.fields:
+                    header[key] = card.fields[key]
+            if "tests" in card.fields:
+                header["tests"] = [
+                    {"name": t.name, "file": t.file, "asserts": t.asserts}
+                    for t in card.tests]
+            path.write_text(render_card_file(header, card.done_text))
+            if commit:
+                Git(self.worktree).commit_all(f"{card.id}: add")
+            return path
 
     def delete_card(self, card_id: str) -> None:
-        path = self._path(card_id)
-        if path.exists():
-            path.unlink()
-            Git(self.worktree).commit_all(f"{card_id}: remove")
+        with self._lock:
+            path = self._path(card_id)
+            if path.exists():
+                path.unlink()
+                Git(self.worktree).commit_all(f"{card_id}: remove")
 
 
 def _holder(raw: dict) -> str:

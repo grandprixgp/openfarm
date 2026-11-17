@@ -19,10 +19,24 @@ import hashlib
 import json
 import os
 import re
+import threading
 from pathlib import Path
 
 from .errors import Invalid
-from .state import append_jsonl, read_json, utc_now
+from .state import append_jsonl, read_json, utc_now, write_json
+
+_GLOBAL_LOCKS_GUARD = threading.Lock()
+_GLOBAL_LOCKS: dict[Path, threading.RLock] = {}
+
+
+def _global_thread_lock(root: Path) -> threading.RLock:
+    key = Path(root).resolve()
+    with _GLOBAL_LOCKS_GUARD:
+        lock = _GLOBAL_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _GLOBAL_LOCKS[key] = lock
+        return lock
 
 # The fields of a project entry that travel to the global library. Evidence and
 # card IDs stay behind: they name the source project's cards.
@@ -103,26 +117,29 @@ class GlobalLibrary:
         self.entries_dir = self.root / "entries"
         self.ledger_path = self.root / "ledger.jsonl"
         self._lock_path = self.root / ".lock"
-        self._depth = 0
+        self._local = threading.local()
 
     @contextlib.contextmanager
     def _locked(self):
-        if self._depth:
-            self._depth += 1
-            try:
-                yield
-            finally:
-                self._depth -= 1
-            return
-        self.root.mkdir(parents=True, exist_ok=True)
-        with open(self._lock_path, "a+", encoding="utf-8") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            self._depth += 1
-            try:
-                yield
-            finally:
-                self._depth -= 1
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        tlock = _global_thread_lock(self.root)
+        with tlock:
+            depth = int(getattr(self._local, "depth", 0) or 0)
+            if depth > 0:
+                self._local.depth = depth + 1
+                try:
+                    yield
+                finally:
+                    self._local.depth = depth
+                return
+            self.root.mkdir(parents=True, exist_ok=True)
+            with self._lock_path.open("a+", encoding="utf-8") as handle:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                self._local.depth = 1
+                try:
+                    yield
+                finally:
+                    self._local.depth = 0
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     def _path(self, gid: str) -> Path:
         if not _GID_RE.match(str(gid)):
@@ -131,11 +148,7 @@ class GlobalLibrary:
 
     def _save(self, entry: dict) -> dict:
         entry["updated_at"] = utc_now()
-        self.entries_dir.mkdir(parents=True, exist_ok=True)
-        path = self._path(entry["id"])
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(entry, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        os.replace(tmp, path)
+        write_json(self._path(entry["id"]), entry)
         return entry
 
     def _event(self, event: str, data: dict) -> None:

@@ -25,6 +25,7 @@ import dataclasses
 import inspect
 import json
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Callable
@@ -212,37 +213,45 @@ class MicromanagerBudget:
     spend: float = 0.0
     calls_per_card: dict[str, int] = dataclasses.field(default_factory=dict)
     tokens_by_card: dict[str, int] = dataclasses.field(default_factory=dict)
+    tokens_in_by_card: dict[str, int] = dataclasses.field(default_factory=dict)
+    tokens_out_by_card: dict[str, int] = dataclasses.field(default_factory=dict)
+    spend_by_card: dict[str, float] = dataclasses.field(default_factory=dict)
+    false_rejects_by_card: dict[str, int] = dataclasses.field(default_factory=dict)
     max_calls_per_card: int = 8
     tokens_per_card: int = 200_000
     spend_per_night: float = 10.0
     false_rejects_dismissed: int = 0
+    _lock: threading.RLock = dataclasses.field(
+        default_factory=threading.RLock, init=False, repr=False, compare=False
+    )
 
     def check(self, card_id: str = "") -> None:
-        if self.spend_per_night > 0 and self.spend >= self.spend_per_night:
-            raise Refused(
-                "micromanager-spend-cap",
-                f"frontier micromanager spend {self.spend:.4f} reached cap "
-                f"{self.spend_per_night:.4f}",
-            )
-        if card_id:
-            if (
-                self.max_calls_per_card > 0
-                and self.calls_per_card.get(card_id, 0) >= self.max_calls_per_card
-            ):
+        with self._lock:
+            if self.spend_per_night > 0 and self.spend >= self.spend_per_night:
                 raise Refused(
-                    "micromanager-call-cap",
-                    f"frontier micromanager calls for {card_id} reached cap "
-                    f"{self.max_calls_per_card}",
+                    "micromanager-spend-cap",
+                    f"frontier micromanager spend {self.spend:.4f} reached cap "
+                    f"{self.spend_per_night:.4f}",
                 )
-            if (
-                self.tokens_per_card > 0
-                and self.tokens_by_card.get(card_id, 0) >= self.tokens_per_card
-            ):
-                raise Refused(
-                    "micromanager-token-cap",
-                    f"frontier micromanager tokens for {card_id} reached cap "
-                    f"{self.tokens_per_card}",
-                )
+            if card_id:
+                if (
+                    self.max_calls_per_card > 0
+                    and self.calls_per_card.get(card_id, 0) >= self.max_calls_per_card
+                ):
+                    raise Refused(
+                        "micromanager-call-cap",
+                        f"frontier micromanager calls for {card_id} reached cap "
+                        f"{self.max_calls_per_card}",
+                    )
+                if (
+                    self.tokens_per_card > 0
+                    and self.tokens_by_card.get(card_id, 0) >= self.tokens_per_card
+                ):
+                    raise Refused(
+                        "micromanager-token-cap",
+                        f"frontier micromanager tokens for {card_id} reached cap "
+                        f"{self.tokens_per_card}",
+                    )
 
     def record(
         self,
@@ -251,32 +260,83 @@ class MicromanagerBudget:
         tokens_out: int = 0,
         spend: float = 0.0,
     ) -> None:
-        self.calls += 1
-        self.tokens_in += int(tokens_in)
-        self.tokens_out += int(tokens_out)
-        self.spend += float(spend)
-        if card_id:
-            self.calls_per_card[card_id] = self.calls_per_card.get(card_id, 0) + 1
-            self.tokens_by_card[card_id] = (
-                self.tokens_by_card.get(card_id, 0) + int(tokens_in) + int(tokens_out)
-            )
+        with self._lock:
+            tin = int(tokens_in)
+            tout = int(tokens_out)
+            sp = float(spend)
+            self.calls += 1
+            self.tokens_in += tin
+            self.tokens_out += tout
+            self.spend += sp
+            if card_id:
+                self.calls_per_card[card_id] = self.calls_per_card.get(card_id, 0) + 1
+                self.tokens_by_card[card_id] = (
+                    self.tokens_by_card.get(card_id, 0) + tin + tout
+                )
+                self.tokens_in_by_card[card_id] = (
+                    self.tokens_in_by_card.get(card_id, 0) + tin
+                )
+                self.tokens_out_by_card[card_id] = (
+                    self.tokens_out_by_card.get(card_id, 0) + tout
+                )
+                self.spend_by_card[card_id] = (
+                    self.spend_by_card.get(card_id, 0.0) + sp
+                )
 
-    def record_false_reject_dismissed(self) -> None:
-        self.false_rejects_dismissed += 1
+    def record_false_reject_dismissed(self, card_id: str = "") -> None:
+        with self._lock:
+            self.false_rejects_dismissed += 1
+            if card_id:
+                self.false_rejects_by_card[card_id] = (
+                    self.false_rejects_by_card.get(card_id, 0) + 1
+                )
+
+    def usage_for(self, card_id: str) -> dict:
+        with self._lock:
+            return {
+                "calls": int(self.calls_per_card.get(card_id, 0)),
+                "tokens_in": int(self.tokens_in_by_card.get(card_id, 0)),
+                "tokens_out": int(self.tokens_out_by_card.get(card_id, 0)),
+                "spend": float(self.spend_by_card.get(card_id, 0.0)),
+                "false_rejects_dismissed": int(
+                    self.false_rejects_by_card.get(card_id, 0)
+                ),
+            }
 
     def as_dict(self) -> dict:
-        return {
-            "calls": self.calls,
-            "tokens_in": self.tokens_in,
-            "tokens_out": self.tokens_out,
-            "spend": round(self.spend, 6),
-            "calls_per_card": dict(self.calls_per_card),
-            "tokens_by_card": dict(self.tokens_by_card),
-            "max_calls_per_card": self.max_calls_per_card,
-            "tokens_per_card": self.tokens_per_card,
-            "spend_per_night": self.spend_per_night,
-            "false_rejects_dismissed": self.false_rejects_dismissed,
-        }
+        with self._lock:
+            return {
+                "calls": self.calls,
+                "tokens_in": self.tokens_in,
+                "tokens_out": self.tokens_out,
+                "spend": round(self.spend, 6),
+                "calls_per_card": dict(self.calls_per_card),
+                "tokens_by_card": dict(self.tokens_by_card),
+                "max_calls_per_card": self.max_calls_per_card,
+                "tokens_per_card": self.tokens_per_card,
+                "spend_per_night": self.spend_per_night,
+                "false_rejects_dismissed": self.false_rejects_dismissed,
+            }
+
+
+class _ThreadLocalUsageMixin:
+    """Thread-safe lock and per-thread `last_usage` storage for supervisor backends."""
+
+    def _init_usage(self) -> None:
+        self._usage_local = threading.local()
+        self._lock = threading.RLock()
+
+    @property
+    def last_usage(self) -> dict:
+        usage = getattr(self._usage_local, "usage", None)
+        if usage is None:
+            usage = {"tokens_in": 0, "tokens_out": 0, "spend": 0.0}
+            self._usage_local.usage = usage
+        return usage
+
+    @last_usage.setter
+    def last_usage(self, value: dict) -> None:
+        self._usage_local.usage = dict(value or {})
 
 
 @dataclasses.dataclass
@@ -352,14 +412,14 @@ class SupervisionReport:
 # -- Backends -----------------------------------------------------------------
 
 
-class NullMicromanager:
+class NullMicromanager(_ThreadLocalUsageMixin):
     """No-op micromanager backend when frontier supervision is disabled."""
 
     name = "null"
     enabled = False
 
     def __init__(self) -> None:
-        self.last_usage: dict = {"tokens_in": 0, "tokens_out": 0, "spend": 0.0}
+        self._init_usage()
 
     def hello(self) -> dict:
         return {"name": self.name, "versions": [1], "ops": ["hello", "assist"]}
@@ -372,16 +432,16 @@ class NullMicromanager:
         pass
 
 
-class ScriptedMicromanager:
+class ScriptedMicromanager(_ThreadLocalUsageMixin):
     """Scripted micromanager backend for tests and ``--script`` runs."""
 
     name = "scripted"
     enabled = True
 
     def __init__(self, script: dict | None = None) -> None:
+        self._init_usage()
         self.script = dict(script or {})
         self.calls: list[dict] = []
-        self.last_usage: dict = {"tokens_in": 0, "tokens_out": 0, "spend": 0.0}
 
     def hello(self) -> dict:
         return {"name": self.name, "versions": [1], "ops": ["hello", "assist"]}
@@ -389,7 +449,9 @@ class ScriptedMicromanager:
     def assist(self, op: str, payload: dict) -> dict:
         self.last_usage = {"tokens_in": 0, "tokens_out": 0, "spend": 0.0}
         clean_payload = {k: v for k, v in payload.items() if k != "_card_dir"}
-        self.calls.append({"op": op, "payload": clean_payload})
+        with self._lock:
+            self.calls.append({"op": op, "payload": clean_payload})
+            script_map = self.script
         card_id = str(
             clean_payload.get("card_id")
             or (clean_payload.get("card") or {}).get("id", "")
@@ -403,8 +465,8 @@ class ScriptedMicromanager:
             op,
             "*",
         ):
-            if key and key in self.script:
-                entry = self.script[key]
+            if key and key in script_map:
+                entry = script_map[key]
                 break
 
         if entry is None:
@@ -449,15 +511,15 @@ class ScriptedMicromanager:
         pass
 
 
-class CmdMicromanager:
+class CmdMicromanager(_ThreadLocalUsageMixin):
     """External ``cmd:<argv>`` backend speaking OpenFarm ``micromanager`` v1."""
 
     name = "cmd"
     enabled = True
 
     def __init__(self, spec: str, repo: Path, timeout_s: float = 180.0) -> None:
+        self._init_usage()
         self._adapter = CmdAdapter(spec, repo, timeout_s=timeout_s)
-        self.last_usage: dict = {"tokens_in": 0, "tokens_out": 0, "spend": 0.0}
 
     def hello(self) -> dict:
         return self._adapter.hello("micromanager", {"hello", "assist"})
@@ -559,7 +621,7 @@ def _build_op_prompt(op: str, payload: dict) -> str:
     )
 
 
-class ClaudeAcpMicromanager:
+class ClaudeAcpMicromanager(_ThreadLocalUsageMixin):
     """ACP-backed micromanager running against ``claude-agent-acp`` or native ``claude``."""
 
     name = "claude-acp"
@@ -586,6 +648,7 @@ class ClaudeAcpMicromanager:
         cancel_check: Callable[[], bool] | None = None,
         adapter: ClaudeAcpAdapter | None = None,
     ) -> None:
+        self._init_usage()
         self.command = command
         self.cwd = Path(cwd or state_dir or Path.cwd())
         self.model = model
@@ -606,7 +669,6 @@ class ClaudeAcpMicromanager:
         self._adapter = adapter
         self._session_id: str | None = None
         self._seq = 0
-        self.last_usage: dict = {"tokens_in": 0, "tokens_out": 0, "spend": 0.0}
 
     def hello(self) -> dict:
         return {"name": self.name, "versions": [1], "ops": ["hello", "assist"]}
@@ -619,8 +681,8 @@ class ClaudeAcpMicromanager:
             if proc is not None and proc.poll() is not None:
                 try:
                     self._adapter.close()
-                except Exception:  # noqa: BLE001 - a dead adapter is replaced regardless
-                    pass
+                except Exception:  # dead adapter is always replaced
+                    self._session_id = None
                 self._adapter = None
                 self._session_id = None
         if self._adapter is None:
@@ -656,64 +718,67 @@ class ClaudeAcpMicromanager:
             else (self.card_dir if self.card_dir is not None else self.state_dir)
         )
         clean_payload = {k: v for k, v in payload.items() if k != "_card_dir"}
-
-        adapter, session_id = self._ensure_session()
         prompt_text = _build_op_prompt(op, clean_payload)
-        try:
-            res = adapter.prompt(
-                session_id,
-                prompt_text,
-                timeout_s=self.timeout_s,
-                cancel_check=self.cancel_check,
-            )
-        except Exception:
-            partial = getattr(adapter, "last_usage", None)
-            if partial is not None:
-                p_in = int(getattr(partial, "tokens_in", 0) or 0)
-                p_out = int(getattr(partial, "tokens_out", 0) or 0)
-                p_vcost = float(getattr(partial, "vendor_cost_usd", 0.0) or 0.0)
-                if p_vcost > 0:
-                    p_spend = p_vcost
-                else:
-                    p_spend = (
-                        p_in / 1000.0 * self.cost_per_1k_in
-                        + p_out / 1000.0 * self.cost_per_1k_out
-                    )
-                self.last_usage = {
-                    "tokens_in": p_in,
-                    "tokens_out": p_out,
-                    "spend": p_spend,
-                    "vendor_cost_usd": p_vcost,
-                }
-            raise
 
-        if res.vendor_cost_usd > 0:
-            spend = float(res.vendor_cost_usd)
-        else:
-            spend = (
-                res.tokens_in / 1000.0 * self.cost_per_1k_in
-                + res.tokens_out / 1000.0 * self.cost_per_1k_out
-            )
+        with self._lock:
+            adapter, session_id = self._ensure_session()
+            try:
+                res = adapter.prompt(
+                    session_id,
+                    prompt_text,
+                    timeout_s=self.timeout_s,
+                    cancel_check=self.cancel_check,
+                )
+            except Exception:
+                partial = getattr(adapter, "last_usage", None)
+                if partial is not None:
+                    p_in = int(getattr(partial, "tokens_in", 0) or 0)
+                    p_out = int(getattr(partial, "tokens_out", 0) or 0)
+                    p_vcost = float(getattr(partial, "vendor_cost_usd", 0.0) or 0.0)
+                    if p_vcost > 0:
+                        p_spend = p_vcost
+                    else:
+                        p_spend = (
+                            p_in / 1000.0 * self.cost_per_1k_in
+                            + p_out / 1000.0 * self.cost_per_1k_out
+                        )
+                    self.last_usage = {
+                        "tokens_in": p_in,
+                        "tokens_out": p_out,
+                        "spend": p_spend,
+                        "vendor_cost_usd": p_vcost,
+                    }
+                raise
 
-        self.last_usage = {
-            "tokens_in": res.tokens_in,
-            "tokens_out": res.tokens_out,
-            "spend": spend,
-            "vendor_cost_usd": res.vendor_cost_usd,
-            "latency_s": res.latency_s,
-            "stop_reason": res.stop_reason,
-        }
+            if res.vendor_cost_usd > 0:
+                spend = float(res.vendor_cost_usd)
+            else:
+                spend = (
+                    res.tokens_in / 1000.0 * self.cost_per_1k_in
+                    + res.tokens_out / 1000.0 * self.cost_per_1k_out
+                )
 
-        parsed = parse_json_answer(res.text)
-        self._seq += 1
+            self.last_usage = {
+                "tokens_in": res.tokens_in,
+                "tokens_out": res.tokens_out,
+                "spend": spend,
+                "vendor_cost_usd": res.vendor_cost_usd,
+                "latency_s": res.latency_s,
+                "stop_reason": res.stop_reason,
+            }
+
+            parsed = parse_json_answer(res.text)
+            self._seq += 1
+            seq = self._seq
+
         if artifact_root is not None:
             artifact_path = (
-                artifact_root / "micromanager" / f"{self._seq:02d}-{op}.json"
+                artifact_root / "micromanager" / f"{seq:02d}-{op}.json"
             )
             write_json(
                 artifact_path,
                 {
-                    "seq": self._seq,
+                    "seq": seq,
                     "at": utc_now(),
                     "op": op,
                     "session_id": res.session_id,
@@ -731,9 +796,10 @@ class ClaudeAcpMicromanager:
         return parsed
 
     def close(self) -> None:
-        self._session_id = None
-        if self._adapter is not None:
-            self._adapter.close()
+        with self._lock:
+            self._session_id = None
+            if self._adapter is not None:
+                self._adapter.close()
 
 
 SUPERVISOR_OP_EXPECTS: dict[str, dict] = {
@@ -866,7 +932,7 @@ def _call_tier_complete(backend, **kwargs):
     return backend.complete(**base)
 
 
-class TierMicromanagerBackend:
+class TierMicromanagerBackend(_ThreadLocalUsageMixin):
     """Supervisor seat backed by a configured model tier on the worker backend."""
 
     enabled = True
@@ -885,6 +951,7 @@ class TierMicromanagerBackend:
         temperature: float = 0.2,
         owns_backend: bool = False,
     ) -> None:
+        self._init_usage()
         self.backend = backend
         self.tier = tier
         self.effort = str(effort or "")
@@ -897,7 +964,6 @@ class TierMicromanagerBackend:
         self.temperature = float(temperature)
         self._owns_backend = owns_backend
         self._seq = 0
-        self.last_usage: dict = {"tokens_in": 0, "tokens_out": 0, "spend": 0.0}
 
     def hello(self) -> dict:
         if hasattr(self.backend, "hello"):
@@ -942,16 +1008,44 @@ class TierMicromanagerBackend:
         self.last_usage = {"tokens_in": tok_in, "tokens_out": tok_out, "spend": cost}
         parsed = parse_json_answer(str(getattr(comp, "content", "") or ""))
 
-        self._seq += 1
+        with self._lock:
+            self._seq += 1
+            seq = self._seq
+            if self.board is not None:
+                self.board.ensure()
+                if self.board.get_member("gates") is None:
+                    self.board.upsert_member(
+                        "gates", kind="code", role="gates", added_by="system"
+                    )
+                sup_kind = "scripted" if getattr(self.backend, "name", "") == "scripted" else "api"
+                existing = self.board.get_member(self.member_name)
+                if existing is None:
+                    self.board.upsert_member(
+                        self.member_name,
+                        kind=sup_kind,
+                        role="supervisor",
+                        tier=self.tier.name,
+                        model=self.tier.model,
+                        effort=self.effort,
+                        added_by="system",
+                    )
+                self.board.add_member_usage(
+                    self.member_name,
+                    tokens_in=tok_in,
+                    tokens_out=tok_out,
+                    calls=1,
+                    effort=self.effort,
+                )
+
         artifact_path = None
         if artifact_root is not None:
             artifact_path = (
-                artifact_root / "micromanager" / f"{self._seq:02d}-{op}.json"
+                artifact_root / "micromanager" / f"{seq:02d}-{op}.json"
             )
             write_json(
                 artifact_path,
                 {
-                    "seq": self._seq,
+                    "seq": seq,
                     "at": utc_now(),
                     "op": op,
                     "tier": self.tier.name,
@@ -965,37 +1059,6 @@ class TierMicromanagerBackend:
             )
 
         if self.board is not None:
-            self.board.ensure()
-            if self.board.get_member("gates") is None:
-                self.board.upsert_member(
-                    "gates", kind="code", role="gates", added_by="system"
-                )
-            sup_kind = "scripted" if getattr(self.backend, "name", "") == "scripted" else "api"
-            existing = self.board.get_member(self.member_name)
-            if existing is None:
-                existing = self.board.upsert_member(
-                    self.member_name,
-                    kind=sup_kind,
-                    role="supervisor",
-                    tier=self.tier.name,
-                    model=self.tier.model,
-                    effort=self.effort,
-                    added_by="system",
-                )
-            new_in = int(existing.get("tokens_in", 0) or 0) + tok_in
-            new_out = int(existing.get("tokens_out", 0) or 0) + tok_out
-            new_calls = int(existing.get("calls", 0) or 0) + 1
-            eff_key = self.effort or "none"
-            by_eff = dict(existing.get("tokens_by_effort") or {})
-            by_eff[eff_key] = int(by_eff.get(eff_key, 0) or 0) + tok_in + tok_out
-            self.board.update_member(
-                self.member_name,
-                tokens_in=new_in,
-                tokens_out=new_out,
-                tokens=new_in + new_out,
-                calls=new_calls,
-                tokens_by_effort=by_eff,
-            )
             ev: list[str] = []
             if artifact_path is not None:
                 resolved_art = artifact_path.resolve()
@@ -1030,7 +1093,7 @@ class TierMicromanagerBackend:
             self.backend.close()
 
 
-class ExternalMicromanagerBackend:
+class ExternalMicromanagerBackend(_ThreadLocalUsageMixin):
     """Supervisor seat held outside openfarm over the shared board."""
 
     name = "external"
@@ -1050,6 +1113,7 @@ class ExternalMicromanagerBackend:
         cancel_check: Callable[[], bool] | None = None,
         poll_interval_s: float | None = None,
     ) -> None:
+        self._init_usage()
         self.board = board
         self.timeout_s = float(timeout_s)
         self.on_timeout = str(on_timeout or "fallback")
@@ -1065,7 +1129,6 @@ class ExternalMicromanagerBackend:
             else min(10.0, max(0.05, self.timeout_s / 4.0))
         )
         self._seq = 0
-        self.last_usage: dict = {"tokens_in": 0, "tokens_out": 0, "spend": 0.0}
 
     def hello(self) -> dict:
         return {"name": self.name, "versions": [1], "ops": ["hello", "assist"]}
@@ -1086,9 +1149,11 @@ class ExternalMicromanagerBackend:
         prompt_text = _build_op_prompt(op, clean_payload)
         expects = expects_for_supervisor_op(op)
 
-        self._seq += 1
+        with self._lock:
+            self._seq += 1
+            seq = self._seq
         q_file = self.board.evidence_dir / (
-            f"question-{card_id or 'run'}-{op}-{self._seq}.json"
+            f"question-{card_id or 'run'}-{op}-{seq}.json"
         )
         write_json(
             q_file,
@@ -1559,7 +1624,7 @@ class Micromanager:
                 f"adjudicate_checker returned invalid verdict {verdict!r}",
             )
         if verdict == "dismiss_false_reject" and self.mode != "advisory":
-            self.budget.record_false_reject_dismissed()
+            self.budget.record_false_reject_dismissed(card.id)
         elif self.mode == "advisory":
             verdict = "uphold"
 
@@ -2026,6 +2091,7 @@ def open_micromanager(
     card_budget=None,
     heartbeat_fn: Callable[[], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
+    backend_override=None,
 ) -> Micromanager:
     """Create a configured Micromanager from config (or script override)."""
     repo_path = Path(repo)
@@ -2076,6 +2142,17 @@ def open_micromanager(
             max_calls_per_card=max_calls,
             tokens_per_card=tokens_cap,
             spend_per_night=spend_cap,
+        )
+
+    if backend_override is not None:
+        return Micromanager(
+            backend_override,
+            budget=budget,
+            never_touch=never_touch,
+            forbidden_files=forbidden_files,
+            card_dir=card_dir,
+            mode="active" if mode == "off" else mode,
+            feature_flags=feature_flags,
         )
 
     if script is not None:
