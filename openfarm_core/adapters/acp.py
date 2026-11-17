@@ -359,11 +359,19 @@ def _sanitised_env(
     def _keep_var(key: str, val: object) -> bool:
         if key in _STRIPPED_ENV_EXACT or key.startswith("ANTIGRAVITY_"):
             return False
+        if key.startswith("CLAUDE_CODE_"):
+            # A run started from inside a Claude Code session carries that
+            # session's ids and messaging token. No child gets them; only the
+            # Claude provider may keep its own OAuth token.
+            return (
+                prov == "claude"
+                and allow_oauth
+                and key in _OAUTH_ENV_ALLOW
+                and bool(str(val or "").strip())
+            )
         if prov == "claude":
             if key == "ANTHROPIC_API_KEY" and auth_mode == "oauth" and auth_file is None:
                 return False
-            if key.startswith("CLAUDE_CODE_"):
-                return allow_oauth and key in _OAUTH_ENV_ALLOW and bool(str(val or "").strip())
         elif prov == "antigravity":
             if key in ("GEMINI_API_KEY", "GOOGLE_API_KEY") and (auth_mode == "oauth" or auth_file is not None):
                 return False
