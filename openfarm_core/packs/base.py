@@ -60,6 +60,16 @@ class Pack:
         """
         return None
 
+    def prepare_worktree(self, worktree: Path) -> str:
+        """Ready another checkout of this project for a run, as `configure` does.
+
+        The flow calls it on the trial checkouts it makes beside a card's worktree
+        (revert-check, catch-up), so a run there sees what the card's own runs see.
+        It never changes the pack's own settings. Returns a note, or "" (the
+        default: nothing to do).
+        """
+        return ""
+
     # -- files ----------------------------------------------------------------
 
     def classify_paths(self, paths: list[str]) -> dict:

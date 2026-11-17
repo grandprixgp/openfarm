@@ -868,6 +868,22 @@ class TypeScriptPack(Pack):
             notes.append(tooling["test_script"])
         self.notes = notes
 
+    def prepare_worktree(self, worktree: Path) -> str:
+        """Link the base checkout's `node_modules` into a trial checkout too.
+
+        The same rule as a card worktree's (`link_node_modules`), so a revert-check
+        or catch-up run imports the same packages the card's own runs did. The
+        pack's tools and notes stay those of the card's worktree.
+        """
+        root = Path(worktree)
+        settings = (self._settings if self._settings is not None
+                    else runner_settings(base_checkout(root)))
+        chosen = dict(DEFAULT_SETTINGS)
+        chosen.update(settings or {})
+        if not bool(chosen.get("link_node_modules", True)):
+            return ""
+        return link_node_modules(root, base_checkout(root))
+
     # -- commands -------------------------------------------------------------
 
     def _top(self, unit: str) -> str:

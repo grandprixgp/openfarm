@@ -1772,6 +1772,21 @@ class CardRun:
             self.card.touches, self.worktree
         )
 
+    def _prepare_checkout(self, path: Path) -> None:
+        """A checkout gets what the pack gives the card's own worktree.
+
+        A TypeScript project's linked `node_modules`, for one: without it a run in
+        a revert-check or catch-up checkout could not import what the card's runs
+        import. Also used to set the card's worktree up again after a
+        counter-test removed part of it.
+        """
+        prepare = getattr(self.pack, "prepare_worktree", None)
+        if prepare is None:
+            return
+        note = prepare(path)
+        if note:
+            self.log(f"{self.card.id}: {note}")
+
     def _base_ref(self) -> str:
         name = f"refs/heads/{self.cfg.base_branch}"
         return name if self.git.ref_exists(name) else "HEAD"
@@ -3220,6 +3235,7 @@ class CardRun:
                 shutil.rmtree(revert_target, ignore_errors=True)
                 base_ref = self.scaffold_commit or self.base_commit or "HEAD"
                 self.git.worktree_add(trial_wt, base_ref)
+                self._prepare_checkout(trial_wt)
                 try:
                     overlay = sorted(set(self.frozen_tests) | set(self.phase_a_stub_files))
                     for rel in overlay:
@@ -4006,6 +4022,7 @@ class CardRun:
         if trial.exists():
             shutil.rmtree(trial, ignore_errors=True)
         self.git.worktree_add(trial, self.branch)
+        self._prepare_checkout(trial)
         trial_git = Git(trial)
         try:
             merged, output = trial_git.merge_no_commit(current_base)
