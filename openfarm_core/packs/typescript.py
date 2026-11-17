@@ -1951,3 +1951,626 @@ def _strip_field_initializer(line: str, mask: str) -> str:
             prefix = line[:col].rstrip()
             return f"{prefix};" if prefix else ""
     return line.rstrip()
+
+
+# -- scaffold contracts --------------------------------------------------------
+#
+# A scaffold sets the shape a worker fills in, so, as for Rust and Python, it may
+# only declare: imports, re-exports, types, interfaces, ambient `declare`s, and
+# functions, methods, accessors and arrows whose whole body is one
+# `throw new Error(...)`. Anything this grammar does not know is refused, and a
+# type is skipped only where node's type stripping erases it too.
+
+
+class _ScaffoldRefused(Exception):
+    pass
+
+
+_SCAFFOLD_PUNCT = ("...", "=>", "?.")
+#: Words after which a type, a declaration or a statement must go on.
+_PREFIX_WORDS = frozenset({
+    "export", "default", "declare", "abstract", "async", "const", "let", "var",
+    "function", "class", "interface", "type", "enum", "namespace", "module", "global",
+    "extends", "implements", "keyof", "typeof", "infer", "is", "as", "readonly",
+    "unique", "new", "asserts", "import", "from", "static", "public", "private",
+    "protected", "override", "accessor", "get", "set",
+})
+#: Tokens that cannot start a statement, so a line starting with one goes on.
+_CONTINUES = frozenset({"|", "&", ".", "=>", "extends", "?", ":"})
+#: Before these a `{` opens an object type, not a body.
+_TYPE_OPERAND_BEFORE = frozenset({
+    "", ":", "|", "&", "=>", "<", ",", "(", "[", "?", "keyof", "typeof", "readonly",
+    "extends", "is", "infer", "=", "unique", "asserts",
+})
+_PARAM_MODIFIERS = frozenset({"public", "private", "protected", "readonly", "override"})
+_MEMBER_MODIFIERS = frozenset({"public", "private", "protected", "static", "readonly",
+                               "abstract", "override", "declare", "async", "accessor"})
+_LITERAL_WORDS = frozenset({"true", "false", "null", "undefined"})
+
+
+def _scaffold_tokens(text: str) -> list[tuple[str, str, bool]]:
+    """(kind, text, newline before) for `text`; comments dropped.
+
+    Kinds: id, str, tpl (a template with no substitution), num, punct. A template
+    substitution or an identifier escape is refused outright, so the tokens never
+    drift from what node reads.
+    """
+    out: list[tuple[str, str, bool]] = []
+    i, n = 0, len(text)
+    newline = False
+    while i < n:
+        ch = text[i]
+        if ch in " \t\r\f\v﻿":
+            i += 1
+            continue
+        if ch == "\n" or ch in "  ":
+            newline = True
+            i += 1
+            continue
+        if text.startswith("//", i):
+            end = text.find("\n", i)
+            i = n if end == -1 else end
+            continue
+        if text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            if end == -1:
+                raise _ScaffoldRefused("an unclosed /* comment")
+            if "\n" in text[i:end]:
+                newline = True
+            i = end + 2
+            continue
+        start = i
+        if ch in ("'", '"'):
+            i += 1
+            while i < n and text[i] != ch:
+                if text[i] == "\n":
+                    raise _ScaffoldRefused("a string that runs past its line")
+                i += 2 if text[i] == "\\" else 1
+            if i >= n:
+                raise _ScaffoldRefused("an unclosed string")
+            i += 1
+            out.append(("str", text[start:i], newline))
+        elif ch == "`":
+            i += 1
+            while i < n and text[i] != "`":
+                if text.startswith("${", i):
+                    raise _ScaffoldRefused("a template with a ${...} substitution")
+                i += 2 if text[i] == "\\" else 1
+            if i >= n:
+                raise _ScaffoldRefused("an unclosed template")
+            i += 1
+            out.append(("tpl", text[start:i], newline))
+        elif ch.isdigit() or (ch == "." and i + 1 < n and text[i + 1].isdigit()):
+            i += 1
+            while i < n and (text[i].isalnum() or text[i] in "._"):
+                i += 1
+            out.append(("num", text[start:i], newline))
+        elif ch.isalpha() or ch in "_$#" or ord(ch) > 127:
+            i += 1
+            while i < n and (text[i].isalnum() or text[i] in "_$" or ord(text[i]) > 127):
+                i += 1
+            if not text[start:i].lstrip("#").replace("$", "a").replace("_", "a").isidentifier():
+                raise _ScaffoldRefused(f"an odd name {text[start:i]!r}")
+            out.append(("id", text[start:i], newline))
+        elif ch == "\\":
+            raise _ScaffoldRefused("an escape outside a string")
+        else:
+            for punct in _SCAFFOLD_PUNCT:
+                if text.startswith(punct, i):
+                    i += len(punct)
+                    break
+            else:
+                i += 1
+            out.append(("punct", text[start:i], newline))
+        newline = False
+    return out
+
+
+class _ScaffoldParser:
+    """Declarations and throwing stubs only; raises `_ScaffoldRefused` otherwise."""
+
+    def __init__(self, tokens: list[tuple[str, str, bool]]) -> None:
+        self.toks = tokens
+        self.i = 0
+
+    # -- token helpers --------------------------------------------------------
+
+    def peek(self, ahead: int = 0) -> str:
+        j = self.i + ahead
+        return self.toks[j][1] if j < len(self.toks) else ""
+
+    def kind(self, ahead: int = 0) -> str:
+        j = self.i + ahead
+        return self.toks[j][0] if j < len(self.toks) else ""
+
+    def newline_before(self, ahead: int = 0) -> bool:
+        j = self.i + ahead
+        return self.toks[j][2] if j < len(self.toks) else True
+
+    def at_end(self) -> bool:
+        return self.i >= len(self.toks)
+
+    def take(self, want: str | None = None) -> str:
+        if self.at_end():
+            raise _ScaffoldRefused(f"the text ends where {want or 'more'} was expected")
+        value = self.toks[self.i][1]
+        if want is not None and value != want:
+            raise _ScaffoldRefused(f"{value!r} where {want!r} was expected")
+        self.i += 1
+        return value
+
+    def take_name(self) -> str:
+        if self.kind() != "id":
+            raise _ScaffoldRefused(f"{self.peek() or 'the end'!r} where a name was expected")
+        return self.take()
+
+    def optional(self, want: str) -> bool:
+        if self.peek() == want and not self.at_end():
+            self.i += 1
+            return True
+        return False
+
+    def prev(self) -> tuple[str, str]:
+        if self.i == 0:
+            return "", ""
+        kind, value, _ = self.toks[self.i - 1]
+        return kind, value
+
+    def prev_ends_value(self) -> bool:
+        kind, value = self.prev()
+        if kind in ("str", "tpl", "num"):
+            return True
+        if kind == "id":
+            return value not in _PREFIX_WORDS
+        return value in (")", "]", "}", ">")
+
+    def statement_ends_here(self) -> bool:
+        """At depth 0: an explicit `;`, the end, or a line break node would end on."""
+        if self.at_end():
+            return True
+        return (self.newline_before() and self.prev_ends_value()
+                and self.peek() not in _CONTINUES)
+
+    def end_statement(self) -> None:
+        if self.optional(";"):
+            return
+        if self.at_end() or self.peek() == "}" or self.newline_before():
+            return
+        raise _ScaffoldRefused(f"{self.peek()!r} after a declaration")
+
+    def skip_balanced(self) -> None:
+        """Skip a bracketed group starting at an opener; its contents are types."""
+        pairs = {"(": ")", "[": "]", "{": "}", "<": ">"}
+        stack = [pairs[self.take()]]
+        while stack:
+            if self.at_end():
+                raise _ScaffoldRefused("an unclosed bracket")
+            value = self.take()
+            if value in pairs and (value != "<" or stack[-1] == ">"):
+                stack.append(pairs[value])
+            elif value == "<" and stack[-1] != ">":
+                continue
+            elif value == stack[-1]:
+                stack.pop()
+            elif value in (")", "]", "}") and value != stack[-1]:
+                if stack[-1] == ">":
+                    raise _ScaffoldRefused("an odd bracket inside < >")
+                raise _ScaffoldRefused("unbalanced brackets")
+
+    def skip_type(self, stops: tuple[str, ...], body_may_follow: bool = False) -> None:
+        """Skip a type: it is erased by node, so its contents never run.
+
+        Ends before a depth-0 token in `stops`, before a `{` that opens a body
+        (when `body_may_follow`), or at a line break node would end the type on.
+        """
+        started = False
+        while not self.at_end():
+            value = self.peek()
+            if started and self.statement_ends_here():
+                return
+            if value in stops:
+                return
+            if value == "{":
+                if body_may_follow and self.prev()[1] not in _TYPE_OPERAND_BEFORE \
+                        and started:
+                    return
+                self.skip_balanced()
+            elif value in ("(", "[", "<"):
+                self.skip_balanced()
+            elif value in (")", "]", "}", ">", ";"):
+                return
+            elif value == "@":
+                raise _ScaffoldRefused("a decorator")
+            else:
+                self.take()
+            started = True
+
+    # -- grammar --------------------------------------------------------------
+
+    def statements(self) -> None:
+        while not self.at_end():
+            if self.optional(";"):
+                continue
+            self.statement()
+
+    def statement(self) -> None:
+        word = self.peek()
+        if word == "import":
+            self.import_decl()
+        elif word == "export":
+            self.take()
+            if self.optional("default"):
+                if self.peek() in ("function", "class", "abstract", "async", "interface"):
+                    self.declaration(allow_anonymous=True)
+                    return
+                raise _ScaffoldRefused("export default of a value")
+            if self.peek() in ("{", "*") or (self.peek() == "type"
+                                              and self.peek(1) in ("{", "*")):
+                self.reexport()
+                return
+            if self.peek() == "=":
+                raise _ScaffoldRefused("export =")
+            self.declaration()
+        else:
+            self.declaration()
+
+    def import_decl(self) -> None:
+        self.take("import")
+        if self.kind() == "str":
+            raise _ScaffoldRefused("an import run only for its side effects")
+        self.optional("type")
+        while not self.at_end() and self.peek() != "from":
+            value = self.peek()
+            if value == "{":
+                self.skip_balanced()
+            elif value in ("*", ",", "as") or self.kind() == "id":
+                self.take()
+                if self.peek() == "=":
+                    raise _ScaffoldRefused("import x = require(...)")
+            else:
+                raise _ScaffoldRefused(f"{value!r} in an import")
+        self.take("from")
+        if self.kind() != "str":
+            raise _ScaffoldRefused("an import from something other than a string")
+        self.take()
+        if self.peek() in ("with", "assert") and not self.newline_before():
+            self.take()
+            if self.peek() != "{":
+                raise _ScaffoldRefused("odd import attributes")
+            self.skip_balanced()
+        self.end_statement()
+
+    def reexport(self) -> None:
+        self.optional("type")
+        if self.optional("*"):
+            if self.optional("as"):
+                self.take_name()
+            self.take("from")
+        else:
+            self.take("{")
+            while not self.optional("}"):
+                if self.kind() == "id" or self.peek() == ",":
+                    self.take()
+                elif self.kind() == "str":
+                    self.take()
+                else:
+                    raise _ScaffoldRefused(f"{self.peek()!r} in an export list")
+            if not self.optional("from"):
+                self.end_statement()
+                return
+        if self.kind() != "str":
+            raise _ScaffoldRefused("a re-export from something other than a string")
+        self.take()
+        self.end_statement()
+
+    def declaration(self, allow_anonymous: bool = False) -> None:
+        word = self.peek()
+        if word == "declare":
+            self.take()
+            self.ambient()
+        elif word == "interface":
+            self.take()
+            self.take_name()
+            self.skip_type(("{",))
+            if self.peek() != "{":
+                raise _ScaffoldRefused("an interface with no body")
+            self.skip_balanced()
+        elif word == "type" and self.kind(1) == "id":
+            self.take()
+            self.take_name()
+            if self.peek() == "<":
+                self.skip_balanced()
+            self.take("=")
+            self.skip_type((";",))
+            self.end_statement()
+        elif word in ("async", "function"):
+            self.function(allow_anonymous=allow_anonymous)
+        elif word in ("abstract", "class"):
+            self.optional("abstract")
+            self.class_decl(allow_anonymous=allow_anonymous)
+        elif word in ("const", "let", "var"):
+            self.variable()
+        elif word == "enum" or (word == "const" and self.peek(1) == "enum"):
+            raise _ScaffoldRefused("an enum (node cannot run enums)")
+        elif word in ("namespace", "module"):
+            raise _ScaffoldRefused("a namespace (node cannot run namespaces)")
+        elif word == "@":
+            raise _ScaffoldRefused("a decorator")
+        else:
+            raise _ScaffoldRefused(f"a statement starting {word!r}")
+
+    def ambient(self) -> None:
+        """A `declare` declaration: erased by node, so skipped up to where it ends."""
+        if self.peek() in ("const", "let", "var", "type"):
+            self.take()
+            self.skip_type((";",))
+            self.end_statement()
+            return
+        if self.peek() in ("function", "async"):
+            self.optional("async")
+            self.take("function")
+            self.skip_type((";",), body_may_follow=True)
+            if self.peek() == "{":
+                raise _ScaffoldRefused("a declared function with a body")
+            self.end_statement()
+            return
+        if self.peek() in ("abstract", "class", "module", "namespace", "global", "enum",
+                           "interface"):
+            self.skip_type(("{",))
+            if self.peek() != "{":
+                raise _ScaffoldRefused("an ambient declaration with no body")
+            self.skip_balanced()
+            return
+        raise _ScaffoldRefused(f"declare {self.peek()!r}")
+
+    def params(self) -> None:
+        """A parameter list: names and types only, no defaults, no parameter properties."""
+        start = self.i
+        self.skip_balanced()
+        inner = self.toks[start + 1:self.i - 1]
+        for pos, (kind, value, _) in enumerate(inner):
+            if value == "=":
+                raise _ScaffoldRefused("a parameter default (code that runs)")
+            if value == "@":
+                raise _ScaffoldRefused("a parameter decorator")
+            before = inner[pos - 1][1] if pos else ","
+            if kind == "id" and value in _PARAM_MODIFIERS and before == "," \
+                    and pos + 1 < len(inner) and inner[pos + 1][0] == "id":
+                raise _ScaffoldRefused("a parameter property (node cannot run it)")
+
+    def signature_rest(self) -> bool:
+        """After a name: generics, parameters, return type. True when a body follows."""
+        if self.peek() == "<":
+            self.skip_balanced()
+        if self.peek() != "(":
+            raise _ScaffoldRefused(f"{self.peek()!r} where parameters were expected")
+        self.params()
+        if self.optional(":"):
+            self.skip_type((";", "}"), body_may_follow=True)
+        return self.peek() == "{" and not self.statement_ends_here()
+
+    def throw_body(self) -> None:
+        """Exactly `{ throw new Error(<string>?); }`."""
+        self.take("{")
+        if self.peek() != "throw":
+            raise _ScaffoldRefused("a body that is not exactly one throw new Error(...)")
+        self.take("throw")
+        self.take("new")
+        self.take("Error")
+        self.take("(")
+        if self.kind() in ("str", "tpl"):
+            self.take()
+        self.take(")")
+        self.optional(";")
+        if self.peek() != "}":
+            raise _ScaffoldRefused("a body with more than one throw new Error(...)")
+        self.take("}")
+
+    def function(self, allow_anonymous: bool = False) -> None:
+        self.optional("async")
+        self.take("function")
+        self.optional("*")
+        if self.kind() == "id" and self.peek() not in ("<",):
+            self.take()
+        elif not allow_anonymous:
+            raise _ScaffoldRefused("a function with no name")
+        if self.signature_rest():
+            self.throw_body()
+        else:
+            self.end_statement()  # an overload signature
+
+    def class_decl(self, allow_anonymous: bool = False) -> None:
+        self.take("class")
+        if self.kind() == "id" and self.peek() not in ("extends", "implements"):
+            self.take()
+        elif not allow_anonymous:
+            raise _ScaffoldRefused("a class with no name")
+        if self.peek() == "<":
+            self.skip_balanced()
+        if self.optional("extends"):
+            # A plain, possibly dotted name: anything else is an expression that runs.
+            self.take_name()
+            while self.optional("."):
+                self.take_name()
+            if self.peek() == "<":
+                self.skip_balanced()
+        if self.optional("implements"):
+            self.skip_type(("{",), body_may_follow=True)
+        self.take("{")
+        self.members(closing="}")
+        self.take("}")
+
+    def members(self, closing: str | None) -> None:
+        while not self.at_end() and self.peek() != closing:
+            if self.optional(";"):
+                continue
+            self.member()
+
+    def member(self) -> None:
+        while (self.peek() in _MEMBER_MODIFIERS and self.peek(1) not in
+               ("(", "<", ":", "=", ";", "?", "!", "{", "}")
+               and not self.newline_before(1)):
+            self.take()
+        if self.peek() == "static" and self.peek(1) == "{":
+            raise _ScaffoldRefused("a static block (code that runs)")
+        if self.peek() in ("get", "set") and self.kind(1) in ("id", "str", "num") \
+                and not self.newline_before(1):
+            self.take()
+        if self.peek() == "@":
+            raise _ScaffoldRefused("a decorator")
+        if self.peek() == "[":
+            # An index signature `[key: K]: V`; a computed key is code that runs.
+            if not (self.kind(1) == "id" and self.peek(2) == ":"):
+                raise _ScaffoldRefused("a computed member name")
+            self.skip_balanced()
+            self.take(":")
+            self.skip_type((";", "}"))
+            self.end_statement()
+            return
+        self.optional("*")
+        if self.kind() not in ("id", "str", "num"):
+            raise _ScaffoldRefused(f"{self.peek() or 'the end'!r} where a member was expected")
+        self.take()
+        self.optional("?") or self.optional("!")
+        if self.peek() in ("(", "<"):
+            if self.signature_rest():
+                self.throw_body()
+            else:
+                self.end_statement()  # abstract, declared or an overload
+            return
+        if self.optional(":"):
+            self.skip_type((";", "=", "}"))
+        if self.optional("="):
+            self.initializer(in_class=True)
+        self.end_statement()
+
+    def initializer(self, in_class: bool) -> None:
+        """A stub function, or (in a class) one literal."""
+        if self.peek() in ("async", "function") or self.peek() == "(" or (
+                self.kind() == "id" and self.peek(1) == "=>") or self.peek() == "<":
+            self.arrow_or_function()
+            return
+        if in_class:
+            self.optional("-")
+            if self.kind() in ("str", "tpl", "num") or self.peek() in _LITERAL_WORDS:
+                self.take()
+                return
+        raise _ScaffoldRefused("a value that is not a throwing stub")
+
+    def arrow_or_function(self) -> None:
+        if self.peek() == "function" or (self.peek() == "async" and self.peek(1) == "function"):
+            self.function(allow_anonymous=True)
+            return
+        if self.peek() == "async" and not self.newline_before(1):
+            self.take()
+        if self.kind() == "id" and self.peek(1) == "=>":
+            self.take()
+        else:
+            if self.peek() == "<":
+                self.skip_balanced()
+            if self.peek() != "(":
+                raise _ScaffoldRefused("a value that is not a throwing stub")
+            self.params()
+            if self.optional(":"):
+                self.skip_type(("=>",))
+        self.take("=>")
+        if self.peek() != "{":
+            raise _ScaffoldRefused("an arrow whose body is an expression")
+        self.throw_body()
+
+    def variable(self) -> None:
+        keyword = self.take()  # const / let / var
+        self.take_name()
+        if self.optional(":"):
+            self.skip_type(("=", ";", ","))
+        if self.peek() == ",":
+            raise _ScaffoldRefused("several names in one declaration")
+        if keyword != "const" and self.peek() != "=":
+            self.end_statement()  # a typed name with no value, like Python's `x: int`
+            return
+        self.take("=")
+        self.initializer(in_class=False)
+        if self.peek() == ",":
+            raise _ScaffoldRefused("several names in one declaration")
+        self.end_statement()
+
+
+def typescript_scaffold_problem(body: str, in_class: bool = False) -> str:
+    """Why `body` is not a TypeScript scaffold, or "" when it is one.
+
+    It may hold only declarations and failing stubs: imports, re-exports, types,
+    interfaces, `declare`s, classes whose members are typed fields (a literal
+    default at most) and stub methods, and functions, methods, accessors and
+    arrows whose whole body is one `throw new Error(...)`. With `in_class`, the
+    body is a run of class members (an edit adding to a class it is inside).
+    """
+    if not str(body or "").strip():
+        return "it is empty"
+    try:
+        tokens = _scaffold_tokens(str(body))
+        if not tokens:
+            return "it holds only comments"
+        parser = _ScaffoldParser(tokens)
+        if in_class:
+            parser.members(closing=None)
+        else:
+            parser.statements()
+    except _ScaffoldRefused as exc:
+        return str(exc)
+    return ""
+
+
+def typescript_scaffold_edit_problem(fmt: str, search: str, replace: str,
+                                     content: str | None) -> str:
+    """Why a scaffold edit is not declarations and stubs only, or "".
+
+    A `whole_file` or `append_stub` is judged on its content. A `search_replace`
+    that only inserts lines is judged on what it adds, as class members when the
+    lines before it open a class body, and only when it lands between complete
+    statements; one that changes or drops existing lines is judged whole, so it
+    cannot rewrite logic and call the result a scaffold.
+    """
+    if fmt != "search_replace":
+        return typescript_scaffold_problem(content or "")
+    old = (search or "").splitlines(keepends=True)
+    new = (replace or "").splitlines(keepends=True)
+    head = 0
+    while head < len(old) and head < len(new) and old[head] == new[head]:
+        head += 1
+    tail = 0
+    while (tail < len(old) - head and tail < len(new) - head
+           and old[len(old) - 1 - tail] == new[len(new) - 1 - tail]):
+        tail += 1
+    removed = old[head:len(old) - tail]
+    if not old or any(line.strip() for line in removed):
+        return typescript_scaffold_problem(replace or "")
+    added = "".join(new[head:len(new) - tail])
+    scanner = _TSScanner()
+    masked = [scanner.mask_line(line.rstrip("\n")) for line in old]
+    before = "\n".join(masked[:head]).rstrip()
+    after = "\n".join(masked[len(old) - tail:]).lstrip()
+    if before and before[-1] not in "{};":
+        return "it is inserted in the middle of a statement"
+    if after and not (after[0].isalnum() or after[0] in "_$#}@;"):
+        return "it is inserted in the middle of a statement"
+    return typescript_scaffold_problem(added, in_class=_opens_class_body(before))
+
+
+def _opens_class_body(masked: str) -> bool:
+    """True when the innermost `{` still open at the end of `masked` is a class's."""
+    stack: list[bool] = []
+    header = ""
+    for ch in masked:
+        if ch == "{":
+            stack.append(bool(re.search(r"\bclass\b", header)))
+            header = ""
+        elif ch == "}":
+            if not stack:
+                return False
+            stack.pop()
+            header = ""
+        elif ch == ";":
+            header = ""
+        else:
+            header += ch
+    return bool(stack) and stack[-1]
