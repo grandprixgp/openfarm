@@ -324,23 +324,7 @@ def driver_hold(provider: str, settings=None) -> confine_lib.Hold:
     needs the boundary, Claude is left to its own rules under `auto` and
     confined under `bwrap`, and `off` confines nothing.
     """
-    held = confine_lib.as_settings(settings)
-    mode = held.mode
-    needs_check = not (mode == "off" or (mode == "auto" and provider == "claude"))
-    usable, reason = confine_lib.bwrap_status() if needs_check else (False, "")
-    hold = confine_lib.decide(
-        provider,
-        transport="bridge",
-        tool_policy="none",
-        mode=mode,
-        bwrap_usable=usable,
-        bwrap_reason=reason,
-    )
-    if not hold.note:
-        note = confine_lib.hold_note(hold, reason)
-        if note:
-            hold = dataclasses.replace(hold, note=note)
-    return hold
+    return confine_lib.hold_for(provider, settings, transport="bridge", tool_policy="none")
 
 
 def agy_prompt_too_large(full_prompt: str) -> str:

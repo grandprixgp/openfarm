@@ -232,6 +232,27 @@ def hold_note(hold: "Hold", bwrap_reason: str = "") -> str:
     return ""
 
 
+def hold_for(provider: str, settings=None, *, transport: str,
+             tool_policy: str = "none") -> Hold:
+    """`decide` for a child under `settings`, asking bwrap only when the rule needs it.
+
+    The hold carries its note (`hold_note`) when the child is not confined. This
+    is the adapter's own rule (`ClaudeAcpAdapter._decide_hold`), for callers that
+    hold no adapter: the driver, and the run's notes and shared supervisor.
+    """
+    held = as_settings(settings)
+    mode = held.mode
+    needs_check = not (mode == "off" or (mode == "auto" and provider == "claude"))
+    usable, reason = bwrap_status() if needs_check else (False, "")
+    hold = decide(provider, transport=transport, tool_policy=tool_policy, mode=mode,
+                  bwrap_usable=usable, bwrap_reason=reason)
+    if not hold.note:
+        note = hold_note(hold, reason)
+        if note:
+            hold = dataclasses.replace(hold, note=note)
+    return hold
+
+
 def decide(
     provider: str,
     *,

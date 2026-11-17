@@ -697,7 +697,7 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
 
         `[micromanager] confine = "off"`, or Codex held by its tool flags alone
         because bwrap is unusable. Worked out from the same settings and rules
-        the adapters use (`confinement_summary`), so it holds for every card's
+        the adapters use (`confine.hold_for`), so it holds for every card's
         adapter, the ones already closed included.
         """
         from . import confine as confine_lib
@@ -733,20 +733,12 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
         out: list[str] = []
         for provider, command, policy, settings in seats:
             try:
-                held = ClaudeAcpAdapter(command=command, provider=provider,
-                                        confine=settings).confinement_summary()
+                _transport, hold = _SharedAcpSupervisor.hold_of(
+                    command, provider, policy, settings)
             except (AdapterError, confine_lib.ConfineError):
                 continue
-            row = held.get(policy) if isinstance(held.get(policy), dict) else {}
-            hold = confine_lib.Hold(
-                provider, str(row.get("mode") or held.get("mode") or "auto"),
-                flags=bool(row.get("flags")), boundary=bool(row.get("boundary")),
-                refused=str(row.get("refused") or ""), note=str(row.get("note") or ""))
-            reason = (confine_lib.bwrap_status()[1]
-                      if hold.flags and not hold.boundary and hold.mode != "off" else "")
-            note = confine_lib.hold_note(hold, reason)
-            if note and note not in out:
-                out.append(note)
+            if hold.note and not hold.refused and hold.note not in out:
+                out.append(hold.note)
         return out
 
     if not args.dry_run:
@@ -855,6 +847,24 @@ class _SharedAcpSupervisor:
         self.proto = proto
         self.lock = threading.RLock()
         self.adapter = None
+
+    @staticmethod
+    def hold_of(command, provider: str, tool_policy: str, settings):
+        """`(transport, hold)`: how an adapter for `command` would hold its child.
+
+        The adapter's own rule, worked out without building one. A standalone
+        server's process is held as for tool policy `none`.
+        """
+        from . import confine as confine_lib
+        from .adapters.acp import _bridge_provider, resolve_acp_command
+
+        argv = resolve_acp_command(command, provider=provider)
+        transport = "bridge" if _bridge_provider(argv) else "server"
+        if settings is None:
+            settings = getattr(command, "confine", None)
+        return transport, confine_lib.hold_for(
+            normalize_acp_provider(provider), settings, transport=transport,
+            tool_policy=tool_policy if transport == "bridge" else "none")
 
     def live_adapter(self):
         """The one live adapter, started or replaced as needed (call under `lock`)."""
