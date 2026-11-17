@@ -1632,6 +1632,11 @@ def _format_drive(payload: dict, style: Style) -> str:
         pairs.append(("run_spend", _fmt_usd(payload["run_spend"]) + " (driver included)"))
     elif payload.get("driver_counted_in_run") is False:
         pairs.append(("run_spend", "not counted: the run belongs to another process"))
+    if isinstance(payload.get("run_tokens"), dict):
+        from .budget import describe_split
+        split = payload["run_tokens"]
+        pairs.append(("run_tokens", describe_split(split) + " (driver included"
+                      + (", driver tokens estimated)" if split.get("estimated") else ")")))
     for part, vals in (payload.get("driver_by_part") or {}).items():
         part_txt = (
             f"{_fmt_int(vals.get('tokens_in', 0))} in / {_fmt_int(vals.get('tokens_out', 0))} out, "

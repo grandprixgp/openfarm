@@ -44,7 +44,7 @@ from .board import (
     validate_expected_answer,
 )
 from .briefs import _sanitize_text
-from .budget import NightBudget
+from .budget import NightBudget, token_split
 from .cards import Card
 from .config import Config
 from .coordinator import _clean_json_payload
@@ -2125,8 +2125,36 @@ def _add_driver_to_run_record(state: StateDir, run_id: str, report: dict) -> boo
         if note not in notes:
             notes.append(note)
     record["notes"] = notes
+    tokens = record.get("tokens")
+    if isinstance(tokens, dict):
+        tokens["with_driver"] = driven_token_split(tokens, report)
     write_json(run_file, record)
     return True
+
+
+def driven_token_split(run_tokens: dict, report: dict) -> dict:
+    """Who used a driven run's tokens, the driver's own turns counted.
+
+    The run's own split leaves seats held from outside out of its total, so a
+    driven run reads "100% worker" although the driver did the coordinator's
+    and the supervisor's work. Here the driver's coordinator turns count as the
+    coordinator, and its supervisor and review turns as the supervisor
+    (`review` says how much of that the wave review was). `estimated` is true
+    when any driver turn's tokens were estimated rather than reported.
+    """
+    def part(name: str) -> int:
+        vals = (report.get("by_part") or {}).get(name) or {}
+        return int(vals.get("tokens_in", 0) or 0) + int(vals.get("tokens_out", 0) or 0)
+
+    review = part("review")
+    split = token_split(
+        int(run_tokens.get("worker", 0) or 0),
+        int(run_tokens.get("supervisor", 0) or 0) + part("supervisor") + review,
+        int(run_tokens.get("coordinator", 0) or 0) + part("coordinator"),
+    )
+    split["review"] = review
+    split["estimated"] = bool(report.get("tokens_estimated"))
+    return split
 
 
 def _collect_outcomes(state: StateDir, run_id: str, managed_payload: dict | None) -> list[dict]:
@@ -2780,10 +2808,12 @@ def drive_run(
             _add_driver_to_run_record(state, resolved_rid, report) if managed else False
         )
         run_spend = None
+        run_tokens = None
         if run_record_updated:
             rec = read_json(state.runs / resolved_rid / "run.json")
             if isinstance(rec, dict):
                 run_spend = float(rec.get("spend", 0.0) or 0.0)
+                run_tokens = (rec.get("tokens") or {}).get("with_driver")
         if not managed:
             report["notes"].append(
                 f"attached to run {resolved_rid}, which another process owns: the driver's "
@@ -2810,6 +2840,9 @@ def drive_run(
             # None when attached, where the driver's cost stays outside the run.
             "run_spend": round(run_spend, 6) if run_spend is not None else None,
             "driver_counted_in_run": bool(managed),
+            # Worker, supervisor and coordinator shares with the driver's turns
+            # counted (run.json's `tokens.with_driver`); None when attached.
+            "run_tokens": run_tokens,
             "notes": report["notes"],
             "actions_taken": actions_taken,
             "answers_sent": answers_sent,

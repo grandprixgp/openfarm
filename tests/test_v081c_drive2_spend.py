@@ -141,6 +141,25 @@ class DriveSpendTotalTests(unittest.TestCase):
         self.assertAlmostEqual(record["worker_spend"], 0.04, places=6)
         self.assertTrue(res["driver_counted_in_run"])
 
+        # Lead: the token split with the driver's turns counted. The run's own
+        # split leaves outside seats out, so it would read 100% worker.
+        own = record["tokens"]
+        split = record["tokens"]["with_driver"]
+        self.assertEqual(res["run_tokens"], split)
+        by_part = res["driver_by_part"]
+        def part(name: str) -> int:
+            vals = by_part.get(name) or {}
+            return int(vals.get("tokens_in", 0)) + int(vals.get("tokens_out", 0))
+        self.assertGreater(part("coordinator") + part("supervisor"), 0)
+        self.assertEqual(split["worker"], own["worker"])
+        self.assertEqual(split["coordinator"], own["coordinator"] + part("coordinator"))
+        self.assertEqual(split["supervisor"],
+                         own["supervisor"] + part("supervisor") + part("review"))
+        self.assertEqual(split["total"],
+                         split["worker"] + split["supervisor"] + split["coordinator"])
+        self.assertLess(split["worker_share"], 1.0)
+        self.assertEqual(own["total"], own["worker"] + own["supervisor"] + own["coordinator"])
+
     def test_attached_the_drive_says_its_cost_is_not_counted(self) -> None:
         sp = self._script({
             **_workers("CARD-1"),
@@ -169,6 +188,7 @@ class DriveSpendTotalTests(unittest.TestCase):
                 payload = json.loads(out.getvalue())
                 self.assertFalse(payload["driver_counted_in_run"])
                 self.assertIsNone(payload["run_spend"])
+                self.assertIsNone(payload["run_tokens"])
                 self.assertTrue(any("is not counted against that run's caps" in n
                                     for n in payload["notes"]), payload["notes"])
             else:
