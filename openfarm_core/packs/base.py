@@ -70,6 +70,15 @@ class Pack:
         """
         return ""
 
+    def gate_evidence(self, gate: str) -> dict:
+        """What a gate's record should say about how this pack ran it.
+
+        For instance, that a lint gate was a syntax check only, so nobody reading
+        the record takes it for a type check; a `note` key says it in a sentence.
+        Empty (the default) adds nothing.
+        """
+        return {}
+
     def tooling_summary(self) -> dict:
         """What this pack will run a card with, for `check` and a card record.
 

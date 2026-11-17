@@ -868,6 +868,16 @@ class TypeScriptPack(Pack):
             notes.append(tooling["test_script"])
         self.notes = notes
 
+    def gate_evidence(self, gate: str) -> dict:
+        """The lint gates say whether types were checked or only syntax."""
+        if gate not in ("lint", "workspace-lint", "ws-lint", "typecheck", "build"):
+            return {}
+        if self.has_tsc:
+            return {"typecheck": "tsc", "syntax_only": False}
+        return {"typecheck": "syntax", "syntax_only": True,
+                "note": ("syntax only: node's type stripping parsed the code, no "
+                         "types were checked (no tsc)")}
+
     def tooling_summary(self) -> dict:
         """The runner, the type check and the formatter this pack decided on."""
         tooling = self.tooling or {}

@@ -1779,6 +1779,17 @@ class CardRun:
             self.card.touches, self.worktree
         )
 
+    def _pack_gate_evidence(self, gate: str) -> dict:
+        """What the pack says a gate's record should carry (see `Pack.gate_evidence`)."""
+        evidence = getattr(self.pack, "gate_evidence", None)
+        if evidence is None:
+            return {}
+        try:
+            found = evidence(gate)
+        except Exception:  # noqa: BLE001 - a pack's extra words never stop a gate
+            return {}
+        return dict(found) if isinstance(found, dict) else {}
+
     def _prepare_checkout(self, path: Path) -> None:
         """A checkout gets what the pack gives the card's own worktree.
 
@@ -2883,11 +2894,12 @@ class CardRun:
         lint_result = self._run(runner_kind("lint"),
                                 self.pack.commands("lint", unit=unit)["argv"])
         lint_out, lint_err = self._output(lint_result)
+        lint_evidence = self._pack_gate_evidence("lint")
         lint_gate = self._record_gate(
             GateResult("lint", PASS if lint_result.cls == PASS else
                        (INFRA if lint_result.cls == INFRA else FAIL),
                        "" if lint_result.cls == PASS else
-                       (lint_err or lint_out).strip()[-800:]))
+                       (lint_err or lint_out).strip()[-800:], lint_evidence))
         if lint_result.cls == INFRA or suite.result == INFRA:
             raise Infra("attempt-infra",
                         "a gate did not finish, so the attempt is not judged")
@@ -3179,10 +3191,12 @@ class CardRun:
             ws = self._run(runner_kind("ws-lint"),
                            self.pack.commands("ws-lint")["argv"], counted="fixed")
             ws_out, ws_err = self._output(ws)
+            ws_evidence = self._pack_gate_evidence("workspace-lint")
             ws_gate = self._record_gate(GateResult(
                 "workspace-lint", PASS if ws.cls == PASS else
                 (INFRA if ws.cls == INFRA else FAIL),
-                "" if ws.cls == PASS else (ws_err or ws_out).strip()[-800:]))
+                "" if ws.cls == PASS else (ws_err or ws_out).strip()[-800:],
+                ws_evidence))
             if ws_gate.result == INFRA:
                 raise Infra("workspace-lint-infra", "the workspace lint did not finish")
             if not ws_gate.ok:
