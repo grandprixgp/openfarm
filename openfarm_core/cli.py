@@ -750,7 +750,10 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
         notes.append(
             "the backend reports no prices, so every spend is zero and the spend "
             "caps cannot fire: set [model] cost_per_1k_in and cost_per_1k_out")
-    unpriced = _unpriced_supervisor_note(cfg, mm_script_path)
+    unpriced = _unpriced_supervisor_note(
+        cfg, mm_script_path,
+        swarm_supervisor=(swarm_cfg.supervisor
+                          if swarm_cfg is not None and swarm_cfg.enabled else None))
     if unpriced:
         notes.append(unpriced)
     if cfg.concurrent_cards > 1 and not swarm_parallel:
@@ -1306,20 +1309,32 @@ def _handshake(ctx: Context, source, args, telemetry_raw=None) -> dict:
     return {"refused": False, "reason": "", "adapters": names}
 
 
-def _unpriced_supervisor_note(cfg, mm_script: Path | None) -> str:
+def _unpriced_supervisor_note(cfg, mm_script: Path | None,
+                              swarm_supervisor: str | None = None) -> str:
     """A note when the supervisor's spend cannot be measured, or "".
 
     Codex and Antigravity report no cost. Without `[micromanager]` per-1k rates
     their spend reads zero, so `[micromanager] spend_per_night` and the night's
     cap can never fire on it: the run has to say so, as it does for the workers.
+
+    `swarm_supervisor` is `[swarm] supervisor` when the swarm is on: an ACP
+    adapter named there is the supervisor that runs; `config` means the
+    micromanager's; anything else (`off`, `external`, a tier) is not an ACP child.
     """
     mm = getattr(cfg, "micromanager", None)
-    if (mm is None or mm_script is not None
-            or not is_acp_adapter(cfg.micromanager_adapter)
-            or str(getattr(mm, "mode", "active")) == "off"):
+    if mm is None or mm_script is not None:
         return ""
+    if swarm_supervisor is not None and swarm_supervisor != "config":
+        if not is_acp_adapter(swarm_supervisor):
+            return ""
+        adapter = swarm_supervisor
+    else:
+        adapter = cfg.micromanager_adapter
+        if (not is_acp_adapter(adapter)
+                or str(getattr(mm, "mode", "active")) == "off"):
+            return ""
     from .adapters.acp import provider_prices_spend
-    provider = normalize_acp_provider(cfg.micromanager_adapter)
+    provider = normalize_acp_provider(adapter)
     if provider_prices_spend(provider,
                              float(getattr(mm, "cost_per_1k_in", 0.0) or 0.0),
                              float(getattr(mm, "cost_per_1k_out", 0.0) or 0.0)):

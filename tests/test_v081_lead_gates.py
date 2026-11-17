@@ -59,5 +59,25 @@ class FailedRunWithNothingRedTests(unittest.TestCase):
         self.assertEqual(suite_green(died, [], run_cls="fail", exit_code=1).result, INFRA)
 
 
+class CounterTestStaysInsideTests(unittest.TestCase):
+    """From the outside review (m11): the fallback counter-test path is checked too."""
+
+    def test_a_linked_tests_folder_is_not_written_through(self) -> None:
+        import shutil
+        import tempfile
+        from types import SimpleNamespace
+        from openfarm_core.flow import CardRun
+        tmp = Path(tempfile.mkdtemp(prefix="of-v081-lead-ct-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        worktree, outside = tmp / "wt", tmp / "outside"
+        (worktree / "real_tests").mkdir(parents=True)
+        outside.mkdir()
+        (worktree / "tests").symlink_to(outside)
+        run = SimpleNamespace(worktree=worktree)
+        self.assertFalse(CardRun._counter_stays_inside(run, "tests/openfarm_counter_1.rs"))
+        self.assertTrue(CardRun._counter_stays_inside(run, "real_tests/openfarm_counter_1.rs"))
+        self.assertFalse(CardRun._counter_stays_inside(run, "../outside/x.rs"))
+
+
 if __name__ == "__main__":
     unittest.main()

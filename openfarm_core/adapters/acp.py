@@ -122,6 +122,26 @@ _C0_C1_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 
 _STRIPPED_ENV_EXACT = frozenset({"CLAUDECODE", "ANTHROPIC_AUTH_TOKEN", "AI_AGENT"})
 _OAUTH_ENV_ALLOW = frozenset({"CLAUDE_CODE_OAUTH_TOKEN"})
+#: A variable whose name says it holds a credential. A provider child keeps its
+#: own provider's variables and nothing else of this kind: a child with a shell
+#: (or a model that asks it) would otherwise read a GitHub or cloud token, or
+#: another provider's key, straight out of its environment.
+_SECRET_NAME_RE = re.compile(
+    r"(?:^|_)(?:TOKEN|TOKENS|SECRET|SECRETS|PASSWORD|PASSWD|PASSPHRASE|API_?KEY|APIKEY|"
+    r"ACCESS_KEY|PRIVATE_KEY|CREDENTIAL|CREDENTIALS|AUTH|COOKIE|SESSION_KEY)(?:_|$)",
+    re.IGNORECASE)
+_OWN_ENV_PREFIXES = {
+    "claude": ("ANTHROPIC_", "CLAUDE_"),
+    "codex": ("OPENAI_", "CODEX_"),
+    "antigravity": ("GEMINI_", "GOOGLE_"),
+}
+
+
+def _others_secret(provider: str, key: str) -> bool:
+    """True for a credential-named variable that is not this provider's own."""
+    if not _SECRET_NAME_RE.search(key):
+        return False
+    return not key.upper().startswith(_OWN_ENV_PREFIXES.get(provider, ()))
 _AUTH_ERROR_RE = re.compile(
     r"authentication_failed|authentication required|not authenticated|login required|"
     r"not logged in|please run /login|claude auth login|agy acp --login|codex login|"
@@ -516,7 +536,9 @@ def _sanitised_env(
 
     env: dict[str, str] = {}
     for key, val in source.items():
-        if _keep_var(key, val):
+        # Inherited variables only: what the caller passes in `extra_env` is its
+        # own choice and is kept.
+        if _keep_var(key, val) and not _others_secret(prov, key):
             env[key] = val
 
     if extra_env:

@@ -3878,6 +3878,10 @@ class CardRun:
         """The pack's source extension; `.rs` for packs that predate the field."""
         return str(getattr(self.pack, "extension", "") or ".rs")
 
+    def _counter_stays_inside(self, path: str) -> bool:
+        """Whether a counter-test written at `path` lands inside the worktree."""
+        return resolves_within(self.worktree, path) is not None
+
     def _counter_fallback_path(self, index: int) -> str:
         unit = self._effective_unit()
         ext = self._extension()
@@ -4033,6 +4037,12 @@ class CardRun:
             if not content.strip():
                 self.counter_summary["dropped_uncompiled"] += 1
                 entry.update(outcome="dropped", why="the counter-test is empty")
+            elif not self._counter_stays_inside(path):
+                # The harness's own fallback name, like a name the checker gave,
+                # is never written through a linked folder to outside the worktree.
+                self.counter_summary["dropped_uncompiled"] += 1
+                entry.update(outcome="dropped",
+                             why="its file would land outside the worktree")
             else:
                 before = snapshot()
                 existed = target.exists()

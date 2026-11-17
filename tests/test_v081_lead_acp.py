@@ -196,13 +196,25 @@ class UnpricedSupervisorNoteTests(unittest.TestCase):
     """A supervisor whose spend cannot be measured is said so in the run's notes."""
 
     def _note(self, adapter: str, *, mode: str = "active", rate: float = 0.0,
-              script: Path | None = None) -> str:
+              script: Path | None = None, swarm: str | None = None) -> str:
         from types import SimpleNamespace
         from openfarm_core.cli import _unpriced_supervisor_note
         cfg = SimpleNamespace(
             micromanager_adapter=adapter,
             micromanager=SimpleNamespace(mode=mode, cost_per_1k_in=rate, cost_per_1k_out=0.0))
-        return _unpriced_supervisor_note(cfg, script)
+        return _unpriced_supervisor_note(cfg, script, swarm_supervisor=swarm)
+
+    def test_the_swarms_own_supervisor_is_the_one_judged(self) -> None:
+        # The swarm names its supervisor: that one runs, whatever [adapters] says.
+        self.assertIn("the codex supervisor", self._note("claude-acp", swarm="codex-acp"))
+        self.assertIn("the codex supervisor", self._note("off", swarm="codex-acp"))
+        self.assertEqual(self._note("codex-acp", swarm="codex-acp", rate=0.003), "")
+        # `config` means the micromanager's.
+        self.assertIn("the codex supervisor", self._note("codex-acp", swarm="config"))
+        self.assertEqual(self._note("codex-acp", swarm="config", mode="off"), "")
+        # A seat that is not an ACP child never ran one.
+        for seat in ("off", "external", "tier:high"):
+            self.assertEqual(self._note("codex-acp", swarm=seat), "", seat)
 
     def test_codex_and_antigravity_without_rates_are_noted(self) -> None:
         for adapter, name in (("codex-acp", "codex"), ("antigravity-acp", "antigravity"),
@@ -270,6 +282,51 @@ class ClaudeApiKeyInsideTheBoundaryTests(unittest.TestCase):
         out = dict(line.split("=", 1) for line in done.stdout.splitlines() if "=" in line)
         self.assertEqual(out.get("helper"), "sk-test-KEY-123", done.stderr)
         self.assertNotIn("sk-test", out.get("real", ""), "the real key file is not shown")
+
+
+class OtherPeoplesSecretsStayOutTests(unittest.TestCase):
+    """From the outside review (m7): a child does not inherit credentials that are not its own."""
+
+    BASE = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "TERM": "xterm", "HOME": "/nonexistent",
+            "GITHUB_TOKEN": "gh", "GH_TOKEN": "gh2", "AWS_SECRET_ACCESS_KEY": "aws",
+            "AWS_ACCESS_KEY_ID": "id", "AWS_SESSION_TOKEN": "st", "NPM_TOKEN": "npm",
+            "ANTHROPIC_API_KEY": "ant", "OPENAI_API_KEY": "oai", "GEMINI_API_KEY": "gem",
+            "DATABASE_PASSWORD": "pw", "SSH_AUTH_SOCK": "/run/agent", "MY_APIKEY": "k",
+            "HTTPS_PROXY": "http://proxy.invalid:3128", "SSL_CERT_FILE": "/etc/ssl/cert.pem",
+            "TOKENIZERS_PARALLELISM": "false", "AUTHOR": "me"}
+
+    def _env(self, provider: str, auth_mode: str = "api-key", extra: dict | None = None) -> dict:
+        from openfarm_core.adapters.acp import _sanitised_env
+        env, _home = _sanitised_env(base_env=dict(self.BASE), extra_env=extra,
+                                    isolate_home=False, auth_mode=auth_mode, provider=provider)
+        return env
+
+    def test_each_provider_keeps_only_its_own_key(self) -> None:
+        for provider, own in (("claude", "ANTHROPIC_API_KEY"), ("codex", "OPENAI_API_KEY"),
+                              ("antigravity", "GEMINI_API_KEY")):
+            with self.subTest(provider):
+                env = self._env(provider)
+                self.assertIn(own, env)
+                for other in ("GITHUB_TOKEN", "GH_TOKEN", "AWS_SECRET_ACCESS_KEY",
+                              "AWS_ACCESS_KEY_ID", "AWS_SESSION_TOKEN", "NPM_TOKEN",
+                              "DATABASE_PASSWORD", "SSH_AUTH_SOCK", "MY_APIKEY"):
+                    self.assertNotIn(other, env)
+                for key in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY"):
+                    if key != own:
+                        self.assertNotIn(key, env)
+
+    def test_ordinary_variables_are_kept(self) -> None:
+        env = self._env("codex")
+        for key in ("PATH", "LANG", "TERM", "HTTPS_PROXY", "SSL_CERT_FILE",
+                    "TOKENIZERS_PARALLELISM", "AUTHOR"):
+            self.assertIn(key, env)
+
+    def test_oauth_still_drops_the_providers_own_key(self) -> None:
+        self.assertNotIn("OPENAI_API_KEY", self._env("codex", auth_mode="oauth"))
+
+    def test_what_the_caller_passes_explicitly_is_kept(self) -> None:
+        env = self._env("codex", extra={"TOOL_TOKEN": "explicit"})
+        self.assertEqual(env.get("TOOL_TOKEN"), "explicit")
 
 
 if __name__ == "__main__":
