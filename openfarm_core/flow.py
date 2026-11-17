@@ -4444,6 +4444,11 @@ class CardRun:
             "team": self.team_summary(),
             "handbacks": list(self.handbacks),
         }
+        summary = getattr(self.pack, "tooling_summary", None)
+        if summary is not None:
+            # The runner, tools and the pack's notes this card was judged with.
+            with contextlib.suppress(Exception):
+                record["tooling"] = summary()
         if self.board is not None:
             record["by_effort"] = dict(self.effort_tokens)
         return complete_record(record, CARD_FIELDS)

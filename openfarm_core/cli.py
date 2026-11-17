@@ -223,6 +223,17 @@ def cmd_check(ctx: Context, args) -> int:
     payload = {"card": card.id, "eligible": eligibility.ok,
                "card_hash": card.hash(),
                "failures": eligibility.failures}
+    # What the card's gates will run it with: the runner, the checker and
+    # formatter and the pack's notes, decided from the same config as above.
+    payload.update(eligibility.info)
+    try:
+        pack = _configured_pack(ctx.cfg, ctx.repo)
+        summary = getattr(pack, "tooling_summary", None)
+        payload["tooling"] = (summary() if summary is not None else
+                              {"pack": str(getattr(pack, "name", "") or "external"),
+                               "notes": [str(n) for n in getattr(pack, "notes", [])]})
+    except (AdapterError, Invalid, OSError) as exc:
+        payload["tooling"] = {"error": str(getattr(exc, "message", exc))}
 
     if args.baseline and eligibility.ok:
         try:

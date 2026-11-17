@@ -70,6 +70,26 @@ class Pack:
         """
         return ""
 
+    def tooling_summary(self) -> dict:
+        """What this pack will run a card with, for `check` and a card record.
+
+        `pack`, `runner` (when the pack has one: unittest or pytest, node
+        --test), `lint` and `format` (when the pack says which tool), and
+        `notes`, the pack's own sentences on what it could not use. A pack that
+        knows more says it by overriding this.
+        """
+        out: dict = {"pack": str(self.name)}
+        runner = str(getattr(self, "runner", "") or "")
+        if runner:
+            out["runner"] = runner
+        # A pack whose lint and formatting are ruff only where configured.
+        use_ruff = getattr(self, "use_ruff", None)
+        if isinstance(use_ruff, bool):
+            out["lint"] = "ruff" if use_ruff else "syntax"
+            out["format"] = "ruff" if use_ruff else "off"
+        out["notes"] = [str(note) for note in getattr(self, "notes", []) or []]
+        return out
+
     # -- files ----------------------------------------------------------------
 
     def classify_paths(self, paths: list[str]) -> dict:

@@ -469,6 +469,44 @@ def _format_status(payload: dict, style: Style) -> str:
     return "\n".join(lines)
 
 
+def _format_tooling(tooling: object, style: Style) -> list[str]:
+    """What the card's gates will run it with, the same way for every language."""
+    if not isinstance(tooling, dict) or not tooling:
+        return []
+    if tooling.get("error"):
+        return _render_kv_section("Tooling", [("error", style.red(tooling["error"]))],
+                                  style=style)
+    pairs: list[tuple[str, object]] = []
+    if tooling.get("pack"):
+        pairs.append(("language", tooling["pack"]))
+    if tooling.get("runner"):
+        pairs.append(("tests", tooling["runner"]))
+    if tooling.get("typecheck"):
+        check = tooling["typecheck"]
+        if tooling.get("syntax_only") or check == "syntax":
+            check = style.yellow("syntax only (no types are checked)")
+        elif tooling.get("tsc"):
+            check = f"{check} ({tooling['tsc']})"
+        pairs.append(("typecheck", check))
+    if tooling.get("lint"):
+        lint = tooling["lint"]
+        pairs.append(("lint", style.yellow("syntax only") if lint == "syntax" else lint))
+    if tooling.get("format"):
+        fmt = tooling["format"]
+        if fmt == "off":
+            fmt = style.yellow("off (formatting is not checked)")
+        elif tooling.get("prettier"):
+            fmt = f"{fmt} ({tooling['prettier']})"
+        pairs.append(("format", fmt))
+    lines = _render_kv_section("Tooling", pairs, style=style) if pairs else []
+    notes = [str(note) for note in tooling.get("notes") or [] if str(note).strip()]
+    if notes:
+        lines.append(style.bold("Tooling Notes"))
+        for note in notes:
+            lines.append(f"  {style.yellow(ICON_DOT)} {note}")
+    return lines
+
+
 def _format_check(payload: dict, style: Style) -> str:
     card = payload.get("card", "?")
     eligible = bool(payload.get("eligible"))
@@ -480,6 +518,8 @@ def _format_check(payload: dict, style: Style) -> str:
 
     if payload.get("card_hash"):
         lines.append(format_kv([("card_hash", payload["card_hash"])], style=style))
+
+    lines.extend(_format_tooling(payload.get("tooling"), style))
 
     failures = payload.get("failures") or []
     if failures:

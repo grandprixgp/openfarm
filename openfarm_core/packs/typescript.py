@@ -868,6 +868,21 @@ class TypeScriptPack(Pack):
             notes.append(tooling["test_script"])
         self.notes = notes
 
+    def tooling_summary(self) -> dict:
+        """The runner, the type check and the formatter this pack decided on."""
+        tooling = self.tooling or {}
+        return {
+            "pack": self.name,
+            "runner": str(tooling.get("runner") or "node --test"),
+            "typecheck": "tsc" if self.has_tsc else "syntax",
+            "syntax_only": not self.has_tsc,
+            "tsc": str(tooling.get("tsc") or "") if self.has_tsc else "",
+            "format": "prettier" if self.has_prettier else "off",
+            "prettier": (str(tooling.get("prettier") or "") if self.has_prettier
+                         else ""),
+            "notes": list(self.notes),
+        }
+
     def prepare_worktree(self, worktree: Path) -> str:
         """Link the base checkout's `node_modules` into a trial checkout too.
 
