@@ -133,6 +133,8 @@ class CardRun:
         self._board_members_ready = False
         #: The coordinator's reason when it stopped this card while it ran.
         self.coordinator_stop = ""
+        #: Board seqs of the hints this card posted itself as code.
+        self._own_hint_seqs: set[int] = set()
 
         self._owns_micromanager = micromanager is None
         cancel_fn = lambda: bool(
@@ -704,16 +706,63 @@ class CardRun:
             trusted=trusted,
         )
 
+    def _may_steer(self, author: str) -> bool:
+        """Code, or a name that holds the coordinator's or supervisor's seat now.
+
+        A name typed after `--as` proves nothing by itself: only those may hint a
+        worker or answer for the coordinator.
+        """
+        if self.board is None:
+            return False
+        member = self.board.get_member(str(author or "").strip())
+        if member is None or member.get("state") == "removed":
+            return False
+        if member.get("kind") == "code":
+            return True
+        return self.board.seat_of(author) in ("coordinator", "supervisor")
+
+    def _is_steering_post(self, post: dict, member_name: str) -> bool:
+        """A post addressed to `member_name` by name, from code or a seat holder.
+
+        A note to `all` or to a role is an announcement for people, not a hint.
+        """
+        if member_name not in (post.get("to") or ()):
+            return False
+        if int(post.get("seq", 0) or 0) in self._own_hint_seqs:
+            return True
+        return self._may_steer(str(post.get("from", "") or ""))
+
+    def _steering_posts(self, member_name: str, kind: str,
+                        since: int | None = None) -> list[dict]:
+        """Posts of `kind` that may steer `member_name`: unread ones, or after `since`."""
+        if self.board is None:
+            return []
+        return [
+            post
+            for post in self.board.read(
+                as_name=member_name,
+                since=since,
+                limit=None,
+                for_model=False,
+                advance_cursor=False,
+            )
+            if post.get("kind") == kind and self._is_steering_post(post, member_name)
+        ]
+
     def _consume_member_hints(self, member_name: str) -> list[str]:
         if self.board is None:
             return []
+        # Reading advances the member's cursor past every unread post, so a note
+        # that is skipped here is marked read and not looked at again.
         unread = self.board.read(
             as_name=member_name, limit=None, for_model=True, advance_cursor=True
         )
         return [
             str(post.get("body", "")).strip()
             for post in unread
-            if post.get("kind") == "note" and str(post.get("body", "")).strip()
+            if post.get("kind") == "note"
+            and str(post.get("body", "")).strip()
+            and self._is_steering_post(post, member_name)
         ]
 
     def _refund_member_attempt(self, board_role: str) -> None:
@@ -792,6 +841,7 @@ class CardRun:
         unread_notes_before: int,
         reason: str,
         context_label: str,
+        since_seq: int = 0,
     ) -> tuple[str | None, str]:
         """Interpret coordinator hint/set/retry/block action or board mutation."""
         action = ""
@@ -805,18 +855,14 @@ class CardRun:
         if action == "hint":
             hint_body = str(res_dict.get("body", "") or "").strip()
             if self.board is not None and hint_body:
+                # The coordinator may have posted the hint itself; only a note that
+                # will reach the worker's brief counts as that.
                 existing_notes = [
                     str(post.get("body", "")).strip()
-                    for post in self.board.read(
-                        as_name=member_name,
-                        limit=None,
-                        for_model=False,
-                        advance_cursor=False,
-                    )
-                    if post.get("kind") == "note"
+                    for post in self._steering_posts(member_name, "note")
                 ]
                 if hint_body not in existing_notes:
-                    self.board.post(
+                    posted = self.board.post(
                         author="coordinator",
                         to=[member_name],
                         kind="note",
@@ -824,6 +870,7 @@ class CardRun:
                         body=hint_body,
                         trusted=True,
                     )
+                    self._own_hint_seqs.add(int(posted.get("seq", 0) or 0))
             elif hint_body:
                 self._pending_hints.setdefault(board_role, []).append(hint_body)
             return "hint", ""
@@ -882,17 +929,10 @@ class CardRun:
             return "block", str(res_dict.get("reason", "") or reason)
 
         if not action and self.board is not None:
+            # No answer from the callback: look at what was written while it
+            # waited, counting only what code or a seat holder wrote.
             current = self.board.get_member(member_name) or {}
-            unread_notes_after = sum(
-                1
-                for post in self.board.read(
-                    as_name=member_name,
-                    limit=None,
-                    for_model=False,
-                    advance_cursor=False,
-                )
-                if post.get("kind") == "note"
-            )
+            unread_notes_after = len(self._steering_posts(member_name, "note"))
             tier_or_effort_changed = (
                 member_before is not None
                 and (
@@ -900,9 +940,13 @@ class CardRun:
                     or current.get("effort") != member_before.get("effort")
                 )
             )
+            set_posted = any(
+                str(post.get("body", "") or "").startswith("set ")
+                for post in self._steering_posts(member_name, "action", since=since_seq)
+            )
             if unread_notes_after > unread_notes_before:
                 return "hint", ""
-            if tier_or_effort_changed:
+            if tier_or_effort_changed and set_posted:
                 return "set", ""
 
         return None, str(res_dict.get("reason", "") or reason)
@@ -946,16 +990,7 @@ class CardRun:
         unread_notes_before = 0
         post_rec = None
         if self.board is not None:
-            unread_notes_before = sum(
-                1
-                for post in self.board.read(
-                    as_name=member_name,
-                    limit=None,
-                    for_model=False,
-                    advance_cursor=False,
-                )
-                if post.get("kind") == "note"
-            )
+            unread_notes_before = len(self._steering_posts(member_name, "note"))
             post_rec = self._post_board(
                 author="gates",
                 to=["coordinator"],
@@ -1002,6 +1037,7 @@ class CardRun:
             unread_notes_before=unread_notes_before,
             reason=detail[:300],
             context_label="struggling",
+            since_seq=int((post_rec or {}).get("seq", 0) or 0),
         )
         if outcome in ("hint", "set", "retry"):
             self.diff_hashes.clear()
@@ -1062,16 +1098,7 @@ class CardRun:
         unread_notes_before = 0
         post_rec = None
         if self.board is not None:
-            unread_notes_before = sum(
-                1
-                for post in self.board.read(
-                    as_name=member_name,
-                    limit=None,
-                    for_model=False,
-                    advance_cursor=False,
-                )
-                if post.get("kind") == "note"
-            )
+            unread_notes_before = len(self._steering_posts(member_name, "note"))
             post_rec = self._post_board(
                 author=member_name,
                 to=["coordinator"],
@@ -1160,6 +1187,7 @@ class CardRun:
             unread_notes_before=unread_notes_before,
             reason=reason,
             context_label="handback",
+            since_seq=int((post_rec or {}).get("seq", 0) or 0),
         )
         if outcome in ("hint", "set", "retry"):
             hb_entry["outcome"] = outcome
