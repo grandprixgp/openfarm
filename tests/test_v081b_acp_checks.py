@@ -286,6 +286,79 @@ class AgyPromptLimitTests(_Tmp):
         self.assertEqual(calls.read_text(), "called\n")
 
 
+class NeverStartsAgyTests(_Tmp):
+    """A9: status, probe without Antigravity named, the TUI panel and install-skill never run agy."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.calls = self.tmp / "agy-calls.log"
+        for name in ("agy", "antigravity-acp", "antigravity"):
+            _script(self.bin / name, f"#!/bin/sh\necho \"$0 $*\" >> {self.calls}\nexit 0\n")
+        # Fake claude and codex: they answer the status questions and log nothing.
+        _script(self.bin / "claude", "#!/bin/sh\necho '{\"loggedIn\": false}'\nexit 1\n")
+        _script(self.bin / "codex", "#!/bin/sh\necho 'Not logged in'\nexit 1\n")
+        self.home = self.tmp / "home"
+        self.home.mkdir()
+        env = {"PATH": f"{self.bin}:/usr/bin:/bin", "HOME": str(self.home)}
+        patcher = mock.patch.dict(os.environ, env)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for key in ("CLAUDE_CONFIG_DIR", "CODEX_HOME"):
+            os.environ.pop(key, None)
+
+    def _agy_calls(self) -> str:
+        return self.calls.read_text() if self.calls.exists() else ""
+
+    def test_status_tui_and_install_skill_do_not_start_agy(self) -> None:
+        from openfarm_core.tui import collect_snapshot
+
+        status = inspect_acp_status(None, provider="all")
+        self.assertIn("antigravity", status["providers"])
+        repo = self.tmp / "repo"
+        repo.mkdir()
+        collect_snapshot(repo, view="ops", include_cli_auth=True)
+        install_skill_bundle(target="all")
+        self.assertEqual(self._agy_calls(), "")
+
+    def test_probe_all_skips_antigravity_unless_named(self) -> None:
+        repo = self.tmp / "repo"
+        repo.mkdir()
+        res = probe_acp(repo, provider="all", timeout_s=10)
+        self.assertEqual(self._agy_calls(), "")
+        self.assertTrue(res["results"]["antigravity"]["skipped"])
+        self.assertIn("--provider antigravity", res["results"]["antigravity"]["error"])
+        self.assertIn("antigravity", res["skipped"])
+        # Named explicitly, the probe does start agy (and fails here, as the fake is no
+        # server). Inside the boundary the fake cannot write its log, so watch the spawn.
+        import openfarm_core.adapters.acp as acp_mod
+
+        with mock.patch.object(acp_mod.subprocess, "Popen", wraps=subprocess.Popen) as popen, \
+                self.assertRaises((AdapterError, OSError)):
+            probe_acp(repo, provider="antigravity", timeout_s=5)
+        started = [" ".join(map(str, c.args[0])) for c in popen.call_args_list]
+        names = (str(self.bin / "agy"), str(self.bin / "antigravity-acp"))
+        self.assertTrue(any(n in s for s in started for n in names), started)
+
+    def test_repo_configured_antigravity_probe_needs_the_provider_named(self) -> None:
+        repo = self.tmp / "repo"
+        (repo / ".openfarm").mkdir(parents=True)
+        state = self.tmp / "state"
+        cfg_text = (
+            '[project]\nname = "demo"\nstate_dir = "%s"\n'
+            '[adapters]\nlanguages = ["python"]\nmodel = "openai-compatible"\nmicromanager = "antigravity-acp"\n'
+            '[model]\nendpoint = "https://api.example.invalid/v1"\n'
+            'allowed_endpoints = ["https://api.example.invalid/v1"]\n'
+            '[model.implementer]\nmodel = "m"\n'
+            '[policy]\ncategories = ["pattern"]\n'
+            '[micromanager]\nmode = "active"\n'
+        ).replace("%s", str(state))
+        (repo / ".openfarm" / "config.toml").write_text(cfg_text)
+        with self.assertRaises(UsageError) as caught:
+            probe_acp(repo, timeout_s=5)
+        self.assertIn("--provider antigravity", str(caught.exception))
+        self.assertEqual(self._agy_calls(), "")
+
+
 class StatusModeTests(_Tmp):
     def test_off_mode_says_so_in_status(self) -> None:
         repo = self.tmp / "repo"

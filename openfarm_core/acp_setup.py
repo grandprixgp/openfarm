@@ -826,6 +826,24 @@ def configure_acp_repo(
     return status
 
 
+def _would_start_antigravity(cmd: str | list[str]) -> bool:
+    """True when probing `cmd` as Antigravity would start an Antigravity program."""
+    from .adapters.acp import _head_names_provider
+
+    try:
+        argv = resolve_acp_command(cmd, provider="antigravity")
+    except (Invalid, ValueError):
+        return True
+    named, _word = _head_names_provider(argv)
+    return named == "antigravity" or _bridge_provider(argv) == "antigravity"
+
+
+_AGY_PROBE_HINT = (
+    "probing Antigravity starts the agy program; it is only done when asked for by "
+    "name: `openfarm acp probe --provider antigravity`"
+)
+
+
 def _probe_single_provider(
     repo_path: Path,
     *,
@@ -929,6 +947,15 @@ def probe_acp(
         results: dict[str, dict[str, object]] = {}
         for item in ACP_PROVIDERS:
             item_cmd = command if command is not None else "auto"
+            if item == "antigravity" and _would_start_antigravity(item_cmd):
+                # `all` is not a request to start agy: that needs the provider by name.
+                results[item] = {
+                    "ok": None,
+                    "skipped": True,
+                    "provider": item,
+                    "error": f"not probed: {_AGY_PROBE_HINT}",
+                }
+                continue
             try:
                 results[item] = _probe_single_provider(
                     repo_path,
@@ -957,6 +984,7 @@ def probe_acp(
             "provider": "all",
             "results": results,
             "failed": failed,
+            "skipped": sorted(n for n, r in results.items() if r.get("skipped")),
         }
         return payload
 
@@ -970,6 +998,8 @@ def probe_acp(
     else:
         prov = repo_provider
 
+    if prov == "antigravity" and requested_prov != "antigravity" and _would_start_antigravity(cmd):
+        raise UsageError(_AGY_PROBE_HINT)
     probe_res = _probe_single_provider(
         repo_path,
         provider=prov,
