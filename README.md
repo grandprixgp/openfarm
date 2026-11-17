@@ -11,11 +11,11 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.8.0-16a34a?style=flat-square" alt="version 0.8.0">
+  <img src="https://img.shields.io/badge/version-0.8.1-16a34a?style=flat-square" alt="version 0.8.1">
   <img src="https://img.shields.io/badge/status-pre--release-d97706?style=flat-square" alt="status: pre-release">
   <img src="https://img.shields.io/badge/python-3.11%2B-7c3aed?style=flat-square" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/runtime%20deps-stdlib%20only-0284c7?style=flat-square" alt="runtime dependencies: standard library only">
-  <img src="https://img.shields.io/badge/language%20packs-Rust%20%26%20Python-ea580c?style=flat-square" alt="language packs: Rust and Python">
+  <img src="https://img.shields.io/badge/language%20packs-Rust%20%7C%20Python%20%7C%20TypeScript-ea580c?style=flat-square" alt="language packs: Rust, Python and TypeScript">
   <img src="https://img.shields.io/badge/UI-stdlib%20TUI%20%2B%20CLI-0ea5e9?style=flat-square" alt="UI: stdlib TUI + CLI">
 </p>
 
@@ -65,7 +65,7 @@ The bar openfarm sets itself is economic, not just "cheap tokens": a merged card
 openfarm is installed and driven through your frontier coding agent (Claude Code, Antigravity, or any agent that reads `.agents/skills`). Two sentences take you from an empty folder to a checked queue of cards.
 
 <p align="center">
-  <img src="docs/assets/openfarm-quickstart.svg" alt="Quickstart flow: New or existing repo (Rust or Python via init or adopt) -> 1. Install (Read and install this skill) -> 2. Initialize (/openfarm-initialize or openfarm adopt) -> Checked queue (invariants, golden slice and baseline-checked cards) -> Swarm + TUI (parallel gated branches, inspect in openfarm tui, merge locally)." width="100%">
+  <img src="docs/assets/openfarm-quickstart.svg" alt="Quickstart flow: New or existing repo (Rust, Python, or TypeScript via init or adopt) -> 1. Install (Read and install this skill) -> 2. Initialize (/openfarm-initialize or openfarm adopt) -> Checked queue (invariants, golden slice and baseline-checked cards) -> Swarm + TUI (parallel gated branches, inspect in openfarm tui or drive, merge locally)." width="100%">
 </p>
 
 ### 1. Install
@@ -84,13 +84,13 @@ cd openfarm
 python3 -m openfarm_core.cli install-skill --target all --install-bin ~/.local/bin --json
 ```
 
-This deploys the `/openfarm-grill-me`, `/openfarm-initialize` and `openfarm` skills, slash commands and the Antigravity plugin, plus an optional `openfarm` launcher on your `PATH`.
+This deploys `/openfarm-grill-me`, `/openfarm-initialize` and `openfarm` across Claude Code (`~/.claude`), Antigravity (`~/.gemini/config`), Codex (`~/.codex/skills` + `~/.codex/openfarm-AGENTS.md`), and `.agents` / workspace directories (`--target codex|claude|antigravity|agents|workspace|all`), plus an optional `openfarm` launcher on your `PATH`.
 
-Sign in once with your Claude OAuth subscription for the Frontier supervisor (optional if you already run Claude Code logged in, or pass `--profile solo` to disable ACP supervision):
+Check Frontier OAuth readiness for Claude, Antigravity (`agy`), or Codex (`codex`) — or pick your ACP provider on `openfarm init --acp-provider claude|antigravity|codex`, or run `openfarm drive` in headless external Driver mode (passing `--profile solo` disables ACP supervision):
 
 ```bash
-openfarm acp status --json
-openfarm acp login          # native Claude OAuth login (--claudeai default)
+openfarm acp status --provider all --json
+openfarm acp login --provider claude      # or --provider antigravity | codex
 ```
 
 ### 2. Grill (Optional) & Initialize
@@ -238,10 +238,10 @@ openfarm keeps a small, bounded memory of what helped weaker models recover from
 The core reads one config file per repository and talks to the outside world only through six adapter interfaces. Each has built-in implementations, and any of them can be swapped for an external command that speaks a small JSON protocol (`{"openfarm": 1, ...}`) over stdin and stdout.
 
 <p align="center">
-  <img src="docs/assets/openfarm-adapters.svg" alt="openfarm core (Python 3.11+ stdlib, one config file enforcing gates, budgets, swarm board and TUI) connected to six adapter interfaces: Card source (files: folder on openfarm-cards), Runner (direct cargo, python, BuildLimiter), Language pack (rust, python), Model backend (openai-compatible, claude-acp, scripted), Telemetry (jsonl plus run board and dossiers), and Micromanager &amp; seats (claude-acp, tier:<name>, external, off). Every interface also accepts cmd:<argv> over stdio JSON." width="100%">
+  <img src="docs/assets/openfarm-adapters.svg" alt="openfarm core (Python 3.11+ stdlib, one config file enforcing gates, budgets, swarm board and TUI) connected to six adapter interfaces: Card source (files: folder on openfarm-cards), Runner (direct cargo, python, node, BuildLimiter), Language pack (rust, python, typescript), Model backend (openai-compatible, claude|antigravity|codex-acp, scripted), Telemetry (jsonl plus run board and dossiers), and Micromanager &amp; seats (claude|antigravity|codex-acp, openfarm drive, tier:<name>, external, off). Every interface also accepts cmd:<argv> over stdio JSON." width="100%">
 </p>
 
-Every adapter also accepts `cmd:<argv>`. Card state lives on its own `openfarm-cards` branch so parallel cards never conflict. TypeScript is not implemented yet. Git is the one hard dependency, and nothing in the core names a particular project.
+Every adapter also accepts `cmd:<argv>`. Card state lives on its own `openfarm-cards` branch so parallel cards never conflict. TypeScript projects run via native Node (`node --test --test-reporter=tap`) and optional `npm` / `tsc` / `prettier`. Git is the one hard dependency, and nothing in the core names a particular project.
 
 ### Safety boundaries
 
@@ -256,15 +256,15 @@ Every adapter also accepts `cmd:<argv>`. Card state lives on its own `openfarm-c
 
 ## Commands
 
-One `openfarm` command with 21 subcommands (`6` pre-config helpers + `15` repository commands), shared exit codes (`0` done, `1` refused or ineligible, `2` usage or config error, `3` trouble or infra) and `--json` output.
+One `openfarm` command with 22 subcommands (`6` pre-config helpers + `16` repository commands), shared exit codes (`0` done, `1` refused or ineligible, `2` usage or config error, `3` trouble or infra) and `--json` output.
 
 | Command | Purpose |
 | --- | --- |
-| `openfarm init NAME` | Scaffold a new repo with validated config (Frontier Claude ACP OAuth default + Worker API key), protected invariants, Rust starter files, `Cargo.lock` and git |
-| `openfarm adopt` | Adopt an existing Rust or Python repository with baseline verification |
-| `openfarm bench` | List or run the 12 efficacy bench tasks (`list`, `run --dry-run` or live arms) |
-| `openfarm install-skill` | Deploy the bundled skills (`/openfarm-grill-me`, `/openfarm-initialize`, `openfarm`), slash commands, Antigravity plugin and optional launcher |
-| `openfarm acp [ACTION]` | Check Frontier OAuth & ACP transport readiness (`status`), run interactive `claude auth login` (`login`), update `.openfarm/config.toml` (`configure`), or run a zero-token ACP handshake (`probe`) |
+| `openfarm init NAME` | Scaffold a new repo with validated config (`--acp-provider claude\|antigravity\|codex` OAuth default + Worker API key), protected invariants, Rust starter files, `Cargo.lock` and git |
+| `openfarm adopt` | Adopt an existing Rust, Python, or TypeScript repository with baseline verification (`--lang rust\|python\|typescript`) |
+| `openfarm bench` | List or run the 12 efficacy bench tasks (`list`, `run --dry-run` or live arms across [`bench/arms/`](bench/arms/)) |
+| `openfarm install-skill` | Deploy the bundled skills (`/openfarm-grill-me`, `/openfarm-initialize`, `openfarm`), slash commands, Antigravity plugin, Codex skills/AGENTS, and optional launcher (`--target claude\|antigravity\|codex\|agents\|workspace\|all`) |
+| `openfarm acp [ACTION]` | Check Frontier OAuth & ACP readiness across `--provider claude\|antigravity\|codex\|all` (`status`), log in (`login`), update `.openfarm/config.toml` (`configure`), or run a zero-token ACP handshake (`probe`) |
 | `openfarm tui` | Launch the 7-view split-pane stdlib TUI (`--run`, `--refresh`, `--once`, `--view`, `--json`; `NO_COLOR`, `/` search, works pre-config too) |
 | `openfarm run` | Work Ready cards, bounded by `--cards`, `--spend`, `--for` or `--until`; `--dry-run` checks without model calls |
 | `openfarm status` | Show farm, card and harness-memory status |
@@ -278,6 +278,7 @@ One `openfarm` command with 21 subcommands (`6` pre-config helpers + `15` reposi
 | `openfarm harness` | Inspect or manage harness memory (`status`, `index`, `show`, `promote`, `demote`, `reset --yes`, `--global`) |
 | `openfarm board` | Inspect or interact with a live run's board (`read`, `post`, `answer`, `wait`) |
 | `openfarm swarm` | Inspect tiers/roster or act as external coordinator (`status`, `tiers`, `join`, `start`, `set`, `hint`, `block`, `remove`) |
+| `openfarm drive` | Drive external `coordinator`/`supervisor` seats headlessly via read-only `claude`, `agy`, or `codex` CLIs (`--agent`, `--seat`, `--wave`, `--record-verdict`) |
 
 ## Configuration
 
@@ -324,38 +325,28 @@ Model calls in these offline tests use a scripted backend and local HTTP test se
 ## Not yet tested
 
 > [!WARNING]
-> **Verified live in v0.8 spot checks (17 Nov 2026; details in [`docs/v0.8-build-log.md`](docs/v0.8-build-log.md)):**
+> **Verified live in v0.8.1 (17 Nov 2026; exact numbers in [`docs/v0.8.1-build-log.md`](docs/v0.8.1-build-log.md) and [`docs/bench-v0.8.1.md`](docs/bench-v0.8.1.md), building on the v0.8 spot checks in [`docs/v0.8-build-log.md`](docs/v0.8-build-log.md)):**
 >
-> - **DeepSeek-only `tier:dsf` (`bench/py-bounded-full`)**: pre-flight `check --baseline` and `--dry-run` passed; verbatim smoke hit `blocked` (`handed-back`) because `test-writer` imported `pytest` without `.openfarm/test-conventions.md`, and adding `unittest` conventions passed all 20 recorded functional/checker gate steps before `tier:dsf` `pre_review` bounced on an earlier degraded `micromanager-shape` step.
-> - **`reasoning_effort` (`low` vs `high` vs `max`)**: changed live outcomes on `py-money-parse` (`low` -> `blocked`/`refused`, `high` -> `blocked`/`tests-unprovable`, `max` -> `in-review` passing 6/6 hidden tests at `52,020` tok), while `rs-percent-zero` passed hidden tests across `low`, `high`, and `max`.
-> - **External coordinator + supervisor (`bench/py-inventory-remove`)**: CLI-driven `swarm` + `board` run reached `in-review` and passed 6/6 hidden tests.
-> - **Parallel Rust `cargo` builds**: two non-colliding cards ran concurrently (`BuildLimiter(2)`) against real `cargo`; under `supervisor = "off"`, `CARD-1` passed `cargo test`/`clippy`/`rustfmt` and hidden tests while `CARD-2` hit `handed-back` on frozen-test `clippy`.
-> - **2-task `openfarm bench` spot check (`repeats = 1`) & 2-project global lesson exchange**: `farm` `1/2` (`rs-percent-zero` pass) vs `solo` `1/2` (`py-bounded-full` pass), plus `proj-alpha` `harness promote --global` (`g-52723ab8fa`) imported and applied by `proj-beta` to pass hidden tests.
+> - **Multi-provider ACP & Driver mode (`claude`, `antigravity`, `codex`)**: Zero-token `openfarm acp status|probe --provider all` passed across all 3 providers; live `rs-percent-zero` passed hidden tests under `farm-codex` (`codex-acp` + DeepSeek), `solo-codex`, and `farm-agy` (`antigravity-acp`); headless `openfarm drive` passed hidden tests on `py-inventory-remove` via both `--agent codex` (`--wave --record-verdict` `clean`) and `--agent antigravity --effort low` (while `claude` properly surfaced an account quota message).
+> - **TypeScript pack & external `cmd:` adapters**: `openfarm adopt` detected `typescript` and `openfarm run --card TS-1` reached `in-review` passing hidden `node --test --test-reporter=tap` assertions; executable protocol v1 `cmd_runner.py` + `cmd_telemetry.py` ran `py-validate-port` to `in-review` passing hidden `unittest` tests.
+> - **Second independent Rust repository & multi-wave greenfield app**: Copied `anyhow` (`MECH-1`) reached `in-review` passing `cargo clippy` and `test_context`; initialized `calorie-log` (`openfarm init --acp-provider codex`) merged Wave 1 (`CARD-001`) -> `done` -> unlocked Wave 2 (`CARD-002`) -> `done`, leaving `main` green on `cargo test --locked` and `cargo clippy`.
+> - **12-task `openfarm bench` (`repeats = 1`, `24` runs) & counter-test calibration**: `farm` (`deepseek/deepseek-v4.1-flash` `x-cmd-zdr: 1` + `codex-acp` sup) scored `9/12` (`75.0%`: `6/6` Python, `3/6` Rust; `968,891` tok, `28.6%` worker share) vs `solo` (`codex-acp` all roles) `9/12` (`75.0%`: `5/6` Python, `4/6` Rust; `840,089` tok). Two live `counter_tests = "reject"` calibration controls passed hidden tests with `0` false rejects across `36` inspected live card records.
 >
 > **Still untested:**
 >
-> - Live remote GitHub URL installs via `uv`, `pipx` or `pip`.
-> - Live paid Anthropic prompt turns through the standalone `claude-agent-acp` binary. Through the built-in native bridge (`claude_native_acp.py`) they have run: Claude supervised v0.6/v0.7 cards and the `solo` / `farm` 2-task spot check.
-> - Any worker endpoint other than Command Code (`x-cmd-zdr: 1` with DeepSeek V4.1 Flash). v0.6 ran 14 cards on openfarm itself (all merged, 5 with small fixes) and v0.7 ran 6 cards (5 merged, 1 written by hand).
-> - The full `12 tasks x 3 repeats` live `openfarm bench run` and the 25-card Rust efficacy pilot (only the 2-task x 1-repeat spot check above has run live).
-> - `openfarm adopt` on someone else's real repository, and organic multi-card global lesson exchange between two long-lived third-party repositories.
-> - Live `cargo-mutants` runs (the parser and gate logic are tested with synthetic output).
-> - Live unattended multi-wave LLM execution of a generated app (for example all `calorie-log` cards) end to end.
-> - External `cmd:` adapters against live repository tools, beyond subprocess test harnesses.
-> - The TypeScript language pack, which is not implemented and refuses with `Invalid("no-typescript-pack")`.
-> - The Python pack against `pytest` (`pytest` is not installed here; parsing is tested on copied `-v` and `--collect-only -q` shapes only, while `unittest` runs against real interpreter output).
-> - The Python pack's `ruff` lint and format path (`ruff` is not installed here, so only the `ast`-only fallback path has run).
->
-> No full 12-task x 3-repeat bench or 25-card pilot has run live, so there are still no general efficacy numbers (acceptance rate, review time, or cost payback against a frontier-only baseline).
+> - Live remote GitHub URL installs via `uv`, `pipx` or `pip` (local clone / wheel `install-skill --target all` and `codex` are tested).
+> - Live multi-turn Claude (`claude`) driver/bench execution when Anthropic weekly quota resets, and standalone `claude-agent-acp` / `codex-acp` npm binaries (`claude_native_acp.py`, `codex_native_acp.py`, and native `agy acp` ran live).
+> - Hosted ZDR OpenAI-compatible worker endpoints other than Command Code (`x-cmd-zdr: 1` with DeepSeek V4.1 Flash).
+> - Repeats 2 and 3 of the 12-task live benchmark (`12 tasks x 3 repeats`), the 25-card Rust efficacy pilot, and counter-test true-bug catch rate against intentionally buggy/borderline implementations.
+> - Live `cargo-mutants`, `pytest`, `ruff`, `tsc`, and `prettier` binaries (`pytest`, `ruff`, `cargo-mutants`, `tsc`, and `prettier` are not installed on this test host, so syntax/node/unittest fallback paths ran live).
 
 ## Roadmap
 
-- [ ] **Live validation:** run everything in [Not yet tested](#not-yet-tested) against real endpoints, tools and installs.
-- [ ] **Run the bench live:** both arms, 3 repeats, and publish the report, failures included.
-- [ ] **Efficacy pilot:** an all-Rust pilot of 25 cards in two batches, with five frontier-baseline cards chosen in advance and all kept in the comparison, measuring per category whether a farm card pays for itself once review time is counted. Test-backfill cards wait for mutation tooling.
-- [ ] **Calibrate the report-only gates:** measure the checker's counter-test false-reject rate and what mutation testing adds before letting either block more broadly.
-- [ ] **Second repository:** run the core unchanged on a second, independent Rust repository before calling it done.
-- [ ] **TypeScript pack and npm runner:** after the Rust pilot.
+- [x] **Multi-provider ACP & Driver mode:** `claude`, `antigravity` (`agy`), and `codex` ACP adapters (`claude`/`agy`/`codex-acp`), headless `openfarm drive`, and Codex skill installation (`install-skill --target codex`).
+- [x] **Second repository & live multi-wave greenfield smoke:** `anyhow` copy (`MECH-1`), two-wave `calorie-log` (`CARD-001` -> `CARD-002`), live TypeScript `node --test`, and live `cmd:` runner/telemetry adapters.
+- [x] **TypeScript pack and Node runner:** `openfarm adopt --lang typescript`, `node --test --test-reporter=tap` / `npm`, optional `tsc` / `prettier` integration, and live card pass.
+- [ ] **Run the full 3-repeat bench live:** extend v0.8.1's 12-task `N = 1` bench ([`docs/bench-v0.8.1.md`](docs/bench-v0.8.1.md)) to `3` repeats across arms including Claude once quota resets.
+- [ ] **Efficacy pilot & adversarial gate calibration:** complete the 25-card all-Rust pilot with frontier baseline cards and measure counter-test catch rates plus `cargo-mutants` payback before promoting `reject` / `required` gates.
 
 ## Contributing
 
