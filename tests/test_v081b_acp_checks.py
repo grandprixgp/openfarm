@@ -106,6 +106,44 @@ class ProviderMismatchTests(_Tmp):
         self.assertIn("[micromanager] binary", caught.exception.message)
 
 
+class SessionRootPermissionTests(_Tmp):
+    """A8: a read is judged against the session's own folder, not the adapter's."""
+
+    def test_reads_are_judged_against_the_session_folder(self) -> None:
+        adapter_root = self.tmp / "adapter-root"
+        (adapter_root / "src").mkdir(parents=True)
+        (adapter_root / "src" / "only-here.rs").write_text("x")
+        card = self.tmp / "card-wt"
+        (card / "src").mkdir(parents=True)
+        (card / "src" / "main.rs").write_text("fn main() {}")
+        (card / "seams").mkdir()
+        (card / "seams" / "core.rs").write_text("x")
+
+        def run(path: str) -> dict:
+            cmd = [sys.executable, str(STAND_IN), "--mode", "hostile-perm",
+                   "--perm-kind", "read", "--perm-path", path]
+            with ClaudeAcpAdapter(cmd, cwd=adapter_root, provider="claude", confine="off",
+                                  never_touch=["seams/**"]) as acp:
+                sid = acp.new_session(cwd=card, tool_policy="read-only")
+                return acp.prompt(sid, "go").permission_events[0]
+
+        self.assertEqual(run(str(card / "src" / "main.rs"))["decision"], "allow_once")
+        self.assertEqual(run("src/main.rs")["decision"], "allow_once")
+        outside = run(str(adapter_root / "src" / "only-here.rs"))
+        self.assertEqual(outside["decision"], "reject_once")
+        self.assertEqual(outside["reason"], "outside-allowed-root")
+        self.assertEqual(run("seams/core.rs")["reason"], "never-touch")
+
+    def test_without_a_session_folder_the_adapter_root_is_used(self) -> None:
+        root = self.tmp / "root"
+        (root / "src").mkdir(parents=True)
+        (root / "src" / "a.rs").write_text("x")
+        acp = ClaudeAcpAdapter([sys.executable, str(STAND_IN)], cwd=root, provider="claude")
+        self.addCleanup(acp.close)
+        self.assertTrue(acp._is_path_allowed_readonly("src/a.rs")[0])
+        self.assertFalse(acp._is_path_allowed_readonly(str(self.tmp / "elsewhere"))[0])
+
+
 class StatusModeTests(_Tmp):
     def test_off_mode_says_so_in_status(self) -> None:
         repo = self.tmp / "repo"

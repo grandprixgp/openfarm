@@ -802,6 +802,7 @@ class ClaudeAcpAdapter:
 
         self.cwd = Path(cwd or Path.cwd())
         self.allowed_root = Path(allowed_root or self.cwd).resolve()
+        self._session_roots: dict[str, Path] = {}
         self._cred_source: Path | None = None
         self.last_sync = None
         self.isolate_home = bool(isolate_home)
@@ -1269,6 +1270,7 @@ class ClaudeAcpAdapter:
             self._initialized = False
             self._authenticated = False
             self._session_ids.clear()
+            self._session_roots.clear()
             self._session_cost_usd = 0.0
             self._initial_creds_bytes = None
             self._boundary_root = None
@@ -1614,10 +1616,22 @@ class ClaudeAcpAdapter:
                 )
         self._session_cost_usd = 0.0
         self._session_policies[session_id] = tool_policy
+        self._remember_session_root(session_id, cwd)
         self._seen_request_ids.setdefault(session_id, set())
         if session_id not in self._session_ids:
             self._session_ids.append(session_id)
         return session_id
+
+    def _remember_session_root(self, session_id: str, cwd: Path | str | None) -> None:
+        # A permission request is judged against its own session's folder; a
+        # session opened without one falls back to the adapter's root.
+        if cwd is None:
+            self._session_roots.pop(session_id, None)
+            return
+        try:
+            self._session_roots[session_id] = Path(cwd).resolve()
+        except (OSError, ValueError):
+            self._session_roots.pop(session_id, None)
 
     def load_session(
         self,
@@ -1668,6 +1682,7 @@ class ClaudeAcpAdapter:
 
         self._session_cost_usd = 0.0
         self._session_policies[session_id] = tool_policy
+        self._remember_session_root(session_id, cwd)
         self._seen_request_ids.setdefault(session_id, set())
         if session_id not in self._session_ids:
             self._session_ids.append(session_id)
@@ -1686,7 +1701,10 @@ class ClaudeAcpAdapter:
 
     # -- permission & request enforcement -------------------------------------
 
-    def _is_path_allowed_readonly(self, raw_path: str) -> tuple[bool, str]:
+    def _is_path_allowed_readonly(
+        self, raw_path: str, root: Path | None = None
+    ) -> tuple[bool, str]:
+        allowed_root = Path(root) if root is not None else self.allowed_root
         raw_str = str(raw_path)
         if "\x00" in raw_str:
             return False, "nul-path"
@@ -1706,11 +1724,11 @@ class ClaudeAcpAdapter:
                     return False, "forbidden-file"
                 if matches_any(lexical_norm, self.never_touch):
                     return False, "never-touch"
-                resolved = (self.allowed_root / lexical_norm).resolve()
+                resolved = (allowed_root / lexical_norm).resolve()
             else:
                 resolved = candidate.resolve()
 
-            root = self.allowed_root.resolve()
+            root = allowed_root.resolve()
             if resolved != root and root not in resolved.parents:
                 return False, "outside-allowed-root"
 
@@ -1736,6 +1754,7 @@ class ClaudeAcpAdapter:
         *,
         timeout_s: float = 30.0,
         cancel_check: Callable[[], bool] | None = None,
+        session_id: str = "",
     ) -> None:
         options = params.get("options")
         if not isinstance(options, list):
@@ -1746,10 +1765,15 @@ class ClaudeAcpAdapter:
 
         tool_kind = str(tool_call.get("kind", "")).strip().lower()
         extracted_paths = _extract_paths_from_tool_call(tool_call)
+        session_root = self._session_roots.get(str(session_id or ""))
+        named_sid = params.get("sessionId")
 
         allow = False
         reason = "policy-none"
-        if tool_policy == "read-only":
+        if session_id and named_sid is not None and str(named_sid) != str(session_id):
+            # A request naming another session is judged by no one's folder.
+            reason = "session-mismatch"
+        elif tool_policy == "read-only":
             if tool_kind not in ("read", "search"):
                 allow = False
                 reason = f"tool-kind-{tool_kind or 'unknown'}-disallowed"
@@ -1759,7 +1783,7 @@ class ClaudeAcpAdapter:
             else:
                 all_ok = True
                 for p in extracted_paths:
-                    ok, why = self._is_path_allowed_readonly(p)
+                    ok, why = self._is_path_allowed_readonly(p, session_root)
                     if not ok:
                         all_ok = False
                         reason = why
@@ -2005,6 +2029,7 @@ class ClaudeAcpAdapter:
                             permission_events,
                             timeout_s=resp_timeout,
                             cancel_check=cancel_check,
+                            session_id=session_id,
                         )
                     elif method == "elicitation/create":
                         permission_events.append(
