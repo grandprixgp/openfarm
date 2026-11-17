@@ -131,13 +131,25 @@ _ALLOWED_ARMS = frozenset({"farm", "solo"})
 
 
 def score(records: list[dict]) -> dict:
+    """Pass rates and token shares per arm and category.
+
+    A record with an `error` is a run that never started (openfarm refused or
+    crashed before the card ran): it says nothing about the arm, so it is listed
+    under `errors` with its reason and left out of every count.
+    """
     for record in records:
         _check_record(record)
 
     arm_totals: dict[str, dict] = {}
     category_totals: dict[str, dict] = {}
+    errors: list[dict] = []
 
     for record in records:
+        if record.get("error"):
+            errors.append({"task": record["task"], "arm": record["arm"],
+                           "repeat": record.get("repeat", 0),
+                           "error": str(record["error"])})
+            continue
         arm = record["arm"]
         category = record["category"]
         passed = bool(record["passed"])
@@ -192,7 +204,10 @@ def score(records: list[dict]) -> dict:
             for arm, stats in arm_stats_by_arm.items()
         }
 
-    return {"arms": arms, "categories": categories}
+    summary = {"arms": arms, "categories": categories}
+    if errors:
+        summary["errors"] = errors
+    return summary
 
 
 def render_report(summary: dict) -> str:
@@ -237,6 +252,22 @@ def render_report(summary: dict) -> str:
         farm = percent(arms["farm"]) if "farm" in arms else "—"
         solo = percent(arms["solo"]) if "solo" in arms else "—"
         lines.append(f"| {category} | {farm} | {solo} |")
+
+    errors = summary.get("errors") or []
+    if errors:
+        lines += [
+            "",
+            "## Runs that did not start",
+            "",
+            "Not counted above: openfarm stopped before the card ran.",
+            "",
+            "| Task | Arm | Repeat | Reason |",
+            "| --- | --- | --- | --- |",
+        ]
+        for entry in errors:
+            reason = " ".join(str(entry.get("error", "")).split()).replace("|", "\\|")
+            lines.append(f"| {entry.get('task', '')} | {entry.get('arm', '')} | "
+                         f"{entry.get('repeat', '')} | {reason} |")
 
     return "\n".join(lines)
 
@@ -414,7 +445,9 @@ def _suite_cmd(language: str) -> list[str]:
     if language == "rust":
         return ["cargo", "test", "--quiet"]
     if language == "typescript":
-        return ["node", "--test", "--test-reporter=tap"]
+        raise Invalid("bad-bench-task",
+                      "a TypeScript task is scored by the pack's own run "
+                      "(_score_typescript), never by a bare node --test")
     return [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-t", "."]
 
 
@@ -440,6 +473,9 @@ def run_once(task: BenchTask, arm: str, arm_text: str | None, repeat: int,
     if dry_run and task.script is None:
         raise Invalid("bad-bench-task", f"{task.id}: a dry run needs script.json")
 
+    # Every path below is handed to a child openfarm that runs in the repo, so a
+    # relative one would be read from the wrong folder.
+    work = Path(work).expanduser().resolve()
     run_dir = work / task.id / f"{arm}-{repeat}"
     if run_dir.exists():
         shutil.rmtree(run_dir)
@@ -488,10 +524,16 @@ def run_once(task: BenchTask, arm: str, arm_text: str | None, repeat: int,
               "run_dir": str(run_dir)}
     try:
         run_payload = json.loads(done.stdout)
-        outcome = (run_payload.get("outcomes") or [{}])[0]
-    except (ValueError, AttributeError):
+    except ValueError:
+        run_payload = None
+    outcomes = run_payload.get("outcomes") if isinstance(run_payload, dict) else None
+    if not outcomes or not isinstance(outcomes[0], dict) \
+            or not outcomes[0].get("final_state"):
+        # The card never ran: an error with its reason, not a failed task.
         record["stop_code"] = f"openfarm-exit-{done.returncode}"
+        record["error"] = _not_started_reason(run_payload, done)
         return record
+    outcome = outcomes[0]
     run_tokens = run_payload.get("tokens") or {}
 
     record["final_state"] = str(outcome.get("final_state", ""))
@@ -522,6 +564,13 @@ def run_once(task: BenchTask, arm: str, arm_text: str | None, repeat: int,
         target = repo / _hidden_target(task, hidden)
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(hidden, target)
+    if task.language == "typescript":
+        passed, log, why = _score_typescript(task, repo)
+        (run_dir / "hidden.log").write_text(log, encoding="utf-8")
+        record["passed"] = passed
+        if why:
+            record["hidden_detail"] = why
+        return record
     scored = subprocess.run(_suite_cmd(task.language), cwd=repo, capture_output=True,
                             text=True, timeout=1800, check=False)
     (run_dir / "hidden.log").write_text(scored.stdout + scored.stderr, encoding="utf-8")
@@ -529,10 +578,62 @@ def run_once(task: BenchTask, arm: str, arm_text: str | None, repeat: int,
     return record
 
 
+def _not_started_reason(payload, done) -> str:
+    """Why a child openfarm produced no outcome for the card, in its own words."""
+    if isinstance(payload, dict):
+        message = payload.get("error") or payload.get("message")
+        if message:
+            kind = payload.get("kind")
+            return f"{kind}: {message}" if kind else str(message)
+        if payload.get("outcomes") == []:
+            return "openfarm ran no card (the card was not ready or not found)"
+    tail = (done.stderr or done.stdout or "").strip().splitlines()[-3:]
+    if tail:
+        return f"openfarm exited {done.returncode}: " + " | ".join(tail)
+    return f"openfarm exited {done.returncode} with no output"
+
+
+def _score_typescript(task: BenchTask, repo: Path) -> tuple[bool, str, str]:
+    """The whole suite plus the hidden test files, named explicitly, read by the
+    pack's parser: passed only when every hidden file really ran and reported
+    tests, all of them passing, and nothing else is red.
+
+    Bare `node --test` would skip `*.spec.ts` and `__tests__/` files and pass
+    with nothing run.
+    """
+    from .gates.checks import suite_green
+    from .packs.typescript import TypeScriptPack
+
+    pack = TypeScriptPack()
+    pack.configure(repo)
+    hidden = [_hidden_target(task, path).as_posix() for path in task.hidden_tests]
+    files = sorted(set(pack.test_files()) | set(hidden))
+    argv = pack.commands("test", files=files)["argv"]
+    done = subprocess.run(argv, cwd=repo, capture_output=True, text=True,
+                          timeout=1800, check=False)
+    log = done.stdout + done.stderr
+    parsed = pack.parse_tests(done.stdout, done.stderr)
+    gate = suite_green(parsed, [], run_cls="pass" if done.returncode == 0 else "fail",
+                       exit_code=done.returncode)
+    if not gate.ok:
+        return False, log, gate.detail
+    if done.returncode != 0:
+        return False, log, f"node --test exited {done.returncode}"
+    counts = parsed.get("file_status") or {}
+    for path in hidden:
+        seen = counts.get(path) or {}
+        if not seen.get("ok"):
+            return False, log, f"hidden test file {path} reported no passing test"
+        if seen.get("failed") or seen.get("ignored"):
+            return False, log, f"hidden test file {path} has tests that did not pass"
+    return True, log, ""
+
+
 def run_bench(tasks: list[BenchTask], arms: dict[str, str | None], repeats: int,
               out: Path, *, dry_run: bool = False,
               log=lambda message: None) -> dict:
     """Every task in every arm `repeats` times; writes the report into `out`."""
+    out = Path(out).expanduser().resolve()
     out.mkdir(parents=True, exist_ok=True)
     work = out / "runs"
     records: list[dict] = []
@@ -543,9 +644,13 @@ def run_bench(tasks: list[BenchTask], arms: dict[str, str | None], repeats: int,
                     log(f"bench: {task.id} {arm} #{repeat}")
                     record = run_once(task, arm, arm_text, repeat, work,
                                       dry_run=dry_run)
-                    log(f"bench: {task.id} {arm} #{repeat} -> "
-                        f"{'pass' if record['passed'] else 'fail'} "
-                        f"({record['final_state'] or record['stop_code']})")
+                    if record.get("error"):
+                        log(f"bench: {task.id} {arm} #{repeat} -> error, the run "
+                            f"never started: {record['error']}")
+                    else:
+                        log(f"bench: {task.id} {arm} #{repeat} -> "
+                            f"{'pass' if record['passed'] else 'fail'} "
+                            f"({record['final_state'] or record['stop_code']})")
                     records.append(record)
                     sink.write(json.dumps(record) + "\n")
                     sink.flush()

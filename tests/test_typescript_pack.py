@@ -617,7 +617,9 @@ class WiringTests(unittest.TestCase):
         }, self)
         task = load_task(task_dir)
         self.assertEqual(task.language, "typescript")
-        self.assertEqual(_suite_cmd("typescript"), ["node", "--test", "--test-reporter=tap"])
+        # Scored by the pack's own run and parser, never by a bare node --test.
+        with self.assertRaises(Invalid):
+            _suite_cmd("typescript")
 
 
 COUNTER_TS = """\

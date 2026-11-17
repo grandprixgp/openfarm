@@ -721,6 +721,10 @@ class TypeScriptPack(Pack):
                     found.append(rel)
         return sorted(found)
 
+    def test_files(self, unit: str = "") -> list[str]:
+        """The test files a full run of `unit` passes to node, repository-relative."""
+        return self._discover_test_files(self._top(unit))
+
     def _has_tsconfig(self, root: str) -> bool:
         if self.worktree is None:
             return True
@@ -1221,6 +1225,9 @@ def _parse_node_output(stdout: str, stderr: str = "") -> dict:
     if report["seen"]:
         parsed["files"] = {file: sorted(names)
                            for file, names in sorted(report["reported"].items())}
+        parsed["file_status"] = {
+            file: dict(report["status"].get(file, {"ok": 0, "failed": 0, "ignored": 0}))
+            for file in parsed["files"]}
     return parsed
 
 
@@ -1243,6 +1250,7 @@ def _split_reporter_lines(stderr: str) -> tuple[list[dict], str]:
 
 def _reporter_summary(events: list[dict]) -> dict:
     reported: dict[str, set[str]] = {}
+    status: dict[str, dict[str, int]] = {}
     skipped_in: set[str] = set()
     file_rows: set[str] = set()
     listed: dict[str, tuple[list[str], int]] = {}
@@ -1263,6 +1271,13 @@ def _reporter_summary(events: list[dict]) -> dict:
                 reported.setdefault(file, set())
                 continue
             reported.setdefault(file, set()).add(name)
+            counts = status.setdefault(file, {"ok": 0, "failed": 0, "ignored": 0})
+            if event.get("skip") or event.get("todo"):
+                counts["ignored"] += 1
+            elif kind == "pass":
+                counts["ok"] += 1
+            else:
+                counts["failed"] += 1
         elif kind == "listed":
             names = [_clean_name(n) for n in (event.get("names") or [])]
             listed[file] = (names, int(event.get("calls", 0) or 0))
@@ -1273,7 +1288,8 @@ def _reporter_summary(events: list[dict]) -> dict:
                 exit_code = None
         elif kind == "end":
             end = True
-    return {"seen": bool(events), "reported": reported, "skipped_in": skipped_in,
+    return {"seen": bool(events), "reported": reported, "status": status,
+            "skipped_in": skipped_in,
             "file_rows": file_rows, "listed": listed, "exit": exit_code, "end": end}
 
 
