@@ -4,11 +4,21 @@ from __future__ import annotations
 
 import contextlib
 import curses
+import fcntl
+import importlib
 import io
 import json
+import os
+import pty
+import re
+import select
 import shutil
+import signal
+import struct
 import sys
 import tempfile
+import termios
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -27,6 +37,9 @@ from openfarm_core.state import StateDir, write_json
 from openfarm_core.tui import (
     VIEWS,
     TuiController,
+    _handle_view_hotkey,
+    _init_curses_theme,
+    _render_curses_frame,
     collect_snapshot,
     dispatch_cli_command,
     read_evidence_file,
@@ -848,6 +861,358 @@ global_dir = "{self.global_harness}"
             test_files = {rel} if rel.startswith("tests/") else set()
             found = pack.patterns(added, [], test_files)
             self.assertEqual(found["banned"], [], f"banned patterns in {rel}: {found['banned']}")
+
+
+class PrettifiedTuiThemeAndControllerTests(unittest.TestCase):
+    """Tests for color themes, visual chrome, selection/search, responsive layout, and hotkeys."""
+
+    def setUp(self) -> None:
+        self._fixture = InitializedRepoTuiTests()
+        self._fixture.setUp()
+        self.addCleanup(self._fixture.doCleanups)
+        self.repo = self._fixture.repo
+        self.run_id = self._fixture.run_id
+
+    def test_init_curses_theme_color_and_no_color_fallback(self) -> None:
+        expected_keys = {
+            "brand",
+            "header",
+            "tab_active",
+            "tab_idle",
+            "ok",
+            "warn",
+            "err",
+            "info",
+            "accent",
+            "border",
+            "selected",
+            "key",
+            "muted",
+        }
+        with mock.patch.dict(os.environ, {"NO_COLOR": "1"}, clear=False):
+            no_color_theme = _init_curses_theme()
+        self.assertEqual(set(no_color_theme.keys()), expected_keys)
+        self.assertEqual(no_color_theme["header"], curses.A_REVERSE)
+        self.assertEqual(no_color_theme["muted"], curses.A_DIM)
+
+        with (
+            mock.patch.dict(os.environ, {"NO_COLOR": ""}, clear=False),
+            mock.patch("curses.has_colors", return_value=False),
+        ):
+            mono_theme = _init_curses_theme()
+        self.assertEqual(set(mono_theme.keys()), expected_keys)
+        self.assertEqual(mono_theme["selected"], curses.A_BOLD | curses.A_REVERSE)
+
+        with (
+            mock.patch.dict(os.environ, {"NO_COLOR": ""}, clear=False),
+            mock.patch("curses.has_colors", return_value=True),
+            mock.patch("curses.start_color"),
+            mock.patch("curses.use_default_colors"),
+            mock.patch("curses.init_pair"),
+            mock.patch("curses.color_pair", side_effect=lambda idx: idx * 256),
+        ):
+            color_theme = _init_curses_theme()
+        self.assertEqual(set(color_theme.keys()), expected_keys)
+        self.assertNotEqual(color_theme["ok"], no_color_theme["ok"])
+
+    def test_once_snapshots_include_unicode_chrome_bars_and_icons(self) -> None:
+        ov_txt = render_snapshot(self.repo, view="overview")
+        self.assertIn("openfarm tui v0.8.0", ov_txt)
+        self.assertIn("╭─", ov_txt)
+        self.assertIn("╰─", ov_txt)
+        self.assertIn("█", ov_txt)
+        self.assertIn("░", ov_txt)
+        self.assertIn("? 1 question", ov_txt)
+
+        cards_txt = render_snapshot(self.repo, view="cards")
+        self.assertIn("◉ in_review", cards_txt)
+        self.assertIn("✓ ready", cards_txt)
+        self.assertIn("⚠ CARD-2", cards_txt)
+
+        board_txt = render_snapshot(self.repo, view="board")
+        self.assertIn("⏸ impl-1", board_txt)
+        self.assertIn("? question", board_txt)
+
+    def test_selection_search_esc_precedence_evidence_enter_and_ops_hotkeys(self) -> None:
+        ctrl = TuiController(self.repo, run_id=self.run_id, view="cards")
+        self.assertEqual(ctrl._selected_card_id(), "CARD-1")
+        ctrl.handle_key("j")
+        self.assertEqual(ctrl._selected_card_id(), "CARD-2")
+        ctrl.handle_key("j")
+        self.assertEqual(ctrl._selected_card_id(), "CARD-3")
+        ctrl.handle_key("j")
+        self.assertEqual(ctrl._selected_card_id(), "CARD-3")
+        ctrl.handle_key(curses.KEY_PPAGE)
+        self.assertEqual(ctrl._selected_card_id(), "CARD-1")
+
+        ctrl.handle_key("]")
+        self.assertEqual(ctrl.detail_scroll, 3)
+        ctrl.handle_key("[")
+        self.assertEqual(ctrl.detail_scroll, 0)
+
+        ctrl.set_search("CARD-3")
+        self.assertEqual(len(ctrl.filtered_items()), 1)
+        self.assertEqual(ctrl._selected_card_id(), "CARD-3")
+
+        # Esc priority: help -> modal -> search_query
+        ctrl.handle_key("?")
+        ctrl.open_modal("Note", ["line 1"])
+        self.assertTrue(ctrl.help_open)
+        ctrl.handle_key(27)
+        self.assertFalse(ctrl.help_open)
+        self.assertTrue(bool(ctrl.modal_lines))
+        ctrl.handle_key(27)
+        self.assertEqual(ctrl.modal_lines, [])
+        self.assertEqual(ctrl.search_query, "CARD-3")
+        ctrl.handle_key(27)
+        self.assertEqual(ctrl.search_query, "")
+
+        # Board Enter opens first evidence file in modal
+        ctrl.set_view("board")
+        self.assertTrue(_handle_view_hotkey(None, ctrl, ord("\r")))
+        self.assertIn("Evidence:", ctrl.modal_title)
+        self.assertIn("Brief evidence line 1", "\n".join(ctrl.modal_lines))
+        ctrl.close_modal()
+
+        # Ops hotkeys a, P, b work cleanly
+        ctrl.set_view("ops")
+        self.assertTrue(_handle_view_hotkey(None, ctrl, ord("a")))
+        self.assertEqual(ctrl.last_command_result["exit_code"], 0)
+        ctrl.close_modal()
+
+        bench_task = self.repo / "bench" / "t1"
+        bench_task.mkdir(parents=True)
+        (bench_task / "card.md").write_text("# card\n", encoding="utf-8")
+        (bench_task / "hidden.py").write_text("assert True\n", encoding="utf-8")
+        (bench_task / "task.toml").write_text(
+            'id = "py-sample"\nlanguage = "python"\ncategory = "small-feature"\n'
+            'card = "card.md"\nhidden_tests = ["hidden.py"]\n',
+            encoding="utf-8",
+        )
+        self.assertTrue(_handle_view_hotkey(None, ctrl, ord("b")))
+        self.assertEqual(ctrl.last_command_result["exit_code"], 0)
+        self.assertIn("py-sample", "\n".join(ctrl.modal_lines))
+        ctrl.close_modal()
+
+        with mock.patch("openfarm_core.cli.probe_acp", return_value={"ok": True, "action": "probe"}):
+            self.assertTrue(_handle_view_hotkey(None, ctrl, ord("P")))
+            self.assertEqual(ctrl.last_command_result["exit_code"], 0)
+            self.assertIn('"action": "probe"', "\n".join(ctrl.modal_lines))
+
+    def test_responsive_curses_frame_renders_at_wide_medium_and_narrow_sizes(self) -> None:
+        for size in ((32, 120), (24, 90), (16, 60)):
+            drawn: list[tuple[int, int, str]] = []
+
+            class SizedStdscr:
+                def erase(self) -> None:
+                    return None
+
+                def getmaxyx(self) -> tuple[int, int]:
+                    return size
+
+                def addnstr(self, y: int, x: int, text: str, n: int, attr: int = 0) -> None:
+                    drawn.append((y, x, text[:n]))
+
+                def refresh(self) -> None:
+                    return None
+
+            ctrl = TuiController(self.repo, run_id=self.run_id, view="overview")
+            for v in VIEWS:
+                ctrl.set_view(v)
+                _render_curses_frame(SizedStdscr(), ctrl)
+            ctrl.handle_key("?")
+            _render_curses_frame(SizedStdscr(), ctrl)
+            text = "\n".join(chunk for _, _, chunk in drawn)
+            self.assertIn("openfarm tui", text)
+            self.assertIn("openfarm TUI Help", text)
+            self.assertIn("╭", text)
+            self.assertIn("╰", text)
+
+
+class LivePtyCursesTuiTests(unittest.TestCase):
+    """End-to-end real-PTY curses tests across color, NO_COLOR, search, modals, and resize."""
+
+    def setUp(self) -> None:
+        self._fixture = InitializedRepoTuiTests()
+        self._fixture.setUp()
+        self.addCleanup(self._fixture.doCleanups)
+        self.repo = self._fixture.repo
+        self.global_harness = self._fixture.global_harness
+        bench_task = self.repo / "bench" / "t1"
+        bench_task.mkdir(parents=True)
+        (bench_task / "card.md").write_text("# card\n", encoding="utf-8")
+        (bench_task / "hidden.py").write_text("assert True\n", encoding="utf-8")
+        (bench_task / "task.toml").write_text(
+            'id = "py-sample"\nlanguage = "python"\ncategory = "small-feature"\n'
+            'card = "card.md"\nhidden_tests = ["hidden.py"]\n',
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def _strip_ansi(raw: bytes) -> str:
+        txt = raw.decode("utf-8", errors="replace")
+        txt = re.sub(r"\x1b\[[0-9;?]*[mK]", "", txt)
+        txt = re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", " ", txt)
+        txt = re.sub(r"\x1b\][^\x07]*\x07", "", txt)
+        txt = re.sub(r"\x1b[()][AB012]|\x1b[=>]", "", txt)
+        return txt
+
+    @staticmethod
+    def _drain_until(
+        master_fd: int,
+        chunks: list[bytes],
+        markers: tuple[str, ...] = (),
+        timeout_s: float = 5.0,
+    ) -> str:
+        ev = threading.Event()
+        buf = b""
+        elapsed = 0.0
+        while elapsed < timeout_s:
+            readable, _, _ = select.select([master_fd], [], [], 0.05)
+            if readable:
+                try:
+                    data = os.read(master_fd, 65536)
+                except OSError:
+                    break
+                if data:
+                    buf += data
+                    chunks.append(data)
+                    if markers:
+                        cleaned = LivePtyCursesTuiTests._strip_ansi(buf)
+                        if all(m in cleaned for m in markers):
+                            break
+                    continue
+            elif buf:
+                cleaned = LivePtyCursesTuiTests._strip_ansi(buf)
+                if not markers or all(m in cleaned for m in markers):
+                    break
+            ev.wait(0.02)
+            elapsed += 0.07
+        return LivePtyCursesTuiTests._strip_ansi(buf)
+
+    def _spawn_pty_tui(self, extra_env: dict[str, str], *, remove_env: tuple[str, ...] = ()):
+        master_fd, slave_fd = pty.openpty()
+        fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", 32, 120, 0, 0))
+        env = dict(os.environ)
+        for key in remove_env:
+            env.pop(key, None)
+        env.update(extra_env)
+        env["OPENFARM_GLOBAL_HARNESS"] = str(self.global_harness)
+        popen_cls = getattr(importlib.import_module("subprocess"), "Popen")
+        proc = popen_cls(
+            [
+                sys.executable,
+                "-m",
+                "openfarm_core.cli",
+                "--repo",
+                str(self.repo),
+                "tui",
+                "--refresh",
+                "0.2",
+            ],
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            env=env,
+            start_new_session=True,
+            close_fds=True,
+        )
+        os.close(slave_fd)
+        return proc, master_fd
+
+    def test_live_pty_color_navigation_search_modals_and_resize(self) -> None:
+        proc, master_fd = self._spawn_pty_tui(
+            {"TERM": "xterm-256color"},
+            remove_env=("NO_COLOR",),
+        )
+        chunks: list[bytes] = []
+        try:
+            init_txt = self._drain_until(master_fd, chunks, markers=("openfarm tui", "╭", "╰"))
+            self.assertIn("openfarm tui", init_txt)
+            self.assertIn("╭", init_txt)
+            self.assertIn("╰", init_txt)
+
+            steps: list[tuple[bytes, tuple[str, ...]]] = [
+                (b"2", ("CARD-1",)),
+                (b"j", ("CARD-2",)),
+                (b"\r", ("Dossier",)),
+                (b"4", ("Board",)),
+                (b"5", ("Swarm",)),
+                (b"6", ("Harness",)),
+                (b"g", ("GLOBAL",)),
+                (b"7", ("py-sample",)),
+                (b"/py-sample\n", ("py-sample",)),
+                (b"?", ("openfarm TUI Help",)),
+                (b"\x1b", ()),
+                (b":status\n", ("run-",)),
+                (b"\x1b", ()),
+            ]
+            for seq, markers in steps:
+                os.write(master_fd, seq)
+                out = self._drain_until(master_fd, chunks, markers=markers)
+                for marker in markers:
+                    self.assertIn(marker, out)
+
+            fcntl.ioctl(master_fd, termios.TIOCSWINSZ, struct.pack("HHHH", 20, 68, 0, 0))
+            os.kill(proc.pid, signal.SIGWINCH)
+            threading.Event().wait(0.15)
+            os.write(master_fd, b"1")
+            resized_out = self._drain_until(master_fd, chunks, markers=("openfarm tui",))
+            self.assertIn("openfarm tui", resized_out)
+
+            os.write(master_fd, b"q")
+            rc = proc.wait(timeout=5)
+            self._drain_until(master_fd, chunks, timeout_s=0.3)
+            self.assertEqual(rc, 0)
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                proc.wait(timeout=3)
+            with contextlib.suppress(OSError):
+                os.close(master_fd)
+
+        full_text = self._strip_ansi(b"".join(chunks))
+        self.assertNotIn("Traceback", full_text)
+        self.assertNotIn(KEY_SENTINEL, full_text)
+        self.assertNotIn("AUTH_SECRET_999", full_text)
+
+    def test_live_pty_no_color_fallback_and_resize(self) -> None:
+        proc, master_fd = self._spawn_pty_tui({"TERM": "xterm-256color", "NO_COLOR": "1"})
+        chunks: list[bytes] = []
+        try:
+            init_txt = self._drain_until(master_fd, chunks, markers=("openfarm tui", "╭", "╰"))
+            self.assertIn("openfarm tui", init_txt)
+            self.assertIn("╭", init_txt)
+            self.assertIn("╰", init_txt)
+
+            os.write(master_fd, b"2")
+            self.assertIn("CARD-1", self._drain_until(master_fd, chunks, markers=("CARD-1",)))
+            os.write(master_fd, b"?")
+            self.assertIn("openfarm TUI Help", self._drain_until(master_fd, chunks, markers=("openfarm TUI Help",)))
+            os.write(master_fd, b"\x1b")
+            self._drain_until(master_fd, chunks)
+
+            fcntl.ioctl(master_fd, termios.TIOCSWINSZ, struct.pack("HHHH", 20, 68, 0, 0))
+            os.kill(proc.pid, signal.SIGWINCH)
+            threading.Event().wait(0.15)
+            os.write(master_fd, b"1")
+            self._drain_until(master_fd, chunks, markers=("openfarm tui",))
+
+            os.write(master_fd, b"q")
+            rc = proc.wait(timeout=5)
+            self._drain_until(master_fd, chunks, timeout_s=0.3)
+            self.assertEqual(rc, 0)
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                proc.wait(timeout=3)
+            with contextlib.suppress(OSError):
+                os.close(master_fd)
+
+        full_text = self._strip_ansi(b"".join(chunks))
+        self.assertNotIn("Traceback", full_text)
+        self.assertNotIn(KEY_SENTINEL, full_text)
+        self.assertNotIn("AUTH_SECRET_999", full_text)
 
 
 if __name__ == "__main__":
