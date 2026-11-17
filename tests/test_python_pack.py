@@ -287,11 +287,13 @@ class CommandTests(unittest.TestCase):
         self.assertTrue(any("ruff is not installed" in n for n in pack.notes))
 
     def test_with_ruff_lint_and_format_use_it(self) -> None:
+        root = _project({"ruff.toml": "line-length = 88\n"})
         pack = PythonPack(ruff=True)
+        pack.configure(root)
         self.assertEqual(pack.commands("lint")["argv"][-1], "ruff")
         self.assertEqual(pack.commands("fmt-check", files=["a.py"])["argv"],
-                         ["ruff", "format", "--check", "a.py"])
-        self.assertEqual(pack.notes, [])
+                         ["ruff", "format", "--no-cache", "--check", "a.py"])
+        self.assertEqual([n for n in pack.notes if "ruff" in n], [])
 
     def test_the_syntax_check_fails_on_a_broken_file(self) -> None:
         pack = PythonPack(ruff=False)

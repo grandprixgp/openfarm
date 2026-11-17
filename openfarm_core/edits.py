@@ -123,19 +123,10 @@ def parse_edits(text: str) -> list[Edit]:
             continue
 
         if fmt == FORMAT_APPEND_STUB:
-            name_match = re.match(
-                r"[ \t]*(?:\r?\n)*[ \t]*(?P<name>[^\r\n]+?)[ \t]*\r?\n",
-                body,
-            )
-            if not name_match or not body[name_match.end():].strip():
-                raise Invalid("bad-block",
-                              f"{path}: append_stub needs the test's name on the "
-                              f"first line, then the stub body")
-            content = body[name_match.end():]
+            test_name, content = _stub_name_and_body(body, path)
             if content.endswith("\n\n"):
                 content = content[:-1]
-            edits.append(Edit(fmt, path, content=content,
-                              test_name=name_match.group("name")))
+            edits.append(Edit(fmt, path, content=content, test_name=test_name))
             continue
 
         search_match = _SEARCH_START.search(body)
@@ -149,6 +140,57 @@ def parse_edits(text: str) -> list[Edit]:
                           search=_strip_one_newline(search),
                           replace=_strip_one_newline(replace)))
     return edits
+
+
+#: A first line that is the stub's own code, not a test's name: a declaration,
+#: decorator, attribute, import or statement in Python, Rust or TypeScript, or a
+#: line ending the way only code ends. Test names are identifiers (Python, Rust)
+#: or prose (TypeScript), so each pattern needs code syntax, not just a keyword.
+_STUB_CODE_LINE = re.compile(
+    r"^(?:"
+    r"(?:async\s+)?def\s+\w+\s*\("                                  # Python def
+    r"|class\s+\w+\s*(?:[:({<]|\bextends\b|\bimplements\b)"         # class
+    r"|(?:pub(?:\([^)]*\))?\s+)?(?:(?:async|const|unsafe)\s+)*fn\s+\w+\s*[<(]"  # Rust fn
+    r"|(?:pub(?:\([^)]*\))?\s+)?(?:struct|enum|trait|impl|mod|use|type)\b.*[{;]$"
+    r"|(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*\w*\s*[<(]"  # TS
+    r"|export\s+(?:default\s+)?(?:const|let|var|class|interface|type|enum|function"
+    r"|async|abstract|declare)\s+[\w{\[*]"
+    r"|(?:const|let|var)\s+\w+\s*[:=]"
+    r"|from\s+[\w.]+\s+import\s+\S"                                   # Python
+    r"|import\s+(?:type\s+)?(?:[\w$]+\s*,?\s*)?(?:\{[^}]*\}|\*\s+as\s+\w+)?\s*"
+    r"from\s+[\"']|import\s+[\"']"                                       # TS
+    r"|(?:raise|throw)\s+(?:new\s+)?[\w.]+\s*(?:\(|$)|return\b.*;$"
+    r"|#\s*!?\[|@\w[\w.]*\s*(?:\(|$)|//|/\*"
+    r")"
+    r"|[{;]$|^\}|(?:\)|->\s*\S+)\s*:$|=>\s*\{?$"
+)
+
+
+def _stub_name_and_body(body: str, path: str) -> tuple[str, str]:
+    """The test name on an `append_stub` block's first line, and the stub after it.
+
+    Blank lines before the name, spaces-only ones included, are skipped, as v0.8
+    did. The name is the whole line, because a TypeScript test is named in prose.
+    A block whose first line is the stub's own code was sent without a name line:
+    refused here, saying so, rather than later as a stub the pack cannot read.
+    """
+    lines = body.splitlines(keepends=True)
+    index = 0
+    while index < len(lines) and not lines[index].strip():
+        index += 1
+    need = (f"{path}: append_stub needs the test's name on its first line, then "
+            f"the stub body")
+    if index >= len(lines):
+        raise Invalid("bad-block", need + " (the block is empty)")
+    name = lines[index].strip()
+    if _STUB_CODE_LINE.search(name):
+        raise Invalid("bad-block",
+                      need + f"; its first line `{name[:80]}` is code, not the name "
+                      "of the test that needs the stub")
+    content = "".join(lines[index + 1:])
+    if not content.strip():
+        raise Invalid("bad-block", need + f" (only the name `{name[:80]}` was sent)")
+    return name, content
 
 
 _FENCE_LINE = re.compile(r"^\s*```[\w.+-]*\s*$")

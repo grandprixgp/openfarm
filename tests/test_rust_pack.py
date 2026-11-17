@@ -288,10 +288,15 @@ class MutationParseTests(unittest.TestCase):
     def setUp(self) -> None:
         self.pack = RustPack()
 
-    def test_json_object(self) -> None:
+    def test_summary_line(self) -> None:
+        # cargo-mutants 27 prints text for a run; `--json` is for `--list` only.
         parsed = self.pack.parse_mutation(
-            '{"total": 10, "killed": 8, "survived": 2, "capped": false}')
+            "Found 10 mutants to test\nok       Unmutated baseline\n"
+            "MISSED   src/lib.rs:1:1: replace f -> bool with true\n"
+            "MISSED   src/lib.rs:2:1: replace g -> bool with true\n"
+            "10 mutants tested: 2 missed, 8 caught\n")
         self.assertEqual(parsed["killed"], 8)
+        self.assertEqual(parsed["survived"], 2)
         self.assertEqual(parsed["total"], 10)
         self.assertFalse(parsed["capped"])
 

@@ -245,33 +245,110 @@ def _listed(test: dict) -> str:
     return f"{binary}::{test['name']}" if binary else str(test["name"])
 
 
-def ignored_or_filtered(parsed: dict, named: list) -> GateResult:
-    """The named tests must be reported passed, not ignored, filtered or absent."""
+def rows_for_test(rows: list[dict], name: str, file: str = "",
+                  row_file=None) -> list[dict]:
+    """The result (or listing) rows that belong to one named test.
+
+    A row belongs when its name is the test's name, or when the test names a
+    function and the row is one of its parameter cases (`test_param[1-2]` for
+    `test_param`, as pytest reports them). A name that carries its own parameter
+    id matches that row only. Names are never matched as substrings: a runner's
+    `-k test_adds` also runs `test_adds_more`, and that row is another test's.
+
+    `row_file` is the pack's `row_file`: the source file a row came from, or None
+    when its runner does not say. With the card's `file`, rows from another file
+    are another test's too, even with the same name.
+    """
+    name = str(name)
+    out = []
+    for row in rows:
+        row_name = str(row.get("name", ""))
+        if row_name != name and not _is_parameter_row(row_name, name):
+            continue
+        if file and row_file is not None:
+            where = row_file(row)
+            if where and not same_test_file(where, file):
+                continue
+        out.append(row)
+    return out
+
+
+def _is_parameter_row(row_name: str, name: str) -> bool:
+    return ("[" not in name and row_name.startswith(name + "[")
+            and row_name.endswith("]"))
+
+
+def same_test_file(a: str, b: str) -> bool:
+    """True when two spellings of a test file are the same file.
+
+    A runner may report paths from its own root (a unit folder) while a card names
+    them from the repository root, so one may be a suffix of the other, by whole
+    path parts.
+    """
+    left, right = _plain_path(a), _plain_path(b)
+    if not left or not right:
+        return False
+    return (left == right or left.endswith("/" + right)
+            or right.endswith("/" + left))
+
+
+def _plain_path(path: str) -> str:
+    text = normalise(str(path or ""))
+    while text.startswith("./"):
+        text = text[2:]
+    return text.strip("/")
+
+
+def combined_status(rows: list[dict]) -> str:
+    """One status for every row of a named test.
+
+    `not-run` with no rows; the shared status when every row agrees; otherwise
+    `mixed`. A mixed test is neither failing nor passing: it proves nothing.
+    """
+    if not rows:
+        return "not-run"
+    statuses = {str(row.get("status", "unknown")) for row in rows}
+    if len(statuses) == 1:
+        return statuses.pop()
+    return "mixed"
+
+
+def ignored_or_filtered(parsed: dict, named: list,
+                        run_cls: str = "pass", exit_code: int = 0,
+                        files: dict[str, str] | None = None,
+                        row_file=None) -> GateResult:
+    """The named tests must be reported passed, not ignored, filtered or absent.
+
+    Every row of a named test must pass: its parameter cases, and every binary
+    that reported it. `files` maps a name to the card's file for it, so rows of a
+    same-named test elsewhere are left out (see `rows_for_test`).
+
+    Only a finished run can say so. A run the runner classed as infra (timed out,
+    killed, a machine error) is infra here whatever rows it printed before it
+    stopped, and so is one with a binary that printed no footer; a run that does
+    not compile, or that crashed on a signal, is a failure.
+    """
+    unjudged = _unjudged_run(parsed, run_cls, exit_code, "pass-after")
+    if unjudged is not None:
+        return unjudged
     results = parsed.get("results", [])
-    by_name: dict[str, list[dict]] = {}
-    by_pair: dict[tuple[str, str], list[dict]] = {}
-    for entry in results:
-        r_name = entry.get("name", "")
-        r_bin = entry.get("binary", "")
-        by_name.setdefault(r_name, []).append(entry)
-        by_pair.setdefault((r_bin, r_name), []).append(entry)
+    files = files or {}
 
     failed: list[str] = []
     missing: list[str] = []
+    rows_of: dict[str, list[dict]] = {}
     for item in named:
         if isinstance(item, tuple) and len(item) == 2:
             binary, name = str(item[0]), str(item[1])
-            matches = by_pair.get((binary, name), []) if binary else by_name.get(name, [])
-            label = f"{binary}::{name}" if binary else name
         elif isinstance(item, dict):
             binary = str(item.get("binary", ""))
             name = str(item.get("name", ""))
-            matches = by_pair.get((binary, name), []) if binary else by_name.get(name, [])
-            label = f"{binary}::{name}" if binary else name
         else:
-            name = str(item)
-            matches = by_name.get(name, [])
-            label = name
+            binary, name = "", str(item)
+        matches = rows_for_test(results, name, files.get(name, ""), row_file)
+        if binary:
+            matches = [m for m in matches if m.get("binary", "") == binary]
+        label = f"{binary}::{name}" if binary else name
 
         if not matches:
             missing.append(label)
@@ -279,15 +356,17 @@ def ignored_or_filtered(parsed: dict, named: list) -> GateResult:
         bad = [m.get("status", "unknown") for m in matches if m.get("status") != "ok"]
         if bad:
             failed.append(f"{label} ({bad[0]})")
+            rows_of[label] = [dict(m) for m in matches]
 
     if missing:
         return GateResult("pass-after", FAIL,
                           f"named test(s) never reported: {', '.join(missing[:10])}",
-                          {"missing": missing, "not-passed": failed})
+                          {"missing": missing, "not-passed": failed,
+                           "rows": rows_of})
     if failed:
         return GateResult("pass-after", FAIL,
                           f"named test(s) not passing: {', '.join(failed[:10])}",
-                          {"not-passed": failed})
+                          {"not-passed": failed, "rows": rows_of})
     return GateResult("pass-after", PASS, f"all {len(named)} named test(s) passed")
 
 
@@ -329,6 +408,17 @@ def suite_green(parsed: dict, known_failing: list[str],
             {"compile_errors": compile_errors, "unexpected": unexpected,
              "known-red": known_red})
 
+    if run_cls == INFRA:
+        # The runner decides infra, and its word wins over anything the run printed
+        # before it stopped: a killed run's partial output can carry a footer-shaped
+        # line from the code under test, or simply stop before the failing test.
+        return GateResult(
+            "suite", INFRA,
+            "the runner classed the run as infra (timed out, killed or a machine "
+            "error), so its output cannot be judged",
+            {"run_class": run_cls, "exit_code": exit_code,
+             "missing_footers": missing_footers, "unexpected": unexpected})
+
     if missing_footers:
         if run_cls == FAIL and exit_code < 0 and exit_code != -9:
             return GateResult(
@@ -366,6 +456,40 @@ def suite_green(parsed: dict, known_failing: list[str],
         detail += f"; {len(known_red)} known red left out"
     return GateResult("suite", PASS, detail,
                       {"known-red": known_red})
+
+
+def _unjudged_run(parsed: dict, run_cls: str, exit_code: int,
+                  gate: str) -> GateResult | None:
+    """The answer for a run that cannot be read as green, or None if it can.
+
+    The same order as `suite_green`: a compile error is the edit's fault, the
+    runner's infra class wins over the output, a binary without a footer died
+    partway (a crash on a signal other than SIGKILL is the code's fault).
+    """
+    compile_errors = parsed.get("compile_errors", [])
+    missing = parsed.get("missing_footers", [])
+    if compile_errors:
+        targets = sorted({_compile_name(entry) for entry in compile_errors})
+        return GateResult(gate, FAIL,
+                          f"the code did not compile ({len(targets)} target(s)): "
+                          + ", ".join(targets[:8]),
+                          {"compile_errors": compile_errors})
+    if run_cls == INFRA:
+        return GateResult(gate, INFRA,
+                          "the runner classed the run as infra (timed out, killed or "
+                          "a machine error), so its output cannot be judged",
+                          {"run_class": run_cls, "exit_code": exit_code})
+    if missing:
+        if run_cls == FAIL and exit_code < 0 and exit_code != -9:
+            return GateResult(gate, FAIL,
+                              f"test binary crashed with signal {-exit_code}: "
+                              + ", ".join(missing[:8]),
+                              {"missing_footers": missing, "exit_code": exit_code})
+        return GateResult(gate, INFRA,
+                          "a test binary printed no footer, so the run died partway: "
+                          + ", ".join(missing[:8]),
+                          {"missing_footers": missing})
+    return None
 
 
 def _compile_name(entry: dict) -> str:
@@ -407,30 +531,50 @@ def mutation_gate(parsed: dict, min_kill_rate: float, mode: str,
                   category: str,
                   required_for: list[str] | tuple[str, ...] = ("test-backfill",)
                   ) -> GateResult:
-    """Mutation: blocking when mode is required or category is in `required_for`."""
+    """Mutation: blocking when mode is required or category is in `required_for`.
+
+    The kill rate divides by the mutants that could be judged. A pack that counts
+    timed-out and unviable mutants (cargo-mutants does) says so with `judged`,
+    caught plus missed: a mutant that did not build, or whose tests never finished,
+    proves nothing either way. Without `judged` every mutant counts, as before.
+    """
     killed = int(parsed.get("killed", 0))
     survived = int(parsed.get("survived", 0))
     total = int(parsed.get("total", killed + survived))
+    timeout = int(parsed.get("timeout", 0) or 0)
+    unviable = int(parsed.get("unviable", 0) or 0)
+    judged = int(parsed["judged"]) if "judged" in parsed else total
     capped = bool(parsed.get("capped", False))
-    rate = (killed / total) if total else 0.0
+    rate = (killed / judged) if judged else 0.0
 
     evidence = {"killed": killed, "survived": survived, "total": total,
                 "capped": capped, "kill_rate": rate}
+    if "judged" in parsed:
+        evidence.update({"judged": judged, "timeout": timeout, "unviable": unviable})
     blocking = mode == "required" or (
         category in tuple(required_for) and mode != "off")
+    unjudged = []
+    if timeout:
+        unjudged.append(f"{timeout} timed out")
+    if unviable:
+        unjudged.append(f"{unviable} unviable")
+    tail = f"; not judged: {', '.join(unjudged)}" if unjudged else ""
 
     if mode == "off":
         return GateResult("mutation", PASS, "mutation is off in this config",
                           evidence)
     if capped:
-        detail = f"mutation hit its cap after {killed}/{total} mutants"
+        detail = f"mutation hit its cap after {killed}/{judged} mutants"
+        return GateResult("mutation", FAIL if blocking else PASS, detail, evidence)
+    if not judged:
+        detail = f"no mutant could be judged ({total} found{tail})"
         return GateResult("mutation", FAIL if blocking else PASS, detail, evidence)
     if rate < min_kill_rate:
         detail = (f"kill rate {rate:.0%} below the required {min_kill_rate:.0%} "
-                  f"({killed}/{total})")
+                  f"({killed}/{judged}{tail})")
         return GateResult("mutation", FAIL if blocking else PASS, detail, evidence)
     return GateResult("mutation", PASS,
-                      f"kill rate {rate:.0%} ({killed}/{total})", evidence)
+                      f"kill rate {rate:.0%} ({killed}/{judged}{tail})", evidence)
 
 
 def extra_gate_result(name: str, passed: bool, on_fail: str,

@@ -51,6 +51,15 @@ class Pack:
     def error_signature(self, stderr: str) -> dict:
         raise NotImplementedError
 
+    def row_file(self, row: dict) -> str | None:
+        """The source file a result or listing row came from, or None if unknown.
+
+        The gates use it to keep a same-named test in another file from counting
+        for a card's named test. None (the default) leaves every row in, as
+        before; a pack whose rows name their file says so here.
+        """
+        return None
+
     # -- files ----------------------------------------------------------------
 
     def classify_paths(self, paths: list[str]) -> dict:

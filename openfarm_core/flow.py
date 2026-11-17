@@ -24,7 +24,8 @@ from .errors import (AdapterError, GateFailure, Infra, Invalid, Refused,
 from .gates.checks import (PASS, FAIL, INFRA, GateResult, banned_patterns,
                            diff_within_touches, extra_gate_result, frozen_check,
                            _code_of,
-                           ignored_or_filtered, mutation_gate,
+                           combined_status, ignored_or_filtered, mutation_gate,
+                           rows_for_test,
                            paths_touched_by_extra_gate, revert_check,
                            suite_green, test_loss)
 from .gates.eligibility import (check_eligibility, derive_cargo_unit,
@@ -1775,6 +1776,14 @@ class CardRun:
         name = f"refs/heads/{self.cfg.base_branch}"
         return name if self.git.ref_exists(name) else "HEAD"
 
+    def _named_test_files(self) -> dict[str, str]:
+        """The card's file for each named test, so rows of a same-named test in
+        another file are not counted for it."""
+        return {test.name: test.file for test in self.card.tests if test.file}
+
+    def _row_file(self):
+        return getattr(self.pack, "row_file", None)
+
     # -- step 3: baseline green ----------------------------------------------
 
     def _step_baseline(self) -> None:
@@ -2341,13 +2350,17 @@ class CardRun:
         listing = self.pack.parse_list(out)
         write_json(self.card_layout / "gates" / "named-tests-list.json", listing)
 
-        listed = {t["name"] for t in listing.get("tests", [])}
         if not self.card.test_names:
             self._record_gate(GateResult(
                 "named-tests-exist", PASS,
                 f"skipped: a {self.card.category} card names no new tests"))
             return
-        missing = [name for name in self.card.test_names if name not in listed]
+        # A parametrized test is listed once per case (`test_param[1-2]`); those
+        # rows are the named test's, as they are in every run below.
+        listed_rows = _named_rows({"results": listing.get("tests", [])},
+                                  self.card.test_names, self._named_test_files(),
+                                  self._row_file())
+        missing = [name for name in self.card.test_names if not listed_rows[name]]
         if missing:
             load_errors = [str(e) for e in listing.get("errors", []) or []][:5]
             why = ("; could not load: " + " | ".join(load_errors)) if load_errors else ""
@@ -2378,7 +2391,11 @@ class CardRun:
                                              tests=self.card.test_names)["argv"], counted="fixed")
         out, err = self._output(rerun)
         parsed = self.pack.parse_tests(out, err)
-        failures = _named_failures(parsed, self.card.test_names)
+        named_files = self._named_test_files()
+        failures = _named_failures(parsed, self.card.test_names, named_files,
+                                   self._row_file())
+        named_rows = _named_rows(parsed, self.card.test_names, named_files,
+                                 self._row_file())
         compile_errors = parsed.get("compile_errors", [])
 
         if rerun.cls == INFRA:
@@ -2412,6 +2429,21 @@ class CardRun:
                 "the fail-before run did not finish", parsed))
             raise Infra("fail-before-infra", "the fail-before run did not finish")
 
+        # A test whose rows disagree (one parameter case or binary failing, another
+        # passing) proves nothing about the change: every row must fail on base.
+        mixed = [name for name, status in failures.items() if status == "mixed"]
+        if mixed:
+            self._record_gate(GateResult(
+                "fail-before", FAIL,
+                "these named tests were reported both failing and not failing on "
+                "base, so they prove nothing: " + ", ".join(mixed[:10]),
+                {"mixed_on_base": mixed,
+                 "rows": {name: named_rows[name] for name in mixed}}))
+            raise GateFailure(
+                StopCode.TESTS_UNPROVABLE,
+                "named tests are not failing in every row on base: "
+                + ", ".join(mixed[:10]))
+
         # `ignored` is not proof: an ignored test never ran on base, so it proves
         # nothing about what the code does.
         wrong = [name for name, status in failures.items()
@@ -2420,7 +2452,9 @@ class CardRun:
             self._record_gate(GateResult(
                 "fail-before", FAIL,
                 "these named tests do not fail at runtime on base, so they assert "
-                "nothing: " + ", ".join(wrong[:10]), {"passing_on_base": wrong}))
+                "nothing: " + ", ".join(wrong[:10]),
+                {"passing_on_base": wrong,
+                 "rows": {name: named_rows[name] for name in wrong}}))
             raise GateFailure(
                 StopCode.TESTS_UNPROVABLE,
                 "named tests do not fail on base: " + ", ".join(wrong[:10]))
@@ -2429,7 +2463,7 @@ class CardRun:
         self._record_gate(GateResult(
             "fail-before", PASS,
             f"{len(self.card.test_names)} named test(s) failed at runtime on base",
-            {"failures": failures}))
+            {"failures": failures, "rows": named_rows}))
 
     # -- step 7: phase B, the implementer ------------------------------------
 
@@ -3074,10 +3108,18 @@ class CardRun:
                                                       tests=self.card.test_names)["argv"], counted="fixed")
                 out, err = self._output(result)
                 parsed = self.pack.parse_tests(out, err)
-                self.head_status_by_test = _named_failures(parsed, self.card.test_names)
+                self.head_status_by_test = _named_failures(
+                    parsed, self.card.test_names, self._named_test_files(),
+                    self._row_file())
                 gate = self._record_gate(
-                    ignored_or_filtered(parsed, self.card.test_names))
+                    ignored_or_filtered(parsed, self.card.test_names,
+                                        run_cls=result.cls,
+                                        exit_code=result.exit_code,
+                                        files=self._named_test_files(),
+                                        row_file=self._row_file()))
                 named_ok = named_ok and gate.ok
+                if gate.result == INFRA:
+                    raise Infra("pass-after-infra", gate.detail)
                 if not gate.ok:
                     raise GateFailure(
                         StopCode.ATTEMPTS,
@@ -3201,7 +3243,9 @@ class CardRun:
                     self.budget.note_fixed_build()
                     r_out, r_err = self._output(rev_result)
                     r_parsed = self.pack.parse_tests(r_out, r_err)
-                    r_failures = _named_failures(r_parsed, self.card.test_names)
+                    r_failures = _named_failures(r_parsed, self.card.test_names,
+                                                 self._named_test_files(),
+                                                 self._row_file())
                     r_compile = r_parsed.get("compile_errors", [])
                     if (rev_result.cls == INFRA
                             or (r_parsed.get("missing_footers") and not r_compile
@@ -3223,7 +3267,8 @@ class CardRun:
                         )
                         self._record_gate(GateResult(
                             "revert-check", FAIL, detail,
-                            {"compile_errors": r_compile, "not_failing": wrong}))
+                            {"compile_errors": r_compile, "not_failing": wrong,
+                             "failures": r_failures}))
                         raise GateFailure(StopCode.TESTS_UNPROVABLE, detail)
                     self._record_gate(GateResult(
                         "revert-check", PASS,
@@ -3431,6 +3476,10 @@ class CardRun:
                 "mutation", PASS, "no production lines changed"))
             return
 
+        if hasattr(self.pack, "mutation_output"):
+            # The tool's own output folder goes with the card's evidence, never into
+            # the worktree, where it would be an untracked folder on the branch.
+            self.pack.mutation_output = self.card_layout / "gates" / "mutation"
         try:
             argv = self.pack.commands(
                 "mutation", files=production, tests=self.card.test_names)["argv"]
@@ -3460,19 +3509,29 @@ class CardRun:
             return
 
         try:
-            parsed = self.pack.parse_mutation(out)
+            # A pack that knows its tool's exit codes reads them first: a failing
+            # baseline or a usage error is the tool not having run, not a result.
+            reader = getattr(self.pack, "read_mutation", None)
+            if reader is not None:
+                parsed = reader(out, err, result.exit_code)
+            else:
+                parsed = self.pack.parse_mutation(out)
         except Invalid as exc:
             # A tool that is not installed, or prints nothing, is not a finding
             # about the code. In report mode that is recorded and the card carries
             # on; when mutation is this card's only proof, it blocks.
+            not_run = exc.code == "mutation-not-run"
             self._record_gate(GateResult(
                 "mutation", FAIL if breaking else PASS,
-                f"the mutation tool's output could not be read: {exc.message}"))
+                (f"the mutation tool did not run: {exc.message}" if not_run else
+                 f"the mutation tool's output could not be read: {exc.message}"),
+                {"exit_code": result.exit_code}))
             if breaking:
                 raise GateFailure(
                     StopCode.MUTATION_CAP,
-                    "mutation is this card's only proof and its output could not "
-                    "be read") from exc
+                    "mutation is this card's only proof and "
+                    + ("the tool did not run" if not_run else
+                       "its output could not be read")) from exc
             return
         # One mutation run is many builds: `cargo mutants` compiles every mutant, so
         # the cap counts the mutants it set out to test, not the one command. The cap
@@ -3483,6 +3542,9 @@ class CardRun:
             "survived": parsed.get("survived", 0),
             "total": parsed.get("total", 0),
             "capped": parsed.get("capped", False) or self.budget.mutation_capped()}
+        for key in ("timeout", "unviable", "judged"):
+            if key in parsed:
+                self.mutation_summary[key] = parsed.get(key, 0)
         gate = self._record_gate(mutation_gate(
             parsed, self.cfg.mutation_min_kill_rate, mode, self.card.category,
             required_for=self.cfg.mutation_required_for))
@@ -3882,6 +3944,17 @@ class CardRun:
                                  else "it did not compile or could not be collected"))
                     else:
                         status = status_of(parsed, name)
+                        died = bool(parsed.get("missing_footers"))
+                        if died:
+                            # The run died partway: a row it printed is not a pass.
+                            status = "not-run"
+                        elif status == "mixed":
+                            # Any failing row of a counter-test is the finding it
+                            # exists for.
+                            status = ("FAILED" if any(
+                                row.get("status") == "FAILED" for row in rows_for_test(
+                                    parsed.get("results", []), name))
+                                else "not-run")
                         entry["status"] = status
                         if status == "ok":
                             self.counter_summary["passed"] += 1
@@ -3896,7 +3969,8 @@ class CardRun:
                             self.counter_summary["not_run"] += 1
                             entry.update(
                                 outcome="not-run",
-                                why=(f"the runner reported no test named {name!r}"
+                                why=("the run died before it finished" if died
+                                     else f"the runner reported no test named {name!r}"
                                      if status == "not-run"
                                      else f"the runner reported it as {status}"))
                 finally:
@@ -4330,17 +4404,32 @@ def _red(parsed: dict, known: list[str]) -> list[str]:
             if entry.get("status") == "FAILED" and entry.get("name") not in known_set]
 
 
-def _named_failures(parsed: dict, named: list[str]) -> dict[str, str]:
-    by_name = {entry["name"]: entry["status"]
-               for entry in parsed.get("results", [])}
-    return {name: by_name.get(name, "not-run") for name in named}
+def _named_rows(parsed: dict, named: list[str], files: dict[str, str] | None = None,
+                row_file=None) -> dict[str, list[dict]]:
+    """Every row each named test was reported with (`rows_for_test`)."""
+    results = parsed.get("results", [])
+    files = files or {}
+    return {name: rows_for_test(results, name, files.get(name, ""), row_file)
+            for name in named}
+
+
+def _named_failures(parsed: dict, named: list[str],
+                    files: dict[str, str] | None = None,
+                    row_file=None) -> dict[str, str]:
+    """One status per named test, from every row reported for it.
+
+    `FAILED` only when every row failed and `ok` only when every row passed; rows
+    that disagree (a parameter case passing while another fails, or the same test
+    in two binaries) are `mixed`, which proves nothing either way. Keeping the last
+    row instead let a planted or duplicate row decide the proof.
+    """
+    rows = _named_rows(parsed, named, files, row_file)
+    return {name: combined_status(rows[name]) for name in named}
 
 
 def _status_of(parsed: dict, name: str) -> str:
-    for entry in parsed.get("results", []):
-        if entry.get("name") == name:
-            return entry.get("status", "")
-    return "not-run"
+    """A named test's status over all its rows, as `_named_failures` reads it."""
+    return combined_status(rows_for_test(parsed.get("results", []), name))
 
 
 def _report_detail(report) -> str:

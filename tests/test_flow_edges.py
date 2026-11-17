@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -355,6 +356,9 @@ class TestBackfillTests(unittest.TestCase):
             toy.cleanup()
         self._toys = []
 
+    @unittest.skipIf(shutil.which("cargo-mutants") is not None,
+                     "cargo-mutants is installed; test_v081b_packs_mutants runs "
+                     "the real gate")
     def test_a_backfill_card_reaches_in_review(self) -> None:
         self.toy.write_card(
             "BACK-1", title="Pin the empty fascicle length",
