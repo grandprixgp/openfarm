@@ -19,6 +19,7 @@ from openfarm_core.briefs import (
     BriefBook,
     EDIT_FORMAT,
     HANDBACK_INSTRUCTIONS,
+    PLANNER_HANDBACK_INSTRUCTIONS,
     checker_pass1_brief,
     checker_pass2_brief,
     implementer_brief,
@@ -107,12 +108,13 @@ class HandbackParsingAndBriefTests(unittest.TestCase):
         book = BriefBook(self.tmp, never_touch=[], forbidden=[])
         pack = pack_for("python")
 
+        # With the swarm on (handback=True) every brief invites a hand-back.
         briefs = [
-            planner_brief(card, book),
-            test_writer_brief(card, book, pack),
-            implementer_brief(card, book, {"tests/test_full.py": "pass"}),
-            checker_pass1_brief(card, "+def test_x(): pass"),
-            checker_pass2_brief(card, "+return", [{"name": "t", "result": "pass"}], {}),
+            test_writer_brief(card, book, pack, handback=True),
+            implementer_brief(card, book, {"tests/test_full.py": "pass"}, handback=True),
+            checker_pass1_brief(card, "+def test_x(): pass", handback=True),
+            checker_pass2_brief(card, "+return", [{"name": "t", "result": "pass"}], {},
+                                handback=True),
         ]
         for brief in briefs:
             self.assertIn("replan_if", brief.body)
@@ -120,6 +122,14 @@ class HandbackParsingAndBriefTests(unittest.TestCase):
             self.assertIn("the reference module has no such function", brief.body)
             self.assertIn("<<<HANDBACK", brief.body)
             self.assertIn(HANDBACK_INSTRUCTIONS, brief.body)
+
+        # The planner answers in JSON mode, so it is invited to hand back in JSON.
+        planner = planner_brief(card, book, handback=True)
+        self.assertIn("replan_if", planner.body)
+        self.assertIn("a named test already passes on base", planner.body)
+        self.assertIn(PLANNER_HANDBACK_INSTRUCTIONS, planner.body)
+        self.assertIn('{"handback": ', planner.body)
+        self.assertNotIn("<<<HANDBACK", planner.body)
 
         self.assertNotIn("<<<HANDBACK", EDIT_FORMAT)
 
