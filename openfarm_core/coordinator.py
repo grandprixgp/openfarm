@@ -22,6 +22,7 @@ from .cards import Card
 from .errors import AdapterError, GateFailure, Infra, Invalid, Refused, StopCode
 from .micromanager import _call_tier_complete
 from .swarm import (
+    StallMonitor,
     cards_collide,
     swarm_ask,
     swarm_block,
@@ -96,6 +97,48 @@ class CoordinatorRuntime:
         self.ask_supervisor_fn = ask_supervisor_fn
         self.stop_launching = False
         self.lock = threading.RLock()
+        self._coord_busy = 0
+
+    def _set_member_state(self, member_name: str, target_state: str, *, skip_external: bool = False) -> None:
+        if not member_name:
+            return
+        member = self.board.get_member(member_name)
+        if member is None or member.get("state") == "removed":
+            return
+        if skip_external and member.get("kind") == "external":
+            return
+        if member.get("state") != target_state:
+            try:
+                self.board.update_member(member_name, state=target_state)
+            except Refused:
+                return
+
+    @contextlib.contextmanager
+    def coord_busy(self):
+        with self.lock:
+            self._coord_busy += 1
+        self._set_member_state("coordinator", "active", skip_external=True)
+        try:
+            yield
+        finally:
+            with self.lock:
+                self._coord_busy = max(0, self._coord_busy - 1)
+
+    @contextlib.contextmanager
+    def coordinator_waiting(self):
+        self._set_member_state("coordinator", "waiting", skip_external=True)
+        try:
+            yield
+        finally:
+            self._set_member_state("coordinator", "active", skip_external=True)
+
+    def active_work_count(self) -> int:
+        with self.lock:
+            return max(0, len(self.in_flight) - self.board.external_wait_count()) + self._coord_busy
+
+    def has_unfinished_work(self) -> bool:
+        with self.lock:
+            return bool(self.pending or self.in_flight)
 
     def running_ids(self) -> set[str]:
         with self.lock:
@@ -992,7 +1035,7 @@ class SwarmRunner:
                         else contextlib.nullcontext()
                     )
                     since_q = q_seq
-                    with pause_cm:
+                    with pause_cm, self.board.external_wait(card_id=cid, member_name=mname):
                         while True:
                             if self.state.kill_requested(self.cfg.kill_switch):
                                 raise GateFailure(StopCode.KILLED, "run cancelled by kill switch")
@@ -1093,143 +1136,159 @@ class SwarmRunner:
         )
 
         self.coordinator.ensure_member(self.board)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-            pool_holder.append(pool)
-            self.coordinator.on_plan(rt, post_event=True)
+        monitor = StallMonitor(
+            self.board,
+            self.cfg,
+            unfinished_fn=rt.has_unfinished_work,
+            active_work_fn=rt.active_work_count,
+        )
+        monitor.start()
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+                pool_holder.append(pool)
+                with rt.coord_busy():
+                    self.coordinator.on_plan(rt, post_event=True)
 
-            is_ext = isinstance(self.coordinator, ExternalCoordinator)
-            ext_idle_since: float | None = None
+                is_ext = isinstance(self.coordinator, ExternalCoordinator)
+                ext_idle_since: float | None = None
 
-            while True:
-                if is_ext:
-                    self.coordinator.scan_external_actions(rt)
+                while True:
+                    if is_ext:
+                        self.coordinator.scan_external_actions(rt)
 
-                with rt.lock:
-                    if rt.stop_launching or self.state.kill_requested(self.cfg.kill_switch):
-                        reason_skip = (
-                            "the kill switch was set"
-                            if self.state.kill_requested(self.cfg.kill_switch)
-                            else "run stopped"
-                        )
-                        for cid in list(rt.pending):
-                            outcomes_by_card.setdefault(
-                                cid, {"card": cid, "skipped": reason_skip}
-                            )
-                        rt.pending.clear()
-                    elif self.state.is_paused():
-                        for cid in list(rt.pending):
-                            outcomes_by_card.setdefault(
-                                cid, {"card": cid, "skipped": "the queue was paused"}
-                            )
-                        rt.pending.clear()
-                    elif self.deadline is not None and time.monotonic() >= self.deadline:
-                        for cid in list(rt.pending):
-                            outcomes_by_card.setdefault(
-                                cid, {"card": cid, "skipped": "the run's time ran out"}
-                            )
-                        rt.pending.clear()
-                    else:
-                        exhausted = self.night.exhausted()
-                        if exhausted:
-                            for cid in list(rt.pending):
-                                outcomes_by_card.setdefault(
-                                    cid, {"card": cid, "skipped": exhausted}
-                                )
-                            rt.pending.clear()
-                        elif (
-                            self.night.cards_cap is not None
-                            and (self.night.cards_claimed + len(rt.in_flight))
-                            >= self.night.cards_cap
-                            and len(rt.in_flight) == 0
-                        ):
-                            skip_msg = f"{self.night.cards_cap} cards claimed, the run's cap"
-                            for cid in list(rt.pending):
-                                outcomes_by_card.setdefault(
-                                    cid, {"card": cid, "skipped": skip_msg}
-                                )
-                            rt.pending.clear()
-
-                    active_futs = list(rt.in_flight.keys())
-                    has_pending = bool(rt.pending)
-
-                if not active_futs and not has_pending:
-                    break
-
-                if active_futs:
-                    ext_idle_since = None
-                    wait_timeout = (
-                        self.coordinator.poll_interval_s
-                        if is_ext
-                        else None
-                    )
-                    done_futs, _ = concurrent.futures.wait(
-                        active_futs,
-                        timeout=wait_timeout,
-                        return_when=concurrent.futures.FIRST_COMPLETED,
-                    )
-                    if not done_futs:
-                        continue
-                    for fut in done_futs:
-                        with rt.lock:
-                            cid = rt.in_flight.pop(fut)
-                        outcome = fut.result()
-                        with outcomes_lock:
-                            outcomes_by_card[cid] = outcome
-                        with rt.lock:
-                            rt.finished[cid] = outcome
-                            try:
-                                card_obj = Card.from_dict(self.source.read(cid)["card"])
-                                rt.card_map[cid] = card_obj
-                            except AdapterError:
-                                card_obj = None
-                        self.night.note_card()
-                        if self.record_outcome_fn(cid, outcome):
-                            with rt.lock:
-                                rt.stop_launching = True
-                        if not rt.stop_launching:
-                            self.coordinator.on_finished(rt, cid, outcome)
-                    continue
-
-                # active_futs is empty but has_pending is True
-                if not is_ext:
-                    # Try planning once more (e.g. after a dependent card finished externally)
-                    before_len = len(rt.pending)
-                    self.coordinator.on_plan(rt, post_event=False)
                     with rt.lock:
-                        if not rt.in_flight and len(rt.pending) == before_len:
+                        if rt.stop_launching or self.state.kill_requested(self.cfg.kill_switch):
+                            reason_skip = (
+                                "the kill switch was set"
+                                if self.state.kill_requested(self.cfg.kill_switch)
+                                else "run stopped"
+                            )
                             for cid in list(rt.pending):
                                 outcomes_by_card.setdefault(
-                                    cid, {"card": cid, "skipped": "no eligible non-colliding card could start"}
+                                    cid, {"card": cid, "skipped": reason_skip}
                                 )
                             rt.pending.clear()
-                    continue
-
-                if ext_idle_since is None:
-                    ext_idle_since = time.monotonic()
-                idle_elapsed = time.monotonic() - ext_idle_since
-                remaining_ext = self.coordinator.external_wait_s - idle_elapsed
-                if self.deadline is not None:
-                    remaining_ext = min(remaining_ext, self.deadline - time.monotonic())
-                if remaining_ext <= 0:
-                    if self.deadline is not None and time.monotonic() >= self.deadline:
-                        continue
-                    if self.coordinator.on_timeout == "block":
-                        with rt.lock:
+                        elif self.state.is_paused():
                             for cid in list(rt.pending):
-                                _block_unstarted(
-                                    cid,
-                                    StopCode.SEAT_SILENT.value,
-                                    "external coordinator did not start card",
+                                outcomes_by_card.setdefault(
+                                    cid, {"card": cid, "skipped": "the queue was paused"}
                                 )
                             rt.pending.clear()
+                        elif self.deadline is not None and time.monotonic() >= self.deadline:
+                            for cid in list(rt.pending):
+                                outcomes_by_card.setdefault(
+                                    cid, {"card": cid, "skipped": "the run's time ran out"}
+                                )
+                            rt.pending.clear()
+                        else:
+                            exhausted = self.night.exhausted()
+                            if exhausted:
+                                for cid in list(rt.pending):
+                                    outcomes_by_card.setdefault(
+                                        cid, {"card": cid, "skipped": exhausted}
+                                    )
+                                rt.pending.clear()
+                            elif (
+                                self.night.cards_cap is not None
+                                and (self.night.cards_claimed + len(rt.in_flight))
+                                >= self.night.cards_cap
+                                and len(rt.in_flight) == 0
+                            ):
+                                skip_msg = f"{self.night.cards_cap} cards claimed, the run's cap"
+                                for cid in list(rt.pending):
+                                    outcomes_by_card.setdefault(
+                                        cid, {"card": cid, "skipped": skip_msg}
+                                    )
+                                rt.pending.clear()
+
+                        active_futs = list(rt.in_flight.keys())
+                        has_pending = bool(rt.pending)
+
+                    if not active_futs and not has_pending:
                         break
-                    self.coordinator._code_fallback.on_plan(rt, post_event=False)
-                    ext_idle_since = time.monotonic()
-                    continue
-                head_now = self.board.head_seq()
-                self.board.wait_after(
-                    head_now, min(self.coordinator.poll_interval_s, remaining_ext)
-                )
+
+                    if active_futs:
+                        ext_idle_since = None
+                        wait_timeout = (
+                            self.coordinator.poll_interval_s
+                            if is_ext
+                            else None
+                        )
+                        with rt.coordinator_waiting():
+                            done_futs, _ = concurrent.futures.wait(
+                                active_futs,
+                                timeout=wait_timeout,
+                                return_when=concurrent.futures.FIRST_COMPLETED,
+                            )
+                        if not done_futs:
+                            continue
+                        for fut in done_futs:
+                            with rt.lock:
+                                cid = rt.in_flight.pop(fut)
+                            outcome = fut.result()
+                            with outcomes_lock:
+                                outcomes_by_card[cid] = outcome
+                            with rt.lock:
+                                rt.finished[cid] = outcome
+                                try:
+                                    card_obj = Card.from_dict(self.source.read(cid)["card"])
+                                    rt.card_map[cid] = card_obj
+                                except AdapterError:
+                                    card_obj = None
+                            self.night.note_card()
+                            if self.record_outcome_fn(cid, outcome):
+                                with rt.lock:
+                                    rt.stop_launching = True
+                            if not rt.stop_launching:
+                                with rt.coord_busy():
+                                    self.coordinator.on_finished(rt, cid, outcome)
+                        continue
+
+                    # active_futs is empty but has_pending is True
+                    if not is_ext:
+                        # Try planning once more (e.g. after a dependent card finished externally)
+                        before_len = len(rt.pending)
+                        with rt.coord_busy():
+                            self.coordinator.on_plan(rt, post_event=False)
+                        with rt.lock:
+                            if not rt.in_flight and len(rt.pending) == before_len:
+                                for cid in list(rt.pending):
+                                    outcomes_by_card.setdefault(
+                                        cid, {"card": cid, "skipped": "no eligible non-colliding card could start"}
+                                    )
+                                rt.pending.clear()
+                        continue
+
+                    if ext_idle_since is None:
+                        ext_idle_since = time.monotonic()
+                    idle_elapsed = time.monotonic() - ext_idle_since
+                    remaining_ext = self.coordinator.external_wait_s - idle_elapsed
+                    if self.deadline is not None:
+                        remaining_ext = min(remaining_ext, self.deadline - time.monotonic())
+                    if remaining_ext <= 0:
+                        if self.deadline is not None and time.monotonic() >= self.deadline:
+                            continue
+                        if self.coordinator.on_timeout == "block":
+                            with rt.lock:
+                                for cid in list(rt.pending):
+                                    _block_unstarted(
+                                        cid,
+                                        StopCode.SEAT_SILENT.value,
+                                        "external coordinator did not start card",
+                                    )
+                                rt.pending.clear()
+                            break
+                        with rt.coord_busy():
+                            self.coordinator._code_fallback.on_plan(rt, post_event=False)
+                        ext_idle_since = time.monotonic()
+                        continue
+                    head_now = self.board.head_seq()
+                    with rt.coordinator_waiting():
+                        self.board.wait_after(
+                            head_now, min(self.coordinator.poll_interval_s, remaining_ext)
+                        )
+        finally:
+            monitor.stop()
 
         return [
             outcomes_by_card[cid] for cid in self.identifiers if cid in outcomes_by_card

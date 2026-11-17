@@ -1182,7 +1182,7 @@ class ExternalMicromanagerBackend(_ThreadLocalUsageMixin):
             if self.budget is not None and hasattr(self.budget, "pause_clock")
             else contextlib.nullcontext()
         )
-        with pause_ctx:
+        with pause_ctx, self.board.external_wait(card_id=card_id):
             deadline = time.monotonic() + max(0.0, self.timeout_s)
             while True:
                 if self.cancel_check is not None and self.cancel_check():

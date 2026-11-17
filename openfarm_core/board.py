@@ -373,6 +373,8 @@ class Board:
         self.posts_path = self.board_dir / "board.jsonl"
         self.members_path = self.board_dir / "members.json"
         self.state_path = self.board_dir / "state.json"
+        self._ext_wait_lock = threading.Lock()
+        self._ext_wait_count = 0
         self.lock_path = self.board_dir / ".lock"
         self.evidence_dir = self.board_dir / "evidence"
 
@@ -1190,6 +1192,42 @@ class Board:
                 trusted=None,
                 advance_author_cursor=False,
             )
+
+    @contextlib.contextmanager
+    def external_wait(self, *, card_id: str = "", member_name: str = ""):
+        """Track an external-seat wait and park the card's roster members."""
+        targets: list[str] = []
+        if card_id:
+            for member in self.list_members(include_removed=False):
+                if member.get("card") == card_id and member.get("state") == "active":
+                    targets.append(str(member["name"]))
+        if member_name and member_name not in targets:
+            existing = self.get_member(member_name)
+            if existing is not None and existing.get("state") == "active":
+                targets.append(member_name)
+        with self._ext_wait_lock:
+            self._ext_wait_count += 1
+        for name in targets:
+            try:
+                self.update_member(name, state="waiting")
+            except Refused:
+                continue
+        try:
+            yield
+        finally:
+            for name in targets:
+                current = self.get_member(name)
+                if current is not None and current.get("state") == "waiting":
+                    try:
+                        self.update_member(name, state="active")
+                    except Refused:
+                        continue
+            with self._ext_wait_lock:
+                self._ext_wait_count = max(0, self._ext_wait_count - 1)
+
+    def external_wait_count(self) -> int:
+        with self._ext_wait_lock:
+            return self._ext_wait_count
 
     def status(self) -> dict:
         if not self.board_dir.exists():

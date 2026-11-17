@@ -428,6 +428,7 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
         board = Board(board_dir_for(ctx.state, run_id), state_dir=ctx.state)
         board.ensure()
         board.upsert_member("gates", kind="code", role="gates", added_by="system")
+        board.upsert_member("monitor", kind="code", role="monitor", added_by="system")
         if swarm_cfg.coordinator == "code":
             board.upsert_member(
                 "coordinator", kind="code", role="coordinator", added_by="system"

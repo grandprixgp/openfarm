@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Iterable
+import sys
+import threading
+import time
+from typing import Callable, Iterable
 
 from .board import Board, normalize_role
 from .cards import Card
@@ -763,3 +766,224 @@ def swarm_wait(
         body=f"wait: {reason}" if reason else "wait",
     )
     return {"action": "wait", "reason": reason}
+
+
+_INFRA_ROLES = frozenset({"gates", "monitor", "system"})
+
+
+class StallMonitor:
+    """Periodic stall detector (`role = "monitor"`, `kind = "code"`).
+
+    Triggers when the run has not ended, no card thread is actively executing,
+    every non-removed non-infra member is waiting or idle on external input,
+    unfinished work remains, and nothing non-`stall` has been posted within
+    `[swarm] stall_after`. Emits at most one `kind = "stall"` post per board
+    activity sequence until non-`stall` activity advances the board.
+    """
+
+    def __init__(
+        self,
+        board: Board,
+        cfg=None,
+        *,
+        stall_after_s: float | None = None,
+        unfinished_fn: Callable[[], bool] | None = None,
+        active_work_fn: Callable[[], int] | None = None,
+        clock: Callable[[], float] | None = None,
+    ) -> None:
+        if stall_after_s is None:
+            stall_after_s = float(
+                getattr(getattr(cfg, "swarm", None), "stall_after_s", 300.0) or 300.0
+            )
+        self.board = board
+        self.cfg = cfg
+        self.stall_after_s = max(0.01, float(stall_after_s))
+        self.poll_interval_s = min(30.0, max(0.05, self.stall_after_s / 2.0))
+        self._unfinished_fn = unfinished_fn
+        self._active_work_fn = active_work_fn
+        self._clock = clock or time.monotonic
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._scan_seq: int = 0
+        self._last_non_stall_seq: int = 0
+        self._last_activity_at: float | None = None
+        self._stalled_for_seq: int = -1
+        self._all_posts: list[dict] = []
+        self._seed_initial_activity()
+
+    def _seed_initial_activity(self) -> None:
+        cur_now = float(self._clock())
+        with self._lock:
+            if self.board.posts_path.exists():
+                self._sync_posts_unlocked(cur_now)
+            else:
+                self._last_activity_at = cur_now
+
+    def ensure_member(self) -> dict:
+        """Ensure `"monitor"` (`kind="code"`, `role="monitor"`) is registered."""
+        self.board.ensure()
+        existing = self.board.get_member("monitor")
+        if existing is not None:
+            return existing
+        return self.board.upsert_member(
+            "monitor",
+            kind="code",
+            role="monitor",
+            added_by="system",
+        )
+
+    def note_activity(self, *, now: float | None = None) -> None:
+        """Record non-stall activity at `now` (used for deterministic clocks)."""
+        cur_now = float(self._clock() if now is None else now)
+        with self._lock:
+            self._sync_posts_unlocked(cur_now)
+            self._last_activity_at = cur_now
+
+    def _sync_posts_unlocked(self, cur_now: float) -> None:
+        new_posts = self.board.read(
+            as_name="*", since=self._scan_seq, limit=None, for_model=False
+        )
+        for post in new_posts:
+            seq = int(post.get("seq", 0) or 0)
+            if seq > self._scan_seq:
+                self._scan_seq = seq
+            self._all_posts.append(post)
+            if post.get("kind") != "stall":
+                if seq > self._last_non_stall_seq:
+                    self._last_non_stall_seq = seq
+                self._last_activity_at = cur_now
+                self._stalled_for_seq = -1
+        if self._last_activity_at is None:
+            self._last_activity_at = cur_now
+
+    def _every_member_waiting_or_idle_unlocked(self) -> bool:
+        for member in self.board.list_members(include_removed=False):
+            name = str(member.get("name", "") or "")
+            role = normalize_role(str(member.get("role", "") or ""))
+            if name in _INFRA_ROLES or role in _INFRA_ROLES:
+                continue
+            if member.get("state") == "waiting":
+                continue
+            if member.get("kind") == "external":
+                continue
+            return False
+        return True
+
+    def _oldest_unanswered_question_unlocked(self) -> dict | None:
+        answered = {
+            int(post.get("ref", 0) or 0)
+            for post in self._all_posts
+            if post.get("kind") == "answer" and post.get("ref")
+        }
+        for post in self._all_posts:
+            seq = int(post.get("seq", 0) or 0)
+            if post.get("kind") == "question" and seq not in answered:
+                return post
+        return None
+
+    def _has_unfinished_work_unlocked(self) -> bool:
+        if self._unfinished_fn is not None:
+            return bool(self._unfinished_fn())
+        finished_cards = {
+            str(post.get("card", "") or "")
+            for post in self._all_posts
+            if post.get("kind") in ("done", "blocked") and post.get("card")
+        }
+        for member in self.board.list_members(include_removed=False):
+            cid = str(member.get("card", "") or "")
+            if cid and cid not in finished_cards:
+                return True
+        return self._oldest_unanswered_question_unlocked() is not None
+
+    def _stall_targets(self, oldest_q: dict | None) -> list[str]:
+        targets: list[str] = []
+        if oldest_q is not None:
+            for recip in oldest_q.get("to") or []:
+                rs = str(recip or "").strip()
+                if rs and rs not in ("monitor", "all") and rs not in targets:
+                    targets.append(rs)
+        if "coordinator" not in targets:
+            targets.append("coordinator")
+        return targets
+
+    def check_once(self, *, now: float | None = None) -> dict | None:
+        """Inspect board/worker state once; post at most one `stall` if stalled."""
+        cur_now = float(self._clock() if now is None else now)
+        if not self.board.board_dir.exists() or self.board.is_ended():
+            return None
+
+        with self._lock:
+            self._sync_posts_unlocked(cur_now)
+            if self._active_work_fn is not None and int(self._active_work_fn()) > 0:
+                return None
+            if not self._every_member_waiting_or_idle_unlocked():
+                return None
+            if not self._has_unfinished_work_unlocked():
+                return None
+            if self._stalled_for_seq == self._last_non_stall_seq:
+                return None
+            anchor = self._last_activity_at if self._last_activity_at is not None else cur_now
+            idle_s = cur_now - anchor
+            if idle_s < self.stall_after_s:
+                return None
+
+            oldest_q = self._oldest_unanswered_question_unlocked()
+            targets = self._stall_targets(oldest_q)
+            ref_seq = int(oldest_q.get("seq", 0) or 0) if oldest_q is not None else None
+            card_id = str(oldest_q.get("card", "") or "") if oldest_q is not None else ""
+            if ref_seq:
+                body = (
+                    f"stall detected after {idle_s:.1f}s quiet: "
+                    f"unanswered question #{ref_seq} waiting on {', '.join(targets)}"
+                )
+            else:
+                body = (
+                    f"stall detected after {idle_s:.1f}s quiet: "
+                    "unfinished work remains with no active member"
+                )
+            stalled_seq = self._last_non_stall_seq
+            self.ensure_member()
+            post = self.board.post(
+                author="monitor",
+                to=targets,
+                kind="stall",
+                body=body,
+                card=card_id,
+                ref=ref_seq,
+                trusted=True,
+            )
+            self._scan_seq = max(self._scan_seq, int(post.get("seq", 0) or 0))
+            self._all_posts.append(post)
+            self._stalled_for_seq = stalled_seq
+            return post
+
+    def _run_loop(self) -> None:
+        while not self._stop_event.wait(self.poll_interval_s):
+            if self.board.is_ended():
+                break
+            try:
+                self.check_once()
+            except (Refused, OSError, ValueError) as exc:
+                print(f"monitor check error: {exc}", file=sys.stderr)
+
+    def start(self) -> None:
+        """Register `"monitor"` and start the background check loop."""
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._stop_event.clear()
+            self.ensure_member()
+            self._thread = threading.Thread(
+                target=self._run_loop, name="openfarm-stall-monitor", daemon=True
+            )
+            self._thread.start()
+
+    def stop(self, *, timeout_s: float = 2.0) -> None:
+        """Signal the background monitor thread to exit and join it."""
+        self._stop_event.set()
+        with self._lock:
+            thread = self._thread
+            self._thread = None
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=timeout_s)
