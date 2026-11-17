@@ -15,6 +15,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -361,6 +362,32 @@ def _parse_driver_output(
     )
 
 
+#: The process class driver turns start (a name tests can swap).
+_POPEN = subprocess.Popen
+
+#: Default seconds one driver turn may take (`openfarm drive --turn-timeout`).
+DEFAULT_TURN_TIMEOUT_S = 180.0
+
+
+def _end_process_group(proc, *, grace_s: float = 2.0) -> None:
+    """End a driver child's whole process group: TERM, a grace, then KILL.
+
+    The child was started in its own session, so its pid is its group's id.
+    Members that left the group on purpose (their own `setsid`) are not reached.
+    """
+    pgid = proc.pid
+    if grace_s > 0:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(pgid, signal.SIGTERM)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=grace_s)
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(pgid, signal.SIGKILL)
+    with contextlib.suppress(subprocess.TimeoutExpired, OSError, ValueError):
+        # Collect the leader and close the pipes; output is not needed any more.
+        proc.communicate(timeout=max(grace_s, 2.0))
+
+
 class DriverAgent:
     """Headless read-only driver wrapper for `claude`, `agy`, or `codex`."""
 
@@ -374,7 +401,7 @@ class DriverAgent:
         effort: str | None = None,
         never_touch: list[str] | tuple[str, ...] = (),
         forbidden_files: list[str] | tuple[str, ...] = (),
-        timeout_s: float = 180.0,
+        timeout_s: float = DEFAULT_TURN_TIMEOUT_S,
         env: dict[str, str] | None = None,
         script: object = None,
     ) -> None:
@@ -385,7 +412,7 @@ class DriverAgent:
         self.effort = str(effort).strip() if effort else ""
         self.never_touch = list(never_touch or ())
         self.forbidden_files = list(forbidden_files or ())
-        self.timeout_s = float(timeout_s or 180.0)
+        self.timeout_s = float(timeout_s or DEFAULT_TURN_TIMEOUT_S)
         self.extra_env = dict(env) if env is not None else None
         self._script = script
         self._turn_counter = 0
@@ -596,24 +623,38 @@ class DriverAgent:
 
         try:
             try:
-                proc = subprocess.run(
+                # Its own session, so the whole group (the CLI and anything it
+                # started) can be ended before the isolated HOME is deleted.
+                proc = _POPEN(
                     argv,
                     cwd=str(self.cwd),
                     env=env,
-                    input=sub_input,
-                    capture_output=True,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
                     text=True,
-                    timeout=self.timeout_s,
+                    start_new_session=True,
                 )
             except OSError as exc:
                 raise Infra(
                     "driver-spawn-failed", f"{argv[0]} could not start: {exc}"
                 ) from exc
+            try:
+                stdout_text, stderr_text = proc.communicate(
+                    input=sub_input, timeout=self.timeout_s
+                )
             except subprocess.TimeoutExpired as exc:
+                _end_process_group(proc)
                 raise Infra(
                     "driver-timeout",
-                    f"{self.provider} driver timed out after {self.timeout_s}s",
+                    f"{self.provider} driver timed out after {self.timeout_s:g}s "
+                    "(raise it with `openfarm drive --turn-timeout`)",
                 ) from exc
+            except BaseException:
+                _end_process_group(proc)
+                raise
+            # The CLI has exited: whatever it left running in its group goes too.
+            _end_process_group(proc, grace_s=0.0)
 
             if isolated_home is not None:
                 _sync_refreshed_oauth(
@@ -626,8 +667,8 @@ class DriverAgent:
 
         return _parse_driver_output(
             self.provider,
-            proc.stdout or "",
-            proc.stderr or "",
+            stdout_text or "",
+            stderr_text or "",
             proc.returncode,
             stdin_text,
             argv,
@@ -1942,6 +1983,7 @@ def drive_run(
     wave: bool = False,
     record_verdict: bool = False,
     script: Path | None = None,
+    turn_timeout: float = DEFAULT_TURN_TIMEOUT_S,
 ) -> dict:
     """Attach to an active run or start a managed external-seat run and drive it."""
     provider = normalize_acp_provider(agent)
@@ -1950,6 +1992,12 @@ def drive_run(
         raise UsageError(f"invalid --seat {seat!r}: choose from {', '.join(DRIVE_SEATS)}")
     if max_turns < 1:
         raise UsageError("--max-turns must be >= 1")
+    try:
+        turn_timeout = float(turn_timeout)
+    except (TypeError, ValueError) as exc:
+        raise UsageError(f"--turn-timeout must be a number of seconds, got {turn_timeout!r}") from exc
+    if not turn_timeout > 0 or turn_timeout == float("inf"):
+        raise UsageError("--turn-timeout must be a positive number of seconds")
     if cards is not None and cards < 1:
         raise UsageError("--cards must be >= 1")
     if spend is not None:
@@ -2092,6 +2140,7 @@ def drive_run(
             effort=effort,
             never_touch=active_cfg.never_touch,
             forbidden_files=active_cfg.forbidden_files,
+            timeout_s=turn_timeout,
             script=driver_script,
         ) as drv:
             if not board.is_ended():
