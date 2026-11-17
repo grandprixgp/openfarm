@@ -212,6 +212,34 @@ class TypeScriptToolingTests(unittest.TestCase):
         self.assertEqual(outcome["tooling"]["typecheck"], "syntax")
         self.assertFalse(self.log.exists(), self.log.read_text() if self.log.exists() else "")
 
+    def _lint_records(self, gates: list[dict]) -> dict[str, list[dict]]:
+        found: dict[str, list[dict]] = {}
+        for gate in gates:
+            if gate.get("name") in ("lint", "workspace-lint"):
+                found.setdefault(gate["name"], []).append(gate)
+        self.assertEqual(sorted(found), ["lint", "workspace-lint"], found)
+        return found
+
+    def test_the_lint_gate_records_say_the_check_was_syntax_only(self) -> None:
+        """G3: no types were checked, and the lint gates' own records say so."""
+        outcome, gates = self._run(None)
+        self.assertEqual(outcome["final_state"], "in-review", outcome.get("detail"))
+        for name, records in self._lint_records(gates).items():
+            for record in records:
+                with self.subTest(name):
+                    self.assertTrue(record["evidence"]["syntax_only"], record)
+                    self.assertEqual(record["evidence"]["typecheck"], "syntax")
+                    self.assertIn("no types were checked", record["evidence"]["note"])
+
+    def test_the_lint_gate_records_say_tsc_checked_the_types(self) -> None:
+        outcome, gates = self._run(self.other)
+        self.assertEqual(outcome["final_state"], "in-review", outcome.get("detail"))
+        for name, records in self._lint_records(gates).items():
+            for record in records:
+                with self.subTest(name):
+                    self.assertFalse(record["evidence"]["syntax_only"], record)
+                    self.assertEqual(record["evidence"]["typecheck"], "tsc")
+
     def test_a_flag_config_that_turns_the_link_off_reaches_the_card(self) -> None:
         self.other.write_text(self.other.read_text().replace(
             "link_node_modules = true", "link_node_modules = false"))
@@ -273,6 +301,14 @@ class PythonAndRustToolingTests(unittest.TestCase):
         root = self._python_repo({"pytest.ini": "[pytest]\n"})
         tooling = json.loads(_cli(root, "check", "CARD-1").stdout)["tooling"]
         self.assertEqual(tooling["runner"], "pytest")
+
+    def test_packs_other_than_typescript_add_nothing_to_gate_records(self) -> None:
+        from openfarm_core.packs.base import pack_for
+        for language in ("python", "rust"):
+            with self.subTest(language):
+                pack = pack_for(language)
+                self.assertEqual(pack.gate_evidence("lint"), {})
+                self.assertEqual(pack.gate_evidence("workspace-lint"), {})
 
     def test_the_human_tooling_block_reads_alike_for_rust(self) -> None:
         payload = {"card": "CARD-1", "eligible": True, "failures": [],
