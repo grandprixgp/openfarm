@@ -47,8 +47,9 @@ Technical reference for `openfarm_core`, packaging/bootstrap (`pyproject.toml`, 
 - `board.py` (v0.8): Shared append-only per-run message board (`<state_dir>/runs/<run_id>/board/` with `board.jsonl`, `members.json`, `state.json`, `.lock`, `evidence/`), supporting thread/process-safe sequenced posts, reserved-kind / addressee / `expects` answer validation, member cursor tracking, `wait` / `wait_after`, and `external_wait` parking.
 - `swarm.py` (v0.8): `cards_collide` / `collision_reason`, `parse_team_spec`, checked coordinator actions (`swarm_join`, `swarm_start`, `swarm_set`, `swarm_hint`, `swarm_ask`, `swarm_block`, `swarm_remove`, `swarm_wait`, `swarm_status`, `swarm_tiers`), and `StallMonitor` (`role = "monitor"`, `kind = "code"`).
 - `coordinator.py` (v0.8): `CoordinatorRuntime`, `CodeCoordinator`, `ModelCoordinator` (capped calls/tokens + 2-bad-answer permanent/decision fallback), `ExternalCoordinator`, and `SwarmRunner` parallel `ThreadPoolExecutor` card scheduler with `StallMonitor` integration.
-- `tui.py` (v0.8): Pure-stdlib `curses` TUI & snapshot renderer (`openfarm tui`, `VIEWS`: `overview`, `cards`, `dossier`, `board`, `swarm`, `harness`, `ops`) with read-only state-confined evidence inspection and checked board/swarm actions.
-- `cli.py`: 21-subcommand CLI with `PRE_CONFIG_COMMANDS` pre-`Context` dispatch for `init`, `adopt`, `bench` (`list`, `run`), `install-skill`, `acp`, and `tui`, alongside `run`, `status`, `pause`, `resume`, `stop`, `release`, `done`, `dossier`, `check`, `verdict`, `escape`, `supervise`, `harness`, `board`, and `swarm`.
+- `tui.py` (v0.8): Pure-stdlib `curses` TUI & snapshot renderer (`openfarm tui`, `VIEWS`: `overview`, `cards`, `dossier`, `board`, `swarm`, `harness`, `ops`) with `NO_COLOR`/terminal color theme, responsive 2-column/stacked master-detail split, `/` live search, centered modals, read-only state-confined evidence inspection, and checked board/swarm actions.
+- `human_cli.py` (v0.8): Human-friendly CLI output formatting (`Style` gated by TTY / `NO_COLOR` / `TERM!=dumb`, `format_table`/`format_kv`/`format_bar`, formatters across all 21 commands, contextual `error_hint`), preserving 100% `--json` parity.
+- `cli.py`: 21-subcommand CLI with `PRE_CONFIG_COMMANDS` pre-`Context` dispatch for `init`, `adopt`, `bench` (`list`, `run`), `install-skill`, `acp`, and `tui`, alongside `run`, `status`, `pause`, `resume`, `stop`, `release`, `done`, `dossier`, `check`, `verdict`, `escape`, `supervise`, `harness`, `board`, and `swarm`, forgiving bare `board`/`swarm`/`bench` human mode, categorized `--help`, and `difflib` typo hints.
 
 ## Configuration Schema (15 Tables)
 
@@ -142,19 +143,19 @@ Inspired by `google-research/harness2` (`arXiv:2610.14224`), `openfarm_core/harn
 | v0.8 Swarm roster, collisions, checked coordinator actions & CLI | `tests/test_swarm_roster.py` |
 | v0.8 Pipeline board posting, live sets/hints, dossier team, hand-back & `replan_if` | `tests/test_board_pipeline.py`, `tests/test_handback.py` |
 | v0.8 Seats (`tier:<name>` & `external` supervisor, `pause_clock`, `seat-silent`) | `tests/test_tier_supervisor.py`, `tests/test_external_supervisor.py` |
-| v0.8 Parallel cards, `concurrent_builds`, thread safety (`NightBudget`/locks) | `tests/test_parallel_cards.py` |
+| v0.8 Parallel cards, `concurrent_builds`, thread safety (`NightBudget`/locks), and real `cargo` 3/2 parallel crate E2E | `tests/test_parallel_cards.py` |
 | v0.8 Coordinators (`Code`/`Model`/`External`), `SwarmRunner`, gate integrity, `StallMonitor` | `tests/test_coordinator_code.py`, `tests/test_coordinator_model.py`, `tests/test_external_coordinator.py`, `tests/test_gate_integrity_v08.py`, `tests/test_monitor.py` |
-| v0.8 Stdlib TUI (`openfarm tui` 7 views, CLI subcommand, safety & swarm actions) | `tests/test_tui.py` |
+| v0.8 Stdlib TUI (`openfarm tui` 7 views, responsive split-pane, `/` search, real-PTY `curses` tests) & human CLI UX | `tests/test_tui.py`, `tests/test_cli_human.py` |
+
+Live spot-check verification completed on 17 Nov 2026 (against Command Code `deepseek/deepseek-v4.1-flash` `x-cmd-zdr: 1` and Claude ACP OAuth; exact metrics and stop caveats in [`docs/v0.8-build-log.md`](v0.8-build-log.md)):
+- DeepSeek-only `tier:dsf` runs on `bench/py-bounded-full` (verbatim smoke hit `handed-back` when `test-writer` imported `pytest` without `.openfarm/test-conventions.md`; with `unittest` conventions passed 20 recorded functional/checker gate steps then stopped `handed-back` after `tier:dsf` `pre_review` bounced on an earlier degraded `micromanager-shape` step), `reasoning_effort` (`low`/`high`/`max` changed outcomes on `py-money-parse`; `rs-percent-zero` passed all three), external coordinator+supervisor (`py-inventory-remove` `in-review` + 6/6 hidden pass), parallel Rust `cargo` cards (`CARD-1` passed `cargo`/clippy/rustfmt + hidden tests under `supervisor = "off"`, `CARD-2` hit `handed-back` on frozen-test `clippy`), 2-task x 1-repeat `bench run` spot check (`farm` 1/2 vs `solo` 1/2), and 2-project global lesson exchange (`proj-alpha` `g-52723ab8fa` -> `proj-beta` `in-review` + hidden pass).
 
 Explicitly **untested** against live external targets on this machine:
-- Live v0.8 run against Command Code with DeepSeek in every seat (`workers`, `supervisor`, `coordinator`), `reasoning_effort` quality differences on live models, an outside agent holding a seat across a full live run, and parallel cards against real `cargo` builds (**untested** — see [`docs/v0.8-smoke.md`](v0.8-smoke.md)).
-- Global learning between two real projects: only throwaway projects in tests have exchanged lessons; live runs on openfarm itself synced and reported against an empty global library (**untested** across real projects).
-- Live remote GitHub URL installs via `uv`/`pipx`/`pip` and live multi-wave LLM execution of `calorie-log` (**untested**).
-- Live paid Anthropic prompt turns through `claude-agent-acp` (**untested**). Through `claude_native_acp.py` they have run: the v0.6 supervisor on 14 cards of openfarm itself, over the owner's claude.ai login.
-- `[adapters] model = "claude-acp"` (the bench's `solo` arm) against live Claude: tested only against `tests/acp_stand_in.py` (**untested** live).
-- `openfarm bench run` against live arms: every task's dry run passes its hidden tests and every untouched base fails them, but no live arm has run (**untested**).
-- Live `claude-agent-acp` binary with real Anthropic credentials (**untested**).
-- Live hosted ZDR OpenAI-compatible endpoints: v0.6 ran 14 cards of openfarm itself with DeepSeek V4.1 Flash on Command Code's Provider API (`x-cmd-zdr: 1`). No other provider has run.
-- Live `cargo-mutants` binary runs (**untested**).
+- Full `12 tasks x 3 repeats` live `openfarm bench run` and 25-card Rust efficacy pilot (only the 2-task x 1-repeat `bench` spot check above has run live).
+- Organic multi-card global learning across two long-lived third-party repositories, and `openfarm adopt` on an external third-party repository.
+- Live remote GitHub URL installs via `uv`/`pipx`/`pip` and live multi-wave LLM execution of `calorie-log`.
+- Live paid Anthropic prompt turns through the standalone `claude-agent-acp` binary (native `claude_native_acp.py` ran live over `claude.ai` OAuth).
+- Live hosted ZDR OpenAI-compatible endpoints other than Command Code (`x-cmd-zdr: 1` with DeepSeek V4.1 Flash).
+- Live `cargo-mutants`, `pytest`, and `ruff` binary runs (`pytest`/`ruff` are not installed locally).
 - TypeScript language pack (explicitly unimplemented; raises `Invalid("no-typescript-pack")`).
-- External `cmd:` adapter binaries outside subprocess test harnesses (**untested**).
+- External `cmd:` adapter binaries outside subprocess test harnesses.

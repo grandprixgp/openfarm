@@ -1,6 +1,6 @@
 # openfarm spec v0.8
 
-Nov 17, 2026 · implemented on `v0.8` (Stages 1–10 + stdlib TUI; live DeepSeek-only run untested)
+Nov 17, 2026 · implemented on `v0.8` (Stages 1–10 + stdlib TUI/human CLI; live DeepSeek-only, effort, external seats, parallel cargo, 2-task bench & 2-project global exchange verified 17 Nov 2026)
 
 v0.8 builds on v0.7. Until now openfarm ran a fixed team, one card at a time, and openfarm itself called the supervisor. v0.8 adds a shared board that every step of a run is posted to, a team whose members a coordinator chooses (which model tier, which effort), cards worked in parallel, and seats that an agent or person outside openfarm can hold. Everything in v0.7 that this file does not change still holds, and with `[swarm] enabled = false` (the default) a run behaves exactly as in v0.7.
 
@@ -95,7 +95,7 @@ effort_param = "reasoning_effort"
 ```
 
 - Effort is sent in the request body under `effort_param`. With `effort_param = ""` or no effort, nothing is sent.
-- Checked on 16 Nov against Command Code with DeepSeek V4.1 Flash: `reasoning_effort` is accepted, the endpoint allows `off`, `low`, `medium`, `high`, `xhigh` and `max`, and any other value answers 400. Whether effort changes the quality of a card's result is **untested**.
+- Checked on 16 Nov against Command Code with DeepSeek V4.1 Flash: `reasoning_effort` is accepted, the endpoint allows `off`, `low`, `medium`, `high`, `xhigh` and `max`, and any other value answers 400. Checked live on 17 Nov (`coordinator = "code"`, `supervisor = "off"`, `escalate_after = 99`): on `py-money-parse`, `low` (`7,778` tok) stopped `blocked` (`refused`), `high` (`11,722` tok) stopped `blocked` (`tests-unprovable`), and `max` (`52,020` tok, `281.15s`) reached `in-review` and passed `6/6` hidden tests; on `rs-percent-zero`, `low` (`10,699` tok), `high` (`18,100` tok), and `max` (`17,784` tok) all reached `in-review` and passed hidden tests.
 - A member's tier and effort are always stated: by the coordinator, or else from `[swarm] default_tier` and each role's default effort. A member never copies them from whoever added it.
 - An effort outside the tier's `efforts`, or a tier not in the config, is refused.
 - `[model]`'s per-role tables gain `effort` (`implementer = { model = "...", effort = "medium" }`), which also works with the swarm off.
@@ -262,7 +262,7 @@ Offline, with scripted members, each as a test:
 13. No action passes a card whose gate is red.
 14. The full suite passes with `OPENFARM_E2E=1`.
 
-**Untested until someone runs it live:** a run with DeepSeek in every seat; effort's effect on results; an outside agent holding a seat for a whole run; parallel cards against real cargo builds.
+**Live verification (17 Nov 2026):** DeepSeek-only `tier:dsf` runs, `reasoning_effort` comparisons (`low`/`high`/`max`), an external coordinator+supervisor run passing hidden tests, parallel Rust `cargo` runs, a 2-task x 1-repeat `bench run` spot check (`farm` 1/2 vs `solo` 1/2), and a two-project global lesson exchange ran live against Command Code `deepseek/deepseek-v4.1-flash` (`x-cmd-zdr: 1`) and Claude ACP OAuth (full numbers and stop caveats in [`docs/v0.8-build-log.md`](docs/v0.8-build-log.md)). **Still untested:** the full 12-task x 3-repeat efficacy benchmark, `claude-agent-acp`, `cargo-mutants`, `pytest`/`ruff`, remote GitHub installs, and independent third-party repositories.
 
 ## Open for the owner
 
