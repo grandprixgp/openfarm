@@ -15,7 +15,8 @@
   <img src="https://img.shields.io/badge/status-pre--release-d97706?style=flat-square" alt="status: pre-release">
   <img src="https://img.shields.io/badge/python-3.11%2B-7c3aed?style=flat-square" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/runtime%20deps-stdlib%20only-0284c7?style=flat-square" alt="runtime dependencies: standard library only">
-  <img src="https://img.shields.io/badge/language%20pack-Rust-ea580c?style=flat-square" alt="language pack: Rust">
+  <img src="https://img.shields.io/badge/language%20packs-Rust%20%26%20Python-ea580c?style=flat-square" alt="language packs: Rust and Python">
+  <img src="https://img.shields.io/badge/UI-stdlib%20TUI%20%2B%20CLI-0ea5e9?style=flat-square" alt="UI: stdlib TUI + CLI">
 </p>
 
 <p align="center">
@@ -64,7 +65,7 @@ The bar openfarm sets itself is economic, not just "cheap tokens": a merged card
 openfarm is installed and driven through your frontier coding agent (Claude Code, Antigravity, or any agent that reads `.agents/skills`). Two sentences take you from an empty folder to a checked queue of cards.
 
 <p align="center">
-  <img src="docs/assets/openfarm-quickstart.svg" alt="Quickstart flow: Empty folder and a plain-English idea -> 1. Install (Read and install this skill) -> 2. Initialize (/openfarm-initialize name idea) -> Validated repo, golden slice and a checked card queue -> Farm works the cards, you review and merge." width="100%">
+  <img src="docs/assets/openfarm-quickstart.svg" alt="Quickstart flow: New or existing repo (Rust or Python via init or adopt) -> 1. Install (Read and install this skill) -> 2. Initialize (/openfarm-initialize or openfarm adopt) -> Checked queue (invariants, golden slice and baseline-checked cards) -> Swarm + TUI (parallel gated branches, inspect in openfarm tui, merge locally)." width="100%">
 </p>
 
 ### 1. Install
@@ -171,6 +172,10 @@ An arm file sets only the model and supervisor tables; copy one from [`bench/arm
 
 ## Swarm, board, parallel cards, and TUI (v0.8)
 
+<p align="center">
+  <img src="docs/assets/openfarm-swarm.svg" alt="v0.8 swarm architecture: Coordinator seat (code, tier:<name>, external), Supervisor seat (config, tier:<name>, external, off), and code StallMonitor connected to an append-only file-locked board.jsonl while non-colliding cards run in parallel worktrees bounded by globs_overlap and BuildLimiter and inspected live via the 7-view stdlib TUI and humanized CLI." width="100%">
+</p>
+
 Enable `[swarm]` (`enabled = true` in `.openfarm/config.toml`; off by default so v0.7 queues behave identically) to run cards through a shared message board:
 
 - **Tiers & effort (`[tiers.<name>]`, `RoleModel.effort`)**: Define model tiers and effort ladders (`off`..`max`) injected cleanly via `effort_param` (`reasoning_effort` by default) on OpenAI-compatible payloads, while keeping `[model]` endpoint allowlists and `headers` (e.g. `x-cmd-zdr: 1`) invariant across every call.
@@ -182,7 +187,7 @@ Enable `[swarm]` (`enabled = true` in `.openfarm/config.toml`; off by default so
 ## How it works
 
 <p align="center">
-  <img src="docs/assets/openfarm-lanes.svg" alt="Three lanes. Frontier: architect pass, decompose, review, merge locally. Orchestrator: claim and eligibility, run every gate, branch and dossier, with an optional micromanager. Farm: planner, test_writer, implementer and checker, which receive fenced briefs and return edit blocks only." width="100%">
+  <img src="docs/assets/openfarm-lanes.svg" alt="Three lanes: Frontier (grill and architect pass, decompose or adopt, inspect via openfarm tui and external swarm/board commands, review and merge locally), Orchestrator (parallel non-colliding cards, append-only board, every gate, BuildLimiter, StallMonitor, configurable seats), and Farm (stateless planner, test_writer, implementer and checker roles per tier and effort receiving fenced briefs plus cues and returning edit blocks or <<<HANDBACK)." width="100%">
 </p>
 
 | Lane | Who | Does | Never does |
@@ -196,7 +201,7 @@ The **micromanager** is the built-in Frontier supervisor (defaulting in `openfar
 ### Every card, every time
 
 <p align="center">
-  <img src="docs/assets/openfarm-pipeline.svg" alt="Eight-step per-card pipeline: 1 claim and eligibility, 2 isolate, 3 baseline green, 4 shape and plan, 5 phase A tests, 6 phase B code, 7 end gates, 8 catch-up and capture. Ends as a branch with a reviewer dossier, or a clean block with a note." width="100%">
+  <img src="docs/assets/openfarm-pipeline.svg" alt="Eight-step per-card pipeline posted to board.jsonl: 1 claim and eligibility, 2 isolate (parallel when touches are disjoint), 3 baseline green, 4 shape and plan, 5 phase A tests, 6 phase B code (escalates effort or hands back early), 7 end gates, 8 catch-up and project plus global harness capture. Ends as a branch with a reviewer dossier, or a handed-back / clean block." width="100%">
 </p>
 
 <details>
@@ -233,7 +238,7 @@ openfarm keeps a small, bounded memory of what helped weaker models recover from
 The core reads one config file per repository and talks to the outside world only through six adapter interfaces. Each has built-in implementations, and any of them can be swapped for an external command that speaks a small JSON protocol (`{"openfarm": 1, ...}`) over stdin and stdout.
 
 <p align="center">
-  <img src="docs/assets/openfarm-adapters.svg" alt="openfarm core (Python 3.11+ stdlib, one config file) connected to six adapter interfaces: Card source (files: folder), Runner (direct cargo), Language pack (rust), Model backend (openai-compatible, scripted), Telemetry (jsonl), and Micromanager (claude-acp, off, scripted). Every interface also accepts cmd:<argv> over stdio JSON." width="100%">
+  <img src="docs/assets/openfarm-adapters.svg" alt="openfarm core (Python 3.11+ stdlib, one config file enforcing gates, budgets, swarm board and TUI) connected to six adapter interfaces: Card source (files: folder on openfarm-cards), Runner (direct cargo, python, BuildLimiter), Language pack (rust, python), Model backend (openai-compatible, claude-acp, scripted), Telemetry (jsonl plus run board and dossiers), and Micromanager &amp; seats (claude-acp, tier:<name>, external, off). Every interface also accepts cmd:<argv> over stdio JSON." width="100%">
 </p>
 
 Every adapter also accepts `cmd:<argv>`. Card state lives on its own `openfarm-cards` branch so parallel cards never conflict. TypeScript is not implemented yet. Git is the one hard dependency, and nothing in the core names a particular project.

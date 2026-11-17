@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1280" height="404" viewBox="0 0 1280 404" role="img" aria-labelledby="arch-t arch-d">
 <title id="arch-t">openfarm core and six adapter interfaces</title>
-<desc id="arch-d">openfarm core (Python 3.11+ stdlib, one config file) connected over a stdin/stdout JSON protocol to six replaceable adapter interfaces: Card source (files: folder on openfarm-cards), Runner (direct cargo), Language pack (rust), Model backend (openai-compatible, scripted), Telemetry (jsonl), and Micromanager (claude-acp, off, scripted). Every interface also accepts cmd:&lt;argv&gt;.</desc>
+<desc id="arch-d">openfarm core (Python 3.11+ stdlib, one config file) enforcing gates, budgets, swarm board, and stdlib TUI across six replaceable adapter interfaces: Card source (files: folder on openfarm-cards), Runner (direct cargo, python, BuildLimiter), Language pack (rust, python), Model backend (openai-compatible, claude-acp, scripted), Telemetry (jsonl plus run board and dossiers), and Micromanager and seats (claude-acp, tier:&lt;name&gt;, external, off). Every interface also accepts cmd:&lt;argv&gt;.</desc>
 <defs>
   <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
     <stop offset="0" stop-color="#0b1220"/><stop offset="1" stop-color="#17233d"/>
@@ -20,35 +20,35 @@
 <text x="640" y="158" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="11.5" font-weight="700" fill="#fbbf24" text-anchor="middle" letter-spacing="1">ORCHESTRATOR</text>
 <text x="640" y="196" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="23" font-weight="800" fill="#f1f5f9" text-anchor="middle">openfarm core</text>
 <text x="640" y="225" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="14" font-weight="400" fill="#9fb0c8" text-anchor="middle">Python 3.11+ stdlib, one config file</text>
-<text x="640" y="248" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="400" fill="#9fb0c8" text-anchor="middle">enforces gates, budgets + git isolation</text>
+<text x="640" y="248" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="400" fill="#9fb0c8" text-anchor="middle">gates, budgets, swarm board + TUI</text>
 <rect x="506" y="272" width="268" height="36" rx="10" fill="#0b1220" fill-opacity="0.55" stroke="#fbbf24" stroke-opacity="0.4"/>
 <text x="640" y="295" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="13" font-weight="600" fill="#fbbf24" text-anchor="middle">{"openfarm": 1, ...} stdio</text>
 
 <!-- Left column: 3 adapter cards -->
 <rect x="40" y="82" width="360" height="86" rx="12" fill="#38bdf8" fill-opacity="0.10" stroke="#38bdf8" stroke-opacity="0.75" stroke-width="1.5"/>
 <text x="62" y="115" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="17.5" font-weight="700" fill="#f1f5f9" text-anchor="start">Card source</text>
-<text x="62" y="143" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="14" font-weight="600" fill="#38bdf8" text-anchor="start">files:<tspan fill="#9fb0c8" font-weight="400"> folder (openfarm-cards)</tspan></text>
+<text x="62" y="143" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="13.5" font-weight="600" fill="#38bdf8" text-anchor="start">files:<tspan fill="#9fb0c8" font-weight="400"> folder (openfarm-cards)</tspan></text>
 
 <rect x="40" y="184" width="360" height="86" rx="12" fill="#38bdf8" fill-opacity="0.10" stroke="#38bdf8" stroke-opacity="0.75" stroke-width="1.5"/>
 <text x="62" y="217" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="17.5" font-weight="700" fill="#f1f5f9" text-anchor="start">Runner</text>
-<text x="62" y="245" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="14" font-weight="600" fill="#38bdf8" text-anchor="start">direct<tspan fill="#9fb0c8" font-weight="400"> (cargo)</tspan></text>
+<text x="62" y="245" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="13" font-weight="600" fill="#38bdf8" text-anchor="start">direct<tspan fill="#9fb0c8" font-weight="400"> (cargo, python, BuildLimiter)</tspan></text>
 
 <rect x="40" y="286" width="360" height="86" rx="12" fill="#38bdf8" fill-opacity="0.10" stroke="#38bdf8" stroke-opacity="0.75" stroke-width="1.5"/>
 <text x="62" y="319" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="17.5" font-weight="700" fill="#f1f5f9" text-anchor="start">Language pack</text>
-<text x="62" y="347" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="14" font-weight="600" fill="#38bdf8" text-anchor="start">rust</text>
+<text x="62" y="347" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="14" font-weight="600" fill="#38bdf8" text-anchor="start">rust, python</text>
 
 <!-- Right column: 3 adapter cards -->
 <rect x="880" y="82" width="360" height="86" rx="12" fill="#34d399" fill-opacity="0.10" stroke="#34d399" stroke-opacity="0.75" stroke-width="1.5"/>
 <text x="902" y="115" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="17.5" font-weight="700" fill="#f1f5f9" text-anchor="start">Model backend</text>
-<text x="902" y="143" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="14" font-weight="600" fill="#34d399" text-anchor="start">openai-compatible<tspan fill="#9fb0c8" font-weight="400">, scripted</tspan></text>
+<text x="902" y="143" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="12.5" font-weight="600" fill="#34d399" text-anchor="start">openai-compatible, claude-acp<tspan fill="#9fb0c8" font-weight="400">, scripted</tspan></text>
 
 <rect x="880" y="184" width="360" height="86" rx="12" fill="#38bdf8" fill-opacity="0.10" stroke="#38bdf8" stroke-opacity="0.75" stroke-width="1.5"/>
 <text x="902" y="217" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="17.5" font-weight="700" fill="#f1f5f9" text-anchor="start">Telemetry</text>
-<text x="902" y="245" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="14" font-weight="600" fill="#38bdf8" text-anchor="start">jsonl</text>
+<text x="902" y="245" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="13" font-weight="600" fill="#38bdf8" text-anchor="start">jsonl<tspan fill="#9fb0c8" font-weight="400"> (+ run board &amp; dossiers)</tspan></text>
 
 <rect x="880" y="286" width="360" height="86" rx="12" fill="#a78bfa" fill-opacity="0.10" stroke="#a78bfa" stroke-opacity="0.75" stroke-width="1.5"/>
-<text x="902" y="319" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="17.5" font-weight="700" fill="#f1f5f9" text-anchor="start">Micromanager</text>
-<text x="902" y="347" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="14" font-weight="600" fill="#a78bfa" text-anchor="start">claude-acp<tspan fill="#9fb0c8" font-weight="400">, off, scripted</tspan></text>
+<text x="902" y="319" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="17.5" font-weight="700" fill="#f1f5f9" text-anchor="start">Micromanager &amp; seats</text>
+<text x="902" y="347" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="12.5" font-weight="600" fill="#a78bfa" text-anchor="start">claude-acp, tier:&lt;name&gt;, external<tspan fill="#9fb0c8" font-weight="400">, off</tspan></text>
 
 <!-- Connector paths -->
 <path d="M468,187 C434,187 434,125 400,125" fill="none" stroke="#9fb0c8" stroke-width="2"/>
