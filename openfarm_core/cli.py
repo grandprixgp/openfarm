@@ -692,6 +692,68 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
             f"concurrent_cards is {cfg.concurrent_cards} but cards run one at a "
             f"time: the per-card state is ready for a pool, the loop is not")
 
+    def _confinement_notes() -> list[str]:
+        """One note per ACP provider this run used whose child is not confined.
+
+        `[micromanager] confine = "off"`, or Codex held by its tool flags alone
+        because bwrap is unusable. Worked out from the same settings and rules
+        the adapters use (`confinement_summary`), so it holds for every card's
+        adapter, the ones already closed included.
+        """
+        from . import confine as confine_lib
+        seats: list[tuple[str, object, str, object]] = []
+        if script_path is None and is_acp_adapter(cfg.model_adapter):
+            from .adapters.claude_worker import open_acp_worker
+            wb = open_acp_worker(cfg)
+            seats.append((wb.provider, wb.command, "none", wb.confine))
+        if swarm_parallel and script_path is None and is_acp_adapter(coord_spec):
+            from .adapters.claude_worker import open_acp_worker
+            cb = open_acp_worker(cfg, provider=normalize_acp_provider(coord_spec))
+            seats.append((cb.provider, cb.command, "none", cb.confine))
+        sup = mm_seat.proto if mm_seat is not None else None
+        sup_spec = swarm_sup if (swarm_cfg is not None and swarm_cfg.enabled) else "config"
+        if sup is None and mm_script_path is None and (
+            is_acp_adapter(sup_spec)
+            or (sup_spec == "config" and is_acp_adapter(cfg.micromanager_adapter))
+        ):
+            probe_mm = None
+            try:
+                probe_mm = open_micromanager(cfg, ctx.state.root, ctx.repo, worktree=ctx.repo)
+                if isinstance(getattr(probe_mm, "backend", None), ClaudeAcpMicromanager):
+                    sup = probe_mm.backend
+            except (AdapterError, OSError):
+                sup = None
+            finally:
+                if probe_mm is not None:
+                    with contextlib.suppress(Exception):
+                        probe_mm.close()
+        if sup is not None:
+            seats.append((sup.provider, sup.command, sup.tool_policy,
+                          getattr(sup, "confine", None)))
+        out: list[str] = []
+        for provider, command, policy, settings in seats:
+            try:
+                held = ClaudeAcpAdapter(command=command, provider=provider,
+                                        confine=settings).confinement_summary()
+            except (AdapterError, confine_lib.ConfineError):
+                continue
+            row = held.get(policy) if isinstance(held.get(policy), dict) else {}
+            hold = confine_lib.Hold(
+                provider, str(row.get("mode") or held.get("mode") or "auto"),
+                flags=bool(row.get("flags")), boundary=bool(row.get("boundary")),
+                refused=str(row.get("refused") or ""), note=str(row.get("note") or ""))
+            reason = (confine_lib.bwrap_status()[1]
+                      if hold.flags and not hold.boundary and hold.mode != "off" else "")
+            note = confine_lib.hold_note(hold, reason)
+            if note and note not in out:
+                out.append(note)
+        return out
+
+    if not args.dry_run:
+        for note in _confinement_notes():
+            if note not in notes:
+                notes.append(note)
+
     tokens_payload = token_split(
         sum(int(o.get("tokens_in", 0) or 0) + int(o.get("tokens_out", 0) or 0)
             for o in outcomes),
