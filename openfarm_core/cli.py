@@ -240,6 +240,30 @@ def cmd_check(ctx: Context, args) -> int:
     return EXIT_OK if payload["eligible"] else EXIT_REFUSED
 
 
+def _pack_with_config(cfg, cwd: Path):
+    """The project's pack, given the loaded config's settings.
+
+    Straight after `pack_for`: a pack that reads `[runner]` settings (the
+    TypeScript pack) then decides from the same config eligibility was given
+    (`--config` included), not from the file in the base checkout.
+    """
+    pack = pack_for(cfg.languages[0], cfg.cargo_flags, spec=cfg.pack_adapter,
+                    cwd=cwd, python=cfg.runner_python)
+    apply_settings = getattr(pack, "apply_settings", None)
+    if apply_settings is not None:
+        apply_settings(cfg)
+    return pack
+
+
+def _configured_pack(cfg, worktree: Path):
+    """`_pack_with_config`, then configured for `worktree`."""
+    pack = _pack_with_config(cfg, worktree)
+    configure = getattr(pack, "configure", None)
+    if configure is not None:
+        configure(worktree)
+    return pack
+
+
 def _deps_done(source: FileCardSource, card: Card) -> bool:
     if not card.deps:
         return True
@@ -258,12 +282,7 @@ def _baseline_check(ctx: Context, source: FileCardSource, card: Card) -> dict:
         git.worktree_remove(worktree)
     git.worktree_add(worktree, base)
     try:
-        pack = pack_for(
-            ctx.cfg.languages[0], ctx.cfg.cargo_flags,
-            spec=ctx.cfg.pack_adapter, cwd=worktree,
-            python=ctx.cfg.runner_python,
-        )
-        pack.configure(worktree)
+        pack = _configured_pack(ctx.cfg, worktree)
         unit = card.unit or derive_cargo_unit(card.touches, worktree)
         runner = ctx.runner(worktree)
         target = ctx.state.check_dir(card.id) / "target"
@@ -884,10 +903,7 @@ def _run_card(ctx: Context, source: FileCardSource, card_id: str, run_id: str,
     Git(ctx.repo).worktree_add(worktree, base_ref)
 
     card_dir = ctx.state.create_card(card.id, run_id)
-    pack = pack_for(cfg.languages[0], cfg.cargo_flags,
-                    spec=cfg.pack_adapter, cwd=worktree,
-                    python=cfg.runner_python)
-    pack.configure(worktree)
+    pack = _configured_pack(cfg, worktree)
     owns_backend = backend is None
     backend = backend if backend is not None else open_backend(cfg, script)
     runner = ctx.runner(worktree, output_dir=card_dir / "gates" / "output")
@@ -1030,9 +1046,7 @@ def _handshake(ctx: Context, source, args, telemetry_raw=None) -> dict:
                 "adapters": names}
 
     try:
-        pack = pack_for(ctx.cfg.languages[0], ctx.cfg.cargo_flags,
-                        spec=ctx.cfg.pack_adapter, cwd=ctx.repo,
-                        python=ctx.cfg.runner_python)
+        pack = _pack_with_config(ctx.cfg, ctx.repo)
         hello = pack.hello()
         needed = set(REQUIRED_OPS["pack"])
         offered = set(hello.get("ops") or [])

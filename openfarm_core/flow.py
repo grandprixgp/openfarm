@@ -1769,6 +1769,10 @@ class CardRun:
         # The worktree was made by the controller and entered here; one target
         # folder per card, never shared between branches.
         self.git.checkout(self.branch, detach=False)
+        # The pack decides from this run's config (as eligibility did), not from
+        # the base checkout's config file, which `--config` may not be.
+        if hasattr(self.pack, "apply_settings"):
+            self.pack.apply_settings(self.cfg)
         if hasattr(self.pack, "configure"):
             self.pack.configure(self.worktree)
         self.effective_unit = self.card.unit or derive_cargo_unit(
