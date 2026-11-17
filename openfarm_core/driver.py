@@ -16,6 +16,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 from pathlib import Path
@@ -1818,101 +1819,104 @@ def drive_run(
     run_ctx: _ManagedRunContext | None = None
     run_exc: list[BaseException] = []
     run_rc: list[int] = []
+    joined: list[str] = []
+    ks_path = Path(active_cfg.kill_switch) if getattr(active_cfg, "kill_switch", None) else None
 
-    if managed:
-        from .cli import cmd_run
+    def _body() -> dict:
+        nonlocal run_thread, run_ctx
+        if managed:
+            from .cli import cmd_run
 
-        run_ctx = _ManagedRunContext(repo, active_cfg, state, selected_cards)
-        run_args = type("_RunArgs", (), {
-            "cards": cards,
-            "spend": spend,
-            "for_duration": None,
-            "until": None,
-            "card": selected_cards[0] if len(selected_cards) == 1 else None,
-            "dry_run": False,
-            "script": str(worker_script_path) if worker_script_path is not None else None,
-            "mm_script": None,
-            "run_id": resolved_rid,
-            "learn_from": None,
-        })()
-
-        def _bg() -> None:
-            try:
-                rc = cmd_run(run_ctx, run_args)
-                run_rc.append(rc)
-            except BaseException as exc:
-                run_exc.append(exc)
-
-        run_thread = threading.Thread(target=_bg, daemon=True)
-        run_thread.start()
-
-        wait_ev = threading.Event()
-        for _ in range(500):
-            if board.posts_path.exists() or not run_thread.is_alive():
-                break
-            wait_ev.wait(0.02)
-
-        if run_exc:
-            raise run_exc[0]
-        if run_ctx.captured_payload and run_ctx.captured_payload.get("refused"):
-            run_thread.join(timeout=2.0)
-            payload = dict(run_ctx.captured_payload)
-            return {
-                "ok": False,
-                "refused": True,
-                "reason": payload.get("reason", "refused"),
-                "code": payload.get("code", ""),
-                "agent": provider,
-                "seat": clean_seat,
+            run_ctx = _ManagedRunContext(repo, active_cfg, state, selected_cards)
+            run_args = type("_RunArgs", (), {
+                "cards": cards,
+                "spend": spend,
+                "for_duration": None,
+                "until": None,
+                "card": selected_cards[0] if len(selected_cards) == 1 else None,
+                "dry_run": False,
+                "script": str(worker_script_path) if worker_script_path is not None else None,
+                "mm_script": None,
                 "run_id": resolved_rid,
-                "driver_turns": 0,
-                "driver_tokens_in": 0,
-                "driver_tokens_out": 0,
-                "actions_taken": [],
-                "answers_sent": [],
-                "outcomes": [],
-                "reviews": [],
-            }
+                "learn_from": None,
+            })()
 
-        # Give SwarmRunner a moment to post initial `event: plan` or end empty run.
-        for _ in range(100):
-            if board.head_seq() > 0 or board.is_ended() or not run_thread.is_alive():
-                break
-            wait_ev.wait(0.02)
+            def _bg() -> None:
+                try:
+                    rc = cmd_run(run_ctx, run_args)
+                    run_rc.append(rc)
+                except BaseException as exc:
+                    run_exc.append(exc)
 
-    card_map = _load_card_map(source)
-    target_ids: list[str] | None = None
-    if selected_cards:
-        target_ids = list(selected_cards[:cards] if cards is not None else selected_cards)
+            run_thread = threading.Thread(target=_bg, name="openfarm-drive-run", daemon=True)
+            run_thread.start()
 
-    counters = {"turns": 0, "tokens_in": 0, "tokens_out": 0}
-    actions_taken: list[dict] = []
-    answers_sent: list[dict] = []
-    answered_seqs: set[int] = set()
-    resolved_event_seqs: set[int] = set()
+            wait_ev = threading.Event()
+            for _ in range(500):
+                if board.posts_path.exists() or not run_thread.is_alive():
+                    break
+                wait_ev.wait(0.02)
 
-    with DriverAgent(
-        agent=provider,
-        cwd=repo,
-        driver_bin=driver_bin,
-        model=model,
-        effort=effort,
-        never_touch=active_cfg.never_touch,
-        forbidden_files=active_cfg.forbidden_files,
-        script=driver_script,
-    ) as drv:
-        ks_path = Path(active_cfg.kill_switch) if getattr(active_cfg, "kill_switch", None) else None
-        ks_existed = ks_path.exists() if ks_path is not None else False
-        try:
+            if run_exc:
+                raise run_exc[0]
+            if run_ctx.captured_payload and run_ctx.captured_payload.get("refused"):
+                _wait_for_run_thread(run_thread)
+                payload = dict(run_ctx.captured_payload)
+                return {
+                    "ok": False,
+                    "refused": True,
+                    "reason": payload.get("reason", "refused"),
+                    "code": payload.get("code", ""),
+                    "agent": provider,
+                    "seat": clean_seat,
+                    "run_id": resolved_rid,
+                    "driver_turns": 0,
+                    "driver_tokens_in": 0,
+                    "driver_tokens_out": 0,
+                    "actions_taken": [],
+                    "answers_sent": [],
+                    "outcomes": [],
+                    "reviews": [],
+                }
+
+            # Give SwarmRunner a moment to post initial `event: plan` or end empty run.
+            for _ in range(100):
+                if board.head_seq() > 0 or board.is_ended() or not run_thread.is_alive():
+                    break
+                wait_ev.wait(0.02)
+
+        card_map = _load_card_map(source)
+        target_ids: list[str] | None = None
+        if selected_cards:
+            target_ids = list(selected_cards[:cards] if cards is not None else selected_cards)
+
+        counters = {"turns": 0, "tokens_in": 0, "tokens_out": 0}
+        actions_taken: list[dict] = []
+        answers_sent: list[dict] = []
+        answered_seqs: set[int] = set()
+        resolved_event_seqs: set[int] = set()
+
+        with DriverAgent(
+            agent=provider,
+            cwd=repo,
+            driver_bin=driver_bin,
+            model=model,
+            effort=effort,
+            never_touch=active_cfg.never_touch,
+            forbidden_files=active_cfg.forbidden_files,
+            script=driver_script,
+        ) as drv:
             if not board.is_ended():
                 if clean_seat in ("both", "coordinator"):
                     swarm_join(
                         board, active_cfg, name=coord_name, seat="coordinator", owner_kind="agent"
                     )
+                    joined.append(coord_name)
                 if clean_seat in ("both", "supervisor"):
                     swarm_join(
                         board, active_cfg, name=sup_name, seat="supervisor", owner_kind="agent"
                     )
+                    joined.append(sup_name)
 
                 sys_prompt = _build_driver_system_prompt(clean_seat, coord_name, sup_name)
                 scan_seq = 0
@@ -2217,7 +2221,7 @@ def drive_run(
                                     )
 
             if run_thread is not None:
-                run_thread.join(timeout=30.0)
+                _wait_for_run_thread(run_thread)
             if run_exc:
                 raise run_exc[0]
 
@@ -2236,36 +2240,118 @@ def drive_run(
                     counters=counters,
                     max_turns=max_turns,
                 )
-        finally:
-            if managed and run_thread is not None and run_thread.is_alive():
-                with contextlib.suppress(Exception):
-                    board.end(reason="driver-aborted")
-                if ks_path is not None and not ks_existed:
-                    with contextlib.suppress(OSError):
-                        ks_path.parent.mkdir(parents=True, exist_ok=True)
-                        ks_path.write_text("driver-aborted\n", encoding="utf-8")
-                run_thread.join(timeout=15.0)
-                if ks_path is not None and not ks_existed:
-                    with contextlib.suppress(OSError):
-                        ks_path.unlink(missing_ok=True)
+        has_infra = any(o.get("stop_code") == "infra" for o in outcomes) or (
+            bool(run_rc) and run_rc[0] != 0
+        )
+        return {
+            "ok": not has_infra,
+            "agent": provider,
+            "seat": clean_seat,
+            "run_id": resolved_rid,
+            "driver_name": clean_driver_name,
+            "driver_turns": counters["turns"],
+            "driver_tokens_in": counters["tokens_in"],
+            "driver_tokens_out": counters["tokens_out"],
+            "actions_taken": actions_taken,
+            "answers_sent": answers_sent,
+            "outcomes": outcomes,
+            "reviews": reviews,
+        }
 
-    has_infra = any(o.get("stop_code") == "infra" for o in outcomes) or (
-        bool(run_rc) and run_rc[0] != 0
+    try:
+        result = _body()
+    except BaseException as exc:
+        for problem in _end_drive(
+            board=board,
+            run_thread=run_thread,
+            ks_path=ks_path,
+            joined=joined,
+        ):
+            print(f"openfarm drive: {problem}", file=sys.stderr)
+            exc.add_note(problem)
+        raise
+    problems = _end_drive(
+        board=board,
+        run_thread=run_thread,
+        ks_path=ks_path,
+        joined=joined,
     )
-    return {
-        "ok": not has_infra,
-        "agent": provider,
-        "seat": clean_seat,
-        "run_id": resolved_rid,
-        "driver_name": clean_driver_name,
-        "driver_turns": counters["turns"],
-        "driver_tokens_in": counters["tokens_in"],
-        "driver_tokens_out": counters["tokens_out"],
-        "actions_taken": actions_taken,
-        "answers_sent": answers_sent,
-        "outcomes": outcomes,
-        "reviews": reviews,
-    }
+    if problems:
+        result["cleanup_problems"] = problems
+        result["ok"] = False
+    return result
+
+
+def _wait_for_run_thread(thread: threading.Thread) -> None:
+    """Wait, with no cap, until the managed run's thread has really ended."""
+    while thread.is_alive():
+        thread.join(1.0)
+
+
+def _end_drive(
+    *,
+    board: Board,
+    run_thread: threading.Thread | None,
+    ks_path: Path | None,
+    joined: list[str],
+) -> list[str]:
+    """Leave nothing of the drive working. Returns the problems met, never raises them.
+
+    A managed run still going is ended on the board and stopped with the kill
+    switch, and the kill switch stays until the run's thread has really ended
+    (the run's own `finally` then releases `run.lock`). If that wait is itself
+    interrupted, the kill switch is left in place and the problem says how to
+    clear it. The driver's seat members are marked removed either way.
+    """
+    problems: list[str] = []
+    if run_thread is not None and run_thread.is_alive():
+        try:
+            board.end_run("driver-aborted")
+        except Exception as exc:  # reported, never swallowed
+            problems.append(f"could not end the run's board: {type(exc).__name__}: {exc}")
+        made_switch = False
+        if ks_path is not None and not ks_path.exists():
+            try:
+                ks_path.parent.mkdir(parents=True, exist_ok=True)
+                ks_path.write_text("driver-aborted\n", encoding="utf-8")
+                made_switch = True
+            except OSError as exc:
+                problems.append(f"could not write the kill switch {ks_path}: {exc}")
+        try:
+            _wait_for_run_thread(run_thread)
+        except BaseException as exc:  # a second Ctrl-C, most likely
+            where = f" {ks_path}" if ks_path is not None else ""
+            problems.append(
+                f"interrupted ({type(exc).__name__}) while the run was still stopping: "
+                f"the kill switch{where} is left in place so the run stops; once it has "
+                "stopped, clear it with `openfarm resume --clear-kill`"
+            )
+        else:
+            if made_switch and ks_path is not None:
+                try:
+                    ks_path.unlink(missing_ok=True)
+                except OSError as exc:
+                    problems.append(
+                        f"could not remove the kill switch {ks_path}: {exc}; clear it "
+                        "with `openfarm resume --clear-kill`"
+                    )
+    for name in joined:
+        try:
+            member = board.get_member(name)
+            if member is None or member.get("state") == "removed":
+                continue
+            seat = str(member.get("role") or "")
+            board.update_member(name, state="removed")
+            board.post(
+                author="system",
+                to=["all"],
+                kind="roster",
+                body=f"{name} left seat {seat} (drive ended)",
+                trusted=True,
+            )
+        except Exception as exc:  # reported, never swallowed
+            problems.append(f"could not mark {name} removed: {type(exc).__name__}: {exc}")
+    return problems
 
 
 def _pick_turn_key(

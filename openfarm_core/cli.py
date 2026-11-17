@@ -393,6 +393,12 @@ def cmd_run(ctx: Context, args) -> int:
         _emit_ctx(ctx, {"refused": True,
                         "reason": f"another run holds the lock: {holder.get('run_id')}"}, "run")
         return EXIT_REFUSED
+    stale = getattr(ctx.state, "last_lock_takeover", None)
+    if stale:
+        print(f"note: took over run.lock from run {stale.get('run_id')!r} "
+              f"(pid {stale.get('pid')} on {stale.get('host')}, started "
+              f"{stale.get('started_at')}), which is no longer running",
+              file=sys.stderr)
 
     try:
         return _do_run(ctx, args, run_id)
