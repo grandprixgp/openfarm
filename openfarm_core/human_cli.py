@@ -8,6 +8,7 @@ contextual next-step hints.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -485,8 +486,18 @@ def _format_check(payload: dict, style: Style) -> str:
     return "\n".join(lines)
 
 
+def _outcome_card(outcome: object) -> str:
+    """The card an outcome belongs to.
+
+    A real card record carries `card_id`; dry-run and skipped records carry `card`.
+    """
+    if not isinstance(outcome, dict):
+        return ""
+    return str(outcome.get("card_id") or outcome.get("card") or "")
+
+
 def _outcome_row(outcome: dict, style: Style) -> list[str]:
-    card = str(outcome.get("card", ""))
+    card = _outcome_card(outcome)
     if "skipped" in outcome:
         return [
             card,
@@ -621,8 +632,9 @@ def _format_run(payload: dict, style: Style) -> str:
             lines.append(f"  {style.red(ICON_FAIL)} {prob}")
 
     next_tips: list[str] = []
-    in_review = [o["card"] for o in outcomes if o.get("final_state") in ("in-review", "in_review")]
-    blocked = [o["card"] for o in outcomes if o.get("final_state") == "blocked"]
+    in_review = [_outcome_card(o) for o in outcomes
+                 if o.get("final_state") in ("in-review", "in_review")]
+    blocked = [_outcome_card(o) for o in outcomes if o.get("final_state") == "blocked"]
     if in_review:
         sample = in_review[0]
         next_tips.extend([
@@ -633,7 +645,7 @@ def _format_run(payload: dict, style: Style) -> str:
     if blocked:
         next_tips.append(f"openfarm dossier {blocked[0]}  (or: openfarm supervise --triage-blocked)")
     if dry:
-        eligible_dry = [o["card"] for o in outcomes if o.get("eligible")]
+        eligible_dry = [_outcome_card(o) for o in outcomes if o.get("eligible")]
         if eligible_dry:
             next_tips.append(f"openfarm run --cards {len(eligible_dry)}")
     if not next_tips:
@@ -1454,7 +1466,7 @@ def _format_drive(payload: dict, style: Style) -> str:
         lines.append(style.bold(f"Wave Reviews ({len(reviews)})"))
         rev_rows = [
             [
-                r.get("card", ""),
+                _outcome_card(r),
                 format_state(r.get("verdict") or "-", style=style),
                 _fmt_int(r.get("review_tokens", 0)),
                 "yes" if r.get("recorded") else "no",
@@ -1471,7 +1483,7 @@ def _format_drive(payload: dict, style: Style) -> str:
 
     next_tips: list[str] = []
     in_review = [
-        o.get("card_id") or o.get("card")
+        _outcome_card(o)
         for o in outcomes
         if o.get("final_state") in ("in-review", "in_review")
     ]
@@ -1499,8 +1511,34 @@ def _format_fallback(payload: dict, style: Style) -> str:
 
 
 def format_human(kind: str, payload: dict, *, style: Style | None = None) -> str:
-    """Format a command payload for human readers when `--json` is False."""
+    """Format a command payload for human readers when `--json` is False.
+
+    A formatter bug must never turn a command that worked into a failure: the
+    work is already done and its exit code already decided. So any error here
+    falls back to the JSON the command would have printed with `--json`, with a
+    one-line note on stderr.
+    """
     st = style or Style(sys.stdout)
+    try:
+        return format_human_strict(kind, payload, style=st)
+    except Exception as exc:  # any formatter bug, by design
+        with contextlib.suppress(OSError, ValueError):
+            print(
+                f"openfarm: could not format the {kind or 'command'} result for "
+                f"people ({type(exc).__name__}: {exc}); showing it as JSON",
+                file=sys.stderr,
+            )
+        try:
+            return json.dumps(payload, indent=2, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            return str(payload)
+
+
+def format_human_strict(kind: str, payload: dict, *, style: Style | None = None) -> str:
+    """Like `format_human`, but a formatter error raises. For tests."""
+    st = style or Style(sys.stdout)
+    if not isinstance(payload, dict):
+        payload = {"value": payload}
     if kind == "status":
         return _format_status(payload, st)
     if kind == "check":
