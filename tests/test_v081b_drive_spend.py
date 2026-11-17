@@ -82,17 +82,17 @@ class DriverSpendTests(unittest.TestCase):
         res = drive_run(self.toy.root, load_config(self.toy.root), StateDir(self.toy.state_dir),
                         agent="claude", seat="both", card_ids=["CARD-1"], script=sp)
         self.assertEqual(res["outcomes"][0]["final_state"], "in-review")
+        members = self._members(res["run_id"])
+        self.assertEqual(members["driver-coord"]["tokens_in"], 1000)
+        self.assertEqual(members["driver-sup"].get("tokens_in", 0), 180,
+                         "question turns belong to the supervisor's member")
+
         self.assertAlmostEqual(res["driver_spend"], 0.019, places=6)
         self.assertTrue(res["driver_spend_measured"])
         self.assertFalse(res["driver_tokens_estimated"])
         self.assertEqual(res["notes"], [])
         self.assertEqual(res["driver_by_part"]["coordinator"]["tokens_in"], 1000)
         self.assertEqual(res["driver_by_part"]["supervisor"]["tokens_in"], 180)
-
-        members = self._members(res["run_id"])
-        self.assertEqual(members["driver-coord"]["tokens_in"], 1000)
-        self.assertEqual(members["driver-sup"]["tokens_in"], 180,
-                         "question turns belong to the supervisor's member")
 
         record = read_json(self.toy.state_dir / "runs" / res["run_id"] / "run.json", {})
         self.assertTrue(res["run_record_updated"])
@@ -136,9 +136,10 @@ class DriverSpendTests(unittest.TestCase):
         })
         res = drive_run(self.toy.root, load_config(self.toy.root), StateDir(self.toy.state_dir),
                         agent="claude", seat="both", card_ids=["CARD-1"], spend=0.05, script=sp)
+        self.assertNotIn("pre_review", [a["op"] for a in res["answers_sent"]],
+                         "the driver kept spending past --spend")
         self.assertIn("reached its cap of 0.0500", res["spend_stopped"])
         self.assertAlmostEqual(res["driver_spend"], 0.06, places=6)
-        self.assertNotIn("pre_review", [a["op"] for a in res["answers_sent"]])
         pre = [t for t in res["timeouts"] if t["op"] == "pre_review"]
         self.assertTrue(pre, res["timeouts"])
         self.assertIn("reached its cap", pre[0]["reason"])
