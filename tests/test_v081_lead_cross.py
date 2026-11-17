@@ -37,5 +37,23 @@ class FlowRegistersMembersLikeSwarmStartTests(_FlowHarness):
                 (member["tier"], member["model"]), run.cfg.member_defaults(role), role)
 
 
+class ReplanIfOnlyCountsWithTheSwarmOnTests(_FlowHarness):
+    """A malformed `replan_if` is an unknown field with the swarm off (v0.7)."""
+
+    def _rules(self, *, swarm_on: bool) -> list[str]:
+        from openfarm_core.gates.eligibility import check_eligibility
+
+        run = self._card_run(self._script(), swarm_on=swarm_on)
+        run.card.fields["replan_if"] = "not a list"
+        result = check_eligibility(run.card, run.cfg, worktree=run.worktree)
+        return [failure["rule"] for failure in result.failures]
+
+    def test_swarm_off_ignores_a_malformed_replan_if(self) -> None:
+        self.assertNotIn("replan-if", self._rules(swarm_on=False))
+
+    def test_swarm_on_still_refuses_a_malformed_replan_if(self) -> None:
+        self.assertIn("replan-if", self._rules(swarm_on=True))
+
+
 if __name__ == "__main__":
     unittest.main()

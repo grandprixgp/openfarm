@@ -130,7 +130,10 @@ def check_eligibility(card: Card, cfg, deps_done: bool = True,
         result.fail("frontier-estimate",
                     "the card's frontier_estimate is invalid")
 
-    raw_replan_if = card.fields.get("replan_if")
+    # `replan_if` is only read with the swarm on. With it off the field is an
+    # unknown one, as it was in v0.7, and never makes a card ineligible.
+    swarm_on = bool(getattr(getattr(cfg, "swarm", None), "enabled", False))
+    raw_replan_if = card.fields.get("replan_if") if swarm_on else None
     if raw_replan_if is not None and (
         not isinstance(raw_replan_if, list)
         or any(not isinstance(item, str) for item in raw_replan_if)
