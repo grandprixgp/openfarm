@@ -655,7 +655,11 @@ class CardRun:
             if self.board.get_member(mname) is None:
                 tier_cfg = tiers.get(default_tier_name) or next(iter(tiers.values()), None)
                 tier_name = tier_cfg.name if tier_cfg is not None else default_tier_name
-                if tier_cfg is not None and tier_cfg.model:
+                if hasattr(self.cfg, "member_defaults"):
+                    # Same rule `swarm start` uses: a role's own [model] entry
+                    # wins until the coordinator names a tier.
+                    tier_name, model_name = self.cfg.member_defaults(role)
+                elif tier_cfg is not None and tier_cfg.model:
                     model_name = tier_cfg.model
                 else:
                     rm = (getattr(self.cfg, "role_models", {}) or {}).get(
