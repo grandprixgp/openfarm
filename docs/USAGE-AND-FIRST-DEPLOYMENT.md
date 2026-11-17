@@ -447,7 +447,7 @@ openfarm acp probe --provider antigravity --json  # starts agy
 
 Claude reports each turn's cost. `codex exec --json` and `agy` report none, so a Codex or Antigravity child's spend reads zero unless you set per-1k rates, and a spend cap cannot fire on it:
 
-- As the micromanager, set `[micromanager] cost_per_1k_in` and `cost_per_1k_out`, or its `spend_per_night` cannot stop it. No run note warns about this.
+- As the micromanager, set `[micromanager] cost_per_1k_in` and `cost_per_1k_out`, or its `spend_per_night` cannot stop it. Without them the run's notes say so.
 - As the worker backend (`[adapters] model = "codex-acp"` or `"antigravity-acp"`), set `[model] cost_per_1k_in` and `cost_per_1k_out`. Without them `run.json` says `spend_measured: false` and the run's notes say the caps cannot fire.
 - As a driver, the drive's notes say the caps cannot fire for the driver.
 
@@ -549,6 +549,7 @@ The checker is a worker role (`[model] checker`) with two passes after the end g
 | `acp-auth-required` | The provider wants an interactive login | Run `openfarm acp login --provider <p>`, then `openfarm acp probe --provider <p>` |
 | `acp probe --provider all` exits `3` | One probed provider is not ok | Read each provider's result in `--json`; Antigravity is skipped unless named |
 | `note: the backend reports no prices ... spend caps cannot fire` | The worker backend (a worker endpoint, or Codex or Antigravity as workers) has no per-1k rates | Set `[model] cost_per_1k_in` / `cost_per_1k_out` if you want a cap |
+| `note: the codex supervisor reports no cost ... its spend caps cannot fire` (or `antigravity`) | A Codex or Antigravity micromanager has no per-1k rates | Set `[micromanager] cost_per_1k_in` / `cost_per_1k_out` if you want a cap |
 | `note: ... = "off": the <p> child runs with no OS boundary` | `confine = "off"` | Intended only if you accept that the child can read whatever your user can |
 | `unsupported-test-runner` | A TypeScript test script that is not `node --test` | Use `node --test` |
 | `typescript-tools`, `typescript-jsx-unchecked`, `typescript-no-mutation` | See [section 3](#common-eligibility-rejections--fixes) | |
