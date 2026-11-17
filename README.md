@@ -185,7 +185,7 @@ The boundary is a bubblewrap sandbox. It shows the child the system folders, the
 
 `confine = "bwrap"` puts every provider in the boundary, Claude too, and refuses when `bwrap` cannot run. `confine = "off"` puts nothing in a boundary: the child can read whatever your user can, and the run's notes say so.
 
-- **Codex:** use openfarm's bridge, `[micromanager] binary = "codex-exec"`. With `binary = "auto"`, openfarm uses a standalone `codex-acp` server when one is on `PATH`, and that server completed no turn on a ChatGPT login in testing.
+- **Codex:** use openfarm's bridge, `[micromanager] binary = "codex-exec"`. `binary = "auto"` picks the same bridge whenever the `codex` CLI is installed. A standalone `codex-acp` server runs only when you name it (`binary = "codex-acp"`) or when it is the only Codex program on `PATH`; version 0.16.0 completed no turn on a ChatGPT login in testing.
 - **Antigravity:** openfarm starts `agy` with no person typing. Before you use it on your Antigravity OAuth login, check that your Antigravity plan's terms allow that. The other route is an API key: `auth = "api-key"` with `auth_file` passes the key to `agy` as `GEMINI_API_KEY` (untested live). Every Antigravity change since the first build is untested live.
 - **Claude:** the standalone `claude-agent-acp` server is the npm package `@agentclientprotocol/claude-agent-acp` (the older `@zed-industries/claude-agent-acp` name is an old version). Without it on `PATH`, `binary = "auto"` uses openfarm's bridge over `claude -p`.
 

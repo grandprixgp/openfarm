@@ -65,7 +65,7 @@ openfarm init <project_name> \
 
 By default `openfarm init` configures `[adapters] micromanager = "claude-acp"` (or `antigravity-acp` / `codex-acp` via `--acp-provider`), `[micromanager] mode = "active"`, `auth = "oauth"`, `binary = "auto"`, `tool_policy = "none"`, while configuring Workers under `[model]`. Add `--endpoint <URL> --model <MODEL_NAME>` if known, or pass `--profile advisory|solo` / adjust later via `openfarm acp configure --provider ...`. Confirm the JSON response reports `"config_valid": true`.
 
-With `--acp-provider codex`, switch to openfarm's own Codex bridge right after init (with `binary = "auto"` a standalone `codex-acp` on `PATH` would be used, and it completed no turn on a ChatGPT login in testing):
+With `--acp-provider codex`, name openfarm's own Codex bridge right after init. `binary = "auto"` already picks it when the `codex` CLI is installed; naming it keeps a standalone `codex-acp` server (0.16.0 completed no turn on a ChatGPT login in testing) from ever being used:
 ```bash
 openfarm acp configure --provider codex --binary codex-exec --tool-policy none --json
 ```

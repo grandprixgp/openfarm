@@ -83,7 +83,8 @@ Exact table/key validation lives in `openfarm_core/config.py` and is verified by
 | --- | --- | --- |
 | Claude | `"auto"` | `claude-agent-acp` if on `PATH` (npm `@agentclientprotocol/claude-agent-acp`), else openfarm's bridge over `claude` |
 | Claude | `"claude"` | openfarm's bridge over `claude -p` |
-| Codex | `"auto"`, `"codex"`, `"codex-acp"` | a standalone `codex-acp` if on `PATH`, else openfarm's bridge over `codex exec` |
+| Codex | `"auto"`, `"codex"` | openfarm's bridge over `codex exec` when the `codex` CLI is on `PATH`, else a standalone `codex-acp` if that is |
+| Codex | `"codex-acp"` | a standalone `codex-acp` if on `PATH`, else openfarm's bridge over `codex exec` |
 | Codex | `"codex-exec"` | always openfarm's bridge over `codex exec` (recommended) |
 | Antigravity | `"agy-print"` | openfarm's bridge over `agy -p` |
 | Antigravity | `"auto"`, `"agy"`, `"antigravity-acp"` | `antigravity-acp` if on `PATH`, else `agy acp` (agy's own ACP server) |

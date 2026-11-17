@@ -284,13 +284,15 @@ def _inspect_single_provider(
         if resolved_codex
         else {"available": False, "loggedIn": False}
     )
-    if resolved_acp:
+    # What `binary = "auto"` runs: openfarm's bridge over the Codex CLI when it is
+    # there, a standalone `codex-acp` server only when it is all there is.
+    if resolved_codex:
+        resolved_transport = "codex-native-acp"
+        resolved_cmd = resolve_acp_command(["codex-exec"], provider="codex")
+        resolved_cmd[-1] = resolved_codex
+    elif resolved_acp:
         resolved_transport = "codex-acp"
         resolved_cmd = [resolved_acp]
-    elif resolved_codex:
-        resolved_transport = "codex-native-acp"
-        resolved_cmd = resolve_acp_command(["codex"], provider="codex")
-        resolved_cmd[-1] = resolved_codex
     else:
         resolved_transport = "missing"
         resolved_cmd = []

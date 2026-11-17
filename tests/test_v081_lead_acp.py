@@ -123,5 +123,74 @@ for raw in sys.stdin:
         self.assertEqual((res.text, res.tokens_in, res.tokens_out), ("pong", 16305, 4))
 
 
+class CodexAutoChoiceTests(unittest.TestCase):
+    """`binary = "auto"` for Codex means openfarm's own bridge when the Codex CLI is there.
+
+    It is the route seen working live and the only one that turns Codex's tools
+    off. The standalone `codex-acp` server (0.16.0 completed no turn on a ChatGPT
+    login) is used when asked for by name, or when it is all there is.
+    """
+
+    def setUp(self) -> None:
+        import os
+        from unittest import mock
+        self.bin = Path(tempfile.mkdtemp(prefix="openfarm-codex-auto-"))
+        self.addCleanup(shutil.rmtree, self.bin, ignore_errors=True)
+        patcher = mock.patch.dict(os.environ, {"PATH": str(self.bin)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _program(self, name: str) -> str:
+        path = self.bin / name
+        path.write_text("#!/bin/sh\nexit 0\n")
+        path.chmod(0o755)
+        return str(path)
+
+    def _resolve(self, binary: str) -> list[str]:
+        from openfarm_core.adapters.acp import resolve_acp_command
+        return resolve_acp_command([binary], provider="codex")
+
+    def test_both_installed_auto_and_codex_take_the_bridge(self) -> None:
+        cli, server = self._program("codex"), self._program("codex-acp")
+        for binary in ("auto", "codex", "codex-exec"):
+            with self.subTest(binary):
+                cmd = self._resolve(binary)
+                self.assertTrue(cmd[1].endswith("codex_native_acp.py"), cmd)
+                self.assertEqual(cmd[2:4], ["--codex-bin", cli])
+        self.assertEqual(self._resolve("codex-acp"), [server])
+
+    def test_only_the_server_installed_auto_takes_it(self) -> None:
+        server = self._program("codex-acp")
+        self.assertEqual(self._resolve("auto"), [server])
+        self.assertEqual(self._resolve("codex"), [server])
+        # Asked for by name, the bridge is never swapped for the server.
+        self.assertTrue(self._resolve("codex-exec")[1].endswith("codex_native_acp.py"))
+
+    def test_only_the_cli_installed_every_name_takes_the_bridge(self) -> None:
+        self._program("codex")
+        for binary in ("auto", "codex", "codex-acp", "codex-exec"):
+            with self.subTest(binary):
+                self.assertTrue(self._resolve(binary)[1].endswith("codex_native_acp.py"))
+
+    def test_status_reports_what_auto_would_run(self) -> None:
+        from openfarm_core.acp_setup import inspect_acp_status
+        home = Path(tempfile.mkdtemp(prefix="openfarm-codex-auto-home-"))
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        cli, server = self._program("codex"), self._program("codex-acp")
+
+        def codex(**bins) -> dict:
+            status = inspect_acp_status(None, provider="codex", home=home, env={}, **bins)
+            return status["providers"]["codex"]
+
+        both = codex(codex_bin=cli, codex_acp_bin=server)
+        self.assertEqual(both["resolved_transport"], "codex-native-acp")
+        self.assertEqual(both["resolved_command"][-1], cli)
+        self.assertEqual(both["confinement"]["transport"], "bridge")
+        only_server = codex(codex_bin="", codex_acp_bin=server)
+        self.assertEqual(only_server["resolved_transport"], "codex-acp")
+        self.assertEqual(only_server["resolved_command"], [server])
+        self.assertEqual(only_server["confinement"]["transport"], "server")
+
+
 if __name__ == "__main__":
     unittest.main()

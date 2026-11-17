@@ -76,7 +76,7 @@ openfarm acp status --provider all --json
 
 Before you pick a Frontier provider, know how each one's child is held (details: `docs/USAGE-AND-FIRST-DEPLOYMENT.md`, section 5):
 - **Claude** (default, recommended with `tool_policy = "none"`): held by Claude Code's own settings. openfarm puts no OS boundary around it unless `[micromanager] confine = "bwrap"`.
-- **Codex:** set `[micromanager] binary = "codex-exec"` with `tool_policy = "none"`. openfarm turns Codex's tools off with flags and adds a bubblewrap (`bwrap`) boundary when `bwrap` works. With `binary = "auto"` a standalone `codex-acp` on `PATH` is used instead, and that server completed no turn on a ChatGPT login in testing.
+- **Codex:** set `[micromanager] binary = "codex-exec"` with `tool_policy = "none"`. openfarm turns Codex's tools off with flags and adds a bubblewrap (`bwrap`) boundary when `bwrap` works. `binary = "auto"` picks the same bridge whenever the `codex` CLI is installed; a standalone `codex-acp` server runs only when named or when it is the only Codex program on `PATH`, and version 0.16.0 completed no turn on a ChatGPT login in testing.
 - **Antigravity:** always inside the `bwrap` boundary; refused without `bwrap`. openfarm starts `agy` with no person typing. Before using it on an Antigravity OAuth login, tell the owner to check that their Antigravity plan's terms allow that; the other route is an API key (`auth = "api-key"` with `auth_file`). Do not set up Antigravity OAuth as the default. Every Antigravity change in v0.8.1 is untested live.
 - `[micromanager] confine = "off"` removes the boundary: the child can then read whatever the owner's user can. Do not set it without the owner's say-so.
 

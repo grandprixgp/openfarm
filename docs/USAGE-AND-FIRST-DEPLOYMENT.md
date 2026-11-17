@@ -406,7 +406,7 @@ With `isolate_home = true` (the default) each child gets a scratch home with the
 #### Which program runs (`[micromanager] binary`)
 
 - **Claude:** `"auto"` (default) uses the standalone `claude-agent-acp` server if it is on `PATH` (npm package `@agentclientprotocol/claude-agent-acp`; the `@zed-industries/claude-agent-acp` name is an old version), else openfarm's bridge over `claude -p`. `"claude"` always uses the bridge. Both routes answered live.
-- **Codex:** use `binary = "codex-exec"`, openfarm's bridge over `codex exec`. `"auto"`, `"codex"` and `"codex-acp"` use a standalone `codex-acp` server when one is on `PATH`; version 0.16.0 completed no turn on a ChatGPT login in testing.
+- **Codex:** use `binary = "codex-exec"`, openfarm's bridge over `codex exec`. `"auto"` and `"codex"` pick the same bridge whenever the `codex` CLI is installed. A standalone `codex-acp` server runs only for `binary = "codex-acp"`, or when it is the only Codex program on `PATH`; version 0.16.0 completed no turn on a ChatGPT login in testing.
 - **Antigravity:** `"auto"`, `"agy"` and `"antigravity-acp"` use `antigravity-acp` if on `PATH`, else `agy acp`. `"agy-print"` uses openfarm's bridge over `agy -p`, which refuses a prompt over 131072 bytes (`agy-prompt-too-large`) before starting `agy`.
 - A `binary` whose program names another provider than the adapter is refused (`acp-provider-mismatch`).
 

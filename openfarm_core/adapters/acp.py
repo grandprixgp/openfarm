@@ -419,7 +419,14 @@ def resolve_acp_command(
 
     if prov == "codex":
         if head in ("auto", "codex", "codex-acp", "codex-exec") or head_name == "codex":
-            if head in ("auto", "codex", "codex-acp") and "/" not in head and "\\" not in head:
+            # `auto` and `codex` mean openfarm's own bridge over `codex exec` when the
+            # Codex CLI is there: it is the route seen working live, and the only one
+            # that turns Codex's tools off for tool policy `none`. A standalone
+            # `codex-acp` server is used when asked for by name, or when it is all
+            # there is.
+            wants_server = head == "codex-acp" or (
+                head in ("auto", "codex") and not shutil.which("codex"))
+            if wants_server and "/" not in head and "\\" not in head:
                 acp_bin = shutil.which("codex-acp")
                 if acp_bin:
                     return [acp_bin, *rest]
