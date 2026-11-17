@@ -2204,7 +2204,10 @@ class CardRun:
                         "the test writer left the allowed paths: "
                         + ", ".join(report.outside_touches or report.not_additions_only))
                 retryable = {entry["code"] for entry in report.refused}
-                if not retryable <= {"no-unique-match"}:
+                # Asked again with the reason: a search block that did not match,
+                # or a stub the pack could not take (malformed, or one that does
+                # not fail when called). Nothing of a refused answer is on disk.
+                if not retryable <= {"no-unique-match", "non-panicking-stub"}:
                     raise GateFailure(
                         StopCode.REFUSED,
                         "the test writer's answer was refused: "
@@ -2212,6 +2215,11 @@ class CardRun:
                 self.budget.test_writer_attempts -= 1
                 free_retries -= 1
                 if free_retries <= 0:
+                    if "non-panicking-stub" in retryable:
+                        raise GateFailure(
+                            StopCode.REFUSED,
+                            "the test writer's answer was refused: "
+                            + _report_detail(report))
                     raise GateFailure(
                         StopCode.TESTS_UNPROVABLE,
                         "the test writer's search blocks kept failing to match "

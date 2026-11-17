@@ -498,8 +498,14 @@ class PythonPack(Pack):
         try:
             parsed = ast.parse(stub)
         except SyntaxError as exc:
+            hint = ""
+            if "indent" in str(exc.msg):
+                hint = (". A stub is appended at the end of the file, at the top level, "
+                        "so it cannot be a method inside an existing class: leave that "
+                        "method unstubbed (a test that fails on base because the method "
+                        "is missing is proof enough)")
             raise Refused("non-panicking-stub",
-                          f"a stub must be valid Python: {exc.msg}") from exc
+                          f"a stub must be valid Python: {exc.msg}{hint}") from exc
         raises = any(
             isinstance(node, ast.Raise) and node.exc is not None
             and "NotImplementedError" in ast.unparse(node.exc)

@@ -160,10 +160,82 @@ class UnprovableTestsSayWhyTests(test_e2e.GamingTrickTests):
         self.assertIn("(tests/full.rs:", gate["evidence"]["build_errors"])
 
 
+METHOD_STUB = (
+    "=== append_stub: tally/bounded.py\n"
+    "test_a_full_bundle_refuses_a_push\n"
+    "    def drain(self) -> None:\n"
+    "        raise NotImplementedError\n")
+
+
+class RefusedStubIsAskedAgainTests(unittest.TestCase):
+    """A stub the pack cannot take costs the test writer a try, not the card.
+
+    Both bench runs lost `py-inventory-remove` in the solo arm to one refused
+    answer: a method stub, indented for a class it cannot be appended into.
+    """
+
+    def setUp(self) -> None:
+        from tests.test_python_e2e import build_python_toy
+        self.toy = build_python_toy()
+        self.addCleanup(self.toy.cleanup)
+        self.toy.write_card(
+            "CARD-1", title="A full bundle refuses a push", category="small-feature",
+            reference="tests/test_existing.py",
+            unit=".", touches=["tally/bounded.py"], new_symbols=True,
+            tests=[{"name": "test_a_full_bundle_refuses_a_push",
+                    "file": "tests/test_full.py", "asserts": "push raises FullError"}],
+            done_text="push on a full bundle raises `FullError`.")
+        self.toy.commit("add card")
+
+    def _run(self, script: dict) -> dict:
+        import contextlib
+        import io
+        from openfarm_core.cli import main as cli_main
+        path = Path(self.toy.base) / "script.json"
+        path.write_text(json.dumps(script), encoding="utf-8")
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            cli_main(["--repo", str(self.toy.root), "--json", "run", "--card", "CARD-1",
+                      "--cards", "1", "--script", str(path)])
+        return json.loads(out.getvalue())["outcomes"][0]
+
+    def _attempts(self) -> list[dict]:
+        files = sorted((self.toy.state_dir / "cards" / "CARD-1").glob("*/attempts/*.json"))
+        return [json.loads(f.read_text()) for f in files]
+
+    def test_the_second_answer_is_used_and_the_first_one_says_why(self) -> None:
+        from tests.test_python_e2e import GOOD_IMPLEMENTATION, GOOD_TEST
+        good = "=== whole_file: tests/test_full.py\n" + GOOD_TEST
+        outcome = self._run({
+            "CARD-1/test_writer/1": good + "\n" + METHOD_STUB,
+            "CARD-1/test_writer/2": good,
+            "CARD-1/implementer": GOOD_IMPLEMENTATION,
+            "CARD-1/checker_pass1": "RESTATEMENT: a full bundle refuses a push\n"
+                                    "CATCHES: yes\nMISSES: none",
+            "CARD-1/checker_pass2": "{}",
+        })
+        self.assertEqual(outcome["final_state"], "in-review", outcome)
+        refused = [a for a in self._attempts() if a.get("outcome") == "refused"]
+        self.assertEqual(len(refused), 1, [a.get("outcome") for a in self._attempts()])
+        self.assertIn("cannot be a method inside an existing class", refused[0]["detail"])
+        # Nothing of the refused answer stayed: the class has no `drain`.
+        worktrees = list((self.toy.state_dir / "worktrees").glob("CARD-1-*"))
+        for tree in worktrees:
+            self.assertNotIn("def drain", (tree / "tally" / "bounded.py").read_text())
+
+    def test_a_writer_that_never_stops_is_refused_in_the_end(self) -> None:
+        from tests.test_python_e2e import GOOD_TEST
+        bad = "=== whole_file: tests/test_full.py\n" + GOOD_TEST + "\n" + METHOD_STUB
+        outcome = self._run({"CARD-1/test_writer": bad})
+        self.assertEqual(outcome["final_state"], "blocked")
+        self.assertEqual(outcome["stop_code"], "refused")
+        self.assertGreater(len(self._attempts()), 1)
+
+
 def load_tests(loader, tests, pattern):
     """Keep the inherited end-to-end cases from running a second time here."""
     suite = unittest.TestSuite()
-    for case in (RustTestWriterNoteTests, BuildErrorsTests):
+    for case in (RustTestWriterNoteTests, BuildErrorsTests, RefusedStubIsAskedAgainTests):
         suite.addTests(loader.loadTestsFromTestCase(case))
     suite.addTest(UnprovableTestsSayWhyTests(
         "test_a_test_that_does_not_compile_says_what_the_compiler_said"))

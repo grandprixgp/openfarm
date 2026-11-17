@@ -410,7 +410,11 @@ def test_writer_brief(card: Card, book: BriefBook, pack,
             "TypeScript: `throw new Error(\"not implemented\")`) with\n"
             "`append_stub` in files in your touches, additions only."
             "\nA symbol whose signature is already shown above is declared: do not "
-            "stub it again, a second declaration does not compile.")
+            "stub it again, a second declaration does not compile."
+            "\nA stub lands at the end of the file, at the top level. It cannot add a "
+            "method inside an existing Python or TypeScript class: leave such a method "
+            "unstubbed, the test failing on base because it is missing is the proof. "
+            "(In Rust, a new `impl` block at the top level can carry the method.)")
         parts.append("\n" + STUB_FORMAT)
 
     parts.append("\n" + EDIT_FORMAT)
