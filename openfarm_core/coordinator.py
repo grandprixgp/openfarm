@@ -438,7 +438,7 @@ class CodeCoordinator:
 
         if sup_filled and rt.ask_supervisor_fn is not None:
             res = rt.ask_supervisor_fn(info)
-            if isinstance(res, dict) and res.get("action") in ("hint", "set"):
+            if isinstance(res, dict) and res.get("action") in ("hint", "set", "block"):
                 return res
 
         return {"action": "block", "reason": str(info.get("reason", "") or "handed back")}
@@ -686,6 +686,8 @@ class ModelCoordinator:
         *,
         target_card: str = "",
         target_member: str = "",
+        event_name: str = "",
+        event_info: dict | None = None,
     ) -> tuple[bool, dict | None]:
         """Validate & execute coordinator actions. Returns (had_error, card_resolution)."""
         had_error = False
@@ -765,26 +767,37 @@ class ModelCoordinator:
                 elif name == "ask":
                     body = str(act.get("body") or act.get("text") or "").strip()
                     cid = str(act.get("card") or act.get("card_id") or target_card or "")
-                    res_ask = swarm_ask(
-                        rt.board,
-                        rt.cfg,
-                        caller="coordinator",
-                        body=body,
-                        card=cid,
-                    )
                     if target_card and rt.ask_supervisor_fn is not None:
-                        sup_res = rt.ask_supervisor_fn({
+                        # About the card this event is for: the supervisor's own
+                        # handback_triage op is the question (one question, answered
+                        # the same way by every kind of supervisor), carrying the
+                        # coordinator's text as data.
+                        if str(getattr(rt.cfg.swarm, "supervisor", "off") or "off") == "off":
+                            raise Refused("supervisor-off", "supervisor seat is 'off'")
+                        sup_info = dict(event_info or {})
+                        sup_info.update({
                             "card_id": target_card,
-                            "member": target_member,
-                            "reason": body,
-                            "question_post": res_ask.get("post"),
+                            "member": target_member or str(sup_info.get("member", "") or ""),
+                            "event": event_name,
+                            "coordinator_question": body,
                         })
+                        if not sup_info.get("reason"):
+                            sup_info["reason"] = body or str(sup_info.get("detail", "") or "")
+                        sup_res = rt.ask_supervisor_fn(sup_info)
                         if isinstance(sup_res, dict) and sup_res.get("action") in (
                             "hint",
                             "set",
                             "block",
                         ):
                             resolution = sup_res
+                    else:
+                        swarm_ask(
+                            rt.board,
+                            rt.cfg,
+                            caller="coordinator",
+                            body=body,
+                            card=cid,
+                        )
                 elif name == "block":
                     cid = str(act.get("card") or act.get("card_id") or target_card or "").strip()
                     reason = str(act.get("reason") or act.get("body") or "").strip()
@@ -898,6 +911,8 @@ class ModelCoordinator:
                         actions,
                         target_card=target_card,
                         target_member=target_member,
+                        event_name=event,
+                        event_info=event_details,
                     )
                 except (Invalid, ValueError, TypeError, Infra) as exc:
                     if isinstance(exc, Infra) and exc.code not in ("empty-output", "bad-json"):
@@ -1096,6 +1111,133 @@ class ExternalCoordinator:
         self._code_fallback.on_stall(rt, info)
 
 
+def _recent_failing_gates(board: Board, card_id: str, *, limit: int = 3) -> list[str]:
+    """The last few failing gate or defect posts for a card, as plain text."""
+    if not card_id or not board.board_dir.exists():
+        return []
+    out: list[str] = []
+    for post in board.read(as_name="*", since=0, limit=None, for_model=False):
+        if str(post.get("card", "") or "") != card_id:
+            continue
+        kind = post.get("kind")
+        body = str(post.get("body", "") or "")
+        if kind == "defect" or (
+            kind == "gate" and post.get("from") == "gates"
+            and body.split(":", 1)[-1].strip().startswith("fail")
+        ):
+            out.append(_sanitize_text(body))
+    return out[-limit:]
+
+
+def _handback_triage_payload(board: Board, cfg, card: Card | None, info: dict) -> dict:
+    """What the supervisor needs to resolve a hand-back: card, member, reason, failures."""
+    cid = str(info.get("card_id", "") or "")
+    mname = str(info.get("member", "") or "")
+    member = board.get_member(mname) if mname else None
+    worker_reason = str(info.get("reason", "") or "")
+    detail = str(info.get("detail", "") or "")
+    failing = _recent_failing_gates(board, cid)
+    if not detail and failing:
+        detail = failing[-1]
+    card_view: dict = {"id": cid}
+    if card is not None:
+        card_view.update({
+            "title": _sanitize_text(card.title),
+            "category": card.category,
+            "done_text": _sanitize_text(card.done_text),
+            "touches": list(card.touches),
+            "tests": list(getattr(card, "test_names", []) or []),
+        })
+    payload = {
+        "event": str(info.get("event", "") or "handback"),
+        "card": card_view,
+        "member": mname,
+        "role": str(info.get("board_role", "") or info.get("role", "") or (member or {}).get("role", "")),
+        "tier": str((member or {}).get("tier", "") or info.get("tier", "") or ""),
+        "effort": str((member or {}).get("effort", "") or info.get("effort", "") or ""),
+        "handback_reason": _sanitize_text(worker_reason),
+        "failing_detail": _sanitize_text(detail) or "no gate has failed on this card yet",
+        "recent_failures": failing,
+        "attempt": int(info.get("attempt", 0) or 0),
+        "handback_index": int(info.get("handback_index", 0) or 0),
+        "tiers": {
+            name: {"efforts": list(t.efforts)}
+            for name, t in (getattr(cfg, "tiers", {}) or {}).items()
+        },
+        "allowed_actions": ["hint", "set", "block"],
+    }
+    question = str(info.get("coordinator_question", "") or "")
+    if question:
+        payload["coordinator_question"] = _sanitize_text(question)
+    return payload
+
+
+def ask_supervisor_handback(board: Board, cfg, card_map: dict[str, Card], info: dict) -> dict | None:
+    """Ask the supervisor's seat to resolve a hand-back through its `handback_triage` op.
+
+    Asked the same way for every kind of supervisor (config, tier, ACP, external)
+    through the card's micromanager, so an external answer is read from its evidence
+    file and the call's tokens are counted like the supervisor's other calls.
+    Returns a `hint` (the worker tries again with it), a `set` already applied through
+    the checked `swarm_set` (the worker tries again), a `block` carrying the worker's
+    reason, or None when there is no usable answer (the caller then blocks with the
+    worker's reason). An unusable answer never raises; a seat-silent timeout with
+    `on_external_timeout = "block"` and the kill switch still do.
+    """
+    sup_mode = str(getattr(cfg.swarm, "supervisor", "off") or "off")
+    if sup_mode == "off":
+        return None
+    mm = info.get("micromanager")
+    if mm is None or not getattr(mm, "enabled", False) or not hasattr(mm, "handback_triage"):
+        return None
+    cid = str(info.get("card_id", "") or "")
+    mname = str(info.get("member", "") or "")
+    worker_reason = str(info.get("reason", "") or "") or "handed back"
+    payload = _handback_triage_payload(board, cfg, card_map.get(cid), info)
+    try:
+        ans = mm.handback_triage(cid, payload)
+    except (Invalid, Refused, Infra, ValueError, TypeError) as exc:
+        msg = getattr(exc, "message", str(exc))
+        _post_event(
+            board,
+            "handback",
+            f"supervisor handback triage for {mname or cid} gave no usable answer: {msg}",
+            card=cid,
+        )
+        return None
+    if not isinstance(ans, dict) or not ans:
+        return None
+    action = ans.get("action")
+    if action == "hint":
+        if not ans.get("body"):
+            return None
+        return {"action": "hint", "body": str(ans["body"])}
+    if action == "set":
+        if not mname:
+            return None
+        tier = str(ans.get("tier", "") or "") or None
+        effort = str(ans.get("effort", "") or "") or None
+        why = str(ans.get("reason", "") or "")
+        try:
+            swarm_set(
+                board,
+                cfg,
+                caller="coordinator",
+                member_name=mname,
+                tier=tier,
+                effort=effort,
+                reason=("supervisor handback triage" + (f": {why}" if why else ""))[:200],
+            )
+        except Refused:
+            return None  # refusal already posted; block with the worker's reason
+        return {"action": "set", "tier": tier, "effort": effort}
+    if action == "block":
+        why = str(ans.get("reason", "") or "")
+        reason = worker_reason + (f" (supervisor: {why})" if why and why != worker_reason else "")
+        return {"action": "block", "reason": reason}
+    return None
+
+
 class SwarmRunner:
     """Coordinate parallel worker execution across `code`, `tier:<name>`, and `external`."""
 
@@ -1186,102 +1328,7 @@ class SwarmRunner:
 
         def _make_ask_supervisor_fn():
             def _ask(info: dict) -> dict | None:
-                cid = str(info.get("card_id", "") or "")
-                mname = str(info.get("member", "") or "")
-                reason = str(info.get("reason", "") or "")
-                sup_mode = str(getattr(self.cfg.swarm, "supervisor", "off") or "off")
-                if sup_mode == "off":
-                    return None
-                q_post = info.get("question_post")
-                if q_post is None:
-                    try:
-                        ask_res = swarm_ask(
-                            self.board,
-                            self.cfg,
-                            caller="coordinator",
-                            body=f"handback triage for {mname or cid}: {reason}",
-                            card=cid,
-                            attempt=int(info.get("attempt", 0) or 0),
-                            expects={
-                                "op": "handback_triage",
-                                "required": ["action"],
-                                "properties": {
-                                    "action": {"type": "str", "enum": ["hint", "set", "block"]},
-                                    "body": {"type": "str"},
-                                    "tier": {"type": "str"},
-                                    "effort": {"type": "str"},
-                                    "reason": {"type": "str"},
-                                },
-                            },
-                        )
-                        q_post = ask_res.get("post") or {}
-                    except Refused:
-                        return None
-                q_seq = int(q_post.get("seq", 0) or 0)
-
-                if sup_mode == "external":
-                    card_budget = info.get("budget")
-                    hb_fn = info.get("heartbeat_fn")
-                    ext_wait = float(getattr(self.cfg.swarm, "external_wait_s", 1800.0) or 1800.0)
-                    on_to = str(getattr(self.cfg.swarm, "on_external_timeout", "fallback") or "fallback")
-                    dl = time.monotonic() + max(0.0, ext_wait)
-                    pause_cm = (
-                        card_budget.pause_clock()
-                        if card_budget is not None and hasattr(card_budget, "pause_clock")
-                        else contextlib.nullcontext()
-                    )
-                    since_q = q_seq
-                    with pause_cm, self.board.external_wait(card_id=cid, member_name=mname):
-                        while True:
-                            if self.state.kill_requested(self.cfg.kill_switch):
-                                raise GateFailure(StopCode.KILLED, "run cancelled by kill switch")
-                            for item in self.board.read(
-                                as_name="*", since=since_q, limit=None, for_model=False
-                            ):
-                                since_q = max(since_q, int(item.get("seq", 0) or 0))
-                                if item.get("kind") == "answer" and item.get("ref") == q_seq:
-                                    try:
-                                        ans_data = json.loads(str(item.get("body", "") or ""))
-                                    except ValueError:
-                                        ans_data = {}
-                                    act = str(ans_data.get("action", "") or "").lower()
-                                    if act == "hint" and ans_data.get("body") and mname:
-                                        swarm_hint(self.board, self.cfg, caller="coordinator", member_name=mname, body=str(ans_data["body"]))
-                                        return {"action": "hint", "body": str(ans_data["body"])}
-                                    if act == "set" and mname:
-                                        swarm_set(self.board, self.cfg, caller="coordinator", member_name=mname, tier=ans_data.get("tier"), effort=ans_data.get("effort"), reason="supervisor handback triage")
-                                        return {"action": "set", "tier": ans_data.get("tier"), "effort": ans_data.get("effort")}
-                                    if act == "block":
-                                        return {"action": "block", "reason": str(ans_data.get("reason", "") or reason)}
-                            if callable(hb_fn):
-                                hb_fn()
-                            rem = dl - time.monotonic()
-                            if rem <= 0:
-                                break
-                            self.board.wait_after(since_q, min(0.5, rem))
-                    if on_to == "block":
-                        raise GateFailure(StopCode.SEAT_SILENT, f"external supervisor did not answer handback #{q_seq}")
-                    return None
-
-                mm = info.get("micromanager")
-                if mm is None or not getattr(mm, "enabled", False):
-                    return None
-                try:
-                    ans = mm.backend.assist(
-                        "triage_blocked",
-                        {"card_id": cid, "reason": reason, "cards": [{"id": cid, "reason": reason}]},
-                    )
-                    if isinstance(ans, dict):
-                        act = str(ans.get("action", "") or "").lower()
-                        if act == "hint" and ans.get("body") and mname:
-                            swarm_hint(self.board, self.cfg, caller="coordinator", member_name=mname, body=str(ans["body"]))
-                            return {"action": "hint", "body": str(ans["body"])}
-                        if act == "set" and mname:
-                            swarm_set(self.board, self.cfg, caller="coordinator", member_name=mname, tier=ans.get("tier"), effort=ans.get("effort"), reason="supervisor handback triage")
-                            return {"action": "set", "tier": ans.get("tier"), "effort": ans.get("effort")}
-                except (Invalid, Refused, Infra, ValueError):
-                    return None
-                return None
+                return ask_supervisor_handback(self.board, self.cfg, card_map, info)
 
             return _ask
 
