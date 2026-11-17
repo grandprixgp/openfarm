@@ -69,6 +69,43 @@ class _Tmp(unittest.TestCase):
         self.bin.mkdir()
 
 
+class ProviderMismatchTests(_Tmp):
+    """A5: one resolved provider; a binary naming another one is refused."""
+
+    def test_adapter_refuses_a_codex_binary_for_the_claude_provider(self) -> None:
+        codex = _script(self.bin / "codex", "#!/bin/sh\nexit 0\n")
+        for command in ("codex", str(codex), ["agy", "acp"], [sys.executable, str(CODEX_NATIVE_ACP)]):
+            with self.assertRaises(Invalid) as caught:
+                ClaudeAcpAdapter(command=command, provider="claude", cwd=self.tmp)
+            self.assertEqual(caught.exception.code, "acp-provider-mismatch")
+            self.assertIn("claude", caught.exception.message)
+        with self.assertRaises(Invalid) as caught:
+            ClaudeAcpAdapter(command="claude", provider="codex", cwd=self.tmp)
+        self.assertIn("codex", caught.exception.message)
+        self.assertIn("'claude'", caught.exception.message)
+
+    def test_resolve_no_longer_switches_provider_silently(self) -> None:
+        with self.assertRaises(Invalid):
+            resolve_acp_command("codex", provider="claude")
+        # Generic commands (a stand-in, an absolute path not named for a provider) still work.
+        argv = resolve_acp_command([sys.executable, str(STAND_IN)], provider="claude")
+        self.assertEqual(argv[1], str(STAND_IN))
+        self.assertEqual(resolve_acp_command("auto", provider="codex")[1], str(CODEX_NATIVE_ACP))
+
+    def test_open_micromanager_refuses_at_open(self) -> None:
+        repo = self.tmp / "repo"
+        repo.mkdir()
+        state = self.tmp / "state"
+        state.mkdir()
+        data = _base_config(state)
+        data["adapters"]["micromanager"] = "claude-acp"
+        data["micromanager"] = {"mode": "active", "binary": "codex"}
+        cfg = Config(data, repo)
+        with self.assertRaises(Invalid) as caught:
+            open_micromanager(cfg, state, repo, worktree=repo)
+        self.assertIn("[micromanager] binary", caught.exception.message)
+
+
 class StatusModeTests(_Tmp):
     def test_off_mode_says_so_in_status(self) -> None:
         repo = self.tmp / "repo"

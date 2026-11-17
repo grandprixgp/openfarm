@@ -175,6 +175,34 @@ def acp_command(command: str | list[str], confine) -> AcpCommand:
     return out
 
 
+def _head_names_provider(argv: list[str]) -> tuple[str, str]:
+    """`(provider, word)` when the command's program names a provider, else `("", "")`.
+
+    Only the program (or, for an interpreter, the script it runs) counts; a model
+    name in the arguments never does.
+    """
+    if not argv:
+        return "", ""
+    words = [argv[0]]
+    if Path(argv[0]).name.rstrip("0123456789.") in ("python", "node", "nodejs") and len(argv) > 1:
+        words.append(argv[1])
+    for word in words:
+        name = Path(word).name.lower()
+        try:
+            res = Path(word).resolve()
+        except (OSError, ValueError):
+            res = None
+        if res is not None and res in _BRIDGE_SCRIPTS:
+            return _BRIDGE_SCRIPTS[res], word
+        if name in ("agy", "agy-print", "agy-acp", "agy_native_acp.py") or name.startswith("antigravity"):
+            return "antigravity", word
+        if name in ("codex", "codex-acp", "codex-exec", "codex_native_acp.py"):
+            return "codex", word
+        if name in ("claude", "claude-native", "claude-agent-acp", "claude_native_acp.py"):
+            return "claude", word
+    return "", ""
+
+
 def _bridge_provider(argv: list[str]) -> str:
     """The provider of openfarm's own bridge when `argv` runs one, else ``""``."""
     if len(argv) < 2:
@@ -185,6 +213,27 @@ def _bridge_provider(argv: list[str]) -> str:
         return ""
 
 
+def check_provider_matches(command: str | list[str] | None, provider: str, *,
+                           where: str = "") -> None:
+    """Refuse a command whose program names another provider than `provider`."""
+    if command is None or not str(provider or "").strip():
+        return
+    prov = normalize_acp_provider(provider)
+    if isinstance(command, str):
+        try:
+            argv = shlex.split(command)
+        except ValueError:
+            argv = command.split()
+    else:
+        argv = [str(p) for p in command]
+    named, word = _head_names_provider(argv)
+    if named and named != prov:
+        place = f" ({where})" if where else ""
+        raise Invalid(
+            "acp-provider-mismatch",
+            f"the ACP adapter is for {prov} but its binary {word!r} is {named}{place}; "
+            f"set the binary to a {prov} program (or \"auto\"), or name the {named} adapter",
+        )
 
 
 def normalize_acp_provider(value: str) -> str:
@@ -308,10 +357,15 @@ def _is_acp_auth_error(code: object, message: str, data: object) -> bool:
 def resolve_acp_command(
     command: str | list[str],
     *,
-    provider: str = "claude",
+    provider: str = "",
     python_exe: str | None = None,
 ) -> list[str]:
-    """Resolve an ACP command string/argv across Claude, Antigravity, and Codex."""
+    """Resolve an ACP command string/argv across Claude, Antigravity, and Codex.
+
+    One provider decides: an explicit `provider` is used as given (a binary that
+    names another provider is refused), and without one it is inferred from the
+    command.
+    """
     if isinstance(command, str):
         argv = shlex.split(command)
     else:
@@ -324,13 +378,10 @@ def resolve_acp_command(
     head_name = Path(head).name
     py = python_exe or sys.executable
 
-    prov = normalize_acp_provider(provider or "claude")
-    if prov == "claude" and (
-        head in ("agy", "antigravity", "agy-print", "antigravity-print", "antigravity-acp", "agy-acp")
-        or head_name in ("agy", "antigravity", "agy-print", "antigravity-print", "antigravity-acp", "agy-acp", "agy_native_acp.py")
-        or head in ("codex", "codex-acp", "codex-exec")
-        or head_name in ("codex", "codex-acp", "codex-exec", "codex_native_acp.py")
-    ):
+    if str(provider or "").strip():
+        prov = normalize_acp_provider(provider)
+        check_provider_matches(argv, prov)
+    else:
         prov = infer_acp_provider(argv)
 
     if prov == "antigravity":
@@ -733,6 +784,8 @@ class ClaudeAcpAdapter:
                 "acp-bad-auth-mode",
                 f"auth_mode must be 'oauth', 'api-key', or 'auto', got {auth_mode!r}",
             )
+        if str(provider or "").strip():
+            check_provider_matches(command, provider)
         self.provider = infer_acp_provider(command, provider)
         self.name = f"{self.provider}-acp"
         self.argv = resolve_acp_command(command, provider=self.provider)

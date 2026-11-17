@@ -2467,7 +2467,15 @@ def open_micromanager(
             command = [binary, *[str(a) for a in raw_args]] if raw_args else binary
         from . import confine as confine_lib
         from .adapters.acp import acp_command
+        from .adapters.acp import check_provider_matches
 
+        # One provider decides the argv, env, home and sync-back: a binary that
+        # names another provider than the adapter is refused, naming both.
+        check_provider_matches(
+            command, acp_provider,
+            where=f"[adapters] micromanager / [swarm] supervisor is {spec_str!r}, "
+                  "binary from [micromanager] binary",
+        )
         # The confinement settings ride on the command to every adapter it opens,
         # including the run's shared supervisor process.
         key_file = _cfg_get(cfg, "key_file", None)

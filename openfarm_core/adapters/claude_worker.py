@@ -21,6 +21,7 @@ from pathlib import Path
 from .. import confine as confine_lib
 from .acp import (
     ClaudeAcpAdapter,
+    check_provider_matches,
     infer_acp_provider,
     is_acp_adapter,
     normalize_acp_provider,
@@ -176,6 +177,9 @@ def open_acp_worker(cfg, *, provider: str = "") -> ClaudeAcpWorkerBackend:
     binary = "auto" if mismatch else raw_bin
     args = [] if mismatch else [str(a) for a in (getattr(mm, "args", None) or [])]
     command = [binary, *args] if args else binary
+    # One resolved provider decides the argv, env, home and sync-back: a binary
+    # naming another provider is refused here, not run with this one's login.
+    check_provider_matches(command, prov, where="[micromanager] binary")
     return ClaudeAcpWorkerBackend(
         command=command,
         cwd=None,
