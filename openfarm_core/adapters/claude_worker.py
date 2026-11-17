@@ -14,13 +14,18 @@ name means Claude's default.
 
 from __future__ import annotations
 
+import shutil
+import tempfile
 from pathlib import Path
 
+from .. import confine as confine_lib
 from .acp import (
     ClaudeAcpAdapter,
+    check_provider_matches,
     infer_acp_provider,
     is_acp_adapter,
     normalize_acp_provider,
+    provider_prices_spend,
 )
 from .openai_compat import Completion
 
@@ -45,11 +50,21 @@ class ClaudeAcpWorkerBackend:
                  isolate_home: bool = True, auth_file: Path | str | None = None,
                  auth_mode: str = "oauth",
                  cost_per_1k_in: float = 0.0, cost_per_1k_out: float = 0.0,
-                 adapter: ClaudeAcpAdapter | None = None) -> None:
+                 adapter: ClaudeAcpAdapter | None = None,
+                 confine=None,
+                 never_touch: tuple[str, ...] | list[str] = (),
+                 forbidden_files: tuple[str, ...] | list[str] = ()) -> None:
         self.command = command
         self.provider = infer_acp_provider(command, provider)
         self.name = f"{self.provider}-acp-worker"
-        self.cwd = Path(cwd or Path.cwd())
+        # A worker needs no files: without a folder it works in an empty one of
+        # its own, never in the state folder.
+        self._own_cwd: Path | None = None
+        self._cwd: Path | None = Path(cwd) if cwd is not None else None
+        self.confine = confine_lib.as_settings(
+            confine if confine is not None else getattr(command, "confine", None))
+        self.never_touch = list(never_touch or ())
+        self.forbidden_files = list(forbidden_files or ())
         self.effort = effort
         self.timeout_s = float(timeout_s)
         self.isolate_home = isolate_home
@@ -60,9 +75,24 @@ class ClaudeAcpWorkerBackend:
         self._adapter = adapter
 
     @property
+    def cwd(self) -> Path:
+        """The child's folder: the one given, or an empty one made on first use."""
+        if self._cwd is not None:
+            return self._cwd
+        if self._own_cwd is None:
+            self._own_cwd = Path(tempfile.mkdtemp(prefix="openfarm-acp-empty-"))
+            self._own_cwd.chmod(0o700)
+        return self._own_cwd
+
+    @cwd.setter
+    def cwd(self, value: Path | str | None) -> None:
+        self._cwd = Path(value) if value is not None else None
+
+    @property
     def prices_spend(self) -> bool:
-        # ACP providers report vendor cost or allow per-1k pricing fallback.
-        return True
+        # Claude reports a cost per turn; Codex and Antigravity report none, so
+        # their spend is measured only when per-1k rates are configured.
+        return provider_prices_spend(self.provider, self.cost_per_1k_in, self.cost_per_1k_out)
 
     def hello(self) -> dict:
         return {"name": self.name, "versions": [1], "ops": ["hello", "complete"]}
@@ -82,7 +112,9 @@ class ClaudeAcpWorkerBackend:
                 command=self.command, cwd=self.cwd,
                 provider=self.provider,
                 isolate_home=self.isolate_home, auth_file=self.auth_file,
-                auth_mode=self.auth_mode, allowed_root=self.cwd)
+                auth_mode=self.auth_mode, allowed_root=self.cwd,
+                never_touch=self.never_touch, forbidden_files=self.forbidden_files,
+                confine=self.confine)
         if not self._adapter._initialized:
             self._adapter.initialize(timeout_s=min(30.0, self.timeout_s))
         return self._adapter
@@ -119,6 +151,9 @@ class ClaudeAcpWorkerBackend:
         if self._adapter is not None:
             self._adapter.close()
             self._adapter = None
+        if self._own_cwd is not None:
+            shutil.rmtree(self._own_cwd, ignore_errors=True)
+            self._own_cwd = None
 
 
 AcpWorkerBackend = ClaudeAcpWorkerBackend
@@ -143,9 +178,13 @@ def open_acp_worker(cfg, *, provider: str = "") -> ClaudeAcpWorkerBackend:
     )
     binary = "auto" if mismatch else raw_bin
     args = [] if mismatch else [str(a) for a in (getattr(mm, "args", None) or [])]
+    command = [binary, *args] if args else binary
+    # One resolved provider decides the argv, env, home and sync-back: a binary
+    # naming another provider is refused here, not run with this one's login.
+    check_provider_matches(command, prov, where="[micromanager] binary")
     return ClaudeAcpWorkerBackend(
-        command=[binary, *args] if args else binary,
-        cwd=getattr(cfg, "state_dir", None),
+        command=command,
+        cwd=None,
         provider=prov,
         effort=str(getattr(mm, "effort", "") or ""),
         timeout_s=float(getattr(mm, "timeout_s", 600.0)),
@@ -154,6 +193,9 @@ def open_acp_worker(cfg, *, provider: str = "") -> ClaudeAcpWorkerBackend:
         auth_mode=str(getattr(mm, "auth", "oauth") or "oauth"),
         cost_per_1k_in=float(getattr(cfg, "cost_per_1k_in", 0.0)),
         cost_per_1k_out=float(getattr(cfg, "cost_per_1k_out", 0.0)),
+        confine=confine_lib.settings_from_config(cfg),
+        never_touch=list(getattr(cfg, "never_touch", ()) or ()),
+        forbidden_files=list(getattr(cfg, "forbidden_files", ()) or ()),
     )
 
 

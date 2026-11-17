@@ -19,6 +19,12 @@ import threading
 import uuid
 from pathlib import Path
 
+if __package__ in (None, ""):
+    # Run as a script by the ACP adapter: make the package importable.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from openfarm_core import confine as confine_lib
+
 PROTOCOL_VERSION = 1
 _AUTH_HINT_RE = re.compile(
     r"not logged in|please run.*login|codex login|authentication_failed|"
@@ -160,25 +166,16 @@ class NativeCodexAcpServer:
         with self._proc_lock:
             self._cancelled_sessions.add(session_id)
             proc = self._active_procs.get(session_id)
-        if proc is None or proc.poll() is not None:
-            return
-        try:
-            os.killpg(proc.pid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError, OSError):
-            try:
-                proc.terminate()
-            except OSError:
-                pass
-        try:
-            proc.wait(timeout=1.0)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError, OSError):
-                try:
-                    proc.kill()
-                except OSError:
-                    pass
+        # The child leads its own process group: end the whole group, so the
+        # commands it started do not outlive a cancelled or timed-out turn.
+        confine_lib.end_process_group(proc)
+
+    def end_all(self) -> None:
+        """End every running child's process group (on close or SIGTERM)."""
+        with self._proc_lock:
+            procs = list(self._active_procs.items())
+        for sid, _proc in procs:
+            self._terminate_session_proc(sid)
 
     def _handle_initialize(self, req_id: object) -> None:
         self._initialized = True
@@ -235,12 +232,27 @@ class NativeCodexAcpServer:
             if isinstance(sys_meta, dict)
             else ""
         )
+        of_meta = meta.get("openfarm") if isinstance(meta.get("openfarm"), dict) else {}
+        tool_policy = str(of_meta.get("toolPolicy") or opts.get("toolPolicy") or "none")
+        if tool_policy not in ("none", "read-only"):
+            self._send_error(req_id, -32602, f"Unknown tool policy: {tool_policy!r}")
+            return
+        confine_meta = of_meta.get("confine")
+        hold = confine_lib.bridge_plan("codex", tool_policy, confine_meta)
+        if hold.refused:
+            self._send_error(
+                req_id, -32001, hold.refused,
+                data={"kind": "refused", "code": "acp-confine-unavailable"},
+            )
+            return
         sid = f"codex-native-{uuid.uuid4().hex[:12]}"
         self._sessions[sid] = {
             "cwd": cwd,
             "model": str(opts.get("model") or ""),
             "effort": str(opts.get("effort") or ""),
-            "tool_policy": str(opts.get("toolPolicy") or "read-only"),
+            "tool_policy": tool_policy,
+            "hold": hold,
+            "confine_meta": confine_meta if isinstance(confine_meta, dict) else {},
             "system_prompt": system_prompt,
             "used_tokens": 0,
             "cum_cost": 0.0,
@@ -248,6 +260,10 @@ class NativeCodexAcpServer:
         self._send_result(req_id, {"sessionId": sid})
 
     def _build_codex_argv(self, session: dict) -> list[str]:
+        """The `codex exec` argv; the boundary, when held so, wraps it in `_child_argv`."""
+        tool_policy = str(session.get("tool_policy") or "none")
+        hold = session.get("hold")
+        flags = bool(getattr(hold, "flags", True))
         argv = [
             self.codex_bin,
             "exec",
@@ -258,15 +274,24 @@ class NativeCodexAcpServer:
             "--ignore-rules",
             "-s",
             "read-only",
-            "-C",
-            session["cwd"],
         ]
+        if flags:
+            argv.extend(confine_lib.codex_tool_flags(tool_policy))
+        argv.extend(["-C", session["cwd"]])
         if session["model"]:
             argv.extend(["-m", session["model"]])
         if session["effort"]:
             argv.extend(["-c", f'model_reasoning_effort={json.dumps(session["effort"])}'])
         argv.append("-")
         return argv
+
+    def _child_argv(self, session: dict) -> list[str]:
+        argv = self._build_codex_argv(session)
+        hold = session.get("hold")
+        if hold is None:
+            return argv
+        return confine_lib.bridge_child_argv(
+            argv, hold, session.get("confine_meta"), session_dir=session["cwd"])
 
     def _run_prompt(self, req_id: object, params: dict) -> None:
         sid = str(params.get("sessionId") or "")
@@ -285,7 +310,14 @@ class NativeCodexAcpServer:
         with self._proc_lock:
             self._cancelled_sessions.discard(sid)
 
-        argv = self._build_codex_argv(session)
+        try:
+            argv = self._child_argv(session)
+        except confine_lib.ConfineError as exc:
+            self._send_error(
+                req_id, -32001, exc.message,
+                data={"kind": "refused", "code": "acp-confine-unavailable"},
+            )
+            return
         try:
             proc = subprocess.Popen(
                 argv,
@@ -392,6 +424,7 @@ class NativeCodexAcpServer:
 
     def serve(self) -> int:
         prompt_threads: list[threading.Thread] = []
+        _end_children_on_sigterm(self)
         try:
             while True:
                 raw = sys.stdin.readline()
@@ -444,12 +477,31 @@ class NativeCodexAcpServer:
                 else:
                     self._send_error(req_id, -32601, f"Method not found: {method}")
         finally:
-            for sid in list(self._active_procs):
-                self._terminate_session_proc(sid)
+            self.end_all()
             for th in prompt_threads:
                 if th.is_alive():
                     th.join(timeout=1.0)
         return 0
+
+
+def _end_children_on_sigterm(server) -> None:
+    """On SIGTERM (the adapter ending this bridge's group), end the CLI children too.
+
+    Each child leads its own process group, so killing the bridge's group alone
+    would leave them, and what they started, running.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        return
+
+    def _handler(signum, _frame):
+        server.end_all()
+        os._exit(128 + signum)
+
+    try:
+        signal.signal(signal.SIGTERM, _handler)
+        signal.signal(signal.SIGHUP, _handler)
+    except (ValueError, OSError):
+        pass
 
 
 def main(argv: list[str] | None = None) -> int:

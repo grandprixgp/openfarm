@@ -68,7 +68,8 @@ _TABLE_KEYS = {
                      "spend_per_night", "cost_per_1k_in", "cost_per_1k_out",
                      "auth", "auth_file", "isolate_home", "shape_cards",
                      "scaffold_contracts", "coach_on_stall",
-                     "adjudicate_counter_tests", "pre_review"},
+                     "adjudicate_counter_tests", "pre_review",
+                     "confine", "confine_read_roots"},
     "state": {"min_free_mb"},
     "harness": {"enabled", "dir", "capture_on", "max_cues_per_brief",
                 "max_active_adaptations", "min_confidence", "probe_window",
@@ -302,6 +303,7 @@ class MicromanagerConfig:
         "auth", "auth_file", "isolate_home", "shape_cards",
         "scaffold_contracts", "coach_on_stall",
         "adjudicate_counter_tests", "pre_review",
+        "confine", "confine_read_roots",
     )
 
     def __init__(self, **kwargs) -> None:
@@ -784,7 +786,22 @@ class Config:
                 "[micromanager] adjudicate_counter_tests", True),
             pre_review=_as_bool(mm.get("pre_review"),
                                 "[micromanager] pre_review", True),
+            # How provider children are held (see confine.py): auto, bwrap or off.
+            confine=_as_choice(mm.get("confine"), "[micromanager] confine",
+                               "auto", ("auto", "bwrap", "off")),
+            confine_read_roots=self._confine_read_roots(mm.get("confine_read_roots")),
         )
+
+    def _confine_read_roots(self, value) -> list[str]:
+        roots = _as_str_list(value, "[micromanager] confine_read_roots")
+        out: list[str] = []
+        for raw in roots:
+            path = Path(os.path.expanduser(raw))
+            if "\x00" in raw or not path.is_absolute():
+                raise ConfigError(
+                    f"[micromanager] confine_read_roots: {raw!r} must be an absolute path")
+            out.append(str(path))
+        return out
 
     def _parse_extra_gates(self, value) -> list[ExtraGate]:
         if value is None:

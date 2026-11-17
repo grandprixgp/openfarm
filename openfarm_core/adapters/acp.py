@@ -40,6 +40,8 @@ import time
 from pathlib import Path
 from typing import Callable
 
+from .. import confine as confine_lib
+from .. import logins
 from ..errors import AdapterError, Infra, Invalid, Refused
 from ..globs import escapes, matches_any, normalise
 
@@ -101,6 +103,16 @@ def _cleanup_all_isolated_homes() -> None:
 
 atexit.register(_cleanup_all_isolated_homes)
 
+_WARNED: set[str] = set()
+
+
+def _warn_once(text: str) -> None:
+    with _ISOLATED_HOMES_LOCK:
+        if text in _WARNED:
+            return
+        _WARNED.add(text)
+    print(f"openfarm: {text}", file=sys.stderr)
+
 # Control sequence strippers. Order matters: complete sequences first, then
 # lone unclosed prefixes so subsequent printable text is never truncated.
 _OSC_COMPLETE_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
@@ -134,6 +146,110 @@ _DEFAULT_FORBIDDEN_FILES: tuple[str, ...] = (
 CLAUDE_NATIVE_ACP = Path(__file__).resolve().with_name("claude_native_acp.py")
 AGY_NATIVE_ACP = Path(__file__).resolve().with_name("agy_native_acp.py")
 CODEX_NATIVE_ACP = Path(__file__).resolve().with_name("codex_native_acp.py")
+_BRIDGE_SCRIPTS = {
+    CLAUDE_NATIVE_ACP: "claude",
+    AGY_NATIVE_ACP: "antigravity",
+    CODEX_NATIVE_ACP: "codex",
+}
+# Providers whose children report a cost per turn (claude -p and claude-agent-acp do;
+# codex exec --json and agy report none).
+_COST_REPORTING_PROVIDERS = frozenset({"claude"})
+
+
+def provider_reports_cost(provider: str) -> bool:
+    """True when this provider's child reports a vendor cost per turn."""
+    return normalize_acp_provider(provider) in _COST_REPORTING_PROVIDERS
+
+
+def provider_prices_spend(provider: str, cost_per_1k_in: float = 0.0,
+                          cost_per_1k_out: float = 0.0) -> bool:
+    """Spend is measured when the provider reports cost or per-1k rates are set."""
+    return provider_reports_cost(provider) or bool(cost_per_1k_in or cost_per_1k_out)
+
+
+class AcpCommand(list):
+    """An ACP command argv that carries its confinement settings along.
+
+    The settings reach the adapter through code that only passes `command` on
+    (the micromanager and the run's shared supervisor), so they ride with it.
+    """
+
+    confine: confine_lib.ConfineSettings = confine_lib.ConfineSettings()
+
+
+def acp_command(command: str | list[str], confine) -> AcpCommand:
+    """`command` as an argv list carrying `confine` (settings, a mode string or None)."""
+    if isinstance(command, str):
+        try:
+            argv = shlex.split(command)
+        except ValueError as exc:
+            raise Invalid("acp-bad-command", f"cannot parse ACP command {command!r}: {exc}") from exc
+    else:
+        argv = [str(part) for part in command]
+    out = AcpCommand(argv)
+    out.confine = confine_lib.as_settings(confine)
+    return out
+
+
+def _head_names_provider(argv: list[str]) -> tuple[str, str]:
+    """`(provider, word)` when the command's program names a provider, else `("", "")`.
+
+    Only the program (or, for an interpreter, the script it runs) counts; a model
+    name in the arguments never does.
+    """
+    if not argv:
+        return "", ""
+    words = [argv[0]]
+    if Path(argv[0]).name.rstrip("0123456789.") in ("python", "node", "nodejs") and len(argv) > 1:
+        words.append(argv[1])
+    for word in words:
+        name = Path(word).name.lower()
+        try:
+            res = Path(word).resolve()
+        except (OSError, ValueError):
+            res = None
+        if res is not None and res in _BRIDGE_SCRIPTS:
+            return _BRIDGE_SCRIPTS[res], word
+        if name in ("agy", "agy-print", "agy-acp", "agy_native_acp.py") or name.startswith("antigravity"):
+            return "antigravity", word
+        if name in ("codex", "codex-acp", "codex-exec", "codex_native_acp.py"):
+            return "codex", word
+        if name in ("claude", "claude-native", "claude-agent-acp", "claude_native_acp.py"):
+            return "claude", word
+    return "", ""
+
+
+def _bridge_provider(argv: list[str]) -> str:
+    """The provider of openfarm's own bridge when `argv` runs one, else ``""``."""
+    if len(argv) < 2:
+        return ""
+    try:
+        return _BRIDGE_SCRIPTS.get(Path(argv[1]).resolve(), "")
+    except (OSError, ValueError):
+        return ""
+
+
+def check_provider_matches(command: str | list[str] | None, provider: str, *,
+                           where: str = "") -> None:
+    """Refuse a command whose program names another provider than `provider`."""
+    if command is None or not str(provider or "").strip():
+        return
+    prov = normalize_acp_provider(provider)
+    if isinstance(command, str):
+        try:
+            argv = shlex.split(command)
+        except ValueError:
+            argv = command.split()
+    else:
+        argv = [str(p) for p in command]
+    named, word = _head_names_provider(argv)
+    if named and named != prov:
+        place = f" ({where})" if where else ""
+        raise Invalid(
+            "acp-provider-mismatch",
+            f"the ACP adapter is for {prov} but its binary {word!r} is {named}{place}; "
+            f"set the binary to a {prov} program (or \"auto\"), or name the {named} adapter",
+        )
 
 
 def normalize_acp_provider(value: str) -> str:
@@ -257,10 +373,15 @@ def _is_acp_auth_error(code: object, message: str, data: object) -> bool:
 def resolve_acp_command(
     command: str | list[str],
     *,
-    provider: str = "claude",
+    provider: str = "",
     python_exe: str | None = None,
 ) -> list[str]:
-    """Resolve an ACP command string/argv across Claude, Antigravity, and Codex."""
+    """Resolve an ACP command string/argv across Claude, Antigravity, and Codex.
+
+    One provider decides: an explicit `provider` is used as given (a binary that
+    names another provider is refused), and without one it is inferred from the
+    command.
+    """
     if isinstance(command, str):
         argv = shlex.split(command)
     else:
@@ -273,13 +394,10 @@ def resolve_acp_command(
     head_name = Path(head).name
     py = python_exe or sys.executable
 
-    prov = normalize_acp_provider(provider or "claude")
-    if prov == "claude" and (
-        head in ("agy", "antigravity", "agy-print", "antigravity-print", "antigravity-acp", "agy-acp")
-        or head_name in ("agy", "antigravity", "agy-print", "antigravity-print", "antigravity-acp", "agy-acp", "agy_native_acp.py")
-        or head in ("codex", "codex-acp", "codex-exec")
-        or head_name in ("codex", "codex-acp", "codex-exec", "codex_native_acp.py")
-    ):
+    if str(provider or "").strip():
+        prov = normalize_acp_provider(provider)
+        check_provider_matches(argv, prov)
+    else:
         prov = infer_acp_provider(argv)
 
     if prov == "antigravity":
@@ -350,11 +468,20 @@ def _sanitised_env(
     forbidden_files: list[str] | tuple[str, ...] = (),
     provider: str = "claude",
 ) -> tuple[dict[str, str], Path | None]:
-    """Build a sanitised subprocess environment and optional isolated HOME dir."""
+    """Build a sanitised subprocess environment and optional isolated HOME dir.
+
+    The login copied into the isolated home is read from where the provider keeps
+    it (`logins.login_place`: `CLAUDE_CONFIG_DIR` / `CODEX_HOME` first, `$HOME`
+    second), and the child's `CLAUDE_CONFIG_DIR` / `CODEX_HOME` point inside the
+    isolated home, never at the real folders.
+    """
     prov = normalize_acp_provider(provider or "claude")
     source = os.environ if base_env is None else base_env
     orig_home = (extra_env or {}).get("HOME") or source.get("HOME", "")
     allow_oauth = auth_file is None and auth_mode in ("oauth", "auto")
+    login_env = logins.login_env_layer(base_env, extra_env)
+    src_place = logins.login_place(prov, env=login_env)
+    has_login_source = bool(orig_home or src_place.from_env)
 
     def _keep_var(key: str, val: object) -> bool:
         if key in _STRIPPED_ENV_EXACT or key.startswith("ANTIGRAVITY_"):
@@ -402,6 +529,11 @@ def _sanitised_env(
         isolated_home = Path(tempfile.mkdtemp(prefix="openfarm-acp-home-"))
         os.chmod(isolated_home, 0o700)
         _register_isolated_home(isolated_home)
+        # The real login folders are never handed on; the provider's own variable
+        # is set below to the copy inside the isolated home.
+        env.pop("CLAUDE_CONFIG_DIR", None)
+        env.pop("CODEX_HOME", None)
+        env.update(logins.isolated_login_env(prov, isolated_home))
         try:
             if prov == "claude":
                 claude_dir = isolated_home / ".claude"
@@ -438,18 +570,14 @@ def _sanitised_env(
                     os.chmod(helper_path, 0o700)
                     settings["apiKeyHelper"] = str(helper_path)
                 else:
-                    if orig_home and allow_oauth:
-                        creds_src = Path(orig_home) / ".claude" / ".credentials.json"
+                    if has_login_source and allow_oauth:
                         try:
-                            if creds_src.is_file():
-                                creds_dst = claude_dir / ".credentials.json"
-                                shutil.copyfile(creds_src, creds_dst)
-                                os.chmod(creds_dst, 0o600)
+                            logins.copy_in(src_place.credential, claude_dir / ".credentials.json")
                         except OSError:
                             pass
-                        claude_json_src = Path(orig_home) / ".claude.json"
+                        claude_json_src = src_place.meta
                         try:
-                            if claude_json_src.is_file():
+                            if claude_json_src is not None and claude_json_src.is_file():
                                 raw_meta = json.loads(
                                     claude_json_src.read_text(encoding="utf-8")
                                 )
@@ -461,11 +589,16 @@ def _sanitised_env(
                                         if k in raw_meta:
                                             slim_meta[k] = raw_meta[k]
                                     slim_meta["hasCompletedOnboarding"] = True
-                                    claude_json_dst = isolated_home / ".claude.json"
-                                    claude_json_dst.write_text(
-                                        json.dumps(slim_meta) + "\n", encoding="utf-8"
-                                    )
-                                    os.chmod(claude_json_dst, 0o600)
+                                    # $HOME/.claude.json, and the same file inside
+                                    # the folder CLAUDE_CONFIG_DIR names.
+                                    for claude_json_dst in (
+                                        isolated_home / ".claude.json",
+                                        claude_dir / ".claude.json",
+                                    ):
+                                        claude_json_dst.write_text(
+                                            json.dumps(slim_meta) + "\n", encoding="utf-8"
+                                        )
+                                        os.chmod(claude_json_dst, 0o600)
                         except (OSError, ValueError):
                             pass
 
@@ -481,27 +614,18 @@ def _sanitised_env(
                 ag_dir = gemini_dir / "antigravity-cli"
                 ag_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
                 os.chmod(ag_dir, 0o700)
-                if orig_home and allow_oauth:
-                    tok_src = Path(orig_home) / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
+                if has_login_source and allow_oauth:
                     try:
-                        if tok_src.is_file():
-                            tok_dst = ag_dir / "antigravity-oauth-token"
-                            shutil.copyfile(tok_src, tok_dst)
-                            os.chmod(tok_dst, 0o600)
+                        logins.copy_in(src_place.credential, ag_dir / "antigravity-oauth-token")
                     except OSError:
                         pass
             elif prov == "codex":
                 codex_dir = isolated_home / ".codex"
                 codex_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
                 os.chmod(codex_dir, 0o700)
-                env["CODEX_HOME"] = str(codex_dir)
-                if orig_home and allow_oauth:
-                    auth_src = Path(orig_home) / ".codex" / "auth.json"
+                if has_login_source and allow_oauth:
                     try:
-                        if auth_src.is_file():
-                            auth_dst = codex_dir / "auth.json"
-                            shutil.copyfile(auth_src, auth_dst)
-                            os.chmod(auth_dst, 0o600)
+                        logins.copy_in(src_place.credential, codex_dir / "auth.json")
                     except OSError:
                         pass
 
@@ -669,18 +793,34 @@ class ClaudeAcpAdapter:
         allowed_root: Path | str | None = None,
         max_line_bytes: int = DEFAULT_MAX_LINE_BYTES,
         stderr_tail_lines: int = 100,
+        confine=None,
     ) -> None:
         if auth_mode not in ("oauth", "api-key", "auto"):
             raise Invalid(
                 "acp-bad-auth-mode",
                 f"auth_mode must be 'oauth', 'api-key', or 'auto', got {auth_mode!r}",
             )
+        if str(provider or "").strip():
+            check_provider_matches(command, provider)
         self.provider = infer_acp_provider(command, provider)
         self.name = f"{self.provider}-acp"
         self.argv = resolve_acp_command(command, provider=self.provider)
+        if confine is None:
+            confine = getattr(command, "confine", None)
+        try:
+            self.confine = confine_lib.as_settings(confine)
+        except confine_lib.ConfineError as exc:
+            raise Invalid(exc.code, exc.message) from exc
+        self.transport = "bridge" if _bridge_provider(self.argv) else "server"
+        self.process_hold: confine_lib.Hold | None = None
+        self._boundary_root: Path | None = None
+        self.notes: list[str] = []
 
         self.cwd = Path(cwd or Path.cwd())
         self.allowed_root = Path(allowed_root or self.cwd).resolve()
+        self._session_roots: dict[str, Path] = {}
+        self._cred_source: Path | None = None
+        self.last_sync = None
         self.isolate_home = bool(isolate_home)
         self.auth_file = Path(auth_file) if auth_file is not None else None
         self.auth_mode = str(auth_mode)
@@ -754,6 +894,14 @@ class ClaudeAcpAdapter:
         self._stderr_tail.clear()
         self._orig_home = (self.extra_env or {}).get("HOME") or os.environ.get("HOME", "")
         self._initial_creds_bytes = None
+        hold = self._decide_hold("none")
+        if self.transport == "server" and hold.refused:
+            raise Refused("acp-confine-unavailable", hold.refused)
+        login_place = logins.login_place(
+            self.provider, env=logins.login_env_layer(None, self.extra_env))
+        self._cred_source = login_place.credential
+        if not (self._orig_home or login_place.from_env):
+            self._cred_source = None
         env, isolated_home = _sanitised_env(
             extra_env=self.extra_env,
             isolate_home=self.isolate_home,
@@ -765,15 +913,31 @@ class ClaudeAcpAdapter:
         )
         self._isolated_home = isolated_home
         if isolated_home is not None:
-            iso_creds = self._isolated_cred_path(isolated_home)
-            if iso_creds.is_file():
+            iso_rel = self._isolated_cred_path(isolated_home).relative_to(isolated_home).parts
+            initial, _why = logins.read_isolated(isolated_home, iso_rel)
+            self._initial_creds_bytes = initial
+        argv = list(self.argv)
+        if self.transport == "server":
+            self.process_hold = hold
+            self._note_hold(hold)
+            if hold.boundary:
                 try:
-                    self._initial_creds_bytes = iso_creds.read_bytes()
-                except OSError:
-                    self._initial_creds_bytes = None
+                    argv = confine_lib.boundary_argv(
+                        argv,
+                        session_dir=self.cwd,
+                        home_dir=isolated_home,
+                        hide_globs=self._hide_globs(),
+                        hide_paths=self.confine.hide_paths,
+                        read_roots=self.confine.read_roots,
+                        env=env,
+                    )
+                except confine_lib.ConfineError as exc:
+                    self._cleanup_isolated_home()
+                    raise Refused("acp-confine-unavailable", exc.message) from exc
+                self._boundary_root = self.cwd.resolve()
         try:
             proc = subprocess.Popen(
-                self.argv,
+                argv,
                 cwd=str(self.cwd),
                 env=env,
                 stdin=subprocess.PIPE,
@@ -786,7 +950,7 @@ class ClaudeAcpAdapter:
             self._cleanup_isolated_home()
             raise Infra(
                 "acp-spawn-failed",
-                f"{self.argv[0]} could not start: {exc}",
+                f"{argv[0]} could not start: {exc}",
             ) from exc
 
         self._proc = proc
@@ -985,70 +1149,103 @@ class ClaudeAcpAdapter:
     def _isolated_cred_path(self, home_dir: Path) -> Path:
         return home_dir.joinpath(*self._cred_relpath())
 
+    # -- confinement ----------------------------------------------------------
+
+    def _hide_globs(self) -> list[str]:
+        out: list[str] = []
+        for pat in (*_DEFAULT_FORBIDDEN_FILES, *self.forbidden_files, *self.never_touch):
+            norm = normalise(str(pat or ""))
+            if norm and norm not in out:
+                out.append(norm)
+        return out
+
+    def _decide_hold(self, tool_policy: str) -> confine_lib.Hold:
+        mode = self.confine.mode
+        needs_check = not (mode == "off" or (mode == "auto" and self.provider == "claude"))
+        usable, reason = confine_lib.bwrap_status() if needs_check else (False, "")
+        return confine_lib.decide(
+            self.provider,
+            transport=self.transport,
+            tool_policy=tool_policy,
+            mode=mode,
+            bwrap_usable=usable,
+            bwrap_reason=reason,
+        )
+
+    def _note_hold(self, hold: confine_lib.Hold) -> None:
+        if hold.note and hold.note not in self.notes:
+            self.notes.append(hold.note)
+            _warn_once(hold.note)
+
+    def confinement_summary(self) -> dict:
+        """How this adapter's children are (or would be) held, per tool policy."""
+        out: dict[str, object] = {"mode": self.confine.mode, "transport": self.transport}
+        for policy in ("none", "read-only"):
+            out[policy] = self._decide_hold(policy).as_dict()
+        return out
+
+    def _bridge_meta(self, tool_policy: str, hold: confine_lib.Hold) -> dict:
+        return {
+            "toolPolicy": tool_policy,
+            "confine": {
+                "mode": self.confine.mode,
+                "flags": hold.flags,
+                "boundary": hold.boundary,
+                "bwrap": confine_lib.find_bwrap() if hold.boundary else "",
+                "hideGlobs": self._hide_globs(),
+                "hidePaths": list(self.confine.hide_paths),
+                "readRoots": list(self.confine.read_roots),
+            },
+        }
+
+    def _check_session_inside_boundary(self, session_cwd: Path) -> None:
+        root = self._boundary_root
+        if root is None:
+            return
+        try:
+            resolved = session_cwd.resolve()
+        except (OSError, ValueError) as exc:
+            raise Refused("acp-confine-session-outside", f"bad session folder {session_cwd}: {exc}") from exc
+        if resolved != root and root not in resolved.parents:
+            raise Refused(
+                "acp-confine-session-outside",
+                f"this {self.provider} ACP server was confined to {root} when it started; "
+                f"a session at {resolved} would be outside its boundary. Use openfarm's own "
+                "bridge ([micromanager] binary = \"codex-exec\" for Codex, \"agy-print\" for "
+                "Antigravity), or set [micromanager] confine = \"off\".",
+            )
+        parts = resolved.relative_to(root).parts
+        globs = self._hide_globs()
+        if any(matches_any("/".join(parts[: i + 1]), globs) for i in range(len(parts))):
+            raise Refused(
+                "acp-confine-session-outside",
+                f"session folder {resolved} is hidden inside this server's boundary "
+                "(never_touch / forbidden_files)",
+            )
+
     def _persist_refreshed_oauth_credentials(self) -> None:
-        """Persist refreshed OAuth credentials back to host HOME safely."""
+        """Copy a refreshed login back to where it was read from, if it is safe to."""
         if (
             self._isolated_home is None
             or self.auth_file is not None
             or self.auth_mode not in ("oauth", "auto")
-            or not self._orig_home
+            or self._cred_source is None
         ):
             return
-        iso_creds = self._isolated_cred_path(self._isolated_home)
-        if not iso_creds.is_file():
-            return
-        try:
-            raw = iso_creds.read_bytes()
-        except OSError:
-            return
-        if not raw or raw == self._initial_creds_bytes:
-            return
-
-        if self.provider == "claude":
-            try:
-                parsed = json.loads(raw.decode("utf-8"))
-            except (ValueError, UnicodeDecodeError):
-                return
-            if not isinstance(parsed, dict) or not isinstance(
-                parsed.get("claudeAiOauth"), dict
-            ):
-                return
-            prefix = ".credentials-"
-        elif self.provider == "antigravity":
-            try:
-                decoded = raw.decode("utf-8")
-            except UnicodeDecodeError:
-                return
-            if not decoded.strip() or "\x00" in decoded:
-                return
-            prefix = ".antigravity-oauth-token-"
-        else:  # codex
-            try:
-                parsed = json.loads(raw.decode("utf-8"))
-            except (ValueError, UnicodeDecodeError):
-                return
-            if not isinstance(parsed, dict):
-                return
-            prefix = ".auth-"
-
-        target = Path(self._orig_home).joinpath(*self._cred_relpath())
-        target_dir = target.parent
-        if not target_dir.is_dir():
-            return
-        try:
-            fd, tmp_name = tempfile.mkstemp(prefix=prefix, dir=str(target_dir))
-            tmp_path = Path(tmp_name)
-            try:
-                os.chmod(tmp_path, 0o600)
-                with os.fdopen(fd, "wb") as handle:
-                    handle.write(raw)
-                os.replace(tmp_path, target)
-                os.chmod(target, 0o600)
-            except Exception:
-                tmp_path.unlink(missing_ok=True)
-                raise
-        except OSError:
-            return
+        result = logins.sync_back(
+            self.provider,
+            isolated_home=self._isolated_home,
+            target=self._cred_source,
+            initial=self._initial_creds_bytes,
+        )
+        self.last_sync = result
+        if result.status == "refused":
+            note = (
+                f"the refreshed {self.provider} login was not copied back to "
+                f"{self._cred_source}: {result.reason}"
+            )
+            self.notes.append(note)
+            print(f"openfarm: {note}", file=sys.stderr)
 
     def _cleanup_isolated_home(self) -> None:
         if self._isolated_home is not None:
@@ -1089,8 +1286,10 @@ class ClaudeAcpAdapter:
             self._initialized = False
             self._authenticated = False
             self._session_ids.clear()
+            self._session_roots.clear()
             self._session_cost_usd = 0.0
             self._initial_creds_bytes = None
+            self._boundary_root = None
             self._cleanup_isolated_home()
 
     # -- ACP RPC methods ------------------------------------------------------
@@ -1347,8 +1546,15 @@ class ClaudeAcpAdapter:
                 "acp-bad-tool-policy",
                 f"tool_policy must be 'none' or 'read-only', got {tool_policy!r}",
             )
+        session_path = Path(cwd) if cwd is not None else self.cwd
+        hold = self._decide_hold(tool_policy)
+        if hold.refused:
+            raise Refused("acp-confine-unavailable", hold.refused)
         if not self._initialized:
             self.initialize(timeout_s=timeout_s)
+        self._check_session_inside_boundary(session_path)
+        if self.transport == "bridge":
+            self._note_hold(hold)
         if (
             not self._authenticated
             and self.auth_methods
@@ -1388,8 +1594,11 @@ class ClaudeAcpAdapter:
             if effort:
                 codex_opts["effort"] = str(effort)
             meta["codex"] = {"options": codex_opts}
+        if self.transport == "bridge":
+            # openfarm's own bridges apply the policy and the boundary per prompt.
+            meta["openfarm"] = self._bridge_meta(tool_policy, hold)
 
-        session_cwd = str(Path(cwd) if cwd is not None else self.cwd)
+        session_cwd = str(session_path)
         req_id = self._next_id()
         deadline = time.monotonic() + float(timeout_s)
         self._send_json(
@@ -1423,10 +1632,22 @@ class ClaudeAcpAdapter:
                 )
         self._session_cost_usd = 0.0
         self._session_policies[session_id] = tool_policy
+        self._remember_session_root(session_id, cwd)
         self._seen_request_ids.setdefault(session_id, set())
         if session_id not in self._session_ids:
             self._session_ids.append(session_id)
         return session_id
+
+    def _remember_session_root(self, session_id: str, cwd: Path | str | None) -> None:
+        # A permission request is judged against its own session's folder; a
+        # session opened without one falls back to the adapter's root.
+        if cwd is None:
+            self._session_roots.pop(session_id, None)
+            return
+        try:
+            self._session_roots[session_id] = Path(cwd).resolve()
+        except (OSError, ValueError):
+            self._session_roots.pop(session_id, None)
 
     def load_session(
         self,
@@ -1440,10 +1661,15 @@ class ClaudeAcpAdapter:
                 "acp-bad-tool-policy",
                 f"tool_policy must be 'none' or 'read-only', got {tool_policy!r}",
             )
+        hold = self._decide_hold(tool_policy)
+        if hold.refused:
+            raise Refused("acp-confine-unavailable", hold.refused)
         if not self._initialized:
             self.initialize(timeout_s=timeout_s)
 
-        session_cwd = str(Path(cwd) if cwd is not None else self.cwd)
+        session_path = Path(cwd) if cwd is not None else self.cwd
+        self._check_session_inside_boundary(session_path)
+        session_cwd = str(session_path)
         req_id = self._next_id()
         deadline = time.monotonic() + float(timeout_s)
         self._replaying_history = True
@@ -1472,6 +1698,7 @@ class ClaudeAcpAdapter:
 
         self._session_cost_usd = 0.0
         self._session_policies[session_id] = tool_policy
+        self._remember_session_root(session_id, cwd)
         self._seen_request_ids.setdefault(session_id, set())
         if session_id not in self._session_ids:
             self._session_ids.append(session_id)
@@ -1490,7 +1717,10 @@ class ClaudeAcpAdapter:
 
     # -- permission & request enforcement -------------------------------------
 
-    def _is_path_allowed_readonly(self, raw_path: str) -> tuple[bool, str]:
+    def _is_path_allowed_readonly(
+        self, raw_path: str, root: Path | None = None
+    ) -> tuple[bool, str]:
+        allowed_root = Path(root) if root is not None else self.allowed_root
         raw_str = str(raw_path)
         if "\x00" in raw_str:
             return False, "nul-path"
@@ -1510,11 +1740,11 @@ class ClaudeAcpAdapter:
                     return False, "forbidden-file"
                 if matches_any(lexical_norm, self.never_touch):
                     return False, "never-touch"
-                resolved = (self.allowed_root / lexical_norm).resolve()
+                resolved = (allowed_root / lexical_norm).resolve()
             else:
                 resolved = candidate.resolve()
 
-            root = self.allowed_root.resolve()
+            root = allowed_root.resolve()
             if resolved != root and root not in resolved.parents:
                 return False, "outside-allowed-root"
 
@@ -1540,6 +1770,7 @@ class ClaudeAcpAdapter:
         *,
         timeout_s: float = 30.0,
         cancel_check: Callable[[], bool] | None = None,
+        session_id: str = "",
     ) -> None:
         options = params.get("options")
         if not isinstance(options, list):
@@ -1550,10 +1781,15 @@ class ClaudeAcpAdapter:
 
         tool_kind = str(tool_call.get("kind", "")).strip().lower()
         extracted_paths = _extract_paths_from_tool_call(tool_call)
+        session_root = self._session_roots.get(str(session_id or ""))
+        named_sid = params.get("sessionId")
 
         allow = False
         reason = "policy-none"
-        if tool_policy == "read-only":
+        if session_id and named_sid is not None and str(named_sid) != str(session_id):
+            # A request naming another session is judged by no one's folder.
+            reason = "session-mismatch"
+        elif tool_policy == "read-only":
             if tool_kind not in ("read", "search"):
                 allow = False
                 reason = f"tool-kind-{tool_kind or 'unknown'}-disallowed"
@@ -1563,7 +1799,7 @@ class ClaudeAcpAdapter:
             else:
                 all_ok = True
                 for p in extracted_paths:
-                    ok, why = self._is_path_allowed_readonly(p)
+                    ok, why = self._is_path_allowed_readonly(p, session_root)
                     if not ok:
                         all_ok = False
                         reason = why
@@ -1809,6 +2045,7 @@ class ClaudeAcpAdapter:
                             permission_events,
                             timeout_s=resp_timeout,
                             cancel_check=cancel_check,
+                            session_id=session_id,
                         )
                     elif method == "elicitation/create":
                         permission_events.append(

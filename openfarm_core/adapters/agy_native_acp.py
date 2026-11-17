@@ -18,7 +18,15 @@ import threading
 import uuid
 from pathlib import Path
 
+if __package__ in (None, ""):
+    # Run as a script by the ACP adapter: make the package importable.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from openfarm_core import confine as confine_lib
+
 PROTOCOL_VERSION = 1
+# Linux's MAX_ARG_STRLEN: one argv word, NUL included, is at most 32 pages.
+MAX_ARG_BYTES = 32 * 4096
 _AUTH_HINT_RE = re.compile(
     r"not logged in|please run /login|authentication_failed|"
     r"authentication required|not authenticated|invalid.*token|"
@@ -137,25 +145,16 @@ class NativeAgyAcpServer:
         with self._proc_lock:
             self._cancelled_sessions.add(session_id)
             proc = self._active_procs.get(session_id)
-        if proc is None or proc.poll() is not None:
-            return
-        try:
-            os.killpg(proc.pid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError, OSError):
-            try:
-                proc.terminate()
-            except OSError:
-                pass
-        try:
-            proc.wait(timeout=1.0)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError, OSError):
-                try:
-                    proc.kill()
-                except OSError:
-                    pass
+        # The child leads its own process group: end the whole group, so the
+        # commands it started do not outlive a cancelled or timed-out turn.
+        confine_lib.end_process_group(proc)
+
+    def end_all(self) -> None:
+        """End every running child's process group (on close or SIGTERM)."""
+        with self._proc_lock:
+            procs = list(self._active_procs.items())
+        for sid, _proc in procs:
+            self._terminate_session_proc(sid)
 
     def _handle_initialize(self, req_id: object) -> None:
         self._initialized = True
@@ -214,6 +213,20 @@ class NativeAgyAcpServer:
         elif isinstance(sys_meta, dict) and sys_meta.get("append"):
             system_prompt = str(sys_meta.get("append") or "")
 
+        of_meta = meta.get("openfarm") if isinstance(meta.get("openfarm"), dict) else {}
+        tool_policy = str(of_meta.get("toolPolicy") or "none")
+        if tool_policy not in ("none", "read-only"):
+            self._send_error(req_id, -32602, f"Unknown tool policy: {tool_policy!r}")
+            return
+        confine_meta = of_meta.get("confine")
+        hold = confine_lib.bridge_plan("antigravity", tool_policy, confine_meta)
+        if hold.refused:
+            self._send_error(
+                req_id, -32001, hold.refused,
+                data={"kind": "refused", "code": "acp-confine-unavailable"},
+            )
+            return
+
         sid = f"agy-native-{uuid.uuid4().hex[:12]}"
         model = str(opts.get("model") or "")
         effort = str(opts.get("effort") or "")
@@ -221,6 +234,9 @@ class NativeAgyAcpServer:
             "cwd": cwd,
             "model": model,
             "effort": effort,
+            "tool_policy": tool_policy,
+            "hold": hold,
+            "confine_meta": confine_meta if isinstance(confine_meta, dict) else {},
             "system_prompt": system_prompt,
             "used_tokens": 0,
             "cum_cost": 0.0,
@@ -273,6 +289,13 @@ class NativeAgyAcpServer:
         argv.extend(["-p", full_prompt])
         return argv
 
+    def _child_argv(self, session: dict, argv: list[str]) -> list[str]:
+        hold = session.get("hold")
+        if hold is None:
+            return argv
+        return confine_lib.bridge_child_argv(
+            argv, hold, session.get("confine_meta"), session_dir=session["cwd"])
+
     def _run_prompt(self, req_id: object, params: dict) -> None:
         sid = str(params.get("sessionId") or "")
         session = self._sessions.get(sid)
@@ -290,7 +313,30 @@ class NativeAgyAcpServer:
         with self._proc_lock:
             self._cancelled_sessions.discard(sid)
 
+        size = len(full_prompt.encode("utf-8"))
+        if size + 1 > MAX_ARG_BYTES:
+            # agy takes the prompt as one argv word (-p); Linux refuses a word over
+            # MAX_ARG_STRLEN with "[Errno 7] Argument list too long".
+            self._send_error(
+                req_id,
+                -32602,
+                f"the prompt is {size} bytes, but agy takes it as one command-line "
+                f"argument (-p) and Linux caps one argument at {MAX_ARG_BYTES} bytes "
+                f"(MAX_ARG_STRLEN, including its NUL); shorten the prompt below "
+                f"{MAX_ARG_BYTES - 1} bytes",
+                data={"kind": "refused", "code": "agy-prompt-too-large",
+                      "bytes": size, "limit": MAX_ARG_BYTES - 1},
+            )
+            return
         argv = self._build_agy_argv(session, full_prompt)
+        try:
+            argv = self._child_argv(session, argv)
+        except confine_lib.ConfineError as exc:
+            self._send_error(
+                req_id, -32001, exc.message,
+                data={"kind": "refused", "code": "acp-confine-unavailable"},
+            )
+            return
         try:
             proc = subprocess.Popen(
                 argv,
@@ -431,6 +477,7 @@ class NativeAgyAcpServer:
 
     def serve(self) -> int:
         prompt_threads: list[threading.Thread] = []
+        _end_children_on_sigterm(self)
         try:
             while True:
                 raw = sys.stdin.readline()
@@ -485,12 +532,31 @@ class NativeAgyAcpServer:
                 else:
                     self._send_error(req_id, -32601, f"Method not found: {method}")
         finally:
-            for sid in list(self._active_procs):
-                self._terminate_session_proc(sid)
+            self.end_all()
             for th in prompt_threads:
                 if th.is_alive():
                     th.join(timeout=1.0)
         return 0
+
+
+def _end_children_on_sigterm(server) -> None:
+    """On SIGTERM (the adapter ending this bridge's group), end the CLI children too.
+
+    Each child leads its own process group, so killing the bridge's group alone
+    would leave them, and what they started, running.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        return
+
+    def _handler(signum, _frame):
+        server.end_all()
+        os._exit(128 + signum)
+
+    try:
+        signal.signal(signal.SIGTERM, _handler)
+        signal.signal(signal.SIGHUP, _handler)
+    except (ValueError, OSError):
+        pass
 
 
 def main(argv: list[str] | None = None) -> int:

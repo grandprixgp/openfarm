@@ -16,9 +16,13 @@ import subprocess
 import tomllib
 from pathlib import Path
 
+from . import confine as confine_lib
+from . import logins
 from .adapters.acp import (
     ACP_PROVIDERS,
     ClaudeAcpAdapter,
+    _bridge_provider,
+    _sanitised_env,
     acp_adapter_for_provider,
     infer_acp_provider,
     is_acp_adapter,
@@ -37,15 +41,18 @@ def _safe_claude_auth_status(
     *,
     home: Path,
     timeout_s: float = 5.0,
+    config_dir: Path | None = None,
 ) -> dict:
     """Query `claude auth status` while stripping personal email/org fields."""
     env = {
         k: v
         for k, v in os.environ.items()
-        if k not in ("CLAUDECODE", "ANTHROPIC_AUTH_TOKEN", "AI_AGENT")
+        if k not in ("CLAUDECODE", "ANTHROPIC_AUTH_TOKEN", "AI_AGENT", "CLAUDE_CONFIG_DIR")
         and not k.startswith("CLAUDE_CODE_")
     }
     env["HOME"] = str(home)
+    if config_dir is not None:
+        env["CLAUDE_CONFIG_DIR"] = str(config_dir)
     try:
         proc = subprocess.run(
             [claude_bin, "auth", "status"],
@@ -90,15 +97,18 @@ def _safe_codex_auth_status(
     *,
     home: Path,
     timeout_s: float = 5.0,
+    codex_home: Path | None = None,
 ) -> dict:
-    """Query `codex login status` without leaking email/account identifiers."""
-    env = {
-        k: v
-        for k, v in os.environ.items()
-        if k not in ("OPENAI_API_KEY", "CODEX_HOME")
-    }
+    """Query `codex login status` without leaking email/account identifiers.
+
+    The child gets the environment every Codex child gets (no Claude session
+    variables, no Antigravity variables, no `OPENAI_API_KEY` in OAuth mode).
+    """
+    env, _ = _sanitised_env(provider="codex", isolate_home=False, auth_mode="oauth")
+    env.pop("CODEX_HOME", None)
+    env.pop("CLAUDE_CONFIG_DIR", None)
     env["HOME"] = str(home)
-    env["CODEX_HOME"] = str(home / ".codex")
+    env["CODEX_HOME"] = str(codex_home if codex_home is not None else home / ".codex")
     try:
         proc = subprocess.run(
             [codex_bin, "login", "status"],
@@ -145,6 +155,7 @@ def _inspect_single_provider(
     *,
     resolved_home: Path,
     source_env: dict[str, str] | os._Environ[str],
+    place: logins.LoginPlace | None = None,
     claude_bin: str | None = None,
     acp_bin: str | None = None,
     agy_bin: str | None = None,
@@ -155,12 +166,14 @@ def _inspect_single_provider(
     if provider == "claude":
         resolved_claude = claude_bin if claude_bin is not None else (shutil.which("claude") or "")
         resolved_acp = acp_bin if acp_bin is not None else (shutil.which("claude-agent-acp") or "")
-        creds_file = resolved_home / ".claude" / ".credentials.json"
+        place = place or logins.login_place("claude", env={}, home=resolved_home)
+        creds_file = place.credential
         creds_present = creds_file.is_file()
         creds_mode = oct(stat.S_IMODE(creds_file.stat().st_mode)) if creds_present else None
         oauth_token_env = bool(str(source_env.get("CLAUDE_CODE_OAUTH_TOKEN") or "").strip())
         cli_status = (
-            _safe_claude_auth_status(resolved_claude, home=resolved_home)
+            _safe_claude_auth_status(resolved_claude, home=resolved_home,
+                                     config_dir=place.config_dir if place.from_env else None)
             if resolved_claude
             else {"available": False, "loggedIn": False}
         )
@@ -190,6 +203,7 @@ def _inspect_single_provider(
             "oauth_token_env": oauth_token_env,
             "credentials_file_present": creds_present,
             "credentials_mode": creds_mode,
+            "credentials_from": place.from_env or "HOME",
             "cli_auth": cli_status,
         }
 
@@ -200,7 +214,8 @@ def _inspect_single_provider(
             if antigravity_acp_bin is not None
             else (shutil.which("antigravity-acp") or "")
         )
-        token_file = resolved_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
+        place = place or logins.login_place("antigravity", env={}, home=resolved_home)
+        token_file = place.credential
         token_present = token_file.is_file()
         token_nonempty = False
         token_mode = None
@@ -251,7 +266,8 @@ def _inspect_single_provider(
     resolved_acp = (
         codex_acp_bin if codex_acp_bin is not None else (shutil.which("codex-acp") or "")
     )
-    auth_file = resolved_home / ".codex" / "auth.json"
+    place = place or logins.login_place("codex", env={}, home=resolved_home)
+    auth_file = place.credential
     auth_present = auth_file.is_file()
     auth_nonempty = False
     auth_mode = None
@@ -264,7 +280,7 @@ def _inspect_single_provider(
             auth_present = False
     api_key_env = bool(str(source_env.get("OPENAI_API_KEY") or "").strip())
     cli_status = (
-        _safe_codex_auth_status(resolved_codex, home=resolved_home)
+        _safe_codex_auth_status(resolved_codex, home=resolved_home, codex_home=place.config_dir)
         if resolved_codex
         else {"available": False, "loggedIn": False}
     )
@@ -293,6 +309,7 @@ def _inspect_single_provider(
         "api_key_env": api_key_env,
         "credentials_file_present": auth_present,
         "credentials_mode": auth_mode,
+        "credentials_from": place.from_env or "HOME",
         "cli_auth": cli_status,
     }
 
@@ -315,6 +332,9 @@ def inspect_acp_status(
         Path(home).expanduser().resolve() if home is not None else Path.home().resolve()
     )
     source_env = os.environ if env is None else env
+    # Where each login lives: the environment first, $HOME second; an explicit
+    # `home` without an explicit `env` looks in that home only.
+    login_env = None if (env is None and home is None) else (dict(env) if env is not None else None)
 
     cfg: Config | None = None
     repo_provider = "claude"
@@ -344,6 +364,9 @@ def inspect_acp_status(
             item,
             resolved_home=resolved_home,
             source_env=source_env,
+            place=logins.login_place(
+                item, env=login_env,
+                home=resolved_home if home is not None else None),
             claude_bin=claude_bin,
             acp_bin=acp_bin,
             agy_bin=agy_bin,
@@ -352,6 +375,7 @@ def inspect_acp_status(
             codex_acp_bin=codex_acp_bin,
         )
 
+    confinement = _confinement_report(cfg, providers)
     primary = providers[primary_provider]
     claude_info = providers.get("claude") or {}
 
@@ -369,7 +393,10 @@ def inspect_acp_status(
         "credentials_mode": primary["credentials_mode"],
         "cli_auth": primary["cli_auth"],
         "providers": providers,
+        "confinement": confinement,
     }
+    if confinement.get("notes"):
+        payload["hint"] = " ".join(str(n) for n in confinement["notes"])
     if "antigravity" in providers:
         payload["agy_cli"] = providers["antigravity"].get("agy_cli")
         payload["antigravity_acp"] = providers["antigravity"].get("antigravity_acp")
@@ -412,6 +439,57 @@ def inspect_acp_status(
     return payload
 
 
+def _repo_confine(cfg: Config | None) -> confine_lib.ConfineSettings:
+    if cfg is None:
+        return confine_lib.ConfineSettings()
+    return confine_lib.settings_from_config(cfg)
+
+
+def _provider_transport(cfg: Config | None, provider: str, info: dict) -> str:
+    """`bridge` when openfarm's own bridge would run this provider, else `server`."""
+    cmd: list[str] | None = None
+    if cfg is not None and is_acp_adapter(cfg.micromanager_adapter) \
+            and normalize_acp_provider(cfg.micromanager_adapter) == provider:
+        raw_bin = str(cfg.micromanager.binary or "auto")
+        if raw_bin != "auto":
+            try:
+                cmd = resolve_acp_command([raw_bin, *cfg.micromanager.args], provider=provider)
+            except (Invalid, ValueError):
+                cmd = None
+    if cmd is None:
+        cmd = [str(c) for c in (info.get("resolved_command") or [])]
+    return "bridge" if _bridge_provider(cmd) else "server"
+
+
+def _confinement_report(cfg: Config | None, providers: dict[str, dict]) -> dict:
+    """How each provider's child would be held, per tool policy, under the repo's setting."""
+    settings = _repo_confine(cfg)
+    needs_bwrap = settings.mode != "off" and (
+        settings.mode == "bwrap" or any(p != "claude" for p in providers))
+    usable, detail = confine_lib.bwrap_status() if needs_bwrap else (False, "not checked")
+    notes: list[str] = []
+    for name, info in providers.items():
+        transport = _provider_transport(cfg, name, info)
+        held: dict[str, object] = {"mode": settings.mode, "transport": transport}
+        for policy in ("none", "read-only"):
+            hold = confine_lib.decide(name, transport=transport, tool_policy=policy,
+                                      mode=settings.mode, bwrap_usable=usable,
+                                      bwrap_reason=detail)
+            held[policy] = hold.describe()
+            if hold.refused:
+                held[f"{policy}_refused"] = hold.refused
+            if hold.note and hold.note not in notes:
+                notes.append(hold.note)
+        info["confinement"] = held
+    return {
+        "setting": confine_lib.CONFINE_SETTING,
+        "mode": settings.mode,
+        "bwrap": {"usable": usable, "detail": detail},
+        "read_roots": list(settings.read_roots),
+        "notes": notes,
+    }
+
+
 def run_acp_login(
     *,
     provider: str = "claude",
@@ -444,7 +522,11 @@ def run_acp_login(
         Path(home).expanduser().resolve() if home is not None else None
     )
     if resolved_home is not None:
+        # An explicit home decides where the login goes, not this process's
+        # CLAUDE_CONFIG_DIR / CODEX_HOME.
         env["HOME"] = str(resolved_home)
+        env.pop("CLAUDE_CONFIG_DIR", None)
+        env.pop("CODEX_HOME", None)
 
     if prov == "antigravity":
         resolved_agy = agy_bin if agy_bin is not None else shutil.which("agy")
@@ -744,6 +826,24 @@ def configure_acp_repo(
     return status
 
 
+def _would_start_antigravity(cmd: str | list[str]) -> bool:
+    """True when probing `cmd` as Antigravity would start an Antigravity program."""
+    from .adapters.acp import _head_names_provider
+
+    try:
+        argv = resolve_acp_command(cmd, provider="antigravity")
+    except (Invalid, ValueError):
+        return True
+    named, _word = _head_names_provider(argv)
+    return named == "antigravity" or _bridge_provider(argv) == "antigravity"
+
+
+_AGY_PROBE_HINT = (
+    "probing Antigravity starts the agy program; it is only done when asked for by "
+    "name: `openfarm acp probe --provider antigravity`"
+)
+
+
 def _probe_single_provider(
     repo_path: Path,
     *,
@@ -753,6 +853,7 @@ def _probe_single_provider(
     effective_iso: bool,
     effective_auth_file: Path | str | None,
     timeout_s: float,
+    confine: confine_lib.ConfineSettings | None = None,
 ) -> dict[str, object]:
     adapter = ClaudeAcpAdapter(
         command=cmd,
@@ -761,22 +862,32 @@ def _probe_single_provider(
         isolate_home=effective_iso,
         auth_file=effective_auth_file,
         auth_mode=effective_auth,
+        confine=confine,
     )
     try:
         init_res = adapter.initialize(timeout_s=float(timeout_s))
         resolved_argv = list(adapter.argv)
         agent_caps = dict(adapter.agent_capabilities)
         auth_methods = list(adapter.auth_methods)
+        held = adapter.confinement_summary()
+        notes = list(adapter.notes)
     finally:
         adapter.close()
-    return {
+    out: dict[str, object] = {
         "ok": True,
         "provider": provider,
         "protocol_version": init_res.get("protocolVersion"),
         "resolved_argv": resolved_argv,
         "agent_capabilities": agent_caps,
         "auth_methods": auth_methods,
+        "confinement": held,
     }
+    off_note = held["none"].get("note") if isinstance(held.get("none"), dict) else ""
+    if off_note and off_note not in notes:
+        notes.append(off_note)
+    if notes:
+        out["notes"] = notes
+    return out
 
 
 def probe_acp(
@@ -804,8 +915,10 @@ def probe_acp(
         except Invalid as exc:
             raise UsageError(exc.message) from exc
 
+    confine_settings = confine_lib.ConfineSettings()
     if (repo_path / CONFIG_PATH).is_file():
         cfg = load_config(repo_path)
+        confine_settings = _repo_confine(cfg)
         repo_provider = _repo_acp_provider(cfg)
         effective_auth = cfg.micromanager.auth
         effective_iso = cfg.micromanager.isolate_home
@@ -834,6 +947,15 @@ def probe_acp(
         results: dict[str, dict[str, object]] = {}
         for item in ACP_PROVIDERS:
             item_cmd = command if command is not None else "auto"
+            if item == "antigravity" and _would_start_antigravity(item_cmd):
+                # `all` is not a request to start agy: that needs the provider by name.
+                results[item] = {
+                    "ok": None,
+                    "skipped": True,
+                    "provider": item,
+                    "error": f"not probed: {_AGY_PROBE_HINT}",
+                }
+                continue
             try:
                 results[item] = _probe_single_provider(
                     repo_path,
@@ -843,6 +965,7 @@ def probe_acp(
                     effective_iso=effective_iso,
                     effective_auth_file=effective_auth_file,
                     timeout_s=timeout_s,
+                    confine=confine_settings,
                 )
             except (AdapterError, OSError) as exc:
                 results[item] = {
@@ -850,13 +973,20 @@ def probe_acp(
                     "provider": item,
                     "error": getattr(exc, "message", str(exc)),
                 }
-        return {
+        probed = [r for r in results.values() if not r.get("skipped")]
+        failed = sorted(name for name, r in results.items()
+                        if not r.get("skipped") and not r.get("ok"))
+        payload = {
             **status,
-            "ok": any(bool(r.get("ok")) for r in results.values()),
+            # ok only when every provider that was probed answered.
+            "ok": bool(probed) and not failed,
             "action": "probe",
             "provider": "all",
             "results": results,
+            "failed": failed,
+            "skipped": sorted(n for n, r in results.items() if r.get("skipped")),
         }
+        return payload
 
     if provider is not None:
         try:
@@ -868,6 +998,8 @@ def probe_acp(
     else:
         prov = repo_provider
 
+    if prov == "antigravity" and requested_prov != "antigravity" and _would_start_antigravity(cmd):
+        raise UsageError(_AGY_PROBE_HINT)
     probe_res = _probe_single_provider(
         repo_path,
         provider=prov,
@@ -876,6 +1008,7 @@ def probe_acp(
         effective_iso=effective_iso,
         effective_auth_file=effective_auth_file,
         timeout_s=timeout_s,
+        confine=confine_settings,
     )
     status = inspect_acp_status(repo_path, provider=prov)
     return {
