@@ -65,6 +65,17 @@ class RunConfinementNotesTests(unittest.TestCase):
         self.assertEqual(_confine_notes(record["notes"]), [confine_lib.off_note("codex")])
         self.assertIn(confine_lib.off_note("codex"), human)
 
+    def test_working_the_notes_out_leaves_no_temp_folder_behind(self) -> None:
+        """Lead: the worker backend opened only for its settings is closed again."""
+        import tempfile
+        from pathlib import Path as _Path
+        def empties() -> set:
+            return {p.name for p in _Path(tempfile.gettempdir()).glob("openfarm-acp-empty-*")}
+        before = empties()
+        self._configure(provider="codex", confine="off", binary="codex-exec")
+        self._run(usable=True)
+        self.assertEqual(empties() - before, set())
+
     def test_codex_on_flags_alone_is_noted(self) -> None:
         self._configure(provider="codex", confine="auto", binary="codex-exec")
         record, _ = self._run(usable=False)

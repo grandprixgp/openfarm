@@ -755,6 +755,14 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
             f"concurrent_cards is {cfg.concurrent_cards} but cards run one at a "
             f"time: the per-card state is ready for a pool, the loop is not")
 
+    # What a language pack could not use (no tsc, so no types were checked; ruff
+    # not configured), once per run. Packs that had nothing to say add nothing.
+    for o in outcomes:
+        tooling = o.get("tooling") if isinstance(o, dict) else None
+        for note in (tooling.get("notes") if isinstance(tooling, dict) else None) or []:
+            if note and note not in notes:
+                notes.append(str(note))
+
     def _confinement_notes() -> list[str]:
         """One note per ACP provider this run used whose child is not confined.
 
@@ -769,10 +777,14 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
             from .adapters.claude_worker import open_acp_worker
             wb = open_acp_worker(cfg)
             seats.append((wb.provider, wb.command, "none", wb.confine))
+            with contextlib.suppress(Exception):
+                wb.close()  # only its settings were wanted; it made a temp folder
         if swarm_parallel and script_path is None and is_acp_adapter(coord_spec):
             from .adapters.claude_worker import open_acp_worker
             cb = open_acp_worker(cfg, provider=normalize_acp_provider(coord_spec))
             seats.append((cb.provider, cb.command, "none", cb.confine))
+            with contextlib.suppress(Exception):
+                cb.close()
         sup = mm_seat.proto if mm_seat is not None else None
         sup_spec = swarm_sup if (swarm_cfg is not None and swarm_cfg.enabled) else "config"
         if sup is None and mm_script_path is None and (
@@ -2848,32 +2860,6 @@ def cmd_acp(args) -> int:
     if action == "probe" and payload.get("ok") is False:
         return EXIT_TROUBLE
     return EXIT_OK
-
-
-def _acp_confinement_lines(payload: dict) -> list[str]:
-    """Plain lines saying how each provider's child is held: flags, boundary or nothing."""
-    block = payload.get("confinement")
-    providers = payload.get("providers")
-    if not isinstance(block, dict) or not isinstance(providers, dict):
-        return []
-    bw = block.get("bwrap") if isinstance(block.get("bwrap"), dict) else {}
-    head = (f"Confinement ({block.get('setting', '[micromanager] confine')} = "
-            f"\"{block.get('mode', 'auto')}\"; bwrap: {bw.get('detail', 'unknown')})")
-    lines = ["", head]
-    for name, info in providers.items():
-        held = info.get("confinement") if isinstance(info, dict) else None
-        if not isinstance(held, dict):
-            continue
-        line = (f"  {name}: tool policy none -> {held.get('none', '?')}, "
-                f"read-only -> {held.get('read-only', '?')} ({held.get('transport', '?')})")
-        lines.append(line)
-        for policy in ("none", "read-only"):
-            why = held.get(f"{policy}_refused")
-            if why:
-                lines.append(f"    {policy}: {why}")
-    for note in block.get("notes") or ():
-        lines.append(f"  note: {note}")
-    return lines
 
 
 def cmd_tui(args) -> int:

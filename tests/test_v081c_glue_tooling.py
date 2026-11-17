@@ -231,6 +231,20 @@ class TypeScriptToolingTests(unittest.TestCase):
                     self.assertEqual(record["evidence"]["typecheck"], "syntax")
                     self.assertIn("no types were checked", record["evidence"]["note"])
 
+    def test_a_runs_notes_carry_the_packs_notes_once(self) -> None:
+        """Lead: what the pack could not use is said once per run, in its notes."""
+        res = _cli(self.root, "run", "--card", "CARD-1", "--script", str(self.script),
+                   "--cards", "1")
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        payload = json.loads(res.stdout)
+        pack_notes = payload["outcomes"][0]["tooling"]["notes"]
+        self.assertTrue(pack_notes, payload["outcomes"][0]["tooling"])
+        for note in pack_notes:
+            self.assertEqual(payload["notes"].count(note), 1, payload["notes"])
+        run_json = json.loads(sorted((self.state / "runs").rglob("run.json"))[-1].read_text())
+        for note in pack_notes:
+            self.assertIn(note, run_json["notes"])
+
     def test_the_lint_gate_records_say_tsc_checked_the_types(self) -> None:
         outcome, gates = self._run(self.other)
         self.assertEqual(outcome["final_state"], "in-review", outcome.get("detail"))
