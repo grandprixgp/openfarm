@@ -73,25 +73,16 @@ class NativeClaudeAcpServer:
         with self._proc_lock:
             self._cancelled_sessions.add(session_id)
             proc = self._active_procs.get(session_id)
-        if proc is None or proc.poll() is not None:
-            return
-        try:
-            os.killpg(proc.pid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError, OSError):
-            try:
-                proc.terminate()
-            except OSError:
-                pass
-        try:
-            proc.wait(timeout=1.0)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError, OSError):
-                try:
-                    proc.kill()
-                except OSError:
-                    pass
+        # The child leads its own process group: end the whole group, so the
+        # commands it started do not outlive a cancelled or timed-out turn.
+        confine_lib.end_process_group(proc)
+
+    def end_all(self) -> None:
+        """End every running child's process group (on close or SIGTERM)."""
+        with self._proc_lock:
+            procs = list(self._active_procs.items())
+        for sid, _proc in procs:
+            self._terminate_session_proc(sid)
 
     def _handle_initialize(self, req_id: object) -> None:
         self._initialized = True
@@ -385,6 +376,7 @@ class NativeClaudeAcpServer:
 
     def serve(self) -> int:
         prompt_threads: list[threading.Thread] = []
+        _end_children_on_sigterm(self)
         try:
             while True:
                 raw = sys.stdin.readline()
@@ -437,12 +429,31 @@ class NativeClaudeAcpServer:
                 else:
                     self._send_error(req_id, -32601, f"Method not found: {method}")
         finally:
-            for sid in list(self._active_procs):
-                self._terminate_session_proc(sid)
+            self.end_all()
             for th in prompt_threads:
                 if th.is_alive():
                     th.join(timeout=1.0)
         return 0
+
+
+def _end_children_on_sigterm(server) -> None:
+    """On SIGTERM (the adapter ending this bridge's group), end the CLI children too.
+
+    Each child leads its own process group, so killing the bridge's group alone
+    would leave them, and what they started, running.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        return
+
+    def _handler(signum, _frame):
+        server.end_all()
+        os._exit(128 + signum)
+
+    try:
+        signal.signal(signal.SIGTERM, _handler)
+        signal.signal(signal.SIGHUP, _handler)
+    except (ValueError, OSError):
+        pass
 
 
 def main(argv: list[str] | None = None) -> int:

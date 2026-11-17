@@ -162,6 +162,108 @@ class SpendMeasuredTests(_Tmp):
             self.assertTrue(w.prices_spend, prov)
 
 
+class ProbeAndChildTests(_Tmp):
+    """A6: probe all is ok only when all are ok; Codex status is sanitised; groups end."""
+
+    def test_probe_all_fails_when_one_provider_fails(self) -> None:
+        repo = self.tmp / "repo"
+        repo.mkdir()
+        good = [sys.executable, str(STAND_IN), "--mode", "normal"]
+
+        def fake_probe(_repo, *, provider, cmd, **_kw):
+            if provider == "codex":
+                raise Invalid("acp-x", "codex is broken")
+            return {"ok": True, "provider": provider}
+
+        with mock.patch("openfarm_core.acp_setup._probe_single_provider", side_effect=fake_probe), \
+                mock.patch("openfarm_core.acp_setup.inspect_acp_status", return_value={}):
+            res = probe_acp(repo, provider="all", command=good)
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["failed"], ["codex"])
+        self.assertTrue(res["results"]["claude"]["ok"])
+        self.assertFalse(res["results"]["codex"]["ok"])
+        with mock.patch("openfarm_core.acp_setup._probe_single_provider",
+                        side_effect=lambda _r, *, provider, cmd, **_k: {"ok": True, "provider": provider}), \
+                mock.patch("openfarm_core.acp_setup.inspect_acp_status", return_value={}):
+            self.assertTrue(probe_acp(repo, provider="all", command=good)["ok"])
+
+    def test_codex_login_status_gets_the_sanitised_environment(self) -> None:
+        seen = self.tmp / "seen.json"
+        codex = _script(self.bin / "codex", (
+            "#!/usr/bin/env python3\nimport json, os\n"
+            f"open({str(seen)!r}, 'w').write(json.dumps(sorted(os.environ)))\n"
+            "print('Logged in using ChatGPT')\n"))
+        leak = {"CLAUDECODE": "1", "CLAUDE_CODE_SESSION_ID": "s", "CLAUDE_CODE_MESSAGING_TOKEN": "t",
+                "ANTIGRAVITY_X": "1", "OPENAI_API_KEY": "sk-x", "AI_AGENT": "1",
+                "CLAUDE_CONFIG_DIR": str(self.tmp / "cfg")}
+        with mock.patch.dict(os.environ, leak):
+            res = _safe_codex_auth_status(str(codex), home=self.tmp)
+        self.assertTrue(res.get("loggedIn"))
+        names = set(json.loads(seen.read_text()))
+        for key in leak:
+            self.assertNotIn(key, names)
+        self.assertIn("CODEX_HOME", names)
+
+    def _grandchild_codex(self, pid_file: Path) -> Path:
+        return _script(self.bin / "codex", (
+            "#!/usr/bin/env python3\nimport signal, subprocess, sys, time\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "sys.stdin.read()\n"
+            "p = subprocess.Popen(['sh', '-c', 'trap \"\" TERM; sleep 300 & wait'])\n"
+            f"open({str(pid_file)!r}, 'w').write(str(p.pid))\n"
+            "time.sleep(300)\n"))
+
+    def _gone(self, pid: int, within_s: float = 10.0) -> bool:
+        deadline = time.monotonic() + within_s
+        while time.monotonic() < deadline:
+            try:
+                state = Path(f"/proc/{pid}/stat").read_text().split()[2]
+            except OSError:
+                return True
+            if state == "Z":
+                return True
+            time.sleep(0.1)
+        os.kill(pid, signal.SIGKILL)  # do not leave it behind
+        return False
+
+    def _wait_for(self, path: Path) -> int:
+        deadline = time.monotonic() + 20
+        while not path.is_file() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        time.sleep(0.2)
+        return int(path.read_text())
+
+    def test_a_timed_out_turn_ends_the_whole_child_group(self) -> None:
+        pid_file = self.tmp / "grandchild.pid"
+        codex = self._grandchild_codex(pid_file)
+        acp = ClaudeAcpAdapter([sys.executable, str(CODEX_NATIVE_ACP), "--codex-bin", str(codex)],
+                               cwd=self.tmp, provider="codex", auth_mode="api-key", confine="off")
+        sid = acp.new_session(cwd=self.tmp, tool_policy="none")
+        with self.assertRaises(AdapterError):
+            acp.prompt(sid, "hang", timeout_s=3)
+        acp.close()
+        self.assertTrue(self._gone(self._wait_for(pid_file)), "the grandchild outlived the turn")
+
+    def test_a_stopped_bridge_ends_its_child_group(self) -> None:
+        # The adapter's last resort on close is SIGTERM to the bridge's group; the
+        # bridge must take its CLI child's own group down with it.
+        import threading
+
+        pid_file = self.tmp / "grandchild.pid"
+        codex = self._grandchild_codex(pid_file)
+        acp = ClaudeAcpAdapter([sys.executable, str(CODEX_NATIVE_ACP), "--codex-bin", str(codex)],
+                               cwd=self.tmp, provider="codex", auth_mode="api-key", confine="off")
+        self.addCleanup(acp.close)
+        sid = acp.new_session(cwd=self.tmp, tool_policy="none")
+        th = threading.Thread(target=lambda: self.assertRaises(AdapterError, acp.prompt, sid, "hang",
+                                                               timeout_s=60), daemon=True)
+        th.start()
+        pid = self._wait_for(pid_file)
+        os.killpg(acp._proc.pid, signal.SIGTERM)
+        th.join(timeout=30)
+        self.assertTrue(self._gone(pid), "the bridge's child group outlived the bridge")
+
+
 class StatusModeTests(_Tmp):
     def test_off_mode_says_so_in_status(self) -> None:
         repo = self.tmp / "repo"

@@ -2657,6 +2657,8 @@ def cmd_acp(args) -> int:
     if not want_json and action in ("status", "probe"):
         for line in _acp_confinement_lines(payload):
             print(line)
+    if action == "probe" and payload.get("ok") is False:
+        return EXIT_TROUBLE
     return EXIT_OK
 
 

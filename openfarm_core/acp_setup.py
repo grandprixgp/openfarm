@@ -22,6 +22,7 @@ from .adapters.acp import (
     ACP_PROVIDERS,
     ClaudeAcpAdapter,
     _bridge_provider,
+    _sanitised_env,
     acp_adapter_for_provider,
     infer_acp_provider,
     is_acp_adapter,
@@ -98,12 +99,14 @@ def _safe_codex_auth_status(
     timeout_s: float = 5.0,
     codex_home: Path | None = None,
 ) -> dict:
-    """Query `codex login status` without leaking email/account identifiers."""
-    env = {
-        k: v
-        for k, v in os.environ.items()
-        if k not in ("OPENAI_API_KEY", "CODEX_HOME")
-    }
+    """Query `codex login status` without leaking email/account identifiers.
+
+    The child gets the environment every Codex child gets (no Claude session
+    variables, no Antigravity variables, no `OPENAI_API_KEY` in OAuth mode).
+    """
+    env, _ = _sanitised_env(provider="codex", isolate_home=False, auth_mode="oauth")
+    env.pop("CODEX_HOME", None)
+    env.pop("CLAUDE_CONFIG_DIR", None)
     env["HOME"] = str(home)
     env["CODEX_HOME"] = str(codex_home if codex_home is not None else home / ".codex")
     try:
@@ -943,13 +946,19 @@ def probe_acp(
                     "provider": item,
                     "error": getattr(exc, "message", str(exc)),
                 }
-        return {
+        probed = [r for r in results.values() if not r.get("skipped")]
+        failed = sorted(name for name, r in results.items()
+                        if not r.get("skipped") and not r.get("ok"))
+        payload = {
             **status,
-            "ok": any(bool(r.get("ok")) for r in results.values()),
+            # ok only when every provider that was probed answered.
+            "ok": bool(probed) and not failed,
             "action": "probe",
             "provider": "all",
             "results": results,
+            "failed": failed,
         }
+        return payload
 
     if provider is not None:
         try:

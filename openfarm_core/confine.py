@@ -627,3 +627,39 @@ def bridge_child_argv(child_argv: list[str], hold: Hold, meta, *, session_dir: s
     )
 
 
+def end_process_group(proc, *, grace_s: float = 1.0) -> None:
+    """End `proc` and everything in its process group (it must lead its group)."""
+    import signal as _signal
+
+    if proc is None:
+        return
+    if proc.poll() is not None:
+        # The leader is gone but what it started may still run in its group.
+        try:
+            os.killpg(proc.pid, _signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        return
+    try:
+        os.killpg(proc.pid, _signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=grace_s)
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(proc.pid, _signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+    try:
+        proc.wait(timeout=grace_s)
+    except subprocess.TimeoutExpired:
+        pass
