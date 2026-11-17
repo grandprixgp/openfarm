@@ -1,6 +1,6 @@
-# From Empty Folder to Shipped App (Openfarm v0.8.0 Starter Guide)
+# From Empty Folder to Shipped App (Openfarm v0.8.1 Starter Guide)
 
-This guide shows **both human owners and prospective frontier AI agents** how to go from an **empty folder** and a **plain-English idea** (`"An app to track my calories"`) to a gate-verified, human-reviewed application using **Openfarm v0.8.0**.
+This guide shows **both human owners and prospective frontier AI agents** how to go from an **empty folder** and a **plain-English idea** (`"An app to track my calories"`) to a gate-verified, human-reviewed application using **Openfarm v0.8.1**.
 
 > **For related docs:** See [README.md](../README.md) for architecture overview, [docs/USAGE-AND-FIRST-DEPLOYMENT.md](USAGE-AND-FIRST-DEPLOYMENT.md) for detailed configuration & operator runbooks on existing repositories (`tallybox`), and [docs/openfarm-internals.md](openfarm-internals.md) for module internals.
 
@@ -8,7 +8,7 @@ This guide shows **both human owners and prospective frontier AI agents** how to
 
 ## Part 1 — For Human Owners: The Two-Step Workflow
 
-You do **not** need to hand-write `.openfarm/config.toml`, memorize card schemas, or copy Rust boilerplate by hand. Openfarm v0.8.0 packages the CLI, slash commands (`/openfarm-grill-me` and `/openfarm-initialize`), native Claude ACP OAuth setup (`openfarm acp`), plugin rules, and frontier architect/operator skills into a **single repository or package target**.
+You do **not** need to hand-write `.openfarm/config.toml`, memorize card schemas, or copy Rust boilerplate by hand. Openfarm v0.8.1 packages the CLI, slash commands (`/openfarm-grill-me` and `/openfarm-initialize`), frontier provider setup for Claude, Codex and Antigravity (`openfarm acp`), plugin rules, and frontier architect/operator skills into a **single repository or package target**.
 
 ### Your Two Prompts
 
@@ -60,7 +60,7 @@ Ensure `~/.local/bin` is on your `PATH`, then verify:
 openfarm --help
 ```
 
-You should see all **21 subcommands**: `init`, `adopt`, `bench`, `install-skill`, `acp`, `tui`, `run`, `status`, `pause`, `resume`, `stop`, `release`, `done`, `dossier`, `check`, `verdict`, `escape`, `supervise`, `harness`, `board`, `swarm`.
+You should see all **22 subcommands**: `init`, `adopt`, `bench`, `install-skill`, `acp`, `tui`, `run`, `status`, `pause`, `resume`, `stop`, `release`, `done`, `dossier`, `check`, `verdict`, `escape`, `supervise`, `harness`, `board`, `swarm`, `drive`.
 
 Sign in once with your Claude OAuth subscription for Frontier ACP supervision (no Frontier API key needed; Workers remain API-key authenticated):
 
@@ -68,6 +68,8 @@ Sign in once with your Claude OAuth subscription for Frontier ACP supervision (n
 openfarm acp status --json
 openfarm acp login          # optional if already signed into Claude Code
 ```
+
+Codex and Antigravity can supervise instead (`--provider codex|antigravity`). Read [Frontier Providers](USAGE-AND-FIRST-DEPLOYMENT.md#5-frontier-providers-claude-codex-and-antigravity) first: Antigravity needs bubblewrap (and Codex wants it), Codex should use `binary = "codex-exec"`, and you must check that your Antigravity plan's terms allow openfarm to start `agy` without a person typing before you use it on OAuth.
 
 #### Option B — Package Install (`uv`, `pipx`, or `pip`)
 
@@ -80,8 +82,8 @@ openfarm install-skill --target all --json
 ```
 
 `install-skill` supports `--target`:
-- `all` (default): installs into Claude Code (`~/.claude/skills/` + `~/.claude/commands/openfarm-initialize.md`), Antigravity (`~/.gemini/config/skills/` + `~/.gemini/config/plugins/openfarm/`), and shared `.agents` (`~/.agents/skills/`).
-- `claude`, `antigravity`, `agents`, or `workspace` (`<dest>/.agents/skills/` + `<dest>/.claude/commands/openfarm-initialize.md`).
+- `all` (default): installs into Claude Code (`$CLAUDE_CONFIG_DIR`, default `~/.claude`: `skills/` + `commands/openfarm-initialize.md`), Antigravity (`~/.gemini/config/skills/` + `~/.gemini/config/plugins/openfarm/`), Codex (`$CODEX_HOME`, default `~/.codex`: `skills/` + `openfarm-AGENTS.md`; whether Codex reads these by itself is untested), and shared `.agents` (`~/.agents/skills/`).
+- `claude`, `antigravity`, `codex`, `agents`, or `workspace` (`<dest>/.agents/skills/`, `<dest>/.codex/skills/` + `<dest>/.claude/commands/openfarm-initialize.md`).
 - Supports `--dry-run` and `--dest PATH` to preview or target a custom directory.
 
 ---
@@ -113,6 +115,7 @@ openfarm init calorie-log \
 Useful optional flags on `openfarm init`:
 - `--endpoint https://<your-zdr-provider>/v1 --model <model-id>` — configure your Zero Data Retention (ZDR) OpenAI-compatible Worker coding model endpoint and model name.
 - `--profile auto|solo|advisory|active` — `auto` selects `active` (`claude-acp`, `auth = "oauth"`, `binary = "auto"`) as the default way to plug the Frontier supervisor in (`openfarm acp configure` adjusts settings later; `--profile solo` disables Frontier ACP).
+- `--acp-provider claude|antigravity|codex` — which provider supervises (default `claude`).
 - `--mutation auto|off|report|required` — `auto` selects `report` if `cargo-mutants` is on `PATH`, else `off`.
 - `--state-dir PATH` / `--key-file PATH` — override external state/key paths (enforced strictly **outside** the repository, created with `0o700` permissions).
 - `--force` — allow scaffolding into a non-empty directory (without `--force`, `openfarm init` refuses non-empty dirs with exit code `1`).
@@ -575,16 +578,18 @@ rustfmt --edition 2021 --check src/*.rs tests/*.rs
 ## Part 3 — Honest Testing & Untested Boundaries
 
 Verified automatically in Openfarm's local test suite (including `tests/test_v05_skill_bootstrap.py`):
-- PEP 621 offline wheel packaging (`pyproject.toml`, `dependencies = []`, bundling all 9 `openfarm_core/skill_assets/` files).
+- PEP 621 offline wheel packaging (`pyproject.toml`, `dependencies = []`, bundling all 12 `openfarm_core/skill_assets/` files).
 - Byte-for-byte parity between repo `skills/` and `openfarm_core/skill_assets/skills/`, YAML frontmatter, `$ARGUMENTS` slash command, and plugin JSON.
-- `openfarm install-skill` (`--target all|claude|antigravity|agents|workspace`, `--install-bin` executable `openfarm` launcher, `--dry-run`).
+- `openfarm install-skill` (`--target all|claude|antigravity|codex|agents|workspace`, `--install-bin` executable `openfarm` launcher, `--dry-run`).
 - `openfarm init calorie-log` (`Git.init`, strict 15-table `load_config`, `0o700` state/key dirs, non-empty refusal, path traversal & Rust keyword guards, compiling `cargo test` + `cargo clippy -- -D warnings` + `rustfmt --check`).
 - The exact `calorie-log` domain skeleton (`invariants.rs` + `goals.rs` + `lib.rs` + `baseline_tests.rs`), `openfarm check CARD-001` (`exit 0`), negative seam `CARD-900` (`exit 1`), `openfarm run --dry-run`, and single-card `--script` execution to `in-review`.
 
-Explicitly **untested** offline in this repository:
-- **Live remote GitHub URL installs via `uv tool install` / `pipx install` / `pip install`** (tested via offline PEP 621 wheel build + local `openfarm install-skill`).
-- **Live `claude-agent-acp` binary execution with real Anthropic credentials** (verified via `tests/acp_stand_in.py`).
-- **Live hosted ZDR OpenAI-compatible endpoints** (verified via local HTTP test servers & `ScriptedBackend`).
-- **Live `cargo-mutants` binary runs** (parsed from synthetic outputs; binary not installed locally).
-- **Live unattended multi-wave LLM execution of all 8 `calorie-log` cards end-to-end**.
-- **TypeScript language pack** (`Invalid("no-typescript-pack")`, unimplemented).
+What ran live on 17 Nov 2026 (real ruff, pytest, cargo-mutants, `tsc` and `prettier`; the checker with a live model; Claude through both routes; Codex through openfarm's bridge; `openfarm drive` with Codex and Claude) is listed in the [README](../README.md#whats-verified) with the numbers in the [build log](v0.8.1-build-log.md).
+
+Explicitly **untested**:
+- **Remote GitHub URL installs via `uv tool install` / `pipx install` / `pip install`** (tested via offline PEP 621 wheel build + local `openfarm install-skill`).
+- **Hosted worker endpoints other than Command Code**.
+- **Unattended multi-wave LLM execution of all 8 `calorie-log` cards end-to-end**.
+- **Everything Antigravity since the first agent's runs**: the boundary around `agy`, the login copy, the prompt-size refusal, the driver.
+- **TypeScript on a real npm-installed project with a live model writing counter-tests**.
+- The rest of the list is in the [README](../README.md#not-yet-tested).
