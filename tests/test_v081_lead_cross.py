@@ -70,5 +70,52 @@ class CounterTestBlockEndTests(unittest.TestCase):
         self.assertNotIn("second", answer.counter_tests[0]["content"])
 
 
+
+class CheckBaselineNamedRowsTests(unittest.TestCase):
+    """`check --baseline` judges named tests by the run's own row rule.
+
+    The base suite has to be green and a card's test cannot be on known_failing,
+    so on base a named test is either absent or passing; what matters is whose
+    rows are counted for it.
+    """
+
+    def _check(self, files: dict) -> dict:
+        import json as _json
+        from tests.test_v081b_packs_gates import build_python_toy, run_cli
+        toy = build_python_toy()
+        self.addCleanup(toy.cleanup)
+        for path, content in files.items():
+            toy.write(path, content)
+        toy.write_card(
+            "CARD-1", title="A full bundle refuses a push", category="pinned-bugfix",
+            unit=".", touches=["tally/bounded.py"],
+            tests=[{"name": "test_a_full_bundle_refuses_a_push",
+                    "file": "tests/test_full.py", "asserts": "push raises FullError"}],
+            done_text="`Bounded(1).push(8)` after one push raises `FullError`.")
+        toy.commit("tally: CARD-1")
+        result = run_cli(toy.root, "check", "CARD-1", "--baseline")
+        return _json.loads(result.stdout)
+
+    def test_a_same_named_passing_test_in_another_file_does_not_refuse_the_card(self) -> None:
+        # The old rule took the last row with the name, whatever file it came from,
+        # and refused the card as "already passing on base".
+        from tests.test_v081b_packs_gates import OTHER_FILE_TEST
+        payload = self._check({"tests/test_other.py": OTHER_FILE_TEST})
+        baseline = payload["baseline"]
+        self.assertEqual(baseline["named"],
+                         {"test_a_full_bundle_refuses_a_push": "not-run"})
+        self.assertTrue(baseline["ok"], baseline)
+        self.assertTrue(payload["eligible"], payload)
+
+    def test_the_card_s_own_test_passing_on_base_still_refuses_it(self) -> None:
+        from tests.test_v081b_packs_gates import OTHER_FILE_TEST
+        payload = self._check({"tests/test_full.py": OTHER_FILE_TEST})
+        baseline = payload["baseline"]
+        self.assertEqual(baseline["passing_on_base"],
+                         ["test_a_full_bundle_refuses_a_push"])
+        self.assertFalse(baseline["ok"])
+        self.assertFalse(payload["eligible"])
+
+
 if __name__ == "__main__":
     unittest.main()

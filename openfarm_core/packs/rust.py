@@ -52,6 +52,13 @@ _COMPILE_FAIL_RE = re.compile(
     r"^error: could not compile `(?P<pkg>[^`]+)`"
     r"(?:\s+\((?P<target>[^)]+)\))?", re.MULTILINE)
 
+#: What follows a `could not compile` line when rustc was killed rather than
+#: reporting an error (cargo 1.100, seen live): no "due to N previous errors",
+#: and a "Caused by" block naming the signal.
+_KILLED_COMPILER_RE = re.compile(
+    r"[^\n]*\n\s*\nCaused by:\n\s+process didn't exit successfully: [^\n]*"
+    r"\(signal: \d+")
+
 #: cargo-mutants' closing line: `13 mutants tested: 6 missed, 7 caught`, with
 #: ` in 3s` after `tested` when times are shown (`--no-times` drops them).
 _MUTANTS_SUMMARY_RE = re.compile(
@@ -321,7 +328,12 @@ class RustPack(Pack):
             if rem_bin not in missing:
                 missing.append(rem_bin)
 
-        for match in _COMPILE_FAIL_RE.finditer(f"{stdout}\n{stderr}"):
+        combined = f"{stdout}\n{stderr}"
+        for match in _COMPILE_FAIL_RE.finditer(combined):
+            if _KILLED_COMPILER_RE.match(combined, match.end()):
+                # The compiler itself was killed (out of memory, say). That is the
+                # machine, not the edit: the runner classes the run infra.
+                continue
             target = _target_name(match.group("target") or "")
             compile_errors.append({
                 "pkg": match.group("pkg"),

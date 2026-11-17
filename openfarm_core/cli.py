@@ -65,7 +65,7 @@ from .dossier import build_dossier, render_markdown
 from .errors import (AdapterError, ConfigError, GateFailure, Infra, Invalid,
                      Refused, StopCode, UsageError)
 from .flow import CardRun
-from .gates.checks import suite_green
+from .gates.checks import combined_status, rows_for_test, suite_green
 from .gates.eligibility import check_eligibility, derive_cargo_unit
 from .git import Git, GitRefused
 from .globs import matches_any, normalise, resolves_within
@@ -343,18 +343,31 @@ def _baseline_check(ctx: Context, source: FileCardSource, card: Card) -> dict:
                              "would prove nothing",
                     "compile_errors": parsed.get("compile_errors", [])}
 
-        statuses = {entry["name"]: entry["status"]
-                    for entry in parsed.get("results", [])}
-        named = {name: statuses.get(name, "not-run") for name in card.test_names}
+        # The same rule the run's fail-before gate uses: every row reported for a
+        # named test decides (a parametrized test has one row per case), and rows
+        # of a same-named test in another file are left out.
+        files = {test.name: test.file for test in card.tests if test.file}
+        row_file = getattr(pack, "row_file", None)
+        rows = parsed.get("results", [])
+        named = {name: combined_status(rows_for_test(rows, name, files.get(name, ""),
+                                                     row_file))
+                 for name in card.test_names}
         passing = [name for name, status in named.items() if status == "ok"]
-        return {
-            "ok": not passing,
+        mixed = [name for name, status in named.items() if status == "mixed"]
+        out = {
+            "ok": not passing and not mixed,
             "class": result.cls,
             "named": named,
             "failed_on_base": [name for name, status in named.items()
                                if status == "FAILED"],
             "passing_on_base": passing,
         }
+        if mixed:
+            out["mixed_on_base"] = mixed
+            out["error"] = ("these named tests were reported both failing and not "
+                            "failing on base, so they prove nothing: "
+                            + ", ".join(mixed))
+        return out
     finally:
         if lock_held and cache_lock is not None:
             cache_lock.release()

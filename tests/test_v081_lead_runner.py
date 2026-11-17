@@ -57,6 +57,16 @@ class KilledCompilerTests(unittest.TestCase):
         for kind in ("test", "lint", "build"):
             self.assertEqual(self.runner.classify(101, "", KILLED, kind), INFRA, kind)
 
+    def test_a_killed_compiler_is_not_a_compile_error_and_the_suite_gate_says_infra(self) -> None:
+        from openfarm_core.gates.checks import suite_green
+        from openfarm_core.packs.rust import RustPack
+        parsed = RustPack().parse_tests("", KILLED)
+        self.assertEqual(parsed["compile_errors"], [])
+        self.assertEqual(suite_green(parsed, [], INFRA, 101).result, INFRA)
+        # A real compile error beside it is still reported.
+        real = KILLED + "error: could not compile `toy` (lib) due to 1 previous error\n"
+        self.assertEqual(len(RustPack().parse_tests("", real)["compile_errors"]), 1)
+
     def test_a_compile_error_is_still_a_code_failure(self) -> None:
         stderr = ("   Compiling toy v0.1.0 (/x)\n"
                   "error[E0308]: mismatched types\n"
