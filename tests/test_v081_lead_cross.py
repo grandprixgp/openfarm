@@ -55,5 +55,20 @@ class ReplanIfOnlyCountsWithTheSwarmOnTests(_FlowHarness):
         self.assertIn("replan-if", self._rules(swarm_on=True))
 
 
+class CounterTestBlockEndTests(unittest.TestCase):
+    def test_a_code_line_starting_with_triple_equals_does_not_end_a_block(self) -> None:
+        from openfarm_core.roles import parse_pass2
+        answer = parse_pass2(
+            "VERDICT: changes-requested\nREASONS:\nx\nTRACEABILITY:\ny\nEDGE CASES:\nz\n"
+            "=== counter_test: wraps\n"
+            "import test from \"node:test\";\n"
+            "test(\"wraps\", () => {\n  if (a\n    === b) throw new Error(\"x\");\n});\n"
+            "=== counter_test: second\ntest(\"second\", () => {});\n")
+        self.assertTrue(answer.readable)
+        self.assertEqual([t["name"] for t in answer.counter_tests], ["wraps", "second"])
+        self.assertIn("=== b) throw", answer.counter_tests[0]["content"])
+        self.assertNotIn("second", answer.counter_tests[0]["content"])
+
+
 if __name__ == "__main__":
     unittest.main()

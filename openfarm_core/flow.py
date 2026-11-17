@@ -36,7 +36,7 @@ from .harness_scope import project_markers
 from .harness_memory import (GuidanceSelection, HarnessLibrary, _classify_failure,
                              _is_unsafe_path)
 from .micromanager import open_micromanager
-from .roles import (Plan, Roles, parse_answer_edits, parse_counter_tests,
+from .roles import (Plan, Roles, parse_answer_edits,
                     parse_handback, parse_plan, parse_restatement, wants_planner)
 from .state import append_jsonl, baseline_lock_for, utc_now, utc_after, write_json
 from .swarm import WORKER_ROLES, swarm_set, worker_kind_for_config, worker_member_name

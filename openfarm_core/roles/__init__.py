@@ -332,8 +332,8 @@ _MIN_EDGE_CASES = 2
 
 _RUNNERS = {
     ("python", "unittest"): (
-        "Python's stdlib `unittest` (`python -m unittest -v <module>`; pytest is not "
-        "installed). The file needs its own imports and a `unittest.TestCase` class; "
+        "Python's stdlib `unittest` (`python -m unittest -v <module>`; this project "
+        "does not use pytest). The file needs its own imports and a `unittest.TestCase` class; "
         "the counter-test is a method of that class named exactly as in its header."),
     ("python", "pytest"): (
         "pytest (`python -m pytest -v <file>`). The file needs its own imports; the "
@@ -465,7 +465,9 @@ _LABEL_RE = re.compile(
 _COUNTER_HEADER_RE = re.compile(
     r"^[ \t]*===+[ \t]*counter[ _-]?tests?[ \t]*:[ \t]*(?P<name>.*?)[ \t]*=*[ \t]*$",
     re.IGNORECASE | re.MULTILINE)
-_ANY_HEADER_RE = re.compile(r"^[ \t]*===+[ \t]*\S", re.MULTILINE)
+#: The next header of any kind: `=== word:`. A code line that only starts with
+#: `===` (a wrapped comparison in TypeScript) does not end a block.
+_ANY_HEADER_RE = re.compile(r"^[ \t]*===+[ \t]*[A-Za-z][A-Za-z0-9 _-]*:", re.MULTILINE)
 _LEGACY_BLOCK_RE = re.compile(
     r"COUNTER_TEST\s*:\s*(?P<name>\S+)\s*\n(?P<content>.*?)(?=\nCOUNTER_TEST|\Z)",
     re.DOTALL)

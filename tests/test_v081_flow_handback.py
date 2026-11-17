@@ -208,6 +208,9 @@ class _FlowHarness(unittest.TestCase):
         branch = f"of/{run_id}/CARD-1"
         self.toy.git.create_branch(branch, "main")
         self.toy.git.worktree_add(worktree, branch)
+        # Registered after the toy's own clean-up, so it runs first and the toy's
+        # base folder is empty when that tries to remove it.
+        self.addCleanup(shutil.rmtree, worktree, True)
         book = BriefBook(worktree, cfg.never_touch, cfg.forbidden_files)
         book.pack = pack_for("python")
         return CardRun(card, cfg, state, layout, worktree, DirectRunner(worktree),
