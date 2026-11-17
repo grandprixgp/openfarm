@@ -192,5 +192,85 @@ class CodexAutoChoiceTests(unittest.TestCase):
         self.assertEqual(only_server["confinement"]["transport"], "server")
 
 
+class UnpricedSupervisorNoteTests(unittest.TestCase):
+    """A supervisor whose spend cannot be measured is said so in the run's notes."""
+
+    def _note(self, adapter: str, *, mode: str = "active", rate: float = 0.0,
+              script: Path | None = None) -> str:
+        from types import SimpleNamespace
+        from openfarm_core.cli import _unpriced_supervisor_note
+        cfg = SimpleNamespace(
+            micromanager_adapter=adapter,
+            micromanager=SimpleNamespace(mode=mode, cost_per_1k_in=rate, cost_per_1k_out=0.0))
+        return _unpriced_supervisor_note(cfg, script)
+
+    def test_codex_and_antigravity_without_rates_are_noted(self) -> None:
+        for adapter, name in (("codex-acp", "codex"), ("antigravity-acp", "antigravity"),
+                              ("agy-acp", "antigravity")):
+            with self.subTest(adapter):
+                note = self._note(adapter)
+                self.assertIn(f"the {name} supervisor reports no cost", note)
+                self.assertIn("[micromanager] cost_per_1k_in", note)
+
+    def test_nothing_to_say_when_spend_is_measured_or_nothing_runs(self) -> None:
+        self.assertEqual(self._note("codex-acp", rate=0.003), "")
+        self.assertEqual(self._note("claude-acp"), "", "claude reports its own cost")
+        self.assertEqual(self._note("codex-acp", mode="off"), "")
+        self.assertEqual(self._note("off"), "")
+        self.assertEqual(self._note("scripted"), "")
+        self.assertEqual(self._note("codex-acp", script=Path("mm.json")), "")
+
+
+class ClaudeApiKeyInsideTheBoundaryTests(unittest.TestCase):
+    """A Claude child on an API key finds it under `confine = "bwrap"` too.
+
+    The key helper runs inside the child. It used to read the real key file,
+    which the boundary does not show.
+    """
+
+    def _env(self) -> tuple[dict, Path, Path]:
+        from openfarm_core.adapters.acp import _sanitised_env
+        tmp = Path(tempfile.mkdtemp(prefix="openfarm-claude-key-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        key = tmp / "elsewhere" / "claude.key"
+        key.parent.mkdir()
+        key.write_text("sk-test-KEY-123\n")
+        env, home = _sanitised_env(base_env={"PATH": "/usr/bin:/bin"}, auth_file=key,
+                                   auth_mode="api-key", provider="claude")
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        return env, home, key
+
+    def test_the_helper_reads_a_private_copy_in_the_isolated_home(self) -> None:
+        import stat
+        import subprocess
+        _env, home, key = self._env()
+        settings = json.loads((home / ".claude" / "settings.json").read_text())
+        helper = Path(settings["apiKeyHelper"])
+        self.assertTrue(helper.is_relative_to(home))
+        self.assertNotIn(str(key), helper.read_text())
+        copy = home / ".claude" / "api-key"
+        self.assertEqual(stat.S_IMODE(copy.stat().st_mode), 0o600)
+        done = subprocess.run([str(helper)], capture_output=True, text=True, timeout=30)
+        self.assertEqual(done.stdout, "sk-test-KEY-123")
+
+    def test_it_works_inside_a_real_boundary(self) -> None:
+        import subprocess
+        from openfarm_core import confine
+        usable, why = confine.bwrap_status()
+        if not usable:
+            self.skipTest(f"bwrap is not usable here: {why}")
+        _env, home, key = self._env()
+        session = Path(tempfile.mkdtemp(prefix="openfarm-claude-key-session-"))
+        self.addCleanup(shutil.rmtree, session, ignore_errors=True)
+        helper = json.loads((home / ".claude" / "settings.json").read_text())["apiKeyHelper"]
+        script = f"echo helper=$({helper} 2>&1); echo real=$(cat {key} 2>&1 | head -c 40)"
+        argv = confine.boundary_argv(["/bin/sh", "-c", script], session_dir=session,
+                                     home_dir=home)
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+        out = dict(line.split("=", 1) for line in done.stdout.splitlines() if "=" in line)
+        self.assertEqual(out.get("helper"), "sk-test-KEY-123", done.stderr)
+        self.assertNotIn("sk-test", out.get("real", ""), "the real key file is not shown")
+
+
 if __name__ == "__main__":
     unittest.main()

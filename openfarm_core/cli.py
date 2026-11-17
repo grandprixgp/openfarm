@@ -750,6 +750,9 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
         notes.append(
             "the backend reports no prices, so every spend is zero and the spend "
             "caps cannot fire: set [model] cost_per_1k_in and cost_per_1k_out")
+    unpriced = _unpriced_supervisor_note(cfg, mm_script_path)
+    if unpriced:
+        notes.append(unpriced)
     if cfg.concurrent_cards > 1 and not swarm_parallel:
         notes.append(
             f"concurrent_cards is {cfg.concurrent_cards} but cards run one at a "
@@ -1301,6 +1304,29 @@ def _handshake(ctx: Context, source, args, telemetry_raw=None) -> dict:
                     "adapters": names}
 
     return {"refused": False, "reason": "", "adapters": names}
+
+
+def _unpriced_supervisor_note(cfg, mm_script: Path | None) -> str:
+    """A note when the supervisor's spend cannot be measured, or "".
+
+    Codex and Antigravity report no cost. Without `[micromanager]` per-1k rates
+    their spend reads zero, so `[micromanager] spend_per_night` and the night's
+    cap can never fire on it: the run has to say so, as it does for the workers.
+    """
+    mm = getattr(cfg, "micromanager", None)
+    if (mm is None or mm_script is not None
+            or not is_acp_adapter(cfg.micromanager_adapter)
+            or str(getattr(mm, "mode", "active")) == "off"):
+        return ""
+    from .adapters.acp import provider_prices_spend
+    provider = normalize_acp_provider(cfg.micromanager_adapter)
+    if provider_prices_spend(provider,
+                             float(getattr(mm, "cost_per_1k_in", 0.0) or 0.0),
+                             float(getattr(mm, "cost_per_1k_out", 0.0) or 0.0)):
+        return ""
+    return (f"the {provider} supervisor reports no cost, so its spend reads zero and "
+            f"its spend caps cannot fire: set [micromanager] cost_per_1k_in and "
+            f"cost_per_1k_out")
 
 
 def _backend_prices_spend(cfg, script: Path | None) -> bool:

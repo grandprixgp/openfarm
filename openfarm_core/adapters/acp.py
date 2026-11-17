@@ -568,10 +568,16 @@ def _sanitised_env(
                     "permissions": {"deny": deny_rules},
                 }
                 if auth_file is not None:
-                    auth_path = Path(auth_file).expanduser().resolve()
+                    # The helper runs inside the child. Under a boundary the child
+                    # sees its isolated home but not the real key file, so the key
+                    # travels as a private copy in that home, removed with it.
+                    key_copy = claude_dir / "api-key"
+                    fd = os.open(key_copy, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                        handle.write(_read_api_key_file(auth_file))
                     helper_path = claude_dir / "api-key-helper.sh"
                     helper_path.write_text(
-                        f"#!/bin/sh\ntr -d '\\r\\n' < {shlex.quote(str(auth_path))}\n",
+                        f"#!/bin/sh\ntr -d '\\r\\n' < {shlex.quote(str(key_copy))}\n",
                         encoding="utf-8",
                     )
                     os.chmod(helper_path, 0o700)
