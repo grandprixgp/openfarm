@@ -343,12 +343,24 @@ def swarm_join(
 
 
 def _resolve_role_assignment(cfg, role: str, spec: dict | None) -> tuple[str, str, str]:
+    """`(tier, model, effort)` for one role of a started card.
+
+    A tier named in the team spec gives its model. Otherwise the role keeps
+    its configured model (`Config.member_defaults`), as with the swarm off.
+    """
     spec_dict = dict(spec or {})
     raw_tier = spec_dict.get("tier")
-    tier_name = str(raw_tier).strip() if raw_tier else cfg.swarm.default_tier
-    if tier_name not in cfg.tiers:
-        raise Refused("unknown-tier", f"unknown tier {tier_name!r}")
-    tier_cfg = cfg.tiers[tier_name]
+    if raw_tier:
+        tier_name = str(raw_tier).strip()
+        if tier_name not in cfg.tiers:
+            raise Refused("unknown-tier", f"unknown tier {tier_name!r}")
+        tier_cfg = cfg.tiers[tier_name]
+        model_name = tier_cfg.model
+    else:
+        tier_name, model_name = cfg.member_defaults(role)
+        if tier_name not in cfg.tiers:
+            raise Refused("unknown-tier", f"unknown tier {tier_name!r}")
+        tier_cfg = cfg.tiers[tier_name]
 
     if "effort" in spec_dict and spec_dict["effort"] is not None:
         effort = str(spec_dict["effort"])
@@ -372,7 +384,7 @@ def _resolve_role_assignment(cfg, role: str, spec: dict | None) -> tuple[str, st
                 f"default effort {effort!r} for {role} is not in tier {tier_cfg.name!r} "
                 f"efforts {list(tier_cfg.efforts)!r}",
             )
-    return tier_cfg.name, tier_cfg.model, effort
+    return tier_cfg.name, model_name, effort
 
 
 def swarm_start(
@@ -535,12 +547,13 @@ def swarm_start(
         f"{role}={resolved[role][0]}:{resolved[role][2] or 'default'}"
         for role in WORKER_ROLES
     )
+    models = ", ".join(f"{role}={resolved[role][1]}" for role in WORKER_ROLES)
     board.post(
         author=caller,
         to=["all"],
         kind="action",
         card=card_id,
-        body=f"start {card_id} ({summary})",
+        body=f"start {card_id} ({summary}; models: {models})",
     )
     return {"action": "start", "card": card_id, "team": created}
 
@@ -627,10 +640,17 @@ def swarm_set(
         else:
             target_effort = current_effort
 
+    # Naming a tier gives the tier's model; changing only the effort keeps the
+    # model the member is really called with (a role's own model, say).
+    target_model = (
+        tier_cfg.model
+        if tier is not None
+        else str(member.get("model", "") or "") or tier_cfg.model
+    )
     updated = board.update_member(
         member_name,
         tier=tier_cfg.name,
-        model=tier_cfg.model,
+        model=target_model,
         effort=target_effort,
     )
     msg = f"set {member_name}: tier={tier_cfg.name}, effort={target_effort or 'none'}"

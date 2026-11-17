@@ -1109,6 +1109,35 @@ class Config:
                     return tier
         return default
 
+    def member_defaults(self, role: str) -> tuple[str, str]:
+        """`(tier name, model)` for a swarm member nobody named a tier for.
+
+        A role with its own model in `[model]` (one that differs from
+        `[model] implementer`, such as an independent checker) keeps that
+        model, exactly as with the swarm off; its tier is the one that serves
+        that model, else `[swarm] default_tier`, which also gives the
+        `effort_param`. Every other role takes `[swarm] default_tier`. A tier
+        named by the coordinator (`--team`, `swarm set`) replaces both.
+        """
+        aliases = {
+            "checker_pass1": "checker",
+            "checker_pass2": "checker",
+            "test-writer": "test_writer",
+        }
+        key = aliases.get(role, role)
+        default = self.tiers[self.swarm.default_tier]
+        role_model = self.role_models.get(key)
+        implementer = self.role_models.get("implementer")
+        base_model = implementer.model if implementer is not None else ""
+        if (
+            key != "implementer"
+            and role_model is not None
+            and role_model.model
+            and role_model.model != base_model
+        ):
+            return (self.tier_for_model(role_model.model).name, role_model.model)
+        return (default.name, default.model)
+
     def effort_for_role(self, role: str) -> tuple[str, str]:
         """Return `(effort, effort_param)` for a configured role, or `("", "")`."""
         aliases = {
