@@ -1412,6 +1412,79 @@ def _format_bench_list(payload: dict, style: Style) -> str:
     return "\n".join(lines)
 
 
+def _format_drive(payload: dict, style: Style) -> str:
+    if payload.get("refused"):
+        reason = payload.get("reason", "refused")
+        lines = [style.red(f"{ICON_FAIL} Drive refused: {reason}")]
+        if payload.get("code"):
+            lines.append(format_kv([("code", payload["code"])], style=style))
+        lines.extend(_render_next(["openfarm status"], style=style))
+        return "\n".join(lines)
+
+    run_id = payload.get("run_id", "?")
+    agent = payload.get("agent", "?")
+    seat = payload.get("seat", "both")
+    ok = bool(payload.get("ok", True))
+    badge = style.green(f"{ICON_OK} ok") if ok else style.red(f"{ICON_FAIL} failed")
+    lines = [style.heading(f"Driver Run {run_id}") + f"  [{agent} / {seat}]  {badge}"]
+    lines.extend(_render_kv_section("Driver", [
+        ("agent", agent),
+        ("seat", seat),
+        ("driver_turns", payload.get("driver_turns", 0)),
+        ("driver_tokens", f"{_fmt_int(payload.get('driver_tokens_in', 0))} in / {_fmt_int(payload.get('driver_tokens_out', 0))} out"),
+        ("actions_taken", len(payload.get("actions_taken") or ())),
+        ("answers_sent", len(payload.get("answers_sent") or ())),
+    ], style=style))
+
+    outcomes = payload.get("outcomes") or []
+    lines.append(style.bold(f"Outcomes ({len(outcomes)})"))
+    if outcomes:
+        rows = [_outcome_row(o, style) for o in outcomes]
+        lines.append(format_table(
+            ["CARD", "STATE", "STOP CODE", "ATTEMPTS", "DETAIL"],
+            rows,
+            style=style,
+            right_align={3},
+        ))
+    else:
+        lines.append(f"  {style.dim('(no card outcomes)')}")
+
+    reviews = payload.get("reviews") or []
+    if reviews:
+        lines.append(style.bold(f"Wave Reviews ({len(reviews)})"))
+        rev_rows = [
+            [
+                r.get("card", ""),
+                format_state(r.get("verdict") or "-", style=style),
+                _fmt_int(r.get("review_tokens", 0)),
+                "yes" if r.get("recorded") else "no",
+                _truncate(r.get("note") or "-", 56),
+            ]
+            for r in reviews
+        ]
+        lines.append(format_table(
+            ["CARD", "VERDICT", "TOKENS", "RECORDED", "NOTE"],
+            rev_rows,
+            style=style,
+            right_align={2},
+        ))
+
+    next_tips: list[str] = []
+    in_review = [
+        o.get("card_id") or o.get("card")
+        for o in outcomes
+        if o.get("final_state") in ("in-review", "in_review")
+    ]
+    if in_review:
+        sample = in_review[0]
+        next_tips.append(f"openfarm dossier {sample}")
+        next_tips.append(f"git merge --no-ff openfarm/{sample}-<slug> && openfarm done {sample}")
+    else:
+        next_tips.append("openfarm status")
+    lines.extend(_render_next(next_tips, style=style))
+    return "\n".join(lines)
+
+
 def _format_fallback(payload: dict, style: Style) -> str:
     if payload.get("error"):
         kind = payload.get("kind") or "error"
@@ -1486,6 +1559,8 @@ def format_human(kind: str, payload: dict, *, style: Style | None = None) -> str
         return _format_acp(kind, payload, st)
     if kind == "bench_list":
         return _format_bench_list(payload, st)
+    if kind == "drive":
+        return _format_drive(payload, st)
     return _format_fallback(payload, st)
 
 
@@ -1528,5 +1603,5 @@ def error_hint(kind: str, message: str) -> str:
     if "outside the repository" in low:
         return "point state_dir and key_file outside the repository (e.g. ~/.openfarm/<name> and ~/.config/openfarm/<name>.key)"
     if kind == "usage error" and "no subcommand" in low:
-        return "run 'openfarm --help' to list all 21 commands and workflows"
+        return "run 'openfarm --help' to list all 22 commands and workflows"
     return ""

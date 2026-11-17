@@ -2111,6 +2111,7 @@ def _format_ops_lines(snap: dict, *, width: int = 96) -> list[str]:
         out.extend(_box_lines("Recent Supervise Reports", sup_lines, width=width))
 
     out.append("Pre-config helpers: init, adopt, install-skill")
+    out.append("Driver mode: openfarm drive --agent claude|antigravity|codex --seat both [--wave]")
     out.append("Actions: [a]cp status  [P]robe  [C]onfigure  [s]upervise  [b]ench list  [B]ench dry-run  [I]nit  [A]dopt  [K]install-skill")
     return out
 
@@ -3446,6 +3447,7 @@ def _help_lines() -> list[str]:
         "  verdict CARD clean --review-tokens 1000 | escape CARD --note ... | dossier CARD",
         "  board read | board post --as A --to B --body ... | board answer SEQ --as A --file ...",
         "  swarm join --name N --seat coordinator|supervisor | swarm start CARD --as N",
+        "  drive --agent claude|antigravity|codex --seat both [--wave] [--record-verdict]",
         "  harness status [--global] | harness index | harness show ID | harness reset --yes",
         "  acp status | acp probe | supervise --triage-blocked | bench list | init NAME | adopt",
     ]

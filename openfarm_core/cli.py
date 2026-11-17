@@ -1785,11 +1785,11 @@ def cmd_swarm(ctx: Context, args) -> int:
 # -- the parser ----------------------------------------------------------------
 
 _CLI_EPILOG = """\
-Command groups (21 commands):
+Command groups (22 commands):
   Setup & Auth         init, adopt, install-skill, acp
   Run & Monitor        check, run, status, pause, resume, stop, tui
   Review & Harness     dossier, verdict, done, release, escape, supervise, harness
-  Swarm, Board & Bench swarm, board, bench
+  Swarm, Board & Bench swarm, board, drive, bench
 
 Common workflows:
   Bootstrap & auth     openfarm init my-app --idea "track habits"
@@ -2171,6 +2171,49 @@ def build_parser() -> argparse.ArgumentParser:
     tui_p.add_argument("--view", choices=TUI_VIEWS, default="overview",
                        help="initial TUI view (default: overview)")
 
+    drive_p = sub.add_parser(
+        "drive",
+        help="drive external coordinator/supervisor seats with claude, agy, or codex",
+        formatter_class=raw_fmt,
+        epilog="Examples:\n  openfarm drive --agent claude --seat both\n  openfarm drive --agent codex --seat both --cards 3 --wave\n  openfarm drive --agent antigravity --run RUN_ID --seat supervisor",
+    )
+    drive_p.add_argument(
+        "--agent",
+        choices=("claude", "antigravity", "agy", "codex"),
+        default="claude",
+        help="external driver CLI provider (default: claude)",
+    )
+    drive_p.add_argument(
+        "--seat",
+        choices=("both", "coordinator", "supervisor"),
+        default="both",
+        help="board seat(s) to drive (default: both)",
+    )
+    drive_p.add_argument("--run", dest="run_id", default=None,
+                         help="attach to an active run id (omit to start a managed run)")
+    drive_p.add_argument("--cards", type=int, default=None,
+                         help="maximum cards to run")
+    drive_p.add_argument("--card", action="append", default=[],
+                         help="specific card id to run (repeatable)")
+    drive_p.add_argument("--spend", type=float, default=None,
+                         help="spend cap for a managed run")
+    drive_p.add_argument("--driver-name", default="driver",
+                         help="board member name prefix (default: driver)")
+    drive_p.add_argument("--driver-bin", default=None,
+                         help="path to driver CLI executable")
+    drive_p.add_argument("--model", default=None,
+                         help="model override for the driver agent")
+    drive_p.add_argument("--effort", choices=("low", "medium", "high", "xhigh", "max"),
+                         default=None, help="reasoning effort for the driver agent")
+    drive_p.add_argument("--max-turns", type=int, default=40,
+                         help="maximum driver turns (default: 40)")
+    drive_p.add_argument("--wave", action="store_true",
+                         help="inspect in-review dossiers and diffs after the run")
+    drive_p.add_argument("--record-verdict", action="store_true",
+                         help="record wave review verdicts on ledger (never merges or pushes)")
+    drive_p.add_argument("--script", default=None,
+                         help="JSON scripted responses for offline tests")
+
     return parser
 
 
@@ -2398,6 +2441,35 @@ def cmd_tui(args) -> int:
     )
 
 
+def cmd_drive(ctx: Context, args) -> int:
+    """Drive external coordinator/supervisor board seats with a headless agent."""
+    from .driver import drive_run
+
+    payload = drive_run(
+        ctx.repo,
+        ctx.cfg,
+        ctx.state,
+        agent=args.agent,
+        seat=args.seat,
+        run_id=args.run_id,
+        cards=args.cards,
+        card_ids=list(getattr(args, "card", None) or ()),
+        spend=args.spend,
+        driver_name=args.driver_name,
+        driver_bin=args.driver_bin,
+        model=args.model,
+        effort=args.effort,
+        max_turns=args.max_turns,
+        wave=bool(args.wave),
+        record_verdict=bool(args.record_verdict),
+        script=Path(args.script) if getattr(args, "script", None) else None,
+    )
+    _emit_ctx(ctx, payload, "drive")
+    if payload.get("refused"):
+        return EXIT_REFUSED
+    return EXIT_OK if payload.get("ok") else EXIT_TROUBLE
+
+
 PRE_CONFIG_COMMANDS = {
     "adopt": cmd_adopt,
     "bench": cmd_bench,
@@ -2424,6 +2496,7 @@ COMMANDS = {
     "harness": cmd_harness,
     "board": cmd_board,
     "swarm": cmd_swarm,
+    "drive": cmd_drive,
 }
 
 

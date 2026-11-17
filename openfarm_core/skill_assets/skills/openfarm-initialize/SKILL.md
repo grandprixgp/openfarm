@@ -27,24 +27,24 @@ Unless the user passed `--no-grill`, explicitly requested zero questions, or an 
 
 Extract `<project_name>` (normalized to ASCII slug, e.g. `calorie-log`) and `<project_idea>` (e.g. `"An app to track my calories"`).
 
-Check toolchain, Worker key availability, and Frontier Claude OAuth readiness once:
+Check toolchain, Worker key availability, and Frontier OAuth readiness once:
 ```bash
 rustc --version && cargo --version && cargo clippy --version && rustfmt --version
-openfarm acp status --json
+openfarm acp status --provider all --json
 command -v cargo-mutants || echo "no cargo-mutants (will default mutation=off)"
 ls -la ~/.config/openfarm/ 2>/dev/null || true
 ```
 
-- **Frontier Model (Claude ACP via OAuth, default):** Look at `oauth_ready` and `resolved_transport` in `openfarm acp status --json`:
-  - If `resolved_transport` is `"claude-agent-acp"` or `"claude-native-acp"` and `oauth_ready: true`, Frontier ACP supervision is ready with zero extra API keys.
-  - If `oauth_ready: false`, guide the owner once to sign in via `openfarm acp login` (or `claude auth login --claudeai`), or pass `--profile solo` if intentionally disabling Frontier ACP supervision.
+- **Frontier Model (Claude / Antigravity / Codex ACP via OAuth, or Driver Mode):** Look at `oauth_ready` and `resolved_transport` in `openfarm acp status --json` (or `--provider claude|antigravity|codex|all`):
+  - If `oauth_ready: true`, Frontier ACP supervision (`init --acp-provider claude|antigravity|codex`) and Driver mode (`openfarm drive --agent ...`) are ready with zero extra API keys.
+  - If `oauth_ready: false`, guide the owner once to sign in via `openfarm acp login --provider <provider>` (or `claude auth login --claudeai` / `agy acp --login` / `codex login`), or pass `--profile solo` if intentionally disabling Frontier ACP supervision.
 - **Worker Models (ZDR OpenAI-compatible API key):** Ask **at most once** if a ZDR endpoint URL / Worker API key file is not yet configured (or proceed immediately with placeholder settings if the user wants an offline dry-run or scripted run).
 
 ### Existing repository instead of an empty directory
 
 When the directory already holds a git repository with code, `openfarm init` refuses it. Take this path instead:
 
-1. Make sure the work tree is clean, then run `openfarm adopt --dir . --json`. It writes `.openfarm/config.toml`, `.openfarm/PROJECT_SPEC.md` and `cards/.gitkeep`, commits nothing, and runs the suite once. If `known_failing_proposed` is not empty, show the owner those tests and copy them into `[policy] known_failing` only if they agree.
+1. Make sure the work tree is clean, then run `openfarm adopt --dir . --json` (auto-detects Rust, Python, or TypeScript, or pass `--lang rust|python|typescript`). It writes `.openfarm/config.toml`, `.openfarm/PROJECT_SPEC.md` and `cards/.gitkeep`, commits nothing, and runs the suite once. If `known_failing_proposed` is not empty, show the owner those tests and copy them into `[policy] known_failing` only if they agree.
 2. Grill as in step 0, reading the existing code for facts instead of asking.
 3. Instead of step 3's new skeleton: propose `never_touch` from the code (the modules that hold the project's invariants), and pick one existing, well-tested module as the reference slice that `pattern` and `small-feature` cards name in `reference`. Write no new skeleton. Put both, and the module ownership map, in `.openfarm/PROJECT_SPEC.md`, and confirm `never_touch` with the owner.
 4. Fill in `[model]` (endpoint, key file, models and any zero-retention header) as in step 1, then continue at step 4 (cards) and step 5 (commit and check) on the repository's own base branch rather than `main`.
@@ -56,11 +56,12 @@ Run `openfarm init` in the target empty directory (never let a frontier model ha
 ```bash
 openfarm init <project_name> \
   --dir . \
+  --acp-provider claude \
   --idea "<project_idea>" \
   --json
 ```
 
-By default `openfarm init` configures `[adapters] micromanager = "claude-acp"`, `[micromanager] mode = "active"`, `auth = "oauth"`, `binary = "auto"`, while configuring Workers under `[model]`. Add `--endpoint <URL> --model <MODEL_NAME>` if known, or pass `--profile advisory|solo` / adjust later via `openfarm acp configure`. Confirm the JSON response reports `"config_valid": true`.
+By default `openfarm init` configures `[adapters] micromanager = "claude-acp"` (or `antigravity-acp` / `codex-acp` via `--acp-provider`), `[micromanager] mode = "active"`, `auth = "oauth"`, `binary = "auto"`, while configuring Workers under `[model]`. Add `--endpoint <URL> --model <MODEL_NAME>` if known, or pass `--profile advisory|solo` / adjust later via `openfarm acp configure --provider ...`. Confirm the JSON response reports `"config_valid": true`.
 
 Verify zero-token ACP handshake works in the initialized repo when supervision is enabled:
 ```bash
@@ -111,4 +112,4 @@ If any card fails `openfarm check`, fix its frontmatter or `Done` text immediate
 
 ### 6. Hand Off or Start Wave 1
 
-Summarize the created files, `never_touch` seam (`src/invariants.rs`), verified card count, external `state_dir` / `key_file` paths, and ask the owner whether to launch Wave 1 immediately (via the [openfarm](../openfarm/SKILL.md) skill) or stop after setup.
+Summarize the created files, `never_touch` seam (`src/invariants.rs`), verified card count, external `state_dir` / `key_file` paths, and ask the owner whether to launch Wave 1 immediately (via the [openfarm](../openfarm/SKILL.md) skill using `openfarm run` or `openfarm drive`) or stop after setup.

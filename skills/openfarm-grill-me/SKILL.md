@@ -41,8 +41,8 @@ Read [prompts/grill_protocol.md](./prompts/grill_protocol.md) for the exact 5-br
    - **Branch 1 — Protected Seam Invariants (`src/invariants.rs`)**: bounds, overflow rules, validation laws, and `DomainError` variants locked under `never_touch`.
    - **Branch 2 — Public Surface & Golden Reference Slice**: `pub` types (`rust_tests_in_separate_files = true`) and which single vertical slice workers will imitate.
    - **Branch 3 — Scope Boundaries, Crate Dependencies & Extra Gates**: non-goals for v1 and pinned dependencies (`**/Cargo.toml` and `Cargo.lock` are `forbidden_files` for workers).
-   - **Branch 4 — Frontier (Claude ACP OAuth) & Worker (API Key) Runtime**:
-     - Default Frontier supervision is native Claude ACP via OAuth (`[micromanager] auth = "oauth"`, `binary = "auto"`). If `openfarm acp status --json` shows `oauth_ready: false`, confirm whether the owner wants to run `openfarm acp login` now (default) or fall back to `--profile solo`.
+   - **Branch 4 — Frontier (Claude / Antigravity / Codex ACP or Driver Mode) & Worker (API Key) Runtime**:
+     - Default Frontier supervision is native ACP via OAuth (`claude-acp`, `antigravity-acp`/`agy-acp`, or `codex-acp` via `init --acp-provider <provider>`, or automated Driver mode `openfarm drive --agent claude|antigravity|codex`). If `openfarm acp status --json` shows `oauth_ready: false`, confirm whether the owner wants to run `openfarm acp login --provider <provider>` now (default) or fall back to `--profile solo`.
      - Confirm Worker ZDR OpenAI-compatible endpoint/model + `~/.config/openfarm/<project>.key` and spend caps (unless offline/scripted test only).
    - **Branch 5 — Concrete Wave 1–3 Boundaries & Eligibility**: resolve edge-case outputs so card `## Done` bullets never contain banned vague words (`handle`, `properly`, `robust`, `decide how`).
 

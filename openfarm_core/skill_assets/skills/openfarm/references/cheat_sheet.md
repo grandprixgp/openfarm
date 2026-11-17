@@ -1,16 +1,16 @@
 # Openfarm v0.8.0 Cheat Sheet
 
-## 21 CLI Subcommands (`--repo`, `--config`, `--json`)
+## 22 CLI Subcommands (`--repo`, `--config`, `--json`)
 
 Exit codes: `0` ok/eligible | `1` refused/ineligible | `2` usage/config | `3` infra/trouble
 
 | Command | Usage |
 | --- | --- |
-| `init` | `openfarm init <NAME> [--dir PATH] [--idea TEXT] [--profile auto\|solo\|advisory\|active] [--mutation auto\|off\|report\|required] [--endpoint URL] [--model NAME] [--commit]` |
-| `adopt` | `openfarm adopt [--dir DIR] [--lang rust\|python] [--state-dir PATH] [--key-file PATH] [--no-suite]` |
+| `init` | `openfarm init <NAME> [--dir PATH] [--idea TEXT] [--profile auto\|solo\|advisory\|active] [--acp-provider claude\|antigravity\|codex] [--mutation auto\|off\|report\|required] [--endpoint URL] [--model NAME] [--commit]` |
+| `adopt` | `openfarm adopt [--dir DIR] [--lang rust\|python\|typescript] [--state-dir PATH] [--key-file PATH] [--no-suite]` |
 | `bench` | `openfarm bench list [--dir bench]` / `openfarm bench run [--task ID]... [--arm farm=FILE] [--arm solo=FILE] [--repeats N] [--out DIR] [--dry-run]` |
-| `install-skill` | `openfarm install-skill [--target all\|claude\|antigravity\|agents\|workspace] [--dest PATH] [--install-bin PATH] [--dry-run]` |
-| `acp` | `openfarm acp [status\|login\|configure\|probe] [--mode active\|advisory\|off] [--auth oauth\|api-key\|auto] [--binary auto\|claude\|claude-agent-acp] [--model M] [--effort low\|medium\|high] [--tool-policy none\|read-only] [--claudeai\|--console] [--setup-token]` |
+| `install-skill` | `openfarm install-skill [--target all\|claude\|antigravity\|codex\|agents\|workspace] [--dest PATH] [--install-bin PATH] [--dry-run]` |
+| `acp` | `openfarm acp [status\|login\|configure\|probe] [--provider claude\|antigravity\|codex\|all] [--mode active\|advisory\|off] [--auth oauth\|api-key\|auto] [--binary auto\|claude\|claude-agent-acp\|agy\|agy-print\|antigravity-acp\|codex\|codex-acp] [--model M] [--effort low\|medium\|high\|xhigh\|max] [--tool-policy none\|read-only] [--claudeai\|--console] [--setup-token]` |
 | `tui` | `openfarm tui [--run ID] [--refresh SEC] [--once] [--view overview\|cards\|dossier\|board\|swarm\|harness\|ops]` |
 | `check` | `openfarm check <CARD> [--baseline]` |
 | `supervise` | `openfarm supervise (--triage-blocked \| --prepare-queue) [--card ID] [--apply] [--mm-script PATH]` |
@@ -24,6 +24,7 @@ Exit codes: `0` ok/eligible | `1` refused/ineligible | `2` usage/config | `3` in
 | `harness` | `openfarm harness [status\|index\|show\|promote\|demote\|reset] [TARGET] [--reason TEXT] [--yes]`; `status`, `promote <gid>` and `demote <gid>` take `--global` for the global library |
 | `board` | `openfarm board (read \| post \| answer \| wait) [--run ID] [--as MEMBER] ...` |
 | `swarm` | `openfarm swarm (status \| tiers \| join \| start \| set \| hint \| block \| remove) [--run ID] ...` |
+| `drive` | `openfarm drive [--agent claude\|antigravity\|agy\|codex] [--seat both\|coordinator\|supervisor] [--run ID] [--cards N] [--card ID]... [--spend AMT] [--driver-name NAME] [--driver-bin PATH] [--model M] [--effort E] [--max-turns N] [--wave] [--record-verdict] [--script PATH]` |
 
 ## 9 Card Categories & Rules
 

@@ -1,10 +1,11 @@
 ---
 name: openfarm-installer
 description: >-
-  Install the Openfarm v0.8.0 CLI package, native Claude ACP OAuth bridge,
-  /openfarm-grill-me design interview, and /openfarm-initialize skills into
-  Claude Code, Antigravity, or workspace customization directories from a single
-  repository or package target.
+  Install the Openfarm v0.8.0 CLI package, multi-provider ACP OAuth bridges and
+  Driver mode (Claude Code, Antigravity agy, Codex), /openfarm-grill-me design
+  interview, and /openfarm-initialize skills into Claude Code, Antigravity,
+  Codex, or workspace customization directories from a single repository or
+  package target.
 ---
 
 # Openfarm Installer Skill (`v0.8.0`)
@@ -43,9 +44,10 @@ pip install --user <GITHUB_URL_OR_LOCAL_PATH>
 openfarm install-skill --target all --json
 ```
 
-If deploying into a specific project workspace only (without touching `~/.claude` or `~/.gemini/config`), run:
+If deploying into a specific runtime or project workspace only (for example `--target codex`, `--target claude`, `--target antigravity`, or `--target workspace` without touching global home folders), run:
 
 ```bash
+openfarm install-skill --target codex --json
 openfarm install-skill --target workspace --dest /path/to/workspace --json
 ```
 
@@ -57,16 +59,17 @@ Confirm both the CLI binary and installed customization files exist:
 openfarm --help
 ```
 
-Check that the output lists all 21 subcommands (`init`, `adopt`, `bench`, `install-skill`, `acp`, `tui` alongside `run`, `status`, `pause`, `resume`, `stop`, `release`, `dossier`, `check`, `verdict`, `escape`, `supervise`, `harness`, `done`, `board`, and `swarm`), and confirm the installed skill files exist in at least one active discovery root:
+Check that the output lists all 22 subcommands (`init`, `adopt`, `bench`, `install-skill`, `acp`, `tui` alongside `run`, `status`, `pause`, `resume`, `stop`, `release`, `dossier`, `check`, `verdict`, `escape`, `supervise`, `harness`, `done`, `board`, `swarm`, and `drive`), and confirm the installed skill files exist in at least one active discovery root:
 - `~/.claude/skills/openfarm-initialize/SKILL.md`, `~/.claude/skills/openfarm-grill-me/SKILL.md`, `~/.claude/commands/openfarm-initialize.md`, and `~/.claude/commands/openfarm-grill-me.md`
 - `~/.gemini/config/skills/openfarm-initialize/SKILL.md`, `~/.gemini/config/skills/openfarm-grill-me/SKILL.md`, and `~/.gemini/config/plugins/openfarm/plugin.json`
+- `~/.codex/skills/openfarm-initialize/SKILL.md`, `~/.codex/skills/openfarm-grill-me/SKILL.md`, and `~/.codex/openfarm-AGENTS.md`
 - `~/.agents/skills/openfarm-initialize/SKILL.md` and `~/.agents/skills/openfarm-grill-me/SKILL.md`
 
-Check Frontier Claude OAuth readiness (optional interactive login once if not signed in):
+Check Frontier OAuth readiness across Claude, Antigravity (`agy`), and Codex (`codex`) for ACP mode or Driver mode (`openfarm drive`):
 ```bash
-openfarm acp status --json
-# If oauth_ready is false and you want Frontier ACP supervision via OAuth:
-# openfarm acp login
+openfarm acp status --provider all --json
+# If oauth_ready is false for your chosen Frontier provider (claude|antigravity|codex):
+# openfarm acp login --provider claude
 ```
 
 ## Step 3 — Confirm Readiness to the Owner
@@ -74,9 +77,9 @@ openfarm acp status --json
 Report:
 1. Where `openfarm` was installed (`which openfarm` or `~/.local/bin/openfarm`).
 2. Which customization roots received `openfarm-grill-me`, `openfarm-initialize`, and `openfarm`.
-3. Whether Frontier Claude ACP OAuth is ready (`openfarm acp status --json`) — noting Workers still authenticate via external API `key_file`.
+3. Whether Frontier ACP OAuth is ready (`openfarm acp status --provider all --json`) for ACP mode (`init --acp-provider claude|antigravity|codex`) and Driver mode (`openfarm drive --agent claude|antigravity|codex`) — noting Workers still authenticate via external API `key_file`.
 4. Tell the human owner they can now grill/initialize any project from an empty directory with:
    ```text
    /openfarm-initialize <project_name> <project_idea>
    ```
-   or stress-test decisions first with `/openfarm-grill-me <project_idea>` (for example: `/openfarm-initialize calorie-log An app to track my calories`).
+   or stress-test decisions first with `/openfarm-grill-me <project_idea>` (for example: `/openfarm-initialize calorie-log An app to track my calories`), or adopt an existing Rust/Python/TypeScript repository with `openfarm adopt --dir . [--lang rust|python|typescript]`.

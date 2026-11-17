@@ -19,7 +19,7 @@ from .config import load_config
 from .errors import ConfigError, Invalid, Refused, UsageError
 from .git import Git
 
-INSTALL_TARGETS = ("claude", "antigravity", "agents", "workspace", "all")
+INSTALL_TARGETS = ("claude", "antigravity", "codex", "agents", "workspace", "all")
 PROFILES = ("auto", "solo", "advisory", "active")
 MUTATION_MODES = ("auto", "off", "report", "required")
 
@@ -140,7 +140,7 @@ def install_skill_bundle(
     base_home = Path(home).expanduser().resolve() if home is not None else Path.home().resolve()
     explicit_dest = Path(dest).expanduser().resolve() if dest is not None else None
 
-    targets_run = ("claude", "antigravity", "agents") if target == "all" else (target,)
+    targets_run = ("claude", "antigravity", "codex", "agents") if target == "all" else (target,)
     installed: dict[str, dict[str, list[str]]] = {}
 
     for item in targets_run:
@@ -167,6 +167,23 @@ def install_skill_bundle(
                 _copy_tree(plugin_src, plugin_dir, dry_run=dry_run)
                 + _copy_tree(skills_src, plugin_dir / "skills", dry_run=dry_run)
             )
+        elif item == "codex":
+            codex_root = (
+                explicit_dest
+                if explicit_dest is not None and target == "codex"
+                else (explicit_dest or base_home) / ".codex"
+            )
+            entry["skills"] = _copy_tree(
+                skills_src, codex_root / "skills", dry_run=dry_run
+            )
+            # Codex rules/*.rules are Starlark execpolicy, so place markdown rules at root.
+            entry["plugin"] = [
+                _copy_file(
+                    plugin_src / "rules" / "AGENTS.md",
+                    codex_root / "openfarm-AGENTS.md",
+                    dry_run=dry_run,
+                )
+            ]
         elif item == "agents":
             agents_root = (
                 explicit_dest
@@ -176,8 +193,9 @@ def install_skill_bundle(
             entry["skills"] = _copy_tree(skills_src, agents_root / "skills", dry_run=dry_run)
         elif item == "workspace":
             ws_root = explicit_dest if explicit_dest is not None else Path.cwd().resolve()
-            entry["skills"] = _copy_tree(
-                skills_src, ws_root / ".agents" / "skills", dry_run=dry_run
+            entry["skills"] = (
+                _copy_tree(skills_src, ws_root / ".agents" / "skills", dry_run=dry_run)
+                + _copy_tree(skills_src, ws_root / ".codex" / "skills", dry_run=dry_run)
             )
             entry["commands"] = _copy_tree(
                 commands_src, ws_root / ".claude" / "commands", dry_run=dry_run

@@ -2,15 +2,15 @@
 
 Follow this protocol whenever running Openfarm waves on a project:
 
-1. **Never paste raw `cargo` build logs or intermediate failed attempt diffs into frontier conversation.** Rely on `openfarm run --cards N --json` to return compact per-card summaries (`final_state`, `stop_code`, `branch`, `harness_revision`).
+1. **Never paste raw `cargo` build logs or intermediate failed attempt diffs into frontier conversation.** Rely on `openfarm run --cards N --json` (ACP mode) or `openfarm drive --agent claude|antigravity|codex --seat both --cards N --json` (Driver mode) to return compact per-card summaries (`final_state`, `stop_code`, `branch`, `harness_revision`).
 2. **Respect the local-only boundary**:
    - Openfarm never pushes branches.
-   - Review `openfarm dossier <CARD-ID>` (note: test diff precedes production diff) and `git diff main..<branch>` before merging onto `main` with `git merge --no-ff`.
-3. **Always record `openfarm verdict`** (`clean`, `minor-fix`, `bounced`, `scrapped` with `--review-tokens <n>`) so payback and review metrics remain accurate.
+   - Review `openfarm dossier <CARD-ID>` (note: test diff precedes production diff) and `git diff main..<branch>` (or use `openfarm drive --wave --record-verdict`, which reviews without reading `never_touch` and never merges/pushes) before merging onto `main` with `git merge --no-ff`.
+3. **Always record `openfarm verdict`** (`clean`, `minor-fix`, `bounced`, `scrapped` with `--review-tokens <n>`, or `--wave --record-verdict` in Driver mode) so payback and review metrics remain accurate.
 4. **Recover cleanly from blocks**:
    - `dirty-baseline`: inspect failing test on `main`, fix or add exact test name to `known_failing` outside the farm, clear cache if needed, re-run `--dry-run`.
-   - `infra`: fix disk/endpoint/ACP issue (if OAuth expired, run `openfarm acp login`), run `openfarm resume`, `openfarm release <ID> --reason "infra retry"`, and re-run.
-   - `acp-auth-required`: Frontier OAuth credentials are missing or expired — run `openfarm acp login` (or `claude auth login --claudeai`), verify with `openfarm acp probe --json`, then `openfarm release <ID> --reason "oauth refreshed"`.
+   - `infra`: fix disk/endpoint/ACP issue (if OAuth expired, run `openfarm acp login --provider claude|antigravity|codex`), run `openfarm resume`, `openfarm release <ID> --reason "infra retry"`, and re-run.
+   - `acp-auth-required`: Frontier OAuth credentials are missing or expired — run `openfarm acp login --provider <provider>` (or `claude auth login --claudeai` / `agy acp --login` / `codex login`), verify with `openfarm acp probe --provider <provider> --json`, then `openfarm release <ID> --reason "oauth refreshed"`.
    - Circuit breaker tripped (`3` consecutive blocks with same stop code): inspect `breaker.json`, run `openfarm supervise --triage-blocked`, fix card scope, then `openfarm resume --clear-breaker`.
 5. **Curate `<state_dir>/harness/` carefully**:
    - Let `HarnessLibrary` auto-promote, probe for `probe_window`, and auto-demote regressions automatically.
