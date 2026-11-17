@@ -121,8 +121,9 @@ ROLE_HEADERS = {
         "Return edit blocks only. You cannot edit tests."),
     "checker_pass1": (
         "You review tests alone, without seeing the implementation.\n"
-        "Say whether these tests would catch a bad implementation, and restate the\n"
-        "done text in your own words."),
+        "Answer in the form given at the end of this brief: restate the done text in\n"
+        "your own words, then say whether these tests would catch a bad\n"
+        "implementation, and what they miss."),
     "checker_pass2": (
         "You review the whole diff against the done text. Answer in the form given\n"
         "at the end of this brief: your verdict and reasons, a traceability table,\n"
@@ -507,9 +508,22 @@ def implementer_brief(card: Card, book: BriefBook, frozen_tests: dict[str, str],
     return Brief("implementer", "\n".join(parts))
 
 
-def checker_pass1_brief(card: Card, test_diff: str, handback: bool = False) -> Brief:
+def checker_pass1_brief(card: Card, test_diff: str, handback: bool = False,
+                        answer_form: str = "", retry_problem: str = "") -> Brief:
+    """The first pass's brief. `answer_form` is `roles.pass1_answer_form()`, the
+    form `roles.parse_pass1` reads. `retry_problem` says why the last answer
+    could not be read, for the one time the pass is asked again."""
+    if not answer_form:
+        from .roles import pass1_answer_form
+        answer_form = pass1_answer_form()
     parts = [ROLE_HEADERS["checker_pass1"], "", _card_section(card, handback), "",
              "The test diff, and nothing else:\n" + fence(test_diff, "test diff")]
+    if retry_problem:
+        parts.append(
+            "\nYour last answer to this brief could not be read: "
+            f"{_sanitize_text(retry_problem).strip()}. Answer again, in exactly the "
+            "form below, from the `RESTATEMENT:` line on.")
+    parts.extend(["", answer_form])
     if handback:
         parts.extend(["", HANDBACK_INSTRUCTIONS])
     return Brief("checker_pass1", "\n".join(parts))
