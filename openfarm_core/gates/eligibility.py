@@ -130,6 +130,13 @@ def check_eligibility(card: Card, cfg, deps_done: bool = True,
         result.fail("frontier-estimate",
                     "the card's frontier_estimate is invalid")
 
+    raw_replan_if = card.fields.get("replan_if")
+    if raw_replan_if is not None and (
+        not isinstance(raw_replan_if, list)
+        or any(not isinstance(item, str) for item in raw_replan_if)
+    ):
+        result.fail("replan-if", "the card's replan_if must be a list of strings")
+
     # 3. Shape: one unit, a handful of files, at least one touch.
     if not card.touches:
         result.fail("no-touches", "the card names no paths in touches")

@@ -6,6 +6,7 @@ files and command output, never from another model's notes.
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import random
@@ -27,7 +28,8 @@ class RoleCall:
                  model: str = "", temperature: float = 0.0,
                  seed: int | None = None, tokens_in: int = 0,
                  tokens_out: int = 0, spend: float = 0.0,
-                 finish_reason: str = "stop") -> None:
+                 finish_reason: str = "stop",
+                 effort: str = "", effort_param: str = "") -> None:
         self.role = role
         self.brief = brief
         self.content = content
@@ -38,6 +40,8 @@ class RoleCall:
         self.tokens_out = tokens_out
         self.spend = spend
         self.finish_reason = finish_reason
+        self.effort = effort
+        self.effort_param = effort_param
 
     @property
     def cut_off(self) -> bool:
@@ -48,7 +52,8 @@ class RoleCall:
         return {"role": self.role, "content": self.content, "model": self.model,
                 "temperature": self.temperature, "seed": self.seed,
                 "tokens_in": self.tokens_in, "tokens_out": self.tokens_out,
-                "spend": self.spend, "finish_reason": self.finish_reason}
+                "spend": self.spend, "finish_reason": self.finish_reason,
+                "effort": self.effort}
 
 
 class Roles:
@@ -79,31 +84,92 @@ class Roles:
         seed = self._rng.randrange(1, 2**31 - 1) if vary_seed else 7
         return model, temperature, seed
 
+    def _complete(self, *, role: str, model: str, temperature: float,
+                  messages: list[dict], seed: int, max_tokens: int,
+                  response_format: str | None, attempt: int,
+                  effort: str, effort_param: str):
+        base = {
+            "role": role,
+            "model": model,
+            "temperature": temperature,
+            "messages": messages,
+            "seed": seed,
+            "max_tokens": max_tokens,
+            "response_format": response_format,
+        }
+        extras = {
+            "card_id": self.card_id,
+            "attempt": attempt,
+            "effort": effort,
+            "effort_param": effort_param,
+        }
+        try:
+            sig = inspect.signature(self.backend.complete)
+            params = sig.parameters
+            has_varkw = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD
+                for p in params.values()
+            )
+            chosen = {k: v for k, v in extras.items() if has_varkw or k in params}
+        except (ValueError, TypeError):
+            chosen = None
+
+        if chosen is not None:
+            try:
+                return self.backend.complete(**base, **chosen)
+            except TypeError:
+                pass
+
+        for subset in (
+            ("card_id", "attempt", "effort", "effort_param"),
+            ("effort", "effort_param"),
+            ("card_id", "attempt"),
+        ):
+            try:
+                return self.backend.complete(
+                    **base, **{k: extras[k] for k in subset}
+                )
+            except TypeError:
+                continue
+        return self.backend.complete(**base)
+
     def call(self, role: str, brief: Brief, attempt: int = 1,
-             response_format: str | None = None) -> RoleCall:
-        model, temperature, seed = self._settings(role)
+             response_format: str | None = None,
+             model: str | None = None,
+             effort: str | None = None,
+             effort_param: str | None = None) -> RoleCall:
+        default_model, temperature, seed = self._settings(role)
+        effective_model = model if model is not None else default_model
+        if effort is None and effort_param is None:
+            if hasattr(self.cfg, "effort_for_role"):
+                eff, eff_param = self.cfg.effort_for_role(role)
+            else:
+                eff, eff_param = ("", "")
+        else:
+            eff = effort or ""
+            if effort_param is not None:
+                eff_param = effort_param
+            elif eff and hasattr(self.cfg, "tier_for_model"):
+                eff_param = self.cfg.tier_for_model(effective_model).effort_param
+            else:
+                eff_param = "reasoning_effort" if eff else ""
         messages = [{"role": "user", "content": brief.body}]
         max_tokens = getattr(self.cfg, "model_max_tokens", 4096)
-        try:
-            completion = self.backend.complete(
-                role=role, model=model, temperature=temperature,
-                messages=messages, seed=seed, max_tokens=max_tokens,
-                response_format=response_format, card_id=self.card_id,
-                attempt=attempt)
-        except TypeError:
-            # A backend that does not take card_id/attempt (a plain stub).
-            completion = self.backend.complete(
-                role=role, model=model, temperature=temperature,
-                messages=messages, seed=seed, max_tokens=max_tokens,
-                response_format=response_format)
+        completion = self._complete(
+            role=role, model=effective_model, temperature=temperature,
+            messages=messages, seed=seed, max_tokens=max_tokens,
+            response_format=response_format, attempt=attempt,
+            effort=eff, effort_param=eff_param,
+        )
 
-        record = RoleCall(role, brief, completion.content, model=model,
+        record = RoleCall(role, brief, completion.content, model=effective_model,
                           temperature=temperature, seed=seed,
                           tokens_in=completion.tokens_in,
                           tokens_out=completion.tokens_out,
                           spend=completion.cost,
                           finish_reason=str(getattr(completion, "finish_reason",
-                                                    "stop") or "stop"))
+                                                    "stop") or "stop"),
+                          effort=eff, effort_param=eff_param)
         self.calls.append(record)
         return record
 

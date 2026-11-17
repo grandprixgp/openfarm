@@ -80,12 +80,14 @@ class ClaudeAcpWorkerBackend:
     def complete(self, role: str, model: str, temperature: float,
                  messages: list[dict], seed: int | None = None,
                  max_tokens: int = 4096,
-                 response_format: str | None = None) -> Completion:
+                 response_format: str | None = None,
+                 effort: str = "",
+                 effort_param: str = "") -> Completion:
         # ACP has no temperature, seed or token cap; Claude's own defaults apply.
         adapter = self._ensure_adapter()
         session_id = adapter.new_session(
             cwd=self.cwd, system_prompt=_SYSTEM_PROMPT, model=model,
-            effort=self.effort, tool_policy="none",
+            effort=effort or self.effort, tool_policy="none",
             timeout_s=min(30.0, self.timeout_s))
         text = "\n\n".join(str(m.get("content", "")) for m in messages)
         result = adapter.prompt(session_id, text, timeout_s=self.timeout_s)

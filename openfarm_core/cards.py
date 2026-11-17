@@ -67,6 +67,7 @@ OPTIONAL_CARD_FIELDS = (
     "unit",
     "context_files",
     "type_changes",
+    "replan_if",
 )
 
 _OPENFARM_BLOCK_RE = re.compile(
@@ -191,6 +192,20 @@ class Card:
     @property
     def type_changes(self) -> bool:
         return bool(self.fields.get("type_changes", False))
+
+    @property
+    def replan_if(self) -> list[str]:
+        raw = self.fields.get("replan_if")
+        if not isinstance(raw, list):
+            return []
+        return [str(item) for item in raw]
+
+    @property
+    def replan_if_valid(self) -> bool:
+        raw = self.fields.get("replan_if")
+        if raw is None:
+            return True
+        return isinstance(raw, list) and all(isinstance(item, str) for item in raw)
 
     # -- serialisation --------------------------------------------------------
 

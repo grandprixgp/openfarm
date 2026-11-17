@@ -282,9 +282,10 @@ class CmdModelBackend:
                  messages: list[dict], seed: int | None = None,
                  max_tokens: int = 4096,
                  response_format: str | None = None,
-                 card_id: str = "", attempt: int = 1):
+                 card_id: str = "", attempt: int = 1,
+                 effort: str = "", effort_param: str = ""):
         from .adapters.openai_compat import Completion
-        result = self.adapter.call("model", "complete", {
+        params = {
             "role": role,
             "model": model,
             "temperature": temperature,
@@ -294,7 +295,12 @@ class CmdModelBackend:
             "response_format": response_format,
             "card_id": card_id,
             "attempt": attempt,
-        })
+        }
+        if effort:
+            params["effort"] = effort
+        if effort_param:
+            params["effort_param"] = effort_param
+        result = self.adapter.call("model", "complete", params)
         tokens_in = _safe_int(result.get("tokens_in"))
         tokens_out = _safe_int(result.get("tokens_out"))
         raw_cost = result.get("cost")

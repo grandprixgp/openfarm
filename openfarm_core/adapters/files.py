@@ -28,7 +28,8 @@ import shutil
 import tomllib
 from pathlib import Path
 
-from ..cards import Card, extract_fenced_fields, hash_value
+from ..cards import (CARD_FIELDS, OPTIONAL_CARD_FIELDS, Card,
+                     extract_fenced_fields, hash_value)
 from ..errors import Infra, Invalid, Refused, Unsupported
 from ..git import Git
 from ..state import utc_after, utc_now
@@ -222,10 +223,8 @@ class FileCardSource:
             block_fields, body = extract_fenced_fields(body, self.fields_block)
             if block_fields:
                 merged = {**block_fields, **header}
-        fields = {k: merged[k] for k in
-                  ("category", "reference", "tests", "test_edits",
-                   "frontier_estimate", "new_symbols", "unit",
-                   "context_files", "type_changes") if k in merged}
+        fields = {k: merged[k] for k in (*CARD_FIELDS, *OPTIONAL_CARD_FIELDS)
+                  if k in merged}
         deps = [str(d) for d in merged.get("depends", merged.get("deps", [])) or []]
         touches = [str(t) for t in merged.get("touches", []) or []]
         done_body = body.strip()
@@ -451,8 +450,9 @@ class FileCardSource:
             "touches": list(card.touches),
             "depends": list(card.deps),
         }
-        for key in ("category", "reference", "test_edits", "frontier_estimate",
-                    "new_symbols", "unit", "context_files", "type_changes"):
+        for key in (*CARD_FIELDS, *OPTIONAL_CARD_FIELDS):
+            if key == "tests":
+                continue
             if key in card.fields:
                 header[key] = card.fields[key]
         if "tests" in card.fields:

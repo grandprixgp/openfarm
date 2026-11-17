@@ -29,6 +29,8 @@ class StopCode(str, enum.Enum):
     REFUSED = "refused"
     INFRA = "infra"
     LEASE_EXPIRED = "lease-expired"
+    HANDED_BACK = "handed-back"
+    SEAT_SILENT = "seat-silent"
 
     # Farm-wide and operator codes, outside the per-card table.
     KILLED = "killed"
