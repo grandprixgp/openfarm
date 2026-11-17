@@ -200,6 +200,11 @@ def _nonempty_str(value) -> bool:
     return isinstance(value, str) and bool(value.strip())
 
 
+#: Fields that would name the account in an Antigravity token, if it has any.
+_AGY_ACCOUNT_KEYS = ("email", "account", "account_id", "user", "user_id", "sub",
+                     "client_id", "project_id")
+
+
 def check_shape(provider: str, raw: bytes, original: bytes | None) -> str:
     """Empty string when `raw` is a plausible refreshed login for the same account."""
     if not raw:
@@ -259,8 +264,36 @@ def check_shape(provider: str, raw: bytes, original: bytes | None) -> str:
             return "the Antigravity token is not text"
         if not text.strip():
             return "the Antigravity token is blank"
-        if original and _json_object(original) is not None and _json_object(raw) is None:
-            return "the original Antigravity token was a JSON object and the new one is not"
+        if not original:
+            return "there was no Antigravity token to compare with, so nothing is copied back"
+        old_obj, new_obj = _json_object(original), _json_object(raw)
+        if old_obj is not None:
+            if new_obj is None:
+                return "the original Antigravity token was a JSON object and the new one is not"
+            # Nothing documents the fields, so the check is on structure: a refreshed
+            # token keeps every field the old one had, and whatever names the
+            # account stays the same.
+            lost = sorted(k for k in old_obj if k not in new_obj)
+            if lost:
+                return "the refreshed Antigravity token lost fields the old one had"
+            for key in _AGY_ACCOUNT_KEYS:
+                if key in old_obj and new_obj.get(key) != old_obj[key]:
+                    return "the refreshed Antigravity token belongs to another account"
+            return ""
+        if new_obj is not None:
+            return "the original Antigravity token was plain text and the new one is a JSON object"
+        # Plain text: one token stays one token (no line or space appears inside
+        # one that had none, and it does not grow out of all proportion).
+        try:
+            old_text = original.decode("utf-8")
+        except UnicodeDecodeError:
+            return "the original Antigravity token is not text, so nothing is copied back"
+        if len(old_text.split()) != len(text.split()):
+            return "the refreshed Antigravity token is not shaped like the old one"
+        if len(text.strip()) > max(4096, 4 * len(old_text.strip())):
+            return "the refreshed Antigravity token is far longer than the old one"
+        if any(ord(ch) < 32 and ch not in "\n\r\t" for ch in text):
+            return "the refreshed Antigravity token has control characters"
         return ""
     return f"unknown provider {provider!r}"
 
@@ -331,17 +364,42 @@ def sync_back(
     if problem:
         return SyncResult("refused", problem)
     dest = Path(target)
+    if dest.is_symlink():
+        # The owner keeps the login elsewhere and links to it (dotfiles). Replacing
+        # the link with a file would leave the old token behind the link's target,
+        # so the refreshed login goes to the file the link points at. The path is
+        # the owner's own, never the child's.
+        try:
+            dest = dest.resolve(strict=True)
+        except OSError as exc:
+            return SyncResult("refused",
+                              f"the credential is a link that does not resolve ({exc.strerror})",
+                              str(target))
     if not dest.parent.is_dir():
         return SyncResult("refused", f"{dest.parent} is not a folder", str(dest))
     prefix = "." + dest.name + "-"
     backup = ""
     try:
+        if not dest.exists() and initial is not None:
+            return SyncResult(
+                "refused", "the login was removed while the child ran, so nothing is "
+                "copied back", str(dest))
         if dest.exists():
             try:
                 previous = dest.read_bytes()
             except OSError as exc:
                 return SyncResult("refused", f"cannot read the current credential to back it up ({exc.strerror})",
                                   str(dest))
+            if previous == raw:
+                return SyncResult("unchanged", "", str(dest))
+            if previous != initial:
+                # Someone else wrote it since this child's copy was taken: another
+                # child that refreshed first, or the owner logging in again. Theirs
+                # stays; this child's older view of the login never replaces it.
+                return SyncResult(
+                    "refused", "the login on disk changed while the child ran (another "
+                    "child refreshed it, or you logged in again), so it is left as it is",
+                    str(dest))
             _write_atomic(dest.parent, dest.name + BACKUP_SUFFIX, previous, prefix)
             backup = str(dest.parent / (dest.name + BACKUP_SUFFIX))
         _write_atomic(dest.parent, dest.name, raw, prefix)
