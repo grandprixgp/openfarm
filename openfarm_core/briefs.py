@@ -124,8 +124,9 @@ ROLE_HEADERS = {
         "Say whether these tests would catch a bad implementation, and restate the\n"
         "done text in your own words."),
     "checker_pass2": (
-        "You review the whole diff. Return a traceability table, at least two traced\n"
-        "edge cases, and up to two counter-tests you expect to fail."),
+        "You review the whole diff against the done text. Answer in the form given\n"
+        "at the end of this brief: your verdict and reasons, a traceability table,\n"
+        "traced edge cases, and counter-tests you expect to fail."),
 }
 
 
@@ -506,7 +507,14 @@ def checker_pass1_brief(card: Card, test_diff: str, handback: bool = False) -> B
 
 
 def checker_pass2_brief(card: Card, full_diff: str, gate_results: list[dict],
-                        modified_files: dict[str, str], handback: bool = False) -> Brief:
+                        modified_files: dict[str, str], handback: bool = False,
+                        answer_form: str = "", retry_problem: str = "") -> Brief:
+    """The second pass's brief. `answer_form` is `roles.pass2_answer_form(...)`
+    for this project; the parser reads that same form. `retry_problem` says why
+    the last answer could not be read, for the one time the pass is asked again."""
+    if not answer_form:
+        from .roles import pass2_answer_form
+        answer_form = pass2_answer_form()
     parts = [ROLE_HEADERS["checker_pass2"], "", _card_section(card, handback), "",
              "The full diff:\n" + fence(full_diff, "diff")]
     parts.append("\nGate results:")
@@ -515,6 +523,12 @@ def checker_pass2_brief(card: Card, full_diff: str, gate_results: list[dict],
     parts.append("\nModified files:")
     for path, text in modified_files.items():
         parts.append(f"\n### {path}\n{text}")
+    if retry_problem:
+        parts.append(
+            "\nYour last answer to this brief could not be read: "
+            f"{_sanitize_text(retry_problem).strip()}. Answer again, in exactly the "
+            "form below, from the `VERDICT:` line on.")
+    parts.append("\n" + answer_form)
     if handback:
         parts.append("\n" + HANDBACK_INSTRUCTIONS)
     return Brief("checker_pass2", "\n".join(parts))

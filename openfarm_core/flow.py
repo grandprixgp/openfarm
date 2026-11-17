@@ -3535,30 +3535,88 @@ class CardRun:
             else "restatement matches the named tests",
             {"restatement": restatement.as_dict()}))
 
+        from .roles import MAX_COUNTER_TESTS, parse_pass2, pass2_answer_form
+
         modified = {}
         for path in changed[:8]:
             full = self.worktree / path
             if full.exists():
                 modified[path] = full.read_text()[:8000]
+        # The brief names the language, the runner and the files the counter-tests
+        # are saved as, in the same form `parse_pass2` reads.
+        language = str(getattr(self.pack, "name", "") or "")
+        crate = ""
+        if language == "rust":
+            import tomllib
+            unit = self._effective_unit()
+            manifests = ([self.worktree / unit / "Cargo.toml"]
+                         if unit and unit != "." else []) + [self.worktree / "Cargo.toml"]
+            for manifest in manifests:
+                try:
+                    data = tomllib.loads(manifest.read_text())
+                except (OSError, ValueError):
+                    continue
+                name = str((data.get("lib") or {}).get("name")
+                           or (data.get("package") or {}).get("name") or "")
+                if name:
+                    crate = name.replace("-", "_")
+                    break
+            if not crate and unit and unit != "." and "/" not in unit:
+                crate = unit.replace("-", "_")
+        answer_form = pass2_answer_form(
+            language, str(getattr(self.pack, "runner", "") or ""),
+            [self._counter_fallback_path(i) for i in range(1, MAX_COUNTER_TESTS + 1)],
+            crate)
+        gate_list = [g.as_dict() for g in self.gates]
         brief2 = checker_pass2_brief(
-            self.card, full_diff, [g.as_dict() for g in self.gates], modified,
-            handback=self.swarm_on)
+            self.card, full_diff, gate_list, modified,
+            handback=self.swarm_on, answer_form=answer_form)
         call2, limit_err = self._call_role_with_handbacks(
             "checker_pass2", brief2, first_attempt=2, response_name="checker-pass2")
         if limit_err is not None:
             self._checker_handback_limit("checker-pass2", limit_err)
+        answer = parse_pass2(call2.content, cut_off=call2.cut_off)
+        first_problem = ""
+        if not answer.readable:
+            # An answer that cannot be read is never "no counter-tests": ask once
+            # more with the form restated. A hand-back is still read first.
+            first_problem = answer.problem
+            retry = checker_pass2_brief(
+                self.card, full_diff, gate_list, modified,
+                handback=self.swarm_on, answer_form=answer_form,
+                retry_problem=answer.problem)
+            asked = sum(1 for c in getattr(self.roles, "calls", []) or []
+                        if getattr(c, "role", "") == "checker_pass2")
+            call2, limit_err = self._call_role_with_handbacks(
+                "checker_pass2", retry, first_attempt=2 + max(1, asked),
+                response_name="checker-pass2-again")
+            if limit_err is not None:
+                self._checker_handback_limit("checker-pass2", limit_err)
+            answer = parse_pass2(call2.content, cut_off=call2.cut_off)
 
-        counters = parse_counter_tests(call2.content)
+        counted_drops = [d for d in answer.dropped if not d.get("over_limit")]
         self.counter_summary = {
-            "written": len(counters.tests),
-            "dropped_uncompiled": 0,
+            "written": len(answer.counter_tests) + len(counted_drops),
+            "dropped_uncompiled": len(counted_drops),
             "passed": 0,
             "failed": 0,
             "not_run": 0,
+            "unreadable": 0 if answer.readable else 1,
         }
         self._last_failing_counters = []
-        if counters.tests:
-            self._run_counter_tests(counters.tests)
+        self.counter_results = []
+        if answer.counter_tests:
+            self._run_counter_tests(answer.counter_tests)
+        self.counter_results += [
+            {"name": d.get("name", ""), "file": "", "outcome": "dropped",
+             "why": d.get("why", ""), "output_head": ""}
+            for d in answer.dropped]
+        self.checker_pass2 = {
+            **answer.as_dict(),
+            "asked_again": bool(first_problem),
+            "first_problem": first_problem,
+            "counter_results": list(self.counter_results),
+        }
 
         if self.board is not None and self._last_failing_counters:
             names = ", ".join(
@@ -3566,7 +3624,7 @@ class CardRun:
             )
             evidence = [
                 str(p)
-                for idx in range(1, len(counters.tests) + 1)
+                for idx in range(1, len(answer.counter_tests) + 1)
                 for p in [self.card_layout / "gates" / f"counter-test-{idx}.json"]
                 if p.exists()
             ]
@@ -3579,11 +3637,31 @@ class CardRun:
                 evidence=evidence,
             )
 
-        self._record_gate(GateResult(
-            "checker-pass2", PASS,
-            f"traceability returned; {len(counters.tests)} counter-test(s), "
-            f"{self.counter_summary['failed']} failing",
-            {"counter_tests": self.counter_summary}))
+        gate_evidence = {"counter_tests": self.counter_summary,
+                         "checker": self.checker_pass2}
+        if not answer.readable:
+            detail = ("the second pass could not be read, even when asked again "
+                      f"({answer.problem}): no counter-test ran, nothing was checked")
+            if self.cfg.counter_tests == "reject":
+                # The person asked for the checker to gate, and no check happened.
+                self._record_gate(GateResult("checker-pass2", FAIL, detail,
+                                             gate_evidence))
+                raise GateFailure(StopCode.CHECKER_REJECT, detail)
+            self._record_gate(GateResult(
+                "checker-pass2", PASS,
+                detail + " (counter-tests are report-only)", gate_evidence))
+        else:
+            said = {"accept": "checker accepts the diff",
+                    "changes-requested": "checker asks for changes"}.get(
+                        answer.verdict, "checker stated no verdict (old answer form)")
+            summary = self.counter_summary
+            detail = (f"{said}; {summary['written']} counter-test(s): "
+                      f"{summary['failed']} failed, {summary['passed']} passed, "
+                      f"{summary['dropped_uncompiled'] + summary['not_run']} dropped")
+            if answer.verdict == "changes-requested" and not summary["failed"]:
+                detail += "; no counter-test fails on the diff"
+            self._record_gate(GateResult("checker-pass2", PASS, detail,
+                                         gate_evidence))
         self._record_attempt("checker", "passed-gates", role="checker_pass2")
 
         if (self.cfg.counter_tests == "reject"
@@ -3663,75 +3741,175 @@ class CardRun:
                 else f"openfarm_counter_{index}")
         if unit and unit != "." and (self.worktree / unit).is_dir() and any(
                 (self.worktree / unit / manifest).is_file()
-                for manifest in ("Cargo.toml", "pyproject.toml", "setup.py")):
+                for manifest in ("Cargo.toml", "pyproject.toml", "setup.py",
+                                 "package.json")):
             return f"{unit.strip('/')}/tests/{stem}{ext}"
         return f"tests/{stem}{ext}"
 
     def _run_counter_tests(self, tests: list[dict]) -> None:
         """Run the checker's counter-tests in this card's own worktree and target.
 
-        Never committed. One that doesn't compile is dropped and counted, because
-        a counter-test can itself be wrong.
+        Each is saved as a new file, run alone, and taken away again: the worktree
+        is left exactly as it was, nothing new, nothing changed, nothing committed.
+        One that doesn't compile is dropped and counted, because a counter-test can
+        itself be wrong. Every outcome goes to `self.counter_results`.
         """
+        import os
+        import re
+
+        if not hasattr(self, "counter_results"):
+            self.counter_results = []
         unit = self._effective_unit()
+
+        def listing(*args: str) -> list[str]:
+            out = self.git._run(["ls-files", "-z", *args]).stdout
+            return [p for p in out.split("\0") if p]
+
+        def snapshot() -> dict:
+            dirty = listing("--modified", "--deleted") + listing(
+                "--others", "--exclude-standard")
+            dirty += [p for p in self.git.staged_changes() if p not in dirty]
+            files: dict[str, bytes | None] = {}
+            for rel in dirty:
+                full = self.worktree / rel
+                files[rel] = (full.read_bytes()
+                              if full.is_file() and not full.is_symlink() else None)
+            ignored = set(listing("--others", "--ignored", "--exclude-standard"))
+            dirs = {""}
+            for rel in list(ignored) + listing() + list(files):
+                parent = Path(rel).parent
+                while str(parent) not in dirs and str(parent) != ".":
+                    dirs.add(str(parent))
+                    parent = parent.parent
+            return {"head": self.git.head(), "branch": self.git.current_branch(),
+                    "files": files, "ignored": ignored, "dirs": dirs,
+                    "status": self.git.status_lines()}
+
+        def restore(before: dict) -> None:
+            if self.git.current_branch() != before["branch"] and before["branch"]:
+                self.git._run(["checkout", "-f", before["branch"]])
+            # Tracked changes and new files go; a commit a test made goes too.
+            self.git.reset_hard(before["head"])
+            for rel, data in before["files"].items():
+                full = self.worktree / rel
+                if data is None:
+                    continue
+                full.parent.mkdir(parents=True, exist_ok=True)
+                full.write_bytes(data)
+            # Ignored files the run left behind (`__pycache__`, `Cargo.lock`, ...).
+            for rel in sorted(set(listing("--others", "--ignored", "--exclude-standard"))
+                              - before["ignored"]):
+                full = self.worktree / rel
+                with contextlib.suppress(OSError):
+                    os.unlink(full)
+                parent = Path(rel).parent
+                while str(parent) not in before["dirs"] and str(parent) != ".":
+                    with contextlib.suppress(OSError):
+                        (self.worktree / parent).rmdir()
+                    parent = parent.parent
+            if (self.git.head() != before["head"]
+                    or self.git.status_lines() != before["status"]):
+                self.log(f"{self.card.id}: the worktree did not come back exactly "
+                         "as it was after a counter-test")
+
+        def head_of(text: str) -> str:
+            lines = text.strip("\n").splitlines()
+            for at, line in enumerate(lines):
+                if re.search(r"^(FAIL|ERROR):|panicked at|AssertionError|"
+                             r"assert(ion)?\b.*(fail|left|right)|^not ok\b|"
+                             r"error(\[E\d+\])?:", line):
+                    return "\n".join(lines[at:at + 12])
+            return "\n".join(lines[:12])
+
+        def status_of(parsed: dict, name: str) -> str:
+            status = _status_of(parsed, name)
+            if status != "not-run":
+                return status
+            for entry in parsed.get("results", []):
+                got = str(entry.get("name", ""))
+                if got and (got.endswith(("::" + name, "." + name))
+                            or name.endswith(("::" + got, "." + got))):
+                    return entry.get("status", "")
+            return "not-run"
+
         for index, counter in enumerate(tests, start=1):
+            name = str(counter.get("name", "") or "")
             raw_path = str(counter.get("file", "") or "").strip()
             path = self._counter_fallback_path(index)
             if raw_path and resolves_within(self.worktree, raw_path):
                 candidate = normalise(raw_path)
+                # Never over an existing file: a counter-test is a new file.
                 if (candidate
                         and not matches_any(candidate, self.cfg.never_touch)
                         and not matches_any(candidate, self.cfg.forbidden_files)
-                        and self._is_test_path(candidate)):
+                        and self._is_test_path(candidate)
+                        and not (self.worktree / candidate).exists()):
                     path = candidate
             target = self.worktree / path
-            content = counter.get("content", "")
-            if not content:
+            content = str(counter.get("content", "") or "")
+            entry = {"name": name, "file": path, "content": content,
+                     "outcome": "", "why": "", "status": "", "output": "",
+                     "output_head": ""}
+            if not content.strip():
                 self.counter_summary["dropped_uncompiled"] += 1
-                continue
-            existed = target.exists()
-            previous = target.read_text() if existed else ""
-            try:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(content)
-                result = self._run(
-                    runner_kind("test"),
-                    self.pack.commands("test", unit=unit, files=[path])["argv"],
-                    counted="model")
-                out, err = self._output(result)
-                parsed = self.pack.parse_tests(out, err)
-                if parsed.get("compile_errors") or result.cls == INFRA:
-                    self.counter_summary["dropped_uncompiled"] += 1
-                    continue
-                status = _status_of(parsed, counter.get("name", ""))
-                if status == "ok":
-                    self.counter_summary["passed"] += 1
-                elif status == "FAILED":
-                    self.counter_summary["failed"] += 1
-                    detail_entry = {
-                        "name": counter.get("name"),
-                        "file": path,
-                        "status": status,
-                        "content": content,
-                        "output": (out + err)[-4000:],
-                    }
-                    self._last_failing_counters.append(detail_entry)
-                    write_json(self.card_layout / "gates"
-                               / f"counter-test-{index}.json",
-                               detail_entry)
-                else:
-                    self.counter_summary["not_run"] += 1
-                    write_json(self.card_layout / "gates"
-                               / f"counter-test-{index}.json",
-                               {"name": counter.get("name"), "file": path,
-                                "status": status,
-                                "output": (out + err)[-4000:]})
-            finally:
-                if existed:
-                    target.write_text(previous)
-                elif target.exists():
-                    target.unlink()
-                self.git.reset_hard("HEAD")
+                entry.update(outcome="dropped", why="the counter-test is empty")
+            else:
+                before = snapshot()
+                existed = target.exists()
+                previous = target.read_bytes() if existed else b""
+                try:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(content)
+                    result = self._run(
+                        runner_kind("test"),
+                        self.pack.commands("test", unit=unit, files=[path])["argv"],
+                        counted="model")
+                    out, err = self._output(result)
+                    parsed = self.pack.parse_tests(out, err)
+                    text = out + ("\n" + err if err else "")
+                    entry["output"] = text[-4000:]
+                    entry["output_head"] = head_of(text)
+                    # No results and no footer: the runner could not even load it
+                    # (a syntax error in a module run by name, for one).
+                    unloaded = (not parsed.get("results")
+                                and bool(parsed.get("missing_footers"))
+                                and result.cls != PASS)
+                    if parsed.get("compile_errors") or result.cls == INFRA or unloaded:
+                        self.counter_summary["dropped_uncompiled"] += 1
+                        entry.update(
+                            outcome="dropped",
+                            why=("the run did not finish" if result.cls == INFRA
+                                 else "it did not compile or could not be collected"))
+                    else:
+                        status = status_of(parsed, name)
+                        entry["status"] = status
+                        if status == "ok":
+                            self.counter_summary["passed"] += 1
+                            entry["outcome"] = "passed"
+                        elif status == "FAILED":
+                            self.counter_summary["failed"] += 1
+                            entry["outcome"] = "failed"
+                            self._last_failing_counters.append(
+                                {k: entry[k] for k in
+                                 ("name", "file", "status", "content", "output")})
+                        else:
+                            self.counter_summary["not_run"] += 1
+                            entry.update(
+                                outcome="not-run",
+                                why=(f"the runner reported no test named {name!r}"
+                                     if status == "not-run"
+                                     else f"the runner reported it as {status}"))
+                finally:
+                    if existed:
+                        target.write_bytes(previous)
+                    elif target.exists() or target.is_symlink():
+                        target.unlink()
+                    restore(before)
+            write_json(self.card_layout / "gates" / f"counter-test-{index}.json",
+                       entry)
+            self.counter_results.append(
+                {k: entry[k] for k in ("name", "file", "outcome", "why", "status",
+                                       "output_head")})
 
     # -- step 9: catch-up -----------------------------------------------------
 
