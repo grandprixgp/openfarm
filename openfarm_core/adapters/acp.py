@@ -1490,7 +1490,7 @@ class ClaudeAcpAdapter:
             req_id, timeout_s=max(0.05, deadline - time.monotonic())
         )
 
-    def _apply_antigravity_config_options(
+    def _apply_config_options(
         self,
         session_id: str,
         config_options: list,
@@ -1625,10 +1625,13 @@ class ClaudeAcpAdapter:
         session_id = str(result.get("sessionId") or "")
         if not session_id:
             raise Invalid("acp-no-session-id", "session/new returned no sessionId")
-        if self.provider == "antigravity":
+        # A standalone server offers its model and effort as ACP config options
+        # (`agy acp`, and the real `codex-acp`, which ignores `_meta.codex`: seen live).
+        if self.provider == "antigravity" or (
+                self.provider == "codex" and self.transport == "server"):
             config_options = result.get("configOptions")
             if isinstance(config_options, list) and config_options:
-                self._apply_antigravity_config_options(
+                self._apply_config_options(
                     session_id,
                     config_options,
                     model=model,
