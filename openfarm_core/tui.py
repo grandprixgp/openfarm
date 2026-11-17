@@ -32,7 +32,7 @@ from .cards import Card, extract_fenced_fields
 from .config import CONFIG_PATH, Config, ConfigError, load_config
 from .dossier import render_markdown
 from .errors import Infra, Invalid, UsageError
-from .git import Git
+from .git import Git, _git_lock_for
 from .harness_global import GlobalLibrary, global_dir_for
 from .harness_memory import HarnessLibrary
 from .state import StateDir, _safe_id, read_json
@@ -564,18 +564,64 @@ def _read_cards_readonly(ctx: TuiContext) -> tuple[list[Card], str]:
     return cards, source_mode
 
 
+# The cards view's branch facts, per repository and card: the unmerged commit
+# count and the diff preview cost two git calls per card, so they are kept until
+# the card's state, its branch, the branch head or the base head moves, or until
+# they are older than `_CARD_GIT_MAX_AGE_S`. The view refreshes every second;
+# without this it ran about three git commands per card on every refresh.
+_CARD_GIT_CACHE: dict[str, dict[str, tuple[tuple, float, int, str]]] = {}
+_CARD_GIT_MAX_AGE_S = 60.0
+_CARD_GIT_LOCK = threading.Lock()
+
+
+def _openfarm_branch_heads(git: Git) -> dict[str, str]:
+    """Every `openfarm/*` branch and its head commit, in one git command."""
+    with _git_lock_for(git.cwd):
+        out = git._run(["for-each-ref", "--format=%(refname:short) %(objectname)",
+                        "refs/heads/openfarm/*"]).stdout
+    heads: dict[str, str] = {}
+    for line in out.splitlines():
+        name, _, sha = line.strip().partition(" ")
+        if name:
+            heads[name] = sha
+    return heads
+
+
+def _card_branch_facts(git: Git, repo_key: str, card: Card, branch: str, branch_head: str,
+                       base_ref: str, base_head: str) -> tuple[int, str]:
+    """`(unmerged commits, diff preview)` for a card's branch, cached."""
+    key = (card.state, branch, branch_head, base_ref, base_head)
+    now = time.monotonic()
+    with _CARD_GIT_LOCK:
+        hit = _CARD_GIT_CACHE.get(repo_key, {}).get(card.id)
+    if hit is not None and hit[0] == key and now - hit[1] < _CARD_GIT_MAX_AGE_S:
+        return hit[2], hit[3]
+    unmerged = git.count_commits(f"refs/heads/{branch}", base_ref)
+    diff_preview = git.diff(ref=f"{base_ref}...refs/heads/{branch}")[:6000]
+    with _CARD_GIT_LOCK:
+        _CARD_GIT_CACHE.setdefault(repo_key, {})[card.id] = (key, now, unmerged, diff_preview)
+    return unmerged, diff_preview
+
+
 def _collect_cards(ctx: TuiContext) -> dict:
     if not ctx.configured or ctx.cfg is None or ctx.state is None:
         return {"configured": False, "source_mode": "unconfigured", "cards": []}
     cards, source_mode = _read_cards_readonly(ctx)
     git = Git(ctx.repo)
+    repo_key = str(ctx.repo)
     base_branch = ctx.cfg.base_branch
     has_head = False
     base_ref = "HEAD"
+    base_head = ""
+    branch_heads: dict[str, str] = {}
     try:
         has_head = git.ref_exists("HEAD")
         if git.ref_exists(f"refs/heads/{base_branch}"):
             base_ref = f"refs/heads/{base_branch}"
+        if has_head:
+            base_head = git.head(base_ref)
+            # One listing, with heads, for every card; not one per card.
+            branch_heads = _openfarm_branch_heads(git)
     except (Infra, OSError):
         has_head = False
 
@@ -592,11 +638,12 @@ def _collect_cards(ctx: TuiContext) -> dict:
         diff_preview = ""
         if has_head:
             try:
-                branches = git.branches(f"openfarm/{card.id}-*")
+                prefix = f"openfarm/{card.id}-"
+                branches = sorted(b for b in branch_heads if b.startswith(prefix))
                 if branches:
-                    br = branches[0]
-                    unmerged = git.count_commits(f"refs/heads/{br}", base_ref)
-                    diff_preview = git.diff(ref=f"{base_ref}...refs/heads/{br}")[:6000]
+                    unmerged, diff_preview = _card_branch_facts(
+                        git, repo_key, card, branches[0], branch_heads[branches[0]],
+                        base_ref, base_head)
             except (Infra, OSError):
                 branches = []
 
