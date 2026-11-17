@@ -23,7 +23,7 @@ from .briefs import _sanitize_text
 from .cards import Card
 from .config import TierConfig
 from .errors import AdapterError, GateFailure, Infra, Invalid, Refused, StopCode
-from .micromanager import _call_tier_complete
+from .micromanager import SEAT_TIMEOUT_PREFIX, _call_tier_complete
 from .swarm import (
     WORKER_ROLES,
     StallMonitor,
@@ -169,11 +169,10 @@ class CoordinatorRuntime:
 
     @contextlib.contextmanager
     def coordinator_waiting(self):
+        # The seat stays "waiting" after the wait until the coordinator next works
+        # (`coord_busy` marks it active), so an idle poll loop does not flip it.
         self._set_member_state("coordinator", "waiting", skip_external=True)
-        try:
-            yield
-        finally:
-            self._set_member_state("coordinator", "active", skip_external=True)
+        yield
 
     def active_work_count(self) -> int:
         with self.lock:
@@ -458,20 +457,60 @@ class CodeCoordinator:
         retire_card_members(rt.board, card_id)
         self.on_plan(rt)
 
-    def on_stall(self, rt: CoordinatorRuntime, _info: dict) -> None:
+    def on_stall(self, rt: CoordinatorRuntime, info: dict) -> None:
+        """Apply the timeout rule (`on_external_timeout`) to a stalled run.
+
+        A stall means no card thread is working: every running card is parked on a
+        silent seat (an external supervisor's question or an external coordinator's
+        hand-back answer). Each parked card's wait is timed out now rather than at
+        the end of `external_wait`, and goes the way a timeout goes: `fallback`
+        skips the supervisor's op or hands the decision to this policy, `block`
+        blocks the card `seat-silent`. With nothing running, the cards waiting to
+        start are the ones stuck: `block` blocks them `seat-silent`, `fallback`
+        lets this policy start them.
+        """
         self.ensure_member(rt.board)
         timeout_policy = str(
             getattr(rt.cfg.swarm, "on_external_timeout", "fallback") or "fallback"
         )
+        stall_post = (info or {}).get("post") or {}
+        stall_seq = int(stall_post.get("seq", 0) or 0) or None
+        parked = sorted(rt.running_ids())
+        for cid in parked:
+            rt.board.post(
+                author="gates",
+                to=["gates"],  # wakes an external supervisor wait, which listens as gates
+                kind="action",
+                card=cid,
+                ref=stall_seq,
+                body=(
+                    f"{SEAT_TIMEOUT_PREFIX}{cid} is waiting on a silent seat and the run "
+                    f"stalled; applying on_external_timeout = {timeout_policy}"
+                ),
+                trusted=True,
+            )
+        if parked:
+            if timeout_policy != "block":
+                self.on_plan(rt)
+            return
         if timeout_policy == "block":
             with rt.lock:
-                for cid in list(rt.pending):
+                waiting = list(rt.pending)
+                for cid in waiting:
                     rt.mark_blocked(
                         cid,
                         StopCode.SEAT_SILENT.value,
                         "stalled with silent seat",
                     )
                 rt.stop_launching = True
+            if waiting:
+                _post_event(
+                    rt.board,
+                    "stall",
+                    "stall: on_external_timeout = block, so cards waiting to start are "
+                    f"blocked seat-silent: {', '.join(waiting)}",
+                    kind="action",
+                )
             return
         self.on_plan(rt)
 
@@ -1042,6 +1081,7 @@ class ExternalCoordinator:
             else contextlib.nullcontext()
         )
 
+        timed_out = False
         with pause_cm, rt.board.external_wait(card_id=card_id, member_name=member_name):
             while True:
                 if (
@@ -1059,6 +1099,15 @@ class ExternalCoordinator:
                     author = str(item.get("from", "") or "")
                     to_list = item.get("to") or []
                     body = str(item.get("body", "") or "")
+                    if (
+                        kind == "action"
+                        and item.get("card") == card_id
+                        and body.startswith(SEAT_TIMEOUT_PREFIX)
+                        and (rt.board.get_member(author) or {}).get("kind") == "code"
+                    ):
+                        # The stall rule timed this silent seat out early.
+                        timed_out = True
+                        break
                     # Only the coordinator's seat steers: a post from anyone else is
                     # data, whatever its kind or addressee.
                     if rt.board.seat_of(author) != "coordinator":
@@ -1070,6 +1119,8 @@ class ExternalCoordinator:
                     if kind == "blocked" and item.get("card") == card_id:
                         return {"action": "block", "reason": body or str(info.get("reason", ""))}
 
+                if timed_out:
+                    break
                 if callable(heartbeat_fn):
                     heartbeat_fn()
                 remaining = deadline - time.monotonic()
@@ -1356,6 +1407,7 @@ class SwarmRunner:
         self.deadline = deadline
         self.run_card_fn = run_card_fn
         self.record_outcome_fn = record_outcome_fn
+        self._stall_scan_seq = 0
 
         if coordinator is not None:
             self.coordinator = coordinator
@@ -1403,6 +1455,38 @@ class SwarmRunner:
                 )
             else:
                 raise Invalid("bad-coordinator", f"unknown coordinator mode {spec!r}")
+
+    def _dispatch_stalls(self, rt: CoordinatorRuntime) -> int:
+        """Call the seated coordinator's `on_stall` once for each new `stall` post.
+
+        Only stall posts written by a code member (the monitor) count. Returns how
+        many were handled.
+        """
+        handled = 0
+        posts = self.board.read(
+            as_name="*", since=self._stall_scan_seq, limit=None, for_model=False
+        )
+        for post in posts:
+            self._stall_scan_seq = max(self._stall_scan_seq, int(post.get("seq", 0) or 0))
+            if post.get("kind") != "stall":
+                continue
+            author = self.board.get_member(str(post.get("from", "") or ""))
+            if author is None or author.get("kind") != "code":
+                continue
+            info = {
+                "post": post,
+                "seq": int(post.get("seq", 0) or 0),
+                "card_id": str(post.get("card", "") or ""),
+                "ref": post.get("ref"),
+                "to": list(post.get("to") or []),
+                "detail": str(post.get("body", "") or ""),
+                "running": sorted(rt.running_ids()),
+                "pending": list(rt.pending),
+            }
+            with rt.coord_busy():
+                self.coordinator.on_stall(rt, info)
+            handled += 1
+        return handled
 
     def run(self) -> list[dict]:
         card_map: dict[str, Card] = {}
@@ -1486,10 +1570,14 @@ class SwarmRunner:
 
                 is_ext = isinstance(self.coordinator, ExternalCoordinator)
                 ext_idle_since: float | None = None
+                # Card threads parked on a silent seat finish no future, so the loop
+                # polls to notice the monitor's stall posts.
+                loop_poll_s = min(1.0, max(0.05, float(monitor.poll_interval_s)))
 
                 while True:
                     if is_ext:
                         self.coordinator.scan_external_actions(rt)
+                    self._dispatch_stalls(rt)
 
                     with rt.lock:
                         if rt.stop_launching or self.state.kill_requested(self.cfg.kill_switch):
@@ -1545,9 +1633,9 @@ class SwarmRunner:
                     if active_futs:
                         ext_idle_since = None
                         wait_timeout = (
-                            self.coordinator.poll_interval_s
+                            min(self.coordinator.poll_interval_s, loop_poll_s)
                             if is_ext
-                            else None
+                            else loop_poll_s
                         )
                         with rt.coordinator_waiting():
                             done_futs, _ = concurrent.futures.wait(
@@ -1623,7 +1711,8 @@ class SwarmRunner:
                     head_now = self.coordinator._scan_seq
                     with rt.coordinator_waiting():
                         self.board.wait_after(
-                            head_now, min(self.coordinator.poll_interval_s, remaining_ext)
+                            head_now,
+                            min(self.coordinator.poll_interval_s, remaining_ext, loop_poll_s),
                         )
         finally:
             monitor.stop()

@@ -1169,6 +1169,31 @@ class TierMicromanagerBackend(_ThreadLocalUsageMixin):
             self.backend.close()
 
 
+#: Body prefix of the code post that ends a card's wait on a silent seat early.
+SEAT_TIMEOUT_PREFIX = "timeout: "
+
+
+def seat_timeout_post(board, *, card_id: str, since_seq: int = 0) -> dict | None:
+    """A code post after `since_seq` telling `card_id`'s wait on a silent seat to time out.
+
+    The coordinator's stall rule writes it (author a `code` member, kind `action`,
+    body starting with `SEAT_TIMEOUT_PREFIX`). Posts by anyone else are ignored.
+    """
+    clean = str(card_id or "").strip()
+    if board is None or not clean or not board.board_dir.exists():
+        return None
+    for post in board.read(as_name="*", since=int(since_seq or 0), limit=None, for_model=False):
+        if post.get("kind") != "action" or str(post.get("card", "") or "") != clean:
+            continue
+        if not str(post.get("body", "") or "").startswith(SEAT_TIMEOUT_PREFIX):
+            continue
+        author = board.get_member(str(post.get("from", "") or ""))
+        if author is None or author.get("kind") != "code":
+            continue
+        return post
+    return None
+
+
 class ExternalMicromanagerBackend(_ThreadLocalUsageMixin):
     """Supervisor seat held outside openfarm over the shared board."""
 
@@ -1253,6 +1278,7 @@ class ExternalMicromanagerBackend(_ThreadLocalUsageMixin):
         )
 
         cursor = int(q["seq"])
+        timed_out_by_stall = False
         pause_ctx = (
             self.budget.pause_clock()
             if self.budget is not None and hasattr(self.budget, "pause_clock")
@@ -1297,6 +1323,15 @@ class ExternalMicromanagerBackend(_ThreadLocalUsageMixin):
                             except (OSError, ValueError):
                                 data = None  # fall back to answer body below
                         return parse_json_answer(str(ans.get("body", "") or ""))
+                if card_id:
+                    # The coordinator asked this card to stop: end the wait now.
+                    stop_reason = self.board.stop_requested(card_id)
+                    if stop_reason:
+                        raise GateFailure(StopCode.REFUSED, stop_reason)
+                    # The stall rule timed this silent seat out early.
+                    if seat_timeout_post(self.board, card_id=card_id, since_seq=int(q["seq"])):
+                        timed_out_by_stall = True
+                        break
                 if self.heartbeat_fn is not None:
                     self.heartbeat_fn()
                 if res.get("reason") == "run-ended" or time.monotonic() >= deadline:
@@ -1305,7 +1340,8 @@ class ExternalMicromanagerBackend(_ThreadLocalUsageMixin):
         if self.on_timeout == "block":
             raise GateFailure(
                 StopCode.SEAT_SILENT,
-                f"external supervisor did not answer question #{q['seq']} ({op})",
+                f"external supervisor did not answer question #{q['seq']} ({op})"
+                + (" before the run stalled" if timed_out_by_stall else ""),
             )
         raise Infra(
             "acp-timeout",
