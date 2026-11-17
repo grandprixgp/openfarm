@@ -3814,8 +3814,10 @@ class CardRun:
     def _counter_fallback_path(self, index: int) -> str:
         unit = self._effective_unit()
         ext = self._extension()
-        # Python test files are found by their `test_` prefix.
+        # Python test files are found by their `test_` prefix, TypeScript ones by
+        # their `.test` suffix (the pack's own test-file rule).
         stem = (f"test_openfarm_counter_{index}" if ext == ".py"
+                else f"openfarm_counter_{index}.test" if ext == ".ts"
                 else f"openfarm_counter_{index}")
         if unit and unit != "." and (self.worktree / unit).is_dir() and any(
                 (self.worktree / unit / manifest).is_file()
