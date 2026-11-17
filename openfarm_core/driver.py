@@ -49,6 +49,7 @@ from .micromanager import SEAT_TIMEOUT_PREFIX
 from .state import StateDir, _safe_id, read_json, utc_now, write_json
 from .swarm import (
     WORKER_ROLES,
+    _card_progress,
     cards_collide,
     swarm_ask,
     swarm_block,
@@ -855,11 +856,16 @@ def _parse_driver_turn(
     return actions, answers, errors
 
 
-def _plan_cards_from_posts(posts: list[dict]) -> list[str]:
+def _plan_cards_from_posts(posts: list[dict], members: dict[str, dict] | None = None) -> list[str]:
+    """Card ids from the run's own `event: plan` post (code, as `gates`)."""
     found: list[str] = []
     for post in posts:
         body = str(post.get("body") or "")
-        if post.get("from") == "gates" and "event: plan; ready:" in body:
+        if (
+            post.get("from") == "gates"
+            and post_is_code(post, members or {})
+            and "event: plan; ready:" in body
+        ):
             rhs = body.split("event: plan; ready:", 1)[1].strip()
             if rhs and rhs != "(none)":
                 found = [part.strip() for part in rhs.split(",") if part.strip()]
@@ -876,11 +882,19 @@ def _parse_board_state(
     answered_seqs: set[int],
     resolved_event_seqs: set[int],
 ) -> dict:
-    members = board.list_members(include_removed=False)
-    finished_cards: set[str] = set()
-    for post in all_posts:
-        if post.get("kind") in ("done", "blocked") and post.get("card"):
-            finished_cards.add(str(post["card"]))
+    """What the board says now, read through the board's own helpers.
+
+    Finished and stopping come from `swarm._card_progress` (a card is finished
+    only on its own final post, or when it was blocked before it started; a
+    coordinator's `blocked` on a running card is a stop request). Only code's
+    posts count as plan, struggling, stall and question events; a hand-back
+    counts only from a worker of that card.
+    """
+    roster = board.list_members(include_removed=True)
+    by_name = {str(m.get("name", "")): m for m in roster}
+    members = [m for m in roster if m.get("state") != "removed"]
+    progress = _card_progress(board)
+    finished_cards: set[str] = set(progress.finished)
 
     running_cards: set[str] = set()
     finished_members: list[dict] = []
@@ -915,17 +929,30 @@ def _parse_board_state(
         kind = str(post.get("kind") or "")
         body = str(post.get("body") or "")
         cid = str(post.get("card") or "")
+        author = str(post.get("from") or "")
+        is_code = post_is_code(post, by_name)
         if kind == "handback" and cid and cid not in finished_cards:
-            unresolved_events.append({"seq": seq, "type": "handback", "card": cid, "from": post.get("from", ""), "body": body})
-        elif kind == "note" and post.get("from") == "gates" and body.startswith("struggling ") and cid and cid not in finished_cards:
+            worker = by_name.get(author) or {}
+            if str(worker.get("card") or "") != cid:
+                continue
+            unresolved_events.append({"seq": seq, "type": "handback", "card": cid, "from": author, "body": body})
+        elif (
+            kind == "note"
+            and author == "gates"
+            and is_code
+            and body.startswith("struggling ")
+            and cid
+            and cid not in finished_cards
+        ):
             unresolved_events.append({"seq": seq, "type": "struggling", "card": cid, "body": body})
-        elif kind == "stall":
+        elif kind == "stall" and author == "monitor" and is_code:
             unresolved_events.append({"seq": seq, "type": "stall", "card": cid, "body": body})
 
-    open_qs = _open_questions_for_supervisor(all_posts, sup_name, answered_seqs)
+    open_qs = _open_questions_for_supervisor(all_posts, sup_name, answered_seqs, by_name)
     return {
         "members": members,
         "finished_cards": finished_cards,
+        "stopping_cards": set(progress.stopping),
         "running_cards": running_cards,
         "finished_members": finished_members,
         "pending_ready": pending_ready,
@@ -1077,8 +1104,8 @@ def _execute_driver_turn(
                         source=source,
                         cards_by_id=card_map,
                     )
-                    finished_cards.add(cid)
-                    running_cards.discard(cid)
+                    # A block on a running card is a stop request: the card stays
+                    # running until its own final post, and the board says so.
                     for ev in unresolved_events:
                         if ev.get("card") == cid:
                             resolved_event_seqs.add(int(ev["seq"]))
@@ -1096,7 +1123,6 @@ def _execute_driver_turn(
                         cfg,
                         caller=coord_name,
                         member_name=mname,
-                        finished_cards=finished_cards,
                         cards_by_id=card_map,
                         source=source,
                     )
@@ -1996,7 +2022,10 @@ def drive_run(
                         all_posts.extend(new_posts)
                         scan_seq = max(scan_seq, *(int(p.get("seq", 0) or 0) for p in new_posts))
                         if target_ids is None:
-                            plan_ids = _plan_cards_from_posts(new_posts)
+                            plan_ids = _plan_cards_from_posts(
+                                new_posts,
+                                {str(m.get("name", "")): m for m in board.list_members(include_removed=True)},
+                            )
                             if plan_ids:
                                 target_ids = plan_ids
                         for m_seat, m_name in (("coordinator", coord_name), ("supervisor", sup_name)):
