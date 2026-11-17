@@ -188,10 +188,14 @@ class ExternalCoordinatorTests(unittest.TestCase):
             pause_ev.wait(0.02)
         self.assertTrue(card1_done, "CARD-1 did not post done")
 
-        c_rem, _out_rem, err_rem = _run_cli(
+        # Code retires a finished card's workers itself (v0.8.1), so an external
+        # coordinator's own remove either wins the race or fails cleanly.
+        c_rem, out_rem, err_rem = _run_cli(
             self.toy.root, "swarm", "remove", "CARD-1-implementer", "--as", "bob"
         )
-        self.assertEqual(c_rem, EXIT_OK, err_rem)
+        if c_rem != EXIT_OK:
+            self.assertEqual(out_rem.get("kind"), "refused", (out_rem, err_rem))
+            self.assertIn("already removed", out_rem.get("error", ""))
 
         c_s2, _out_s2, err_s2 = _run_cli(
             self.toy.root,
