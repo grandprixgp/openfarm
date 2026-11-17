@@ -555,6 +555,12 @@ class CmdMicromanager(_ThreadLocalUsageMixin):
 
 # What an operation's answer may contain, where the schema alone does not say.
 _OP_RULES = {
+    "shape_and_plan": (
+        "Set `steps` to `[]` unless the card genuinely needs sequential steps. "
+        "When `steps` is non-empty, every entry in each step's `tests` list MUST "
+        "be an exact test name from `card.test_names` (never a CLI command or file "
+        "path), and every entry in `touches` must belong to `card.touches`."
+    ),
     "scaffold_contract": (
         "Declare the new symbols' contracts so the frozen tests can import them, "
         "and nothing else. Edit only production files listed in card.touches, "
