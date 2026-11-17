@@ -48,6 +48,7 @@ def build_dossier(card_run, final_state: str,
     mutation = dict(card_run.mutation_summary)
     restatement = (card_run.checker_restatement.as_dict()
                    if card_run.checker_restatement else {})
+    pass1 = dict(getattr(card_run, "checker_pass1", {}) or {})
     pass2 = dict(getattr(card_run, "checker_pass2", {}) or {})
     adjudication = dict(getattr(card_run, "checker_adjudication", {}) or {})
     mm_summary = dict(getattr(card_run, "micromanager_summary", {}) or {})
@@ -107,6 +108,7 @@ def build_dossier(card_run, final_state: str,
         "6_checker": {
             "restatement": restatement,
             "restatement_mismatch": bool(restatement.get("mismatch")),
+            "pass1": pass1,
             "counter_tests": counter,
             "pass2": pass2,
             "said": checker_said(pass2, counter),
@@ -247,6 +249,10 @@ def _not_checked(card_run) -> list[str]:
         out.append("mutation is report-only for this category")
     if card_run.cfg.counter_tests == "report":
         out.append("counter-tests are report-only")
+    pass1 = getattr(card_run, "checker_pass1", None) or {}
+    if pass1 and not pass1.get("readable", True):
+        out.append("the checker's first pass could not be read, so its restatement "
+                   "was not compared with the tests")
     pass2 = getattr(card_run, "checker_pass2", None) or {}
     if pass2 and not pass2.get("readable", True):
         out.append("the checker's second pass could not be read, so no counter-test "
@@ -417,6 +423,24 @@ def render_markdown(payload: dict) -> str:
               f"- Restatement mismatch: {'**yes**' if checker['restatement_mismatch'] else 'no'}"]
     if checker["restatement"].get("text"):
         lines.append(f"  > {checker['restatement']['text'][:400]}")
+    pass1 = checker.get("pass1") or {}
+    if pass1:
+        if not pass1.get("readable", True):
+            lines.append("- First pass: **could not be read**, even when asked again "
+                         f"({pass1.get('problem', '')}). No restatement was compared "
+                         "with the tests.")
+        else:
+            catches = {"yes": "yes", "partly": "partly", "no": "**no**"}.get(
+                pass1.get("catches", ""), "not stated")
+            lines.append("- First pass, would the tests catch a bad implementation: "
+                         f"{catches}")
+        if pass1.get("asked_again"):
+            lines.append("- First pass asked again once: the first answer could not "
+                         f"be read ({pass1.get('first_problem', '')})")
+        if pass1.get("misses"):
+            lines.append("- What the first pass says the tests miss (a model's "
+                         "opinion; it blocks nothing):")
+            lines += _quoted_block(pass1["misses"], 1500)
     counters = checker["counter_tests"]
     pass2 = checker.get("pass2") or {}
     if pass2:
