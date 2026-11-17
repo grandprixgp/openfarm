@@ -16,7 +16,7 @@ from pathlib import Path
 from ..briefs import (Brief, checker_pass1_brief, checker_pass2_brief,
                       implementer_brief, planner_brief, test_writer_brief)
 from ..cards import Card
-from ..edits import Edit, parse_edits
+from ..edits import Edit, parse_edits, parse_handback
 from ..errors import Invalid, Refused
 from ..globs import matches_any, normalise
 

@@ -68,6 +68,20 @@ _EDIT_HEADER = re.compile(
     re.MULTILINE)
 _SEARCH_START = re.compile(r"^<{3,}\s*SEARCH\s*$", re.MULTILINE)
 _SEARCH_END = re.compile(r"^>{3,}\s*REPLACE\s*$", re.MULTILINE)
+_HANDBACK_BLOCK = re.compile(
+    r"^\s*<<<\s*HANDBACK\s*\r?\n(?P<reason>.*?)\r?\n\s*>>>\s*$",
+    re.MULTILINE | re.DOTALL)
+
+
+def parse_handback(text: str) -> str | None:
+    """Extract a worker's hand-back reason when no edit block headers are present."""
+    if not text or _EDIT_HEADER.search(text):
+        return None
+    match = _HANDBACK_BLOCK.search(text)
+    if not match:
+        return None
+    reason = match.group("reason").strip()
+    return reason or None
 
 
 def parse_edits(text: str) -> list[Edit]:
