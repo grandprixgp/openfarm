@@ -120,17 +120,17 @@ class BoardPipelineTests(unittest.TestCase):
         self.assertTrue(board.is_ended())
         posts = board.read(as_name="*", since=0, limit=None, for_model=False)
         kinds = [p["kind"] for p in posts]
-        self.assertEqual(kinds[0], "note")  # claim
+        self.assertEqual(kinds[0], "note")  # plan event / claim
         self.assertIn("brief", kinds)
         self.assertIn("result", kinds)
         self.assertIn("gate", kinds)
-        self.assertEqual(kinds[-1], "done")
+        self.assertIn("done", kinds)
 
         # Gates must never address coordinator; final done addresses coordinator with dossier
         for post in posts:
             if post["kind"] == "gate":
                 self.assertNotIn("coordinator", post["to"])
-        done_post = posts[-1]
+        done_post = next(p for p in reversed(posts) if p["kind"] == "done")
         self.assertEqual(done_post["from"], "gates")
         self.assertEqual(done_post["to"], ["coordinator"])
         self.assertTrue(any(ev.endswith("dossier.md") for ev in done_post["evidence"]))

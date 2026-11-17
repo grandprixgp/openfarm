@@ -92,7 +92,8 @@ class CardRun:
                  deps_done: bool = True, conventions: str = "",
                  log=None, micromanager=None,
                  harness_library: HarnessLibrary | None = None,
-                 board=None, swarm=None, on_handback=None) -> None:
+                 board=None, swarm=None, on_handback=None,
+                 on_struggling=None) -> None:
         self.card = card
         self.cfg = cfg
         self.state = state
@@ -119,12 +120,14 @@ class CardRun:
         self.board = board
         self.swarm = swarm if swarm is not None else getattr(cfg, "swarm", None)
         self.on_handback = on_handback
+        self.on_struggling = on_struggling
         self.team_sets: list[dict] = []
         self.handbacks: list[dict] = []
         self.effort_tokens: dict[str, int] = {}
         self._member_stats: dict[str, dict] = {}
         self._pending_hints: dict[str, list[str]] = {}
         self._role_overrides: dict[str, tuple[str | None, str | None, str | None]] = {}
+        self._effort_failures: dict[str, tuple[str, int]] = {}
         self._board_members_ready = False
 
         self._owns_micromanager = micromanager is None
@@ -761,6 +764,253 @@ class CardRun:
             }
         )
 
+    def _member_effort_key(self, board_role: str) -> str:
+        member_name = worker_member_name(self.card.id, board_role)
+        if self.board is not None:
+            member = self.board.get_member(member_name)
+            if member is not None:
+                return f"{member.get('tier', '')}:{member.get('effort', '')}"
+        ov = self._role_overrides.get(board_role)
+        if ov is not None:
+            return f"{ov[0] or ''}:{ov[1] or ''}"
+        if hasattr(self.cfg, "effort_for_role"):
+            eff, _ = self.cfg.effort_for_role(board_role)
+            return f":{eff}"
+        return ""
+
+    def _apply_coordinator_resolution(
+        self,
+        resolution,
+        *,
+        board_role: str,
+        member_name: str,
+        member_before: dict | None,
+        unread_notes_before: int,
+        reason: str,
+        context_label: str,
+    ) -> tuple[str | None, str]:
+        """Interpret coordinator hint/set/retry/block action or board mutation."""
+        action = ""
+        res_dict: dict = {}
+        if isinstance(resolution, str):
+            action = resolution.strip().lower()
+        elif isinstance(resolution, dict):
+            res_dict = dict(resolution)
+            action = str(res_dict.get("action", "") or "").strip().lower()
+
+        if action == "hint":
+            hint_body = str(res_dict.get("body", "") or "").strip()
+            if self.board is not None and hint_body:
+                existing_notes = [
+                    str(post.get("body", "")).strip()
+                    for post in self.board.read(
+                        as_name=member_name,
+                        limit=None,
+                        for_model=False,
+                        advance_cursor=False,
+                    )
+                    if post.get("kind") == "note"
+                ]
+                if hint_body not in existing_notes:
+                    self.board.post(
+                        author="coordinator",
+                        to=[member_name],
+                        kind="note",
+                        card=self.card.id,
+                        body=hint_body,
+                        trusted=True,
+                    )
+            elif hint_body:
+                self._pending_hints.setdefault(board_role, []).append(hint_body)
+            return "hint", ""
+
+        if action == "set":
+            tier_new = res_dict.get("tier")
+            effort_new = res_dict.get("effort")
+            if self.board is not None:
+                current = self.board.get_member(member_name) or {}
+                changed_by_hook = (
+                    member_before is not None
+                    and (
+                        current.get("tier") != member_before.get("tier")
+                        or current.get("effort") != member_before.get("effort")
+                    )
+                )
+                if not changed_by_hook and (
+                    tier_new is not None or effort_new is not None
+                ):
+                    coord = self.board.get_member("coordinator")
+                    if coord is not None and coord.get("role") == "coordinator":
+                        swarm_set(
+                            self.board,
+                            self.cfg,
+                            caller="coordinator",
+                            member_name=member_name,
+                            tier=tier_new,
+                            effort=effort_new,
+                            reason=f"{context_label}: {reason[:120]}",
+                        )
+                    else:
+                        self._apply_handback_set_no_coordinator(
+                            member_name, tier=tier_new, effort=effort_new
+                        )
+            elif tier_new is not None or effort_new is not None:
+                tiers = getattr(self.cfg, "tiers", {}) or {}
+                tier_cfg = tiers.get(str(tier_new)) if tier_new else None
+                model_ov = tier_cfg.model if tier_cfg is not None else None
+                eff_ov = str(effort_new) if effort_new is not None else None
+                ep_ov = (
+                    tier_cfg.effort_param
+                    if tier_cfg is not None
+                    else (
+                        self.cfg.tier_for_model(model_ov or "").effort_param
+                        if hasattr(self.cfg, "tier_for_model") and eff_ov
+                        else ("reasoning_effort" if eff_ov else None)
+                    )
+                )
+                self._role_overrides[board_role] = (model_ov, eff_ov, ep_ov)
+            return "set", ""
+
+        if action == "retry":
+            return "retry", ""
+
+        if action == "block":
+            return "block", str(res_dict.get("reason", "") or reason)
+
+        if not action and self.board is not None:
+            current = self.board.get_member(member_name) or {}
+            unread_notes_after = sum(
+                1
+                for post in self.board.read(
+                    as_name=member_name,
+                    limit=None,
+                    for_model=False,
+                    advance_cursor=False,
+                )
+                if post.get("kind") == "note"
+            )
+            tier_or_effort_changed = (
+                member_before is not None
+                and (
+                    current.get("tier") != member_before.get("tier")
+                    or current.get("effort") != member_before.get("effort")
+                )
+            )
+            if unread_notes_after > unread_notes_before:
+                return "hint", ""
+            if tier_or_effort_changed:
+                return "set", ""
+
+        return None, str(res_dict.get("reason", "") or reason)
+
+    def _maybe_handle_struggling(
+        self,
+        *,
+        role: str,
+        attempt_no: int,
+        detail: str,
+        diff_text: str = "",
+    ) -> bool:
+        """Track failures at the worker's current effort and escalate via coordinator."""
+        board_role = (
+            "test-writer" if role == "test_writer" else normalize_role(role)
+        )
+        eff_key = self._member_effort_key(board_role)
+        prev_key, prev_count = self._effort_failures.get(board_role, ("", 0))
+        count = 1 if eff_key != prev_key else prev_count + 1
+        self._effort_failures[board_role] = (eff_key, count)
+
+        escalate_after = int(
+            getattr(self.swarm, "escalate_after", 2)
+            if self.swarm is not None
+            else 2
+        )
+        attempts_left = (
+            max(0, self.budget.test_writer_attempt_cap - self.budget.test_writer_attempts)
+            if role == "test_writer"
+            else self.budget.implementer_attempts_left()
+        )
+        if count < max(1, escalate_after) or attempts_left <= 0:
+            return False
+        if self.on_struggling is None:
+            return False
+
+        member_name = worker_member_name(self.card.id, board_role)
+        member_before = (
+            self.board.get_member(member_name) if self.board is not None else None
+        )
+        unread_notes_before = 0
+        post_rec = None
+        if self.board is not None:
+            unread_notes_before = sum(
+                1
+                for post in self.board.read(
+                    as_name=member_name,
+                    limit=None,
+                    for_model=False,
+                    advance_cursor=False,
+                )
+                if post.get("kind") == "note"
+            )
+            post_rec = self._post_board(
+                author="gates",
+                to=["coordinator"],
+                kind="note",
+                attempt=attempt_no,
+                body=(
+                    f"struggling {member_name} ({eff_key or 'default'}, "
+                    f"{count} failure(s)): {detail[:300]}"
+                ),
+                trusted=True,
+            )
+
+        tier_cur = str((member_before or {}).get("tier", "") or "")
+        effort_cur = str((member_before or {}).get("effort", "") or "")
+        cancel_fn = lambda: bool(
+            self.state.kill_requested(getattr(self.cfg, "kill_switch", None))
+        )
+        resolution = self.on_struggling(
+            {
+                "card_id": self.card.id,
+                "role": role,
+                "board_role": board_role,
+                "member": member_name,
+                "attempt": attempt_no,
+                "failed_at_effort": count,
+                "tier": tier_cur,
+                "effort": effort_cur,
+                "detail": detail,
+                "diff": diff_text,
+                "board": self.board,
+                "post": post_rec,
+                "budget": self.budget,
+                "heartbeat_fn": self._heartbeat,
+                "cancel_check": cancel_fn,
+                "micromanager": self.micromanager,
+            }
+        )
+        outcome, block_reason = self._apply_coordinator_resolution(
+            resolution,
+            board_role=board_role,
+            member_name=member_name,
+            member_before=member_before,
+            unread_notes_before=unread_notes_before,
+            reason=detail[:300],
+            context_label="struggling",
+        )
+        if outcome in ("hint", "set", "retry"):
+            self.diff_hashes.clear()
+            self.error_signatures.clear()
+            self.named_history.clear()
+            self._effort_failures[board_role] = (
+                self._member_effort_key(board_role),
+                0,
+            )
+            return True
+        if outcome == "block":
+            raise GateFailure(StopCode.HANDED_BACK, block_reason)
+        return False
+
     def _handle_handback(
         self,
         *,
@@ -867,6 +1117,9 @@ class CardRun:
 
         resolution = None
         if self.on_handback is not None:
+            cancel_fn = lambda: bool(
+                self.state.kill_requested(getattr(self.cfg, "kill_switch", None))
+            )
             resolution = self.on_handback(
                 {
                     "card_id": self.card.id,
@@ -879,122 +1132,26 @@ class CardRun:
                     "reason": reason,
                     "board": self.board,
                     "post": post_rec,
+                    "budget": self.budget,
+                    "heartbeat_fn": self._heartbeat,
+                    "cancel_check": cancel_fn,
+                    "micromanager": self.micromanager,
                 }
             )
 
-        action = ""
-        res_dict: dict = {}
-        if isinstance(resolution, str):
-            action = resolution.strip().lower()
-        elif isinstance(resolution, dict):
-            res_dict = dict(resolution)
-            action = str(res_dict.get("action", "") or "").strip().lower()
-
-        if action == "hint":
-            hint_body = str(res_dict.get("body", "") or "").strip()
-            if self.board is not None and hint_body:
-                existing_notes = [
-                    str(post.get("body", "")).strip()
-                    for post in self.board.read(
-                        as_name=member_name,
-                        limit=None,
-                        for_model=False,
-                        advance_cursor=False,
-                    )
-                    if post.get("kind") == "note"
-                ]
-                if hint_body not in existing_notes:
-                    self.board.post(
-                        author="coordinator",
-                        to=[member_name],
-                        kind="note",
-                        card=self.card.id,
-                        body=hint_body,
-                        trusted=True,
-                    )
-            elif hint_body:
-                self._pending_hints.setdefault(board_role, []).append(hint_body)
-            hb_entry["outcome"] = "hint"
+        outcome, block_reason = self._apply_coordinator_resolution(
+            resolution,
+            board_role=board_role,
+            member_name=member_name,
+            member_before=member_before,
+            unread_notes_before=unread_notes_before,
+            reason=reason,
+            context_label="handback",
+        )
+        if outcome in ("hint", "set", "retry"):
+            hb_entry["outcome"] = outcome
             return None
 
-        if action == "set":
-            tier_new = res_dict.get("tier")
-            effort_new = res_dict.get("effort")
-            if self.board is not None:
-                current = self.board.get_member(member_name) or {}
-                changed_by_hook = (
-                    member_before is not None
-                    and (
-                        current.get("tier") != member_before.get("tier")
-                        or current.get("effort") != member_before.get("effort")
-                    )
-                )
-                if not changed_by_hook and (
-                    tier_new is not None or effort_new is not None
-                ):
-                    coord = self.board.get_member("coordinator")
-                    if coord is not None and coord.get("role") == "coordinator":
-                        swarm_set(
-                            self.board,
-                            self.cfg,
-                            caller="coordinator",
-                            member_name=member_name,
-                            tier=tier_new,
-                            effort=effort_new,
-                            reason=f"handback: {reason[:120]}",
-                        )
-                    else:
-                        self._apply_handback_set_no_coordinator(
-                            member_name, tier=tier_new, effort=effort_new
-                        )
-            elif tier_new is not None or effort_new is not None:
-                tiers = getattr(self.cfg, "tiers", {}) or {}
-                tier_cfg = tiers.get(str(tier_new)) if tier_new else None
-                model_ov = tier_cfg.model if tier_cfg is not None else None
-                eff_ov = str(effort_new) if effort_new is not None else None
-                ep_ov = (
-                    tier_cfg.effort_param
-                    if tier_cfg is not None
-                    else (
-                        self.cfg.tier_for_model(model_ov or "").effort_param
-                        if hasattr(self.cfg, "tier_for_model") and eff_ov
-                        else ("reasoning_effort" if eff_ov else None)
-                    )
-                )
-                self._role_overrides[board_role] = (model_ov, eff_ov, ep_ov)
-            hb_entry["outcome"] = "set"
-            return None
-
-        if action == "retry":
-            hb_entry["outcome"] = "retry"
-            return None
-
-        if not action and self.board is not None:
-            current = self.board.get_member(member_name) or {}
-            unread_notes_after = sum(
-                1
-                for post in self.board.read(
-                    as_name=member_name,
-                    limit=None,
-                    for_model=False,
-                    advance_cursor=False,
-                )
-                if post.get("kind") == "note"
-            )
-            tier_or_effort_changed = (
-                member_before is not None
-                and (
-                    current.get("tier") != member_before.get("tier")
-                    or current.get("effort") != member_before.get("effort")
-                )
-            )
-            if unread_notes_after > unread_notes_before or tier_or_effort_changed:
-                hb_entry["outcome"] = (
-                    "hint" if unread_notes_after > unread_notes_before else "set"
-                )
-                return None
-
-        block_reason = str(res_dict.get("reason", "") or reason)
         hb_entry["outcome"] = "blocked"
         raise GateFailure(StopCode.HANDED_BACK, block_reason)
 
@@ -1929,6 +2086,11 @@ class CardRun:
                 if free_sends <= 0:
                     raise
                 last_failure = exc.detail
+                self._maybe_handle_struggling(
+                    role="test_writer",
+                    attempt_no=attempt,
+                    detail=last_failure,
+                )
                 if self.micromanager.enabled:
                     self._refresh_micromanager_harness_context(
                         "test_writer",
@@ -2668,6 +2830,13 @@ class CardRun:
 
     def _check_progress_with_coach(self, diff: dict, detail: str,
                                    attempt_no: int) -> None:
+        if self._maybe_handle_struggling(
+            role="implementer",
+            attempt_no=attempt_no,
+            detail=detail,
+            diff_text=diff.get("diff", ""),
+        ):
+            return
         try:
             self._check_progress()
         except GateFailure as exc:

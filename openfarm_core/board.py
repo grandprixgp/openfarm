@@ -1077,6 +1077,40 @@ class Board:
                                 members[as_name]["state"] = "active"
                             self._save_members_unlocked(members)
 
+    def head_seq(self) -> int:
+        if not self.board_dir.exists():
+            return 0
+        with self._locked():
+            return self._last_seq_unlocked()
+
+    def wait_after(self, since_seq: int, timeout_s: float) -> dict:
+        """Wait until any post with seq > since_seq lands, run ends, or timeout."""
+        key = self.board_dir.resolve()
+        _, cond = _get_lock_pair(key)
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        with cond:
+            with self._locked():
+                self._ensure_unlocked()
+                cur = self._last_seq_unlocked()
+                if cur > since_seq:
+                    return {"woke": True, "head": cur}
+                if self._is_ended_unlocked():
+                    return {"woke": False, "reason": "run-ended", "head": cur}
+                if float(timeout_s) <= 0:
+                    return {"woke": False, "reason": "timeout", "head": cur}
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    with self._locked():
+                        return {"woke": False, "reason": "timeout", "head": self._last_seq_unlocked()}
+                cond.wait(min(0.05, remaining))
+                with self._locked():
+                    cur = self._last_seq_unlocked()
+                    if cur > since_seq:
+                        return {"woke": True, "head": cur}
+                    if self._is_ended_unlocked():
+                        return {"woke": False, "reason": "run-ended", "head": cur}
+
     def answer(
         self,
         question_seq: int,

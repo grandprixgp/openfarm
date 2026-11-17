@@ -321,7 +321,11 @@ class SwarmActionsTests(unittest.TestCase):
         self.assertEqual(wait_res["action"], "wait")
         self.assertEqual(len(self.board.read(as_name="alice", since=0, limit=None)), cursor_before)
 
-        # Block posts blocked event, after which remove succeeds
+        # Running cards reflects active card before block/finish
+        status_running = swarm_status(self.board, self.cfg)
+        self.assertEqual(status_running["running_cards"], ["CARD-1"])
+
+        # Block posts blocked event, clearing slot before remove runs, and allowing remove
         blk = swarm_block(
             self.board, self.cfg, caller="alice", card_id="CARD-1",
             reason="needs owner", cards_by_id=cards,
@@ -332,7 +336,7 @@ class SwarmActionsTests(unittest.TestCase):
 
         # Status & tiers
         status = swarm_status(self.board, self.cfg)
-        self.assertEqual(status["running_cards"], ["CARD-1"])
+        self.assertEqual(status["running_cards"], [])
         tiers = swarm_tiers(self.cfg)
         self.assertEqual(tiers["default_tier"], "dsf")
         self.assertIn("fast", tiers["tiers"])

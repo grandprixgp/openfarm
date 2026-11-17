@@ -50,6 +50,7 @@ from .briefs import BriefBook
 from .budget import NightBudget, token_split
 from .cards import Card
 from .config import load_config, parse_duration
+from .coordinator import SwarmRunner
 from .dossier import build_dossier, render_markdown
 from .errors import (AdapterError, ConfigError, GateFailure, Infra, Invalid,
                      Refused, StopCode, UsageError)
@@ -66,7 +67,6 @@ from .packs.base import pack_for
 from .state import (StateDir, _safe_id, baseline_lock_for, read_json, utc_now,
                     utc_after, write_json)
 from .swarm import (
-    cards_collide,
     parse_team_spec,
     swarm_block,
     swarm_hint,
@@ -449,6 +449,7 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
         swarm_cfg is not None and swarm_cfg.enabled and not args.dry_run
     )
     shared_mm_backend = None
+    coord_backend = None
     if (
         swarm_parallel
         and mm_script_path is None
@@ -461,6 +462,8 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
             cfg, ctx.state.root, ctx.repo, worktree=ctx.repo, budget=night_mm_budget
         )
         shared_mm_backend = getattr(shared_mm, "backend", None)
+    if swarm_parallel and str(getattr(swarm_cfg, "coordinator", "code") or "").startswith("tier:"):
+        coord_backend = open_backend(cfg, script_path)
     build_limiter = (
         BuildLimiter(getattr(cfg, "concurrent_builds", 2))
         if swarm_parallel
@@ -523,130 +526,68 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
                 night.note_micromanager(outcome.get("micromanager_spend", 0.0) or 0.0)
                 _update_breaker(ctx, consecutive)
         else:
-            max_workers = max(1, int(getattr(cfg, "concurrent_cards", 1) or 1))
-            card_map: dict[str, Card] = {}
-            for cid in identifiers:
-                try:
-                    card_map[cid] = Card.from_dict(source.read(cid)["card"])
-                except AdapterError:
-                    card_map[cid] = Card(id=cid, title="", state="ready", done_text="")
+            rec_lock = threading.Lock()
 
-            pending = list(identifiers)
-            in_flight: dict[concurrent.futures.Future, str] = {}
-            outcomes_by_card: dict[str, dict] = {}
-            stop_launching = False
+            def _run_swarm_card(cid: str, *, on_handback=None, on_struggling=None) -> dict:
+                return _run_card(
+                    ctx,
+                    source,
+                    cid,
+                    run_id,
+                    telemetry,
+                    run_dir,
+                    script_path,
+                    mm_script=mm_script_path,
+                    harness_library=harness_lib,
+                    mm_budget=night_mm_budget,
+                    board=board,
+                    build_limiter=build_limiter,
+                    mm_backend=shared_mm_backend,
+                    on_handback=on_handback,
+                    on_struggling=on_struggling,
+                )
 
-            def _can_launch(cid: str) -> bool:
-                cand = card_map.get(cid)
-                for active_cid in in_flight.values():
-                    active_card = card_map.get(active_cid)
-                    if cand is not None and active_card is not None:
-                        if cards_collide(cand, active_card):
-                            return False
-                return True
-
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-                while pending or in_flight:
-                    if not stop_launching:
-                        remaining_next: list[str] = []
-                        for idx, cid in enumerate(pending):
-                            if len(in_flight) >= max_workers:
-                                remaining_next.extend(pending[idx:])
-                                break
-                            if ctx.state.kill_requested(cfg.kill_switch):
-                                outcomes_by_card[cid] = {
-                                    "card": cid, "skipped": "the kill switch was set"
-                                }
-                                for rest_cid in pending[idx + 1:]:
-                                    outcomes_by_card[rest_cid] = {
-                                        "card": rest_cid, "skipped": "the kill switch was set"
-                                    }
-                                stop_launching = True
-                                remaining_next = []
-                                break
-                            if ctx.state.is_paused():
-                                outcomes_by_card[cid] = {
-                                    "card": cid, "skipped": "the queue was paused"
-                                }
-                                continue
-                            if deadline is not None and _time.monotonic() >= deadline:
-                                outcomes_by_card[cid] = {
-                                    "card": cid, "skipped": "the run's time ran out"
-                                }
-                                continue
-                            reason = night.exhausted()
-                            if reason or (
-                                night.cards_cap is not None
-                                and (night.cards_claimed + len(in_flight)) >= night.cards_cap
-                            ):
-                                skip_msg = (
-                                    reason or f"{night.cards_cap} cards claimed, the run's cap"
-                                )
-                                outcomes_by_card[cid] = {"card": cid, "skipped": skip_msg}
-                                continue
-                            if not _can_launch(cid):
-                                remaining_next.append(cid)
-                                continue
-                            ctx.state.check_disk_space(getattr(cfg, "min_free_mb", 0))
-                            fut = pool.submit(
-                                _run_card,
-                                ctx,
-                                source,
-                                cid,
-                                run_id,
-                                telemetry,
-                                run_dir,
-                                script_path,
-                                mm_script=mm_script_path,
-                                harness_library=harness_lib,
-                                mm_budget=night_mm_budget,
-                                board=board,
-                                build_limiter=build_limiter,
-                                mm_backend=shared_mm_backend,
+            def _record_swarm_outcome(cid: str, outcome: dict) -> bool:
+                nonlocal consecutive
+                with rec_lock:
+                    final_state = outcome.get("final_state")
+                    infra_stop = False
+                    if final_state == "blocked":
+                        code = outcome.get("stop_code", "")
+                        consecutive.append((cid, code, outcome.get("detail", "")))
+                        if code == StopCode.INFRA.value:
+                            ctx.state.pause(
+                                f"infra error on {cid}: {outcome.get('detail', '')}"
                             )
-                            in_flight[fut] = cid
-                        pending = remaining_next
-                    else:
-                        for cid in pending:
-                            outcomes_by_card.setdefault(
-                                cid, {"card": cid, "skipped": "run stopped"}
-                            )
-                        pending = []
-
-                    if not in_flight:
-                        if pending:
-                            break
-                        continue
-
-                    done_futs, _ = concurrent.futures.wait(
-                        in_flight.keys(), return_when=concurrent.futures.FIRST_COMPLETED
+                            infra_stop = True
+                    elif final_state != "released":
+                        consecutive = []
+                    night.note_spend(outcome.get("spend", 0.0) or 0.0)
+                    night.note_micromanager(
+                        outcome.get("micromanager_spend", 0.0) or 0.0
                     )
-                    for fut in done_futs:
-                        cid = in_flight.pop(fut)
-                        outcome = fut.result()
-                        outcomes_by_card[cid] = outcome
-                        final_state = outcome.get("final_state")
-                        if final_state == "blocked":
-                            code = outcome.get("stop_code", "")
-                            consecutive.append((cid, code, outcome.get("detail", "")))
-                            if code == StopCode.INFRA.value:
-                                ctx.state.pause(
-                                    f"infra error on {cid}: {outcome.get('detail', '')}"
-                                )
-                                stop_launching = True
-                        elif final_state != "released":
-                            consecutive = []
-                        night.note_card()
-                        night.note_spend(outcome.get("spend", 0.0) or 0.0)
-                        night.note_micromanager(
-                            outcome.get("micromanager_spend", 0.0) or 0.0
-                        )
-                        _update_breaker(ctx, consecutive)
+                    _update_breaker(ctx, consecutive)
+                    return infra_stop
 
-            outcomes = [
-                outcomes_by_card[cid] for cid in identifiers if cid in outcomes_by_card
-            ]
+            swarm_runner = SwarmRunner(
+                cfg=cfg,
+                state=ctx.state,
+                source=source,
+                board=board,
+                identifiers=identifiers,
+                night=night,
+                deadline=deadline,
+                run_card_fn=_run_swarm_card,
+                record_outcome_fn=_record_swarm_outcome,
+                backend=coord_backend,
+            )
+            outcomes = swarm_runner.run()
     finally:
+        if coord_backend is not None and hasattr(coord_backend, "close"):
+            try:
+                coord_backend.close()
+            except Exception as exc:
+                print(f"coordinator backend close error ignored: {exc}", file=sys.stderr)
         if shared_mm_backend is not None and hasattr(shared_mm_backend, "close"):
             try:
                 shared_mm_backend.close()
@@ -764,7 +705,9 @@ def _run_card(ctx: Context, source: FileCardSource, card_id: str, run_id: str,
               mm_budget: MicromanagerBudget | None = None,
               board: Board | None = None,
               build_limiter: BuildLimiter | None = None,
-              mm_backend=None) -> dict:
+              mm_backend=None,
+              on_handback=None,
+              on_struggling=None) -> dict:
     """Claim one card and drive it. `backend` overrides the configured one."""
     cfg = ctx.cfg
     holder = f"openfarm:{run_id}"
@@ -818,7 +761,8 @@ def _run_card(ctx: Context, source: FileCardSource, card_id: str, run_id: str,
         deps_done=_deps_done(source, card), conventions=conventions,
         log=lambda message: print(message, file=sys.stderr),
         micromanager=mm, harness_library=resolved_harness,
-        board=board, swarm=getattr(cfg, "swarm", None))
+        board=board, swarm=getattr(cfg, "swarm", None),
+        on_handback=on_handback, on_struggling=on_struggling)
     run.card_source = source
     try:
         record = run.run(claim=claim)

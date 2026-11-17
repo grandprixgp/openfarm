@@ -154,10 +154,11 @@ def _load_cards_map(source=None, cards_by_id: dict[str, Card] | None = None) -> 
 
 
 def _running_cards_from_board(board: Board) -> set[str]:
+    finished = _finished_cards_from_board(board)
     return {
         str(m.get("card", ""))
         for m in board.list_members(include_removed=False)
-        if m.get("card")
+        if m.get("card") and str(m.get("card", "")) not in finished
     }
 
 
@@ -317,6 +318,14 @@ def swarm_start(
     if card_id in running:
         raise _refuse(
             board, caller, "already-running", f"card {card_id!r} is already running", card=card_id
+        )
+    if card_id in _finished_cards_from_board(board):
+        raise _refuse(
+            board,
+            caller,
+            "already-finished",
+            f"card {card_id!r} has already finished on the board",
+            card=card_id,
         )
     if card.state != "ready":
         raise _refuse(
