@@ -1351,6 +1351,82 @@ _ACP_PROVIDER_LABELS = {
 }
 
 
+def _acp_held(value: object) -> str:
+    """One tool policy's hold, from the status form (a word) or a probe's hold."""
+    if isinstance(value, dict):
+        return str(value.get("held_by") or ("refused" if value.get("refused") else "?"))
+    return str(value or "?")
+
+
+def _acp_login_place(info: dict) -> str:
+    """Where a provider's login was looked for, and whether it was there."""
+    provider = str(info.get("provider") or "")
+    where = str(info.get("credentials_from") or "HOME")
+    where = "$HOME" if where == "HOME" else where
+    found = bool(info.get("credentials_file_present"))
+    text = f"{where} ({'found' if found else 'not found'})"
+    if info.get("oauth_token_env"):
+        text += ", CLAUDE_CODE_OAUTH_TOKEN set"
+    if info.get("api_key_env") and provider == "antigravity":
+        text += ", API key in the environment"
+    return text
+
+
+def _format_acp_children(payload: dict, style: Style) -> list[str]:
+    """How each provider's child is held, and where its login was found."""
+    providers = payload.get("providers")
+    if not isinstance(providers, dict) or not providers:
+        return []
+    results = payload.get("results") if isinstance(payload.get("results"), dict) else {}
+    top = payload.get("confinement") if isinstance(payload.get("confinement"), dict) else {}
+    rows = []
+    refusals: list[str] = []
+    for name, info in providers.items():
+        if not isinstance(info, dict):
+            continue
+        held = info.get("confinement") if isinstance(info.get("confinement"), dict) else {}
+        probed = (results.get(name) or {}).get("confinement") if isinstance(
+            results.get(name), dict) else None
+        if not held and isinstance(top.get("none"), (dict, str)) and len(providers) == 1:
+            held = top
+        if isinstance(probed, dict) and probed.get("none") is not None:
+            held = probed
+        cells = [name, _acp_login_place(info)]
+        for policy in ("none", "read-only"):
+            word = _acp_held(held.get(policy)) if held else "?"
+            cells.append(style.red(word) if word == "refused" else
+                         style.yellow(word) if word == "nothing" else word)
+            why = held.get(f"{policy}_refused") if held else None
+            if not why and isinstance(held.get(policy), dict):
+                why = held[policy].get("refused")
+            if why:
+                refusals.append(f"{name}, tool policy {policy}: {why}")
+        cells.append(str(held.get("transport") or info.get("resolved_transport") or "missing"))
+        rows.append(cells)
+    if not rows:
+        return []
+    lines = ["", style.bold("Provider Children")]
+    lines.append(format_table(["PROVIDER", "LOGIN FOUND IN", "TOOLS NONE", "READ-ONLY",
+                               "TRANSPORT"], rows, style=style))
+    for line in refusals:
+        lines.append(f"  {style.red(ICON_FAIL)} {line}")
+    if top.get("setting") or top.get("bwrap") or top.get("mode"):
+        pairs: list[tuple[str, object]] = [
+            ("setting", f'{top.get("setting", "[micromanager] confine")} = '
+                        f'"{top.get("mode", "auto")}"')]
+        if isinstance(top.get("bwrap"), dict):
+            bwrap = top["bwrap"]
+            badge = (style.green(f"{ICON_OK} usable") if bwrap.get("usable")
+                     else style.yellow(f"{ICON_DOT} not usable"))
+            pairs.append(("bwrap", f"{badge} ({bwrap.get('detail', 'unknown')})"))
+        if top.get("read_roots"):
+            pairs.append(("read_roots", ", ".join(str(r) for r in top["read_roots"])))
+        lines.extend(_render_kv_section("Confinement", pairs, style=style))
+        for note in top.get("notes") or ():
+            lines.append(f"  {style.yellow(ICON_DOT)} {note}")
+    return lines
+
+
 def _format_acp(kind: str, payload: dict, style: Style) -> str:
     action = payload.get("action") or (kind[4:] if kind.startswith("acp_") else "status")
     raw_prov = str(payload.get("provider") or "").strip().lower()
@@ -1452,6 +1528,9 @@ def _format_acp(kind: str, payload: dict, style: Style) -> str:
             lines.append("")
             lines.append(style.bold("Providers"))
             lines.append(format_table(["PROVIDER", "TRANSPORT", "OAUTH", "CLI"], rows, style=style))
+
+    if action in ("status", "probe"):
+        lines.extend(_format_acp_children(payload, style))
 
     frontier = payload.get("repo_frontier")
     if isinstance(frontier, dict):

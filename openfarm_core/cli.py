@@ -2707,9 +2707,6 @@ def cmd_acp(args) -> int:
         raise UsageError(f"unknown acp action: {action}")
     want_json = bool(getattr(args, "json", False))
     _emit_standalone(payload, want_json, kind=f"acp_{action}")
-    if not want_json and action in ("status", "probe"):
-        for line in _acp_confinement_lines(payload):
-            print(line)
     if action == "probe" and payload.get("ok") is False:
         return EXIT_TROUBLE
     return EXIT_OK
