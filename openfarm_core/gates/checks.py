@@ -245,8 +245,18 @@ def _listed(test: dict) -> str:
     return f"{binary}::{test['name']}" if binary else str(test["name"])
 
 
-def ignored_or_filtered(parsed: dict, named: list) -> GateResult:
-    """The named tests must be reported passed, not ignored, filtered or absent."""
+def ignored_or_filtered(parsed: dict, named: list,
+                        run_cls: str = "pass", exit_code: int = 0) -> GateResult:
+    """The named tests must be reported passed, not ignored, filtered or absent.
+
+    Only a finished run can say so. A run the runner classed as infra (timed out,
+    killed, a machine error) is infra here whatever rows it printed before it
+    stopped, and so is one with a binary that printed no footer; a run that does
+    not compile, or that crashed on a signal, is a failure.
+    """
+    unjudged = _unjudged_run(parsed, run_cls, exit_code, "pass-after")
+    if unjudged is not None:
+        return unjudged
     results = parsed.get("results", [])
     by_name: dict[str, list[dict]] = {}
     by_pair: dict[tuple[str, str], list[dict]] = {}
@@ -329,6 +339,17 @@ def suite_green(parsed: dict, known_failing: list[str],
             {"compile_errors": compile_errors, "unexpected": unexpected,
              "known-red": known_red})
 
+    if run_cls == INFRA:
+        # The runner decides infra, and its word wins over anything the run printed
+        # before it stopped: a killed run's partial output can carry a footer-shaped
+        # line from the code under test, or simply stop before the failing test.
+        return GateResult(
+            "suite", INFRA,
+            "the runner classed the run as infra (timed out, killed or a machine "
+            "error), so its output cannot be judged",
+            {"run_class": run_cls, "exit_code": exit_code,
+             "missing_footers": missing_footers, "unexpected": unexpected})
+
     if missing_footers:
         if run_cls == FAIL and exit_code < 0 and exit_code != -9:
             return GateResult(
@@ -366,6 +387,40 @@ def suite_green(parsed: dict, known_failing: list[str],
         detail += f"; {len(known_red)} known red left out"
     return GateResult("suite", PASS, detail,
                       {"known-red": known_red})
+
+
+def _unjudged_run(parsed: dict, run_cls: str, exit_code: int,
+                  gate: str) -> GateResult | None:
+    """The answer for a run that cannot be read as green, or None if it can.
+
+    The same order as `suite_green`: a compile error is the edit's fault, the
+    runner's infra class wins over the output, a binary without a footer died
+    partway (a crash on a signal other than SIGKILL is the code's fault).
+    """
+    compile_errors = parsed.get("compile_errors", [])
+    missing = parsed.get("missing_footers", [])
+    if compile_errors:
+        targets = sorted({_compile_name(entry) for entry in compile_errors})
+        return GateResult(gate, FAIL,
+                          f"the code did not compile ({len(targets)} target(s)): "
+                          + ", ".join(targets[:8]),
+                          {"compile_errors": compile_errors})
+    if run_cls == INFRA:
+        return GateResult(gate, INFRA,
+                          "the runner classed the run as infra (timed out, killed or "
+                          "a machine error), so its output cannot be judged",
+                          {"run_class": run_cls, "exit_code": exit_code})
+    if missing:
+        if run_cls == FAIL and exit_code < 0 and exit_code != -9:
+            return GateResult(gate, FAIL,
+                              f"test binary crashed with signal {-exit_code}: "
+                              + ", ".join(missing[:8]),
+                              {"missing_footers": missing, "exit_code": exit_code})
+        return GateResult(gate, INFRA,
+                          "a test binary printed no footer, so the run died partway: "
+                          + ", ".join(missing[:8]),
+                          {"missing_footers": missing})
+    return None
 
 
 def _compile_name(entry: dict) -> str:

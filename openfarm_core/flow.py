@@ -3076,8 +3076,12 @@ class CardRun:
                 parsed = self.pack.parse_tests(out, err)
                 self.head_status_by_test = _named_failures(parsed, self.card.test_names)
                 gate = self._record_gate(
-                    ignored_or_filtered(parsed, self.card.test_names))
+                    ignored_or_filtered(parsed, self.card.test_names,
+                                        run_cls=result.cls,
+                                        exit_code=result.exit_code))
                 named_ok = named_ok and gate.ok
+                if gate.result == INFRA:
+                    raise Infra("pass-after-infra", gate.detail)
                 if not gate.ok:
                     raise GateFailure(
                         StopCode.ATTEMPTS,
@@ -3721,6 +3725,9 @@ class CardRun:
                     self.counter_summary["dropped_uncompiled"] += 1
                     continue
                 status = _status_of(parsed, counter.get("name", ""))
+                if parsed.get("missing_footers"):
+                    # The run died partway: a row it printed is not a pass.
+                    status = "not-run"
                 if status == "ok":
                     self.counter_summary["passed"] += 1
                 elif status == "FAILED":
