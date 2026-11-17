@@ -763,7 +763,14 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
         return out
 
     if not args.dry_run:
-        for note in _confinement_notes():
+        # The cards are done by now: a note that cannot be worked out is said, and
+        # never costs the run its record.
+        try:
+            held_notes = _confinement_notes()
+        except Exception as exc:
+            held_notes = [f"could not work out how this run's ACP children were held: "
+                          f"{type(exc).__name__}: {' '.join(str(exc).split())[:200]}"]
+        for note in held_notes:
             if note not in notes:
                 notes.append(note)
 

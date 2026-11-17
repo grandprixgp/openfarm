@@ -99,6 +99,15 @@ class RunConfinementNotesTests(unittest.TestCase):
         record, _ = self._run(usable=True)
         self.assertEqual(_confine_notes(record["notes"]), [confine_lib.off_note("codex")])
 
+    def test_a_note_that_cannot_be_worked_out_never_costs_the_run_its_record(self) -> None:
+        self._configure(provider="codex", confine="off", binary="codex-exec")
+        # One card at a time, so no shared seat: only the notes ask `hold_of`.
+        with mock.patch("openfarm_core.cli._SharedAcpSupervisor.hold_of",
+                        side_effect=RuntimeError("no worker here")):
+            record, _ = self._run(usable=True)
+        self.assertIn("could not work out how this run's ACP children were held: "
+                      "RuntimeError: no worker here", record["notes"])
+
     def test_a_run_without_acp_is_unchanged(self) -> None:
         record, _ = self._run(usable=False)
         self.assertEqual(_confine_notes(record["notes"]), [])
