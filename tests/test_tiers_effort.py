@@ -413,6 +413,13 @@ class StopCodeReplanAndGlobTests(unittest.TestCase):
                     "replan_if": bad_val,
                 },
             )
+            # With the swarm off the field is unknown, as in v0.7, and is ignored.
+            cfg.swarm.enabled = False
+            self.assertNotIn(
+                "replan-if",
+                [f["rule"] for f in check_eligibility(bad_card, cfg).failures],
+            )
+            cfg.swarm.enabled = True
             res = check_eligibility(bad_card, cfg)
             self.assertFalse(res.ok, repr(bad_val))
             self.assertIn("replan-if", [f["rule"] for f in res.failures])
