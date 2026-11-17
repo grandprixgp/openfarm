@@ -13,9 +13,10 @@ import shutil
 import stat
 from pathlib import Path
 
+from .adapters.acp import acp_adapter_for_provider, normalize_acp_provider
 from .config_template import render_config
 from .config import load_config
-from .errors import ConfigError, Refused, UsageError
+from .errors import ConfigError, Invalid, Refused, UsageError
 from .git import Git
 
 INSTALL_TARGETS = ("claude", "antigravity", "agents", "workspace", "all")
@@ -231,6 +232,7 @@ def initialize_project(
     repo_base: Path | None = None,
     idea: str = "",
     profile: str = "auto",
+    acp_provider: str = "claude",
     state_dir: Path | None = None,
     secrets_dir: Path | None = None,
     endpoint: str = "https://api.example.invalid/v1",
@@ -246,6 +248,10 @@ def initialize_project(
     project_slug, crate_name = validate_project_name(name)
     if profile not in PROFILES:
         raise UsageError(f"unknown profile {profile!r}: choose one of {', '.join(PROFILES)}")
+    try:
+        resolved_acp_provider = normalize_acp_provider(acp_provider)
+    except Invalid as exc:
+        raise UsageError(exc.message) from exc
     if mutation not in MUTATION_MODES:
         raise UsageError(
             f"unknown mutation mode {mutation!r}: choose one of {', '.join(MUTATION_MODES)}"
@@ -294,7 +300,11 @@ def initialize_project(
         raise ConfigError("[model] key_file must be outside the repository")
 
     resolved_profile = "active" if profile == "auto" else profile
-    mm_adapter = "off" if resolved_profile == "solo" else "claude-acp"
+    mm_adapter = (
+        "off"
+        if resolved_profile == "solo"
+        else acp_adapter_for_provider(resolved_acp_provider)
+    )
     mm_mode = "off" if resolved_profile == "solo" else resolved_profile
     mm_auth = "oauth"
     mm_binary = "auto"
@@ -317,6 +327,12 @@ def initialize_project(
     os.chmod(resolved_state, 0o700)
     os.chmod(resolved_key.parent, 0o700)
 
+    acp_label = {"claude": "Claude", "antigravity": "Antigravity", "codex": "Codex"}[resolved_acp_provider]
+    acp_cmd_hint = (
+        "`openfarm acp status` / `openfarm acp login`"
+        if resolved_acp_provider == "claude"
+        else f"`openfarm acp status --provider {resolved_acp_provider}` / `openfarm acp login --provider {resolved_acp_provider}`"
+    )
     idea_text = str(idea or "").strip() or f"{project_slug} domain application"
     files_to_write: dict[str, str] = {
         "Cargo.toml": (
@@ -400,7 +416,7 @@ def initialize_project(
             "1. Keep domain invariants in `src/invariants.rs` (`never_touch`) and never weaken `.openfarm/config.toml`.\n"
             "2. Ensure every integration-tested type or function is `pub` and re-exported in `src/lib.rs`.\n"
             f"3. Commit changes on `{branch}` before running `openfarm check` or `openfarm run`.\n"
-            "4. Frontier supervision defaults to native Claude ACP via OAuth (`openfarm acp status` / `openfarm acp login`); lesser workers use the configured ZDR API key file.\n"
+            f"4. Frontier supervision defaults to native {acp_label} ACP via OAuth ({acp_cmd_hint}); lesser workers use the configured ZDR API key file.\n"
             "5. Run waves through `openfarm supervise --prepare-queue --apply` and `openfarm run --cards N --json`,\n"
             "   then review `openfarm dossier <ID>`, record `openfarm verdict`, and merge locally via `git merge --no-ff`.\n"
         ),
@@ -445,6 +461,7 @@ def initialize_project(
         "key_file": str(resolved_key),
         "key_file_present": resolved_key.is_file(),
         "profile": resolved_profile,
+        "acp_provider": resolved_acp_provider,
         "micromanager_adapter": cfg.micromanager_adapter,
         "micromanager_mode": cfg.micromanager.mode,
         "micromanager_auth": cfg.micromanager.auth,
@@ -454,7 +471,7 @@ def initialize_project(
         "config_valid": True,
         "created_files": created_files,
         "next_steps": [
-            "Ensure Frontier Claude OAuth is signed in (`openfarm acp status` / `openfarm acp login`).",
+            f"Ensure Frontier {acp_label} OAuth is signed in ({acp_cmd_hint}).",
             f"Place your Worker ZDR model API key in {resolved_key} (chmod 600).",
             "Expand .openfarm/PROJECT_SPEC.md, src/invariants.rs, a golden slice, and tests/baseline_tests.rs.",
             "Verify `cargo test`, `cargo clippy --all-targets -- -D warnings`, and `rustfmt --edition 2021 --check`.",

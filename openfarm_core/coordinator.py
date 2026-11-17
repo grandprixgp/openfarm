@@ -16,9 +16,12 @@ import time
 from pathlib import Path
 from typing import Callable
 
+from .adapters.acp import acp_adapter_for_provider, is_acp_adapter, normalize_acp_provider
+from .adapters.claude_worker import ClaudeAcpWorkerBackend, open_acp_worker
 from .board import Board, normalize_role
 from .briefs import _sanitize_text
 from .cards import Card
+from .config import TierConfig
 from .errors import AdapterError, GateFailure, Infra, Invalid, Refused, StopCode
 from .micromanager import _call_tier_complete
 from .swarm import (
@@ -385,8 +388,81 @@ class CodeCoordinator:
         self.on_plan(rt)
 
 
+class AcpCoordinatorBackend:
+    """Wrap an ACP worker backend for `ModelCoordinator` when coordinator is ACP."""
+
+    is_acp = True
+
+    def __init__(
+        self,
+        cfg,
+        *,
+        provider: str = "",
+        effort: str = "",
+        worker: ClaudeAcpWorkerBackend | None = None,
+    ) -> None:
+        self.cfg = cfg
+        coord_spec = str(getattr(getattr(cfg, "swarm", None), "coordinator", "claude-acp") or "claude-acp")
+        self.provider = normalize_acp_provider(provider or coord_spec)
+        self.name = acp_adapter_for_provider(self.provider)
+        self.effort = str(effort or "")
+        mm_cfg = getattr(cfg, "micromanager", None)
+        self.model = str(getattr(mm_cfg, "model", "") or "")
+        self.worker = worker if worker is not None else open_acp_worker(cfg, provider=self.provider)
+
+    @property
+    def prices_spend(self) -> bool:
+        return bool(getattr(self.worker, "prices_spend", True))
+
+    def hello(self) -> dict:
+        return {"name": self.name, "versions": [1], "ops": ["hello", "complete"]}
+
+    def complete(
+        self,
+        role: str,
+        model: str,
+        temperature: float,
+        messages: list[dict],
+        seed: int | None = None,
+        max_tokens: int = 4096,
+        response_format: str | None = None,
+        effort: str = "",
+        effort_param: str = "",
+    ):
+        sys_parts: list[str] = []
+        user_messages: list[dict] = []
+        for msg in messages:
+            if str(msg.get("role", "")).lower() == "system":
+                content = str(msg.get("content", "") or "").strip()
+                if content:
+                    sys_parts.append(content)
+            else:
+                user_messages.append(msg)
+        sys_prompt = "\n\n".join(sys_parts) if sys_parts else _COORDINATOR_SYSTEM_PROMPT
+        resolved_model = (
+            self.model
+            if model in ("", self.provider, self.name)
+            else str(model)
+        )
+        return self.worker.complete(
+            role=role,
+            model=resolved_model,
+            temperature=temperature,
+            messages=user_messages or messages,
+            seed=seed,
+            max_tokens=max_tokens,
+            response_format=response_format,
+            effort=effort or self.effort,
+            effort_param=effort_param,
+            system_prompt=sys_prompt,
+        )
+
+    def close(self) -> None:
+        self.worker.close()
+
+
 class ModelCoordinator:
-    """Coordinator seat backed by a configured model tier (`tier:<name>`)."""
+    """Coordinator seat backed by a configured model tier (`tier:<name>`) or ACP provider."""
 
     def __init__(self, cfg, backend, tier, *, effort: str = "") -> None:
         self.cfg = cfg
@@ -402,7 +478,14 @@ class ModelCoordinator:
 
     def ensure_member(self, board: Board) -> None:
         board.ensure()
-        kind = "scripted" if getattr(self.backend, "name", "") == "scripted" else "api"
+        if getattr(self.backend, "name", "") == "scripted":
+            kind = "scripted"
+        elif getattr(self.backend, "is_acp", False) or isinstance(
+            self.backend, (AcpCoordinatorBackend, ClaudeAcpWorkerBackend)
+        ):
+            kind = "acp"
+        else:
+            kind = "api"
         if board.get_member("coordinator") is None:
             board.upsert_member(
                 "coordinator",
@@ -971,6 +1054,31 @@ class SwarmRunner:
                     backend,
                     tier_cfg,
                     effort=str(getattr(cfg.swarm, "coordinator_effort", "") or ""),
+                )
+            elif is_acp_adapter(spec):
+                provider = normalize_acp_provider(spec)
+                coord_effort = str(getattr(cfg.swarm, "coordinator_effort", "") or "")
+                if backend is None:
+                    backend = AcpCoordinatorBackend(
+                        cfg, provider=provider, effort=coord_effort
+                    )
+                elif isinstance(backend, ClaudeAcpWorkerBackend):
+                    backend = AcpCoordinatorBackend(
+                        cfg, provider=provider, effort=coord_effort, worker=backend
+                    )
+                mm_cfg = getattr(cfg, "micromanager", None)
+                coord_model = str(getattr(mm_cfg, "model", "") or "")
+                coord_tier = TierConfig(
+                    name=acp_adapter_for_provider(provider),
+                    model=coord_model or provider,
+                    efforts=("low", "medium", "high", "xhigh", "max"),
+                    effort_param="effort",
+                )
+                self.coordinator = ModelCoordinator(
+                    cfg,
+                    backend,
+                    coord_tier,
+                    effort=coord_effort,
                 )
             else:
                 raise Invalid("bad-coordinator", f"unknown coordinator mode {spec!r}")

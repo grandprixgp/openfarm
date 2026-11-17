@@ -1246,15 +1246,28 @@ def _check_line(ok: bool, text: str, style: Style) -> str:
     return f"  {icon} {text}"
 
 
+_ACP_PROVIDER_LABELS = {
+    "claude": "Claude",
+    "antigravity": "Antigravity",
+    "codex": "Codex",
+}
+
+
 def _format_acp(kind: str, payload: dict, style: Style) -> str:
     action = payload.get("action") or (kind[4:] if kind.startswith("acp_") else "status")
+    raw_prov = str(payload.get("provider") or "").strip().lower()
+    if not raw_prov or raw_prov == "all":
+        display_prov = str(payload.get("primary_provider") or "claude").strip().lower()
+    else:
+        display_prov = raw_prov
+    label = _ACP_PROVIDER_LABELS.get(display_prov, "Claude")
     titles = {
-        "status": "Frontier Claude ACP Status",
-        "login": "Frontier Claude OAuth Login",
-        "configure": "Frontier Claude ACP Configured",
-        "probe": "Frontier Claude ACP Probe",
+        "status": f"Frontier {label} ACP Status",
+        "login": f"Frontier {label} OAuth Login",
+        "configure": f"Frontier {label} ACP Configured",
+        "probe": f"Frontier {label} ACP Probe",
     }
-    lines = [style.heading(titles.get(action, "Frontier Claude ACP"))]
+    lines = [style.heading(titles.get(action, f"Frontier {label} ACP"))]
 
     oauth_ready = bool(payload.get("oauth_ready"))
     transport = str(payload.get("resolved_transport") or "missing")
@@ -1270,10 +1283,24 @@ def _format_acp(kind: str, payload: dict, style: Style) -> str:
         f"(cli_logged_in={logged_in}, credentials_file={creds_present}, env_token={env_tok})",
         style,
     ))
+    if display_prov == "antigravity":
+        tr_detail = (
+            f"(agy={payload.get('agy_cli') or 'missing'}, "
+            f"acp={payload.get('antigravity_acp') or 'missing'})"
+        )
+    elif display_prov == "codex":
+        tr_detail = (
+            f"(codex={payload.get('codex_cli') or 'missing'}, "
+            f"acp={payload.get('codex_acp') or 'missing'})"
+        )
+    else:
+        tr_detail = (
+            f"(claude={payload.get('claude_cli') or 'missing'}, "
+            f"acp={payload.get('claude_agent_acp') or 'missing'})"
+        )
     lines.append(_check_line(
         transport != "missing",
-        f"ACP transport: {transport} "
-        f"(claude={payload.get('claude_cli') or 'missing'}, acp={payload.get('claude_agent_acp') or 'missing'})",
+        f"ACP transport: {transport} {tr_detail}",
         style,
     ))
 
@@ -1282,13 +1309,51 @@ def _format_acp(kind: str, payload: dict, style: Style) -> str:
     if action == "configure" and payload.get("config_path"):
         lines.append(_check_line(True, f"Updated config: {payload['config_path']}", style))
     if action == "probe":
-        methods = ", ".join(str(m.get("id", m)) if isinstance(m, dict) else str(m)
-                            for m in (payload.get("auth_methods") or ())) or "none"
-        lines.append(_check_line(
-            True,
-            f"Handshake protocol v{payload.get('protocol_version', '?')} (auth_methods: {methods})",
-            style,
-        ))
+        if isinstance(payload.get("results"), dict):
+            for pname, pres in payload["results"].items():
+                if not isinstance(pres, dict):
+                    continue
+                if pres.get("ok"):
+                    methods = ", ".join(
+                        str(m.get("id", m)) if isinstance(m, dict) else str(m)
+                        for m in (pres.get("auth_methods") or ())
+                    ) or "none"
+                    lines.append(_check_line(
+                        True,
+                        f"{pname}: protocol v{pres.get('protocol_version', '?')} (auth_methods: {methods})",
+                        style,
+                    ))
+                else:
+                    lines.append(_check_line(
+                        False,
+                        f"{pname}: {pres.get('error', 'probe failed')}",
+                        style,
+                    ))
+        else:
+            methods = ", ".join(str(m.get("id", m)) if isinstance(m, dict) else str(m)
+                                for m in (payload.get("auth_methods") or ())) or "none"
+            lines.append(_check_line(
+                True,
+                f"Handshake protocol v{payload.get('protocol_version', '?')} (auth_methods: {methods})",
+                style,
+            ))
+
+    providers = payload.get("providers")
+    if isinstance(providers, dict) and len(providers) > 1:
+        rows = []
+        for pname, pinfo in providers.items():
+            if not isinstance(pinfo, dict):
+                continue
+            rows.append([
+                pname,
+                str(pinfo.get("resolved_transport") or "missing"),
+                "ready" if pinfo.get("oauth_ready") else "not logged in",
+                str(pinfo.get("cli_path") or "missing"),
+            ])
+        if rows:
+            lines.append("")
+            lines.append(style.bold("Providers"))
+            lines.append(format_table(["PROVIDER", "TRANSPORT", "OAUTH", "CLI"], rows, style=style))
 
     frontier = payload.get("repo_frontier")
     if isinstance(frontier, dict):
@@ -1314,11 +1379,19 @@ def _format_acp(kind: str, payload: dict, style: Style) -> str:
     if payload.get("hint"):
         tips.append(str(payload["hint"]))
     if not oauth_ready:
-        tips.append("openfarm acp login")
+        tips.append(
+            "openfarm acp login"
+            if display_prov == "claude"
+            else f"openfarm acp login --provider {display_prov}"
+        )
     if isinstance(workers, dict) and workers.get("key_file") and not workers.get("key_file_present"):
         tips.append(f"Create worker key file at {workers['key_file']} (chmod 600)")
     if not tips and action != "probe":
-        tips.append("openfarm acp probe")
+        tips.append(
+            "openfarm acp probe"
+            if display_prov == "claude"
+            else f"openfarm acp probe --provider {display_prov}"
+        )
     elif not tips:
         tips.append("openfarm check <CARD>")
     lines.extend(_render_next(tips, style=style, numbered=True))

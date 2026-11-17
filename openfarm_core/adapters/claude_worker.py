@@ -16,7 +16,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .acp import ClaudeAcpAdapter
+from .acp import (
+    ClaudeAcpAdapter,
+    infer_acp_provider,
+    is_acp_adapter,
+    normalize_acp_provider,
+)
 from .openai_compat import Completion
 
 _SYSTEM_PROMPT = (
@@ -28,18 +33,22 @@ _SYSTEM_PROMPT = (
 
 
 class ClaudeAcpWorkerBackend:
-    """A worker backend whose answers come from Claude over ACP."""
+    """A worker backend whose answers come from Claude, Antigravity, or Codex over ACP."""
 
     name = "claude-acp-worker"
+    is_acp = True
 
     def __init__(self, command: str | list[str] = "auto",
                  cwd: Path | str | None = None, *,
+                 provider: str = "",
                  effort: str = "", timeout_s: float = 600.0,
                  isolate_home: bool = True, auth_file: Path | str | None = None,
                  auth_mode: str = "oauth",
                  cost_per_1k_in: float = 0.0, cost_per_1k_out: float = 0.0,
                  adapter: ClaudeAcpAdapter | None = None) -> None:
         self.command = command
+        self.provider = infer_acp_provider(command, provider)
+        self.name = f"{self.provider}-acp-worker"
         self.cwd = Path(cwd or Path.cwd())
         self.effort = effort
         self.timeout_s = float(timeout_s)
@@ -52,7 +61,7 @@ class ClaudeAcpWorkerBackend:
 
     @property
     def prices_spend(self) -> bool:
-        # Claude reports its own cost per turn, so spend caps can fire.
+        # ACP providers report vendor cost or allow per-1k pricing fallback.
         return True
 
     def hello(self) -> dict:
@@ -71,6 +80,7 @@ class ClaudeAcpWorkerBackend:
         if self._adapter is None:
             self._adapter = ClaudeAcpAdapter(
                 command=self.command, cwd=self.cwd,
+                provider=self.provider,
                 isolate_home=self.isolate_home, auth_file=self.auth_file,
                 auth_mode=self.auth_mode, allowed_root=self.cwd)
         if not self._adapter._initialized:
@@ -82,11 +92,14 @@ class ClaudeAcpWorkerBackend:
                  max_tokens: int = 4096,
                  response_format: str | None = None,
                  effort: str = "",
-                 effort_param: str = "") -> Completion:
-        # ACP has no temperature, seed or token cap; Claude's own defaults apply.
+                 effort_param: str = "",
+                 *,
+                 system_prompt: str | None = None) -> Completion:
+        # ACP has no temperature, seed or token cap; provider defaults apply.
         adapter = self._ensure_adapter()
+        resolved_sys = _SYSTEM_PROMPT if system_prompt is None else str(system_prompt)
         session_id = adapter.new_session(
-            cwd=self.cwd, system_prompt=_SYSTEM_PROMPT, model=model,
+            cwd=self.cwd, system_prompt=resolved_sys, model=model,
             effort=effort or self.effort, tool_policy="none",
             timeout_s=min(30.0, self.timeout_s))
         text = "\n\n".join(str(m.get("content", "")) for m in messages)
@@ -98,7 +111,7 @@ class ClaudeAcpWorkerBackend:
                     + result.tokens_out / 1000.0 * self.cost_per_1k_out)
         finish = "length" if result.stop_reason == "max_tokens" else "stop"
         return Completion(content=result.text, tokens_in=result.tokens_in,
-                          tokens_out=result.tokens_out, model=model or "claude",
+                          tokens_out=result.tokens_out, model=model or self.provider,
                           finish_reason=finish, latency_s=result.latency_s,
                           cost=cost)
 
@@ -108,14 +121,32 @@ class ClaudeAcpWorkerBackend:
             self._adapter = None
 
 
-def open_claude_worker(cfg) -> ClaudeAcpWorkerBackend:
-    """The solo arm's backend, connected the way `[micromanager]` says."""
-    mm = cfg.micromanager
-    binary = str(getattr(mm, "binary", "auto") or "auto")
-    args = [str(a) for a in (getattr(mm, "args", None) or [])]
+AcpWorkerBackend = ClaudeAcpWorkerBackend
+
+
+def open_acp_worker(cfg, *, provider: str = "") -> ClaudeAcpWorkerBackend:
+    """Open an ACP worker backend from config (`[adapters]` / `[micromanager]`)."""
+    if str(provider or "").strip():
+        prov = normalize_acp_provider(provider)
+    elif is_acp_adapter(getattr(cfg, "model_adapter", "")):
+        prov = normalize_acp_provider(cfg.model_adapter)
+    else:
+        prov = "claude"
+    mm = getattr(cfg, "micromanager", None)
+    mm_adapter = str(getattr(cfg, "micromanager_adapter", "") or "")
+    raw_bin = str(getattr(mm, "binary", "auto") or "auto")
+    mismatch = (
+        raw_bin != "auto"
+        and is_acp_adapter(mm_adapter)
+        and normalize_acp_provider(mm_adapter) != prov
+        and infer_acp_provider(raw_bin) != prov
+    )
+    binary = "auto" if mismatch else raw_bin
+    args = [] if mismatch else [str(a) for a in (getattr(mm, "args", None) or [])]
     return ClaudeAcpWorkerBackend(
         command=[binary, *args] if args else binary,
-        cwd=cfg.state_dir,
+        cwd=getattr(cfg, "state_dir", None),
+        provider=prov,
         effort=str(getattr(mm, "effort", "") or ""),
         timeout_s=float(getattr(mm, "timeout_s", 600.0)),
         isolate_home=bool(getattr(mm, "isolate_home", True)),
@@ -124,3 +155,8 @@ def open_claude_worker(cfg) -> ClaudeAcpWorkerBackend:
         cost_per_1k_in=float(getattr(cfg, "cost_per_1k_in", 0.0)),
         cost_per_1k_out=float(getattr(cfg, "cost_per_1k_out", 0.0)),
     )
+
+
+def open_claude_worker(cfg) -> ClaudeAcpWorkerBackend:
+    """The solo arm's backend, connected the way `[micromanager]` says."""
+    return open_acp_worker(cfg)

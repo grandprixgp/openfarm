@@ -1,7 +1,8 @@
-"""Claude ACP OAuth discovery, login, probing, and repo config helper (`openfarm acp`).
+"""Multi-provider ACP OAuth discovery, login, probing, and repo config helper (`openfarm acp`).
 
-Keeps the frontier supervisor on native Claude ACP via OAuth by default while
-leaving lesser coding workers on OpenAI-compatible API keys.
+Supports Frontier supervisors across Claude (`claude-acp`), Antigravity
+(`antigravity-acp` / `agy-acp`), and Codex (`codex-acp`), while keeping lesser
+coding workers on OpenAI-compatible API keys by default.
 """
 
 from __future__ import annotations
@@ -15,11 +16,20 @@ import subprocess
 import tomllib
 from pathlib import Path
 
-from .adapters.acp import ClaudeAcpAdapter, resolve_acp_command
+from .adapters.acp import (
+    ACP_PROVIDERS,
+    ClaudeAcpAdapter,
+    acp_adapter_for_provider,
+    infer_acp_provider,
+    is_acp_adapter,
+    normalize_acp_provider,
+    resolve_acp_command,
+)
 from .config import CONFIG_PATH, Config, ConfigError, load_config
-from .errors import Infra, Refused, UsageError
+from .errors import AdapterError, Infra, Invalid, Refused, UsageError
 
 ACP_ACTIONS = ("status", "login", "configure", "probe")
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
 
 def _safe_claude_auth_status(
@@ -75,88 +85,328 @@ def _safe_claude_auth_status(
     return out
 
 
-def inspect_acp_status(
-    repo: Path | None = None,
+def _safe_codex_auth_status(
+    codex_bin: str,
     *,
-    home: Path | None = None,
+    home: Path,
+    timeout_s: float = 5.0,
+) -> dict:
+    """Query `codex login status` without leaking email/account identifiers."""
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("OPENAI_API_KEY", "CODEX_HOME")
+    }
+    env["HOME"] = str(home)
+    env["CODEX_HOME"] = str(home / ".codex")
+    try:
+        proc = subprocess.run(
+            [codex_bin, "login", "status"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {"available": False, "loggedIn": False}
+
+    combined = f"{proc.stdout or ''}\n{proc.stderr or ''}".lower()
+    logged_in = proc.returncode == 0 and "not logged in" not in combined
+    auth_method = "none"
+    if logged_in:
+        if "chatgpt" in combined:
+            auth_method = "chatgpt"
+        elif "api key" in combined or "api_key" in combined:
+            auth_method = "api-key"
+        else:
+            auth_method = "codex"
+    return {
+        "available": True,
+        "loggedIn": logged_in,
+        "authMethod": auth_method,
+        "exitCode": proc.returncode,
+    }
+
+
+def _repo_acp_provider(cfg: Config) -> str:
+    for spec in (
+        cfg.micromanager_adapter,
+        cfg.model_adapter,
+        getattr(getattr(cfg, "swarm", None), "coordinator", ""),
+        getattr(getattr(cfg, "swarm", None), "supervisor", ""),
+    ):
+        if is_acp_adapter(spec):
+            return normalize_acp_provider(spec)
+    return "claude"
+
+
+def _inspect_single_provider(
+    provider: str,
+    *,
+    resolved_home: Path,
+    source_env: dict[str, str] | os._Environ[str],
     claude_bin: str | None = None,
     acp_bin: str | None = None,
-    env: dict[str, str] | None = None,
-) -> dict:
-    """Inspect local Claude OAuth readiness, ACP transport availability, and repo config."""
-    resolved_home = (
-        Path(home).expanduser().resolve() if home is not None else Path.home().resolve()
+    agy_bin: str | None = None,
+    antigravity_acp_bin: str | None = None,
+    codex_bin: str | None = None,
+    codex_acp_bin: str | None = None,
+) -> dict[str, object]:
+    if provider == "claude":
+        resolved_claude = claude_bin if claude_bin is not None else (shutil.which("claude") or "")
+        resolved_acp = acp_bin if acp_bin is not None else (shutil.which("claude-agent-acp") or "")
+        creds_file = resolved_home / ".claude" / ".credentials.json"
+        creds_present = creds_file.is_file()
+        creds_mode = oct(stat.S_IMODE(creds_file.stat().st_mode)) if creds_present else None
+        oauth_token_env = bool(str(source_env.get("CLAUDE_CODE_OAUTH_TOKEN") or "").strip())
+        cli_status = (
+            _safe_claude_auth_status(resolved_claude, home=resolved_home)
+            if resolved_claude
+            else {"available": False, "loggedIn": False}
+        )
+        if resolved_acp:
+            resolved_transport = "claude-agent-acp"
+            resolved_cmd = [resolved_acp]
+        elif resolved_claude:
+            resolved_transport = "claude-native-acp"
+            resolved_cmd = resolve_acp_command(["claude"], provider="claude")
+            resolved_cmd[-1] = resolved_claude
+        else:
+            resolved_transport = "missing"
+            resolved_cmd = []
+        oauth_ready = bool(
+            cli_status.get("loggedIn") or creds_present or oauth_token_env
+        )
+        return {
+            "provider": "claude",
+            "adapter": "claude-acp",
+            "resolved_transport": resolved_transport,
+            "resolved_command": resolved_cmd,
+            "claude_cli": resolved_claude or None,
+            "claude_agent_acp": resolved_acp or None,
+            "cli_path": resolved_claude or None,
+            "acp_bin": resolved_acp or None,
+            "oauth_ready": oauth_ready,
+            "oauth_token_env": oauth_token_env,
+            "credentials_file_present": creds_present,
+            "credentials_mode": creds_mode,
+            "cli_auth": cli_status,
+        }
+
+    if provider == "antigravity":
+        resolved_agy = agy_bin if agy_bin is not None else (shutil.which("agy") or "")
+        resolved_acp = (
+            antigravity_acp_bin
+            if antigravity_acp_bin is not None
+            else (shutil.which("antigravity-acp") or "")
+        )
+        token_file = resolved_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
+        token_present = token_file.is_file()
+        token_nonempty = False
+        token_mode = None
+        if token_present:
+            try:
+                st = token_file.stat()
+                token_nonempty = st.st_size > 0
+                token_mode = oct(stat.S_IMODE(st.st_mode))
+            except OSError:
+                token_present = False
+        api_key_env = bool(
+            str(source_env.get("GEMINI_API_KEY") or source_env.get("GOOGLE_API_KEY") or "").strip()
+        )
+        if resolved_acp:
+            resolved_transport = "antigravity-acp"
+            resolved_cmd = [resolved_acp]
+        elif resolved_agy:
+            resolved_transport = "antigravity-native-acp"
+            resolved_cmd = [resolved_agy, "acp"]
+        else:
+            resolved_transport = "missing"
+            resolved_cmd = []
+        oauth_ready = bool(token_nonempty)
+        cli_status = {
+            "available": bool(resolved_agy),
+            "loggedIn": oauth_ready,
+            "authMethod": "oauth-personal" if oauth_ready else "none",
+        }
+        return {
+            "provider": "antigravity",
+            "adapter": "antigravity-acp",
+            "resolved_transport": resolved_transport,
+            "resolved_command": resolved_cmd,
+            "agy_cli": resolved_agy or None,
+            "antigravity_acp": resolved_acp or None,
+            "cli_path": resolved_agy or None,
+            "acp_bin": resolved_acp or None,
+            "oauth_ready": oauth_ready,
+            "oauth_token_env": False,
+            "api_key_env": api_key_env,
+            "credentials_file_present": token_present,
+            "credentials_mode": token_mode,
+            "cli_auth": cli_status,
+        }
+
+    # codex
+    resolved_codex = codex_bin if codex_bin is not None else (shutil.which("codex") or "")
+    resolved_acp = (
+        codex_acp_bin if codex_acp_bin is not None else (shutil.which("codex-acp") or "")
     )
-    resolved_claude = claude_bin if claude_bin is not None else (shutil.which("claude") or "")
-    resolved_acp = acp_bin if acp_bin is not None else (shutil.which("claude-agent-acp") or "")
-
-    creds_file = resolved_home / ".claude" / ".credentials.json"
-    creds_present = creds_file.is_file()
-    creds_mode = oct(stat.S_IMODE(creds_file.stat().st_mode)) if creds_present else None
-
-    source_env = os.environ if env is None else env
-    oauth_token_env = bool(str(source_env.get("CLAUDE_CODE_OAUTH_TOKEN") or "").strip())
-
+    auth_file = resolved_home / ".codex" / "auth.json"
+    auth_present = auth_file.is_file()
+    auth_nonempty = False
+    auth_mode = None
+    if auth_present:
+        try:
+            st = auth_file.stat()
+            auth_nonempty = st.st_size > 0
+            auth_mode = oct(stat.S_IMODE(st.st_mode))
+        except OSError:
+            auth_present = False
+    api_key_env = bool(str(source_env.get("OPENAI_API_KEY") or "").strip())
     cli_status = (
-        _safe_claude_auth_status(resolved_claude, home=resolved_home)
-        if resolved_claude
+        _safe_codex_auth_status(resolved_codex, home=resolved_home)
+        if resolved_codex
         else {"available": False, "loggedIn": False}
     )
-
     if resolved_acp:
-        resolved_transport = "claude-agent-acp"
+        resolved_transport = "codex-acp"
         resolved_cmd = [resolved_acp]
-    elif resolved_claude:
-        resolved_transport = "claude-native-acp"
-        resolved_cmd = resolve_acp_command(["claude"])
-        # Preserve caller-provided explicit claude binary path if overridden in tests.
-        resolved_cmd[-1] = resolved_claude
+    elif resolved_codex:
+        resolved_transport = "codex-native-acp"
+        resolved_cmd = resolve_acp_command(["codex"], provider="codex")
+        resolved_cmd[-1] = resolved_codex
     else:
         resolved_transport = "missing"
         resolved_cmd = []
-
-    oauth_ready = bool(
-        cli_status.get("loggedIn") or creds_present or oauth_token_env
-    )
-
-    payload: dict[str, object] = {
-        "ok": True,
+    oauth_ready = bool(cli_status.get("loggedIn") or auth_nonempty)
+    return {
+        "provider": "codex",
+        "adapter": "codex-acp",
         "resolved_transport": resolved_transport,
         "resolved_command": resolved_cmd,
-        "claude_cli": resolved_claude or None,
-        "claude_agent_acp": resolved_acp or None,
+        "codex_cli": resolved_codex or None,
+        "codex_acp": resolved_acp or None,
+        "cli_path": resolved_codex or None,
+        "acp_bin": resolved_acp or None,
         "oauth_ready": oauth_ready,
-        "oauth_token_env": oauth_token_env,
-        "credentials_file_present": creds_present,
-        "credentials_mode": creds_mode,
+        "oauth_token_env": False,
+        "api_key_env": api_key_env,
+        "credentials_file_present": auth_present,
+        "credentials_mode": auth_mode,
         "cli_auth": cli_status,
     }
 
+
+def inspect_acp_status(
+    repo: Path | None = None,
+    *,
+    provider: str = "all",
+    home: Path | None = None,
+    claude_bin: str | None = None,
+    acp_bin: str | None = None,
+    agy_bin: str | None = None,
+    antigravity_acp_bin: str | None = None,
+    codex_bin: str | None = None,
+    codex_acp_bin: str | None = None,
+    env: dict[str, str] | None = None,
+) -> dict:
+    """Inspect local OAuth readiness, ACP transport availability, and repo config."""
+    resolved_home = (
+        Path(home).expanduser().resolve() if home is not None else Path.home().resolve()
+    )
+    source_env = os.environ if env is None else env
+
+    cfg: Config | None = None
+    repo_provider = "claude"
     if repo is not None:
         repo_path = Path(repo).resolve()
         cfg_file = repo_path / CONFIG_PATH
         if cfg_file.is_file():
             cfg = load_config(repo_path)
-            payload["repo_frontier"] = {
-                "adapter": cfg.micromanager_adapter,
-                "mode": cfg.micromanager.mode,
-                "enabled": cfg.micromanager_enabled,
-                "auth": cfg.micromanager.auth,
-                "binary": cfg.micromanager.binary,
-                "model": cfg.micromanager.model,
-                "effort": cfg.micromanager.effort,
-                "tool_policy": cfg.micromanager.tool_policy,
-                "auth_file": (
-                    str(cfg.micromanager.auth_file)
-                    if cfg.micromanager.auth_file is not None
-                    else None
-                ),
-            }
-            payload["repo_workers"] = {
-                "adapter": cfg.model_adapter,
-                "endpoint": cfg.endpoint,
-                "key_file": str(cfg.key_file) if cfg.key_file is not None else None,
-                "key_file_present": bool(cfg.key_file and cfg.key_file.is_file()),
+            repo_provider = _repo_acp_provider(cfg)
+
+    raw_prov = str(provider or "all").strip().lower()
+    if raw_prov == "all":
+        wanted = ACP_PROVIDERS
+        primary_provider = repo_provider
+        requested_provider = "all"
+    else:
+        try:
+            primary_provider = normalize_acp_provider(raw_prov)
+        except Invalid as exc:
+            raise UsageError(exc.message) from exc
+        wanted = (primary_provider,)
+        requested_provider = primary_provider
+
+    providers: dict[str, dict[str, object]] = {}
+    for item in wanted:
+        providers[item] = _inspect_single_provider(
+            item,
+            resolved_home=resolved_home,
+            source_env=source_env,
+            claude_bin=claude_bin,
+            acp_bin=acp_bin,
+            agy_bin=agy_bin,
+            antigravity_acp_bin=antigravity_acp_bin,
+            codex_bin=codex_bin,
+            codex_acp_bin=codex_acp_bin,
+        )
+
+    primary = providers[primary_provider]
+    claude_info = providers.get("claude") or {}
+
+    payload: dict[str, object] = {
+        "ok": True,
+        "provider": requested_provider,
+        "primary_provider": primary_provider,
+        "resolved_transport": primary["resolved_transport"],
+        "resolved_command": primary["resolved_command"],
+        "claude_cli": claude_info.get("claude_cli"),
+        "claude_agent_acp": claude_info.get("claude_agent_acp"),
+        "oauth_ready": primary["oauth_ready"],
+        "oauth_token_env": primary["oauth_token_env"],
+        "credentials_file_present": primary["credentials_file_present"],
+        "credentials_mode": primary["credentials_mode"],
+        "cli_auth": primary["cli_auth"],
+        "providers": providers,
+    }
+    if "antigravity" in providers:
+        payload["agy_cli"] = providers["antigravity"].get("agy_cli")
+        payload["antigravity_acp"] = providers["antigravity"].get("antigravity_acp")
+    if "codex" in providers:
+        payload["codex_cli"] = providers["codex"].get("codex_cli")
+        payload["codex_acp"] = providers["codex"].get("codex_acp")
+
+    if cfg is not None:
+        payload["repo_frontier"] = {
+            "adapter": cfg.micromanager_adapter,
+            "mode": cfg.micromanager.mode,
+            "enabled": cfg.micromanager_enabled,
+            "auth": cfg.micromanager.auth,
+            "binary": cfg.micromanager.binary,
+            "model": cfg.micromanager.model,
+            "effort": cfg.micromanager.effort,
+            "tool_policy": cfg.micromanager.tool_policy,
+            "auth_file": (
+                str(cfg.micromanager.auth_file)
+                if cfg.micromanager.auth_file is not None
+                else None
+            ),
+        }
+        payload["repo_workers"] = {
+            "adapter": cfg.model_adapter,
+            "endpoint": cfg.endpoint,
+            "key_file": str(cfg.key_file) if cfg.key_file is not None else None,
+            "key_file_present": bool(cfg.key_file and cfg.key_file.is_file()),
+        }
+        swarm_cfg = getattr(cfg, "swarm", None)
+        if swarm_cfg is not None:
+            payload["repo_swarm"] = {
+                "enabled": swarm_cfg.enabled,
+                "coordinator": swarm_cfg.coordinator,
+                "supervisor": swarm_cfg.supervisor,
+                "coordinator_effort": swarm_cfg.coordinator_effort,
+                "supervisor_effort": swarm_cfg.supervisor_effort,
             }
 
     return payload
@@ -164,14 +414,98 @@ def inspect_acp_status(
 
 def run_acp_login(
     *,
+    provider: str = "claude",
     mode: str = "claudeai",
     sso: bool = False,
     email: str = "",
     setup_token: bool = False,
+    device_auth: bool = False,
     claude_bin: str | None = None,
+    agy_bin: str | None = None,
+    codex_bin: str | None = None,
     home: Path | None = None,
 ) -> dict:
-    """Invoke native `claude auth login` or `claude setup-token` for OAuth setup."""
+    """Invoke native provider OAuth login (`claude`, `agy acp --login`, or `codex login`)."""
+    raw_prov = str(provider or "claude").strip().lower()
+    if raw_prov == "all":
+        raise UsageError("acp login requires a single provider: claude, antigravity, or codex")
+    try:
+        prov = normalize_acp_provider(raw_prov)
+    except Invalid as exc:
+        raise UsageError(exc.message) from exc
+
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("CLAUDECODE", "ANTHROPIC_AUTH_TOKEN", "AI_AGENT")
+        and not k.startswith("CLAUDE_CODE_")
+    }
+    resolved_home: Path | None = (
+        Path(home).expanduser().resolve() if home is not None else None
+    )
+    if resolved_home is not None:
+        env["HOME"] = str(resolved_home)
+
+    if prov == "antigravity":
+        resolved_agy = agy_bin if agy_bin is not None else shutil.which("agy")
+        if not resolved_agy:
+            raise Infra(
+                "antigravity-cli-missing",
+                "Antigravity CLI (`agy`) was not found on PATH; install Antigravity CLI first.",
+            )
+        env.pop("GEMINI_API_KEY", None)
+        env.pop("GOOGLE_API_KEY", None)
+        argv = [resolved_agy, "acp", "--login"]
+        try:
+            proc = subprocess.run(argv, env=env)
+        except OSError as exc:
+            raise Infra("acp-login-spawn-failed", f"failed running {argv[0]}: {exc}") from exc
+        if proc.returncode != 0:
+            raise Refused(
+                "acp-login-failed",
+                f"{' '.join(argv)} exited with code {proc.returncode}",
+            )
+        status = inspect_acp_status(provider="antigravity", home=home, agy_bin=resolved_agy)
+        return {
+            "ok": True,
+            "action": "login",
+            "provider": "antigravity",
+            "login_command": argv,
+            **status,
+        }
+
+    if prov == "codex":
+        resolved_codex = codex_bin if codex_bin is not None else shutil.which("codex")
+        if not resolved_codex:
+            raise Infra(
+                "codex-cli-missing",
+                "Codex CLI (`codex`) was not found on PATH; install Codex CLI first.",
+            )
+        env.pop("OPENAI_API_KEY", None)
+        if resolved_home is not None:
+            env["CODEX_HOME"] = str(resolved_home / ".codex")
+        argv = [resolved_codex, "login"]
+        if device_auth:
+            argv.append("--device-auth")
+        try:
+            proc = subprocess.run(argv, env=env)
+        except OSError as exc:
+            raise Infra("acp-login-spawn-failed", f"failed running {argv[0]}: {exc}") from exc
+        if proc.returncode != 0:
+            raise Refused(
+                "acp-login-failed",
+                f"{' '.join(argv)} exited with code {proc.returncode}",
+            )
+        status = inspect_acp_status(provider="codex", home=home, codex_bin=resolved_codex)
+        return {
+            "ok": True,
+            "action": "login",
+            "provider": "codex",
+            "login_command": argv,
+            **status,
+        }
+
+    # claude
     resolved_claude = claude_bin if claude_bin is not None else shutil.which("claude")
     if not resolved_claude:
         raise Infra(
@@ -191,15 +525,6 @@ def run_acp_login(
         if email.strip():
             argv.extend(["--email", email.strip()])
 
-    env = {
-        k: v
-        for k, v in os.environ.items()
-        if k not in ("CLAUDECODE", "ANTHROPIC_AUTH_TOKEN", "AI_AGENT")
-        and not k.startswith("CLAUDE_CODE_")
-    }
-    if home is not None:
-        env["HOME"] = str(Path(home).expanduser().resolve())
-
     try:
         proc = subprocess.run(argv, env=env)
     except OSError as exc:
@@ -211,10 +536,11 @@ def run_acp_login(
             f"{' '.join(argv)} exited with code {proc.returncode}",
         )
 
-    status = inspect_acp_status(home=home, claude_bin=resolved_claude)
+    status = inspect_acp_status(provider="claude", home=home, claude_bin=resolved_claude)
     return {
         "ok": True,
         "action": "login",
+        "provider": "claude",
         "login_command": argv,
         **status,
     }
@@ -301,6 +627,7 @@ def _upsert_toml_table(
 def configure_acp_repo(
     repo: Path,
     *,
+    provider: str | None = None,
     mode: str | None = None,
     auth: str | None = None,
     binary: str | None = None,
@@ -316,12 +643,24 @@ def configure_acp_repo(
     if not cfg_path.is_file():
         raise ConfigError(f"missing {cfg_path}; run `openfarm init` first")
 
+    if provider is not None:
+        if str(provider).strip().lower() == "all":
+            raise UsageError("acp configure requires a single provider: claude, antigravity, or codex")
+        try:
+            resolved_provider = normalize_acp_provider(provider)
+        except Invalid as exc:
+            raise UsageError(exc.message) from exc
+    else:
+        resolved_provider = _repo_acp_provider(load_config(repo_path))
+
     if mode is not None and mode not in ("active", "advisory", "off"):
         raise UsageError(f"invalid --mode {mode!r}: choose active, advisory, or off")
     if auth is not None and auth not in ("oauth", "api-key", "auto"):
         raise UsageError(f"invalid --auth {auth!r}: choose oauth, api-key, or auto")
-    if effort is not None and effort not in ("low", "medium", "high"):
-        raise UsageError(f"invalid --effort {effort!r}: choose low, medium, or high")
+    if effort is not None and effort not in ("low", "medium", "high", "xhigh", "max"):
+        raise UsageError(
+            f"invalid --effort {effort!r}: choose low, medium, high, xhigh, or max"
+        )
     if tool_policy is not None and tool_policy not in ("none", "read-only"):
         raise UsageError(
             f"invalid --tool-policy {tool_policy!r}: choose none or read-only"
@@ -333,12 +672,13 @@ def configure_acp_repo(
     if mode == "off":
         adapter_updates["micromanager"] = "off"
     elif (
-        mode in ("active", "advisory")
+        provider is not None
+        or mode in ("active", "advisory")
         or auth is not None
         or binary is not None
         or auth_file is not None
     ):
-        adapter_updates["micromanager"] = "claude-acp"
+        adapter_updates["micromanager"] = acp_adapter_for_provider(resolved_provider)
 
     mm_updates: dict[str, object] = {}
     remove_mm: list[str] = []
@@ -380,18 +720,69 @@ def configure_acp_repo(
     cfg = Config(parsed, repo_path, path=cfg_path)
     cfg_path.write_text(updated_text, encoding="utf-8")
 
-    status = inspect_acp_status(repo_path)
+    status = inspect_acp_status(repo_path, provider=resolved_provider)
     status["action"] = "configure"
+    status["provider"] = resolved_provider
     status["config_path"] = str(cfg_path)
     status["micromanager_enabled"] = cfg.micromanager_enabled
     if cfg.micromanager_enabled and cfg.micromanager.auth == "oauth" and not status["oauth_ready"]:
-        status["hint"] = "Run `openfarm acp login` or `claude auth login --claudeai` to authenticate Frontier OAuth."
+        if resolved_provider == "antigravity":
+            status["hint"] = (
+                "Run `openfarm acp login --provider antigravity` or `agy acp --login` "
+                "to authenticate Antigravity OAuth."
+            )
+        elif resolved_provider == "codex":
+            status["hint"] = (
+                "Run `openfarm acp login --provider codex` or `codex login` "
+                "to authenticate Codex OAuth."
+            )
+        else:
+            status["hint"] = (
+                "Run `openfarm acp login` or `claude auth login --claudeai` "
+                "to authenticate Frontier OAuth."
+            )
     return status
+
+
+def _probe_single_provider(
+    repo_path: Path,
+    *,
+    provider: str,
+    cmd: str | list[str],
+    effective_auth: str,
+    effective_iso: bool,
+    effective_auth_file: Path | str | None,
+    timeout_s: float,
+) -> dict[str, object]:
+    adapter = ClaudeAcpAdapter(
+        command=cmd,
+        cwd=repo_path,
+        provider=provider,
+        isolate_home=effective_iso,
+        auth_file=effective_auth_file,
+        auth_mode=effective_auth,
+    )
+    try:
+        init_res = adapter.initialize(timeout_s=float(timeout_s))
+        resolved_argv = list(adapter.argv)
+        agent_caps = dict(adapter.agent_capabilities)
+        auth_methods = list(adapter.auth_methods)
+    finally:
+        adapter.close()
+    return {
+        "ok": True,
+        "provider": provider,
+        "protocol_version": init_res.get("protocolVersion"),
+        "resolved_argv": resolved_argv,
+        "agent_capabilities": agent_caps,
+        "auth_methods": auth_methods,
+    }
 
 
 def probe_acp(
     repo: Path | None = None,
     *,
+    provider: str | None = None,
     command: str | list[str] | None = None,
     auth_mode: str | None = None,
     isolate_home: bool | None = None,
@@ -404,15 +795,32 @@ def probe_acp(
     effective_auth = "oauth"
     effective_iso = True
     effective_auth_file = auth_file
+    repo_provider = "claude"
+
+    requested_prov: str | None = None
+    if provider is not None and str(provider).strip().lower() != "all":
+        try:
+            requested_prov = normalize_acp_provider(provider)
+        except Invalid as exc:
+            raise UsageError(exc.message) from exc
 
     if (repo_path / CONFIG_PATH).is_file():
         cfg = load_config(repo_path)
-        raw_bin = cfg.micromanager.binary or "auto"
-        cmd = [raw_bin, *cfg.micromanager.args] if cfg.micromanager.args else raw_bin
+        repo_provider = _repo_acp_provider(cfg)
         effective_auth = cfg.micromanager.auth
         effective_iso = cfg.micromanager.isolate_home
-        if effective_auth_file is None:
-            effective_auth_file = cfg.micromanager.auth_file
+        raw_bin = str(cfg.micromanager.binary or "auto")
+        mismatch = (
+            requested_prov is not None
+            and is_acp_adapter(cfg.micromanager_adapter)
+            and requested_prov != repo_provider
+            and raw_bin != "auto"
+            and infer_acp_provider(raw_bin) != requested_prov
+        )
+        if not mismatch:
+            cmd = [raw_bin, *cfg.micromanager.args] if cfg.micromanager.args else raw_bin
+            if effective_auth_file is None:
+                effective_auth_file = cfg.micromanager.auth_file
 
     if command is not None:
         cmd = command
@@ -421,28 +829,57 @@ def probe_acp(
     if isolate_home is not None:
         effective_iso = isolate_home
 
-    adapter = ClaudeAcpAdapter(
-        command=cmd,
-        cwd=repo_path,
-        isolate_home=effective_iso,
-        auth_file=effective_auth_file,
-        auth_mode=effective_auth,
-    )
-    try:
-        init_res = adapter.initialize(timeout_s=float(timeout_s))
-        resolved_argv = list(adapter.argv)
-        agent_caps = dict(adapter.agent_capabilities)
-        auth_methods = list(adapter.auth_methods)
-    finally:
-        adapter.close()
+    if provider is not None and str(provider).strip().lower() == "all":
+        status = inspect_acp_status(repo_path, provider="all")
+        results: dict[str, dict[str, object]] = {}
+        for item in ACP_PROVIDERS:
+            item_cmd = command if command is not None else "auto"
+            try:
+                results[item] = _probe_single_provider(
+                    repo_path,
+                    provider=item,
+                    cmd=item_cmd,
+                    effective_auth=effective_auth,
+                    effective_iso=effective_iso,
+                    effective_auth_file=effective_auth_file,
+                    timeout_s=timeout_s,
+                )
+            except (AdapterError, OSError) as exc:
+                results[item] = {
+                    "ok": False,
+                    "provider": item,
+                    "error": getattr(exc, "message", str(exc)),
+                }
+        return {
+            **status,
+            "ok": any(bool(r.get("ok")) for r in results.values()),
+            "action": "probe",
+            "provider": "all",
+            "results": results,
+        }
 
-    status = inspect_acp_status(repo_path)
+    if provider is not None:
+        try:
+            prov = normalize_acp_provider(provider)
+        except Invalid as exc:
+            raise UsageError(exc.message) from exc
+    elif command is not None:
+        prov = infer_acp_provider(command)
+    else:
+        prov = repo_provider
+
+    probe_res = _probe_single_provider(
+        repo_path,
+        provider=prov,
+        cmd=cmd,
+        effective_auth=effective_auth,
+        effective_iso=effective_iso,
+        effective_auth_file=effective_auth_file,
+        timeout_s=timeout_s,
+    )
+    status = inspect_acp_status(repo_path, provider=prov)
     return {
         **status,
-        "ok": True,
+        **probe_res,
         "action": "probe",
-        "protocol_version": init_res.get("protocolVersion"),
-        "resolved_argv": resolved_argv,
-        "agent_capabilities": agent_caps,
-        "auth_methods": auth_methods,
     }

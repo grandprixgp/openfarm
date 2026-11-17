@@ -25,6 +25,7 @@ from typing import Any
 
 from . import __version__
 from .acp_setup import ACP_ACTIONS, inspect_acp_status
+from .adapters.acp import is_acp_adapter, normalize_acp_provider
 from .adapters.files import parse_card_file
 from .bench import load_task, render_report
 from .cards import Card, extract_fenced_fields
@@ -1114,6 +1115,8 @@ def _collect_ops(
     acp_home: Path | None = None,
     claude_bin: str | None = None,
     acp_bin: str | None = None,
+    agy_bin: str | None = None,
+    codex_bin: str | None = None,
     include_cli_auth: bool = False,
     bench_dir: Path | None = None,
     bench_out: Path | None = None,
@@ -1121,25 +1124,100 @@ def _collect_ops(
     if include_cli_auth:
         acp_info = inspect_acp_status(
             ctx.repo if ctx.configured else None,
+            provider="all",
             home=acp_home,
             claude_bin=claude_bin,
             acp_bin=acp_bin,
+            agy_bin=agy_bin,
+            codex_bin=codex_bin,
         )
     else:
+        resolved_home = (
+            Path(acp_home).expanduser().resolve()
+            if acp_home is not None
+            else Path.home().resolve()
+        )
         resolved_claude = claude_bin if claude_bin is not None else (shutil.which("claude") or "")
         resolved_acp = acp_bin if acp_bin is not None else (shutil.which("claude-agent-acp") or "")
-        transport = (
+        claude_transport = (
             "claude-agent-acp"
             if resolved_acp
             else ("claude-native-acp" if resolved_claude else "missing")
         )
+        resolved_agy = agy_bin if agy_bin is not None else (shutil.which("agy") or "")
+        resolved_agy_acp = shutil.which("antigravity-acp") or ""
+        agy_transport = (
+            "antigravity-acp"
+            if resolved_agy_acp
+            else ("antigravity-native-acp" if resolved_agy else "missing")
+        )
+        resolved_codex = codex_bin if codex_bin is not None else (shutil.which("codex") or "")
+        resolved_codex_acp = shutil.which("codex-acp") or ""
+        codex_transport = (
+            "codex-acp"
+            if resolved_codex_acp
+            else ("codex-native-acp" if resolved_codex else "missing")
+        )
+        claude_creds = (resolved_home / ".claude" / ".credentials.json").is_file()
+        agy_creds = (
+            resolved_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
+        ).is_file()
+        codex_creds = (resolved_home / ".codex" / "auth.json").is_file()
+        providers_map = {
+            "claude": {
+                "provider": "claude",
+                "resolved_transport": claude_transport,
+                "cli_path": resolved_claude or None,
+                "acp_bin": resolved_acp or None,
+                "oauth_ready": bool(
+                    claude_creds
+                    or str(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or "").strip()
+                ),
+                "credentials_file_present": claude_creds,
+            },
+            "antigravity": {
+                "provider": "antigravity",
+                "resolved_transport": agy_transport,
+                "cli_path": resolved_agy or None,
+                "acp_bin": resolved_agy_acp or None,
+                "oauth_ready": agy_creds,
+                "credentials_file_present": agy_creds,
+            },
+            "codex": {
+                "provider": "codex",
+                "resolved_transport": codex_transport,
+                "cli_path": resolved_codex or None,
+                "acp_bin": resolved_codex_acp or None,
+                "oauth_ready": codex_creds,
+                "credentials_file_present": codex_creds,
+            },
+        }
+        primary_provider = "claude"
+        if ctx.configured and ctx.cfg is not None:
+            for spec in (
+                ctx.cfg.micromanager_adapter,
+                ctx.cfg.model_adapter,
+                getattr(getattr(ctx.cfg, "swarm", None), "coordinator", ""),
+                getattr(getattr(ctx.cfg, "swarm", None), "supervisor", ""),
+            ):
+                if is_acp_adapter(spec):
+                    primary_provider = normalize_acp_provider(spec)
+                    break
+
         acp_info = {
             "ok": True,
-            "resolved_transport": transport,
+            "provider": "all",
+            "primary_provider": primary_provider,
+            "resolved_transport": providers_map[primary_provider]["resolved_transport"],
             "claude_cli": resolved_claude or None,
             "claude_agent_acp": resolved_acp or None,
+            "agy_cli": resolved_agy or None,
+            "antigravity_acp": resolved_agy_acp or None,
+            "codex_cli": resolved_codex or None,
+            "codex_acp": resolved_codex_acp or None,
             "oauth_token_env": bool(str(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or "").strip()),
             "cli_auth_checked": False,
+            "providers": providers_map,
         }
         if ctx.configured and ctx.cfg is not None:
             cfg = ctx.cfg
@@ -1161,6 +1239,13 @@ def _collect_ops(
                 "endpoint": cfg.endpoint,
                 "key_file_present": bool(cfg.key_file and cfg.key_file.is_file()),
             }
+            swarm_cfg = getattr(cfg, "swarm", None)
+            if swarm_cfg is not None:
+                acp_info["repo_swarm"] = {
+                    "enabled": swarm_cfg.enabled,
+                    "coordinator": swarm_cfg.coordinator,
+                    "supervisor": swarm_cfg.supervisor,
+                }
 
     supervision_reports: list[dict] = []
     if ctx.state is not None:
@@ -1249,6 +1334,8 @@ def collect_snapshot(
     acp_home: Path | None = None,
     claude_bin: str | None = None,
     acp_bin: str | None = None,
+    agy_bin: str | None = None,
+    codex_bin: str | None = None,
     include_cli_auth: bool = False,
     bench_dir: Path | None = None,
     bench_out: Path | None = None,
@@ -1276,6 +1363,8 @@ def collect_snapshot(
             acp_home=acp_home,
             claude_bin=claude_bin,
             acp_bin=acp_bin,
+            agy_bin=agy_bin,
+            codex_bin=codex_bin,
             include_cli_auth=include_cli_auth,
             bench_dir=bench_dir,
             bench_out=bench_out,
@@ -1959,9 +2048,23 @@ def _format_ops_lines(snap: dict, *, width: int = 96) -> list[str]:
     acp = d.get("acp") or {}
     tr = acp.get("resolved_transport", "missing")
     tr_ic = "✗" if tr == "missing" else "✓"
+    primary_prov = acp.get("primary_provider") or "claude"
     acp_lines = [
-        f"ACP: {tr_ic} transport={tr}   claude_cli={acp.get('claude_cli') or 'none'}   agent_acp={acp.get('claude_agent_acp') or 'none'}   oauth_env={acp.get('oauth_token_env', False)}"
+        f"ACP ({primary_prov}): {tr_ic} transport={tr}   claude_cli={acp.get('claude_cli') or 'none'}   agent_acp={acp.get('claude_agent_acp') or 'none'}   oauth_env={acp.get('oauth_token_env', False)}"
     ]
+    providers = acp.get("providers")
+    if isinstance(providers, dict):
+        prov_parts = []
+        for pname in ("claude", "antigravity", "codex"):
+            pinfo = providers.get(pname)
+            if not isinstance(pinfo, dict):
+                continue
+            ptr = pinfo.get("resolved_transport") or "missing"
+            p_ic = "✓" if ptr != "missing" else "✗"
+            auth_tag = "oauth" if pinfo.get("oauth_ready") else "no-auth"
+            prov_parts.append(f"{p_ic} {pname}={ptr}({auth_tag})")
+        if prov_parts:
+            acp_lines.append("Providers: " + "  ".join(prov_parts))
     if "repo_frontier" in acp:
         rf = acp["repo_frontier"]
         rw = acp["repo_workers"]

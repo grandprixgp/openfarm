@@ -7,6 +7,7 @@ import threading
 import time
 from typing import Callable, Iterable
 
+from .adapters.acp import is_acp_adapter
 from .board import Board, normalize_role
 from .cards import Card
 from .errors import Refused
@@ -47,7 +48,7 @@ def worker_kind_for_config(cfg) -> str:
     adapter = str(getattr(cfg, "model_adapter", "openai-compatible") or "")
     if adapter in ("scripted", "stub"):
         return "scripted"
-    if adapter == "claude-acp":
+    if is_acp_adapter(adapter):
         return "acp"
     return "api"
 

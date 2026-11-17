@@ -30,7 +30,13 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from .adapters.acp import ClaudeAcpAdapter
+from .adapters.acp import (
+    ClaudeAcpAdapter,
+    acp_adapter_for_provider,
+    infer_acp_provider,
+    is_acp_adapter,
+    normalize_acp_provider,
+)
 from .packs.python import valid_python_scaffold
 from .cards import Card
 from .edits import (
@@ -622,7 +628,7 @@ def _build_op_prompt(op: str, payload: dict) -> str:
 
 
 class ClaudeAcpMicromanager(_ThreadLocalUsageMixin):
-    """ACP-backed micromanager running against ``claude-agent-acp`` or native ``claude``."""
+    """ACP-backed micromanager targeting Claude, Antigravity, or Codex ACP."""
 
     name = "claude-acp"
     enabled = True
@@ -632,6 +638,7 @@ class ClaudeAcpMicromanager(_ThreadLocalUsageMixin):
         command: str | list[str] = "auto",
         cwd: Path | str | None = None,
         *,
+        provider: str = "",
         model: str = "",
         effort: str = "",
         tool_policy: str = "none",
@@ -650,6 +657,8 @@ class ClaudeAcpMicromanager(_ThreadLocalUsageMixin):
     ) -> None:
         self._init_usage()
         self.command = command
+        self.provider = infer_acp_provider(command, provider)
+        self.name = acp_adapter_for_provider(self.provider)
         self.cwd = Path(cwd or state_dir or Path.cwd())
         self.model = model
         self.effort = effort
@@ -689,6 +698,7 @@ class ClaudeAcpMicromanager(_ThreadLocalUsageMixin):
             self._adapter = ClaudeAcpAdapter(
                 command=self.command,
                 cwd=self.cwd,
+                provider=self.provider,
                 isolate_home=self.isolate_home,
                 auth_file=self.auth_file,
                 auth_mode=self.auth_mode,
@@ -2182,6 +2192,8 @@ def open_micromanager(
         )
 
     swarm_cfg = _cfg_get(cfg, "swarm", None)
+    swarm_acp_spec = ""
+    swarm_sup_effort = ""
     if swarm_cfg is not None and bool(_cfg_get(swarm_cfg, "enabled", False)):
         swarm_sup = str(_cfg_get(swarm_cfg, "supervisor", "config") or "config")
         if swarm_sup == "off":
@@ -2246,6 +2258,9 @@ def open_micromanager(
                 mode="active" if mode == "off" else mode,
                 feature_flags=feature_flags,
             )
+        if is_acp_adapter(swarm_sup):
+            swarm_acp_spec = swarm_sup
+            swarm_sup_effort = str(_cfg_get(swarm_cfg, "supervisor_effort", "") or "")
 
     enabled_flag = _cfg_get(mm_cfg, "enabled", None) if mm_cfg is not None else None
     spec = _cfg_get(mm_cfg, "adapter", None) if mm_cfg is not None else None
@@ -2255,11 +2270,12 @@ def open_micromanager(
             "micromanager_adapter",
             _cfg_get(cfg, "supervisor_adapter", "off"),
         )
-    spec_str = str(spec or "off").strip()
+    spec_str = str(swarm_acp_spec or spec or "off").strip()
+    if swarm_acp_spec and mode == "off":
+        mode = "active"
 
     if (
-        enabled_flag is False
-        or mode == "off"
+        (not swarm_acp_spec and (enabled_flag is False or mode == "off"))
         or spec_str.lower() in ("", "off", "none", "null", "disabled")
     ):
         return Micromanager(
@@ -2302,7 +2318,8 @@ def open_micromanager(
             feature_flags=feature_flags,
         )
 
-    if spec_str.lower() in ("claude-acp", "acp", "claude"):
+    if is_acp_adapter(spec_str):
+        acp_provider = normalize_acp_provider(spec_str)
         explicit_cmd = _cfg_get(
             mm_cfg,
             "command",
@@ -2318,7 +2335,9 @@ def open_micromanager(
             _cfg_get(mm_cfg, "model", _cfg_get(cfg, "micromanager_model", "")) or ""
         )
         effort = str(
-            _cfg_get(mm_cfg, "effort", _cfg_get(cfg, "micromanager_effort", "")) or ""
+            swarm_sup_effort
+            or _cfg_get(mm_cfg, "effort", _cfg_get(cfg, "micromanager_effort", ""))
+            or ""
         )
         tool_policy = str(
             _cfg_get(
@@ -2360,6 +2379,7 @@ def open_micromanager(
         backend = ClaudeAcpMicromanager(
             command=command,
             cwd=cwd,
+            provider=acp_provider,
             model=model,
             effort=effort,
             tool_policy=tool_policy,

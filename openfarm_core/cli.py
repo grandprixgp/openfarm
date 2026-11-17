@@ -38,6 +38,11 @@ from .acp_setup import (
 from .adopt import adopt_project
 from .bench import load_task
 from .board import Board, VALID_POST_KINDS, board_dir_for
+from .adapters.acp import (
+    acp_adapter_for_provider,
+    is_acp_adapter,
+    normalize_acp_provider,
+)
 from .adapters.files import FileCardSource, open_card_source
 from .adapters.jsonl import TelemetrySink, open_telemetry
 from .adapters.openai_compat import open_backend
@@ -465,26 +470,52 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
                 effort=swarm_cfg.supervisor_effort,
                 added_by="system",
             )
+        elif is_acp_adapter(swarm_cfg.supervisor):
+            sup_prov = normalize_acp_provider(swarm_cfg.supervisor)
+            board.upsert_member(
+                "supervisor",
+                kind="acp",
+                role="supervisor",
+                tier=acp_adapter_for_provider(sup_prov),
+                model=str(getattr(getattr(cfg, "micromanager", None), "model", "") or sup_prov),
+                effort=swarm_cfg.supervisor_effort,
+                added_by="system",
+            )
 
     swarm_parallel = bool(
         swarm_cfg is not None and swarm_cfg.enabled and not args.dry_run
     )
     shared_mm_backend = None
     coord_backend = None
+    swarm_sup = swarm_cfg.supervisor if swarm_cfg is not None else "config"
+    uses_acp_sup = is_acp_adapter(swarm_sup) or (
+        swarm_sup == "config"
+        and is_acp_adapter(cfg.micromanager_adapter)
+        and getattr(getattr(cfg, "micromanager", None), "mode", "active") != "off"
+    )
     if (
         swarm_parallel
         and mm_script_path is None
         and getattr(cfg, "concurrent_cards", 1) > 1
-        and swarm_cfg.supervisor == "config"
-        and cfg.micromanager_adapter.lower() in ("claude-acp", "acp", "claude")
-        and getattr(getattr(cfg, "micromanager", None), "mode", "active") != "off"
+        and uses_acp_sup
     ):
         shared_mm = open_micromanager(
             cfg, ctx.state.root, ctx.repo, worktree=ctx.repo, budget=night_mm_budget
         )
         shared_mm_backend = getattr(shared_mm, "backend", None)
-    if swarm_parallel and str(getattr(swarm_cfg, "coordinator", "code") or "").startswith("tier:"):
+    coord_spec = str(getattr(swarm_cfg, "coordinator", "code") or "")
+    if swarm_parallel and coord_spec.startswith("tier:"):
         coord_backend = open_backend(cfg, script_path)
+    elif swarm_parallel and is_acp_adapter(coord_spec):
+        if script_path is not None:
+            coord_backend = open_backend(cfg, script_path)
+        else:
+            from .coordinator import AcpCoordinatorBackend
+            coord_backend = AcpCoordinatorBackend(
+                cfg,
+                provider=normalize_acp_provider(coord_spec),
+                effort=str(getattr(swarm_cfg, "coordinator_effort", "") or ""),
+            )
     build_limiter = (
         BuildLimiter(getattr(cfg, "concurrent_builds", 2))
         if swarm_parallel
@@ -937,7 +968,7 @@ def _handshake(ctx: Context, source, args, telemetry_raw=None) -> dict:
         if (swarm_cfg is not None and swarm_cfg.enabled)
         else "config"
     )
-    should_check_mm = bool(mm_script_raw) or (
+    should_check_mm = bool(mm_script_raw) or is_acp_adapter(swarm_sup) or (
         swarm_sup == "config"
         and mm_cfg is not None
         and getattr(mm_cfg, "mode", "off") != "off"
@@ -964,6 +995,27 @@ def _handshake(ctx: Context, source, args, telemetry_raw=None) -> dict:
     elif swarm_sup != "config":
         names["micromanager"] = swarm_sup
 
+    if (
+        swarm_cfg is not None
+        and swarm_cfg.enabled
+        and is_acp_adapter(str(getattr(swarm_cfg, "coordinator", "") or ""))
+    ):
+        try:
+            if script_path is not None:
+                coord_check = open_backend(ctx.cfg, script_path)
+            else:
+                from .coordinator import AcpCoordinatorBackend
+                coord_check = AcpCoordinatorBackend(
+                    ctx.cfg,
+                    provider=normalize_acp_provider(swarm_cfg.coordinator),
+                )
+            hello = coord_check.hello()
+            check_hello(hello, "model", set(REQUIRED_OPS["model"]))
+            names["coordinator"] = hello.get("name", "")
+        except Invalid as exc:
+            return {"refused": True, "reason": f"coordinator: {exc.message}",
+                    "adapters": names}
+
     return {"refused": False, "reason": "", "adapters": names}
 
 
@@ -971,8 +1023,8 @@ def _backend_prices_spend(cfg, script: Path | None) -> bool:
     """Whether this configuration can report a cost at all."""
     if script is not None or cfg.model_adapter in ("scripted", "stub"):
         return False
-    if cfg.model_adapter == "claude-acp":
-        return True  # Claude reports its own cost per turn.
+    if is_acp_adapter(cfg.model_adapter):
+        return True  # ACP providers report cost per turn or support fallback pricing.
     return bool(getattr(cfg, "cost_per_1k_in", 0.0)
                 or getattr(cfg, "cost_per_1k_out", 0.0))
 
@@ -2029,6 +2081,9 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--idea", default="", help="plain-English project idea")
     init.add_argument("--profile", choices=PROFILES, default="auto",
                       help="micromanager profile (default: auto)")
+    init.add_argument("--acp-provider", choices=("claude", "antigravity", "codex"),
+                      default="claude",
+                      help="Frontier ACP provider for micromanager (default: claude)")
     init.add_argument("--state-dir", default=None, help="external state directory")
     init.add_argument("--secrets-dir", default=None, help="external secrets directory")
     init.add_argument("--endpoint", default="https://api.example.invalid/v1",
@@ -2074,17 +2129,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     acp = sub.add_parser(
         "acp",
-        help="inspect, log in via OAuth, configure, or probe Frontier Claude ACP",
+        help="inspect, log in via OAuth, configure, or probe Frontier ACP providers",
         formatter_class=raw_fmt,
-        epilog="Examples:\n  openfarm acp status\n  openfarm acp login\n  openfarm acp configure --mode active --auth oauth\n  openfarm acp probe",
+        epilog="Examples:\n  openfarm acp status\n  openfarm acp login --provider antigravity\n  openfarm acp configure --provider codex --mode active --auth oauth\n  openfarm acp probe",
     )
     acp.add_argument("action", nargs="?", default="status", choices=ACP_ACTIONS)
+    acp.add_argument("--provider", choices=("claude", "antigravity", "codex", "all"),
+                     default=None,
+                     help="ACP provider (`claude`, `antigravity`, `codex`, or `all`)")
     acp.add_argument("--mode", choices=("active", "advisory", "off"), default=None)
     acp.add_argument("--auth", choices=("oauth", "api-key", "auto"), default=None)
     acp.add_argument("--binary", default=None,
-                     help="ACP binary or resolution mode (`auto`, `claude`, `claude-agent-acp`)")
+                     help="ACP binary or resolution mode (`auto`, `claude`, `claude-agent-acp`, `agy`, `agy-print`, `antigravity-acp`, `codex`, `codex-acp`)")
     acp.add_argument("--model", default=None)
-    acp.add_argument("--effort", choices=("low", "medium", "high"), default=None)
+    acp.add_argument("--effort", choices=("low", "medium", "high", "xhigh", "max"), default=None)
     acp.add_argument("--tool-policy", choices=("none", "read-only"), default=None)
     acp.add_argument("--auth-file", default=None)
     acp.add_argument("--clear-auth-file", action="store_true")
@@ -2231,6 +2289,7 @@ def cmd_init(args) -> int:
         repo_base=repo_base,
         idea=args.idea,
         profile=args.profile,
+        acp_provider=args.acp_provider,
         state_dir=Path(args.state_dir) if args.state_dir else None,
         secrets_dir=Path(args.secrets_dir) if args.secrets_dir else None,
         endpoint=args.endpoint,
@@ -2285,11 +2344,13 @@ def cmd_install_skill(args) -> int:
 def cmd_acp(args) -> int:
     repo = Path(args.repo) if getattr(args, "repo", None) else Path.cwd()
     action = args.action
+    provider = getattr(args, "provider", None)
     if action == "status":
-        payload = inspect_acp_status(repo)
+        payload = inspect_acp_status(repo, provider=provider or "all")
     elif action == "login":
         login_mode = "console" if args.console else "claudeai"
         payload = run_acp_login(
+            provider=provider or "claude",
             mode=login_mode,
             sso=bool(args.sso),
             email=args.email,
@@ -2298,6 +2359,7 @@ def cmd_acp(args) -> int:
     elif action == "configure":
         payload = configure_acp_repo(
             repo,
+            provider=provider,
             mode=args.mode,
             auth=args.auth,
             binary=args.binary,
@@ -2310,6 +2372,7 @@ def cmd_acp(args) -> int:
     elif action == "probe":
         payload = probe_acp(
             repo,
+            provider=provider,
             command=args.binary,
             auth_mode=args.auth,
         )

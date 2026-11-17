@@ -111,10 +111,114 @@ _C0_C1_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 _STRIPPED_ENV_EXACT = frozenset({"CLAUDECODE", "ANTHROPIC_AUTH_TOKEN", "AI_AGENT"})
 _OAUTH_ENV_ALLOW = frozenset({"CLAUDE_CODE_OAUTH_TOKEN"})
 _AUTH_ERROR_RE = re.compile(
-    r"authentication_failed|not logged in|please run /login|claude auth login|"
+    r"authentication_failed|authentication required|not authenticated|login required|"
+    r"not logged in|please run /login|claude auth login|agy acp --login|codex login|"
     r"invalid bearer token|unauthorized|\b401\b|\boauth\b",
     re.IGNORECASE,
 )
+
+ACP_PROVIDERS: tuple[str, ...] = ("claude", "antigravity", "codex")
+ACP_ADAPTER_NAMES: tuple[str, ...] = (
+    "claude-acp",
+    "antigravity-acp",
+    "agy-acp",
+    "codex-acp",
+)
+_DEFAULT_FORBIDDEN_FILES: tuple[str, ...] = (
+    ".openfarm/**",
+    ".claude/**",
+    ".gemini/**",
+    ".codex/**",
+    ".agents/**",
+)
+CLAUDE_NATIVE_ACP = Path(__file__).resolve().with_name("claude_native_acp.py")
+AGY_NATIVE_ACP = Path(__file__).resolve().with_name("agy_native_acp.py")
+CODEX_NATIVE_ACP = Path(__file__).resolve().with_name("codex_native_acp.py")
+
+
+def normalize_acp_provider(value: str) -> str:
+    """Normalise an ACP provider or adapter name into ``claude|antigravity|codex``."""
+    low = str(value or "").strip().lower()
+    if low in ("claude", "claude-acp", "acp"):
+        return "claude"
+    if low in ("antigravity", "antigravity-acp", "agy", "agy-acp"):
+        return "antigravity"
+    if low in ("codex", "codex-acp"):
+        return "codex"
+    raise Invalid(
+        "acp-bad-provider",
+        f"unknown ACP provider {value!r}; choose from {', '.join(ACP_PROVIDERS)}",
+    )
+
+
+def acp_adapter_for_provider(provider: str) -> str:
+    """Return canonical adapter name (``<provider>-acp``) for an ACP provider."""
+    return f"{normalize_acp_provider(provider)}-acp"
+
+
+def is_acp_adapter(spec: str) -> bool:
+    """True when `spec` names any supported ACP adapter or provider alias."""
+    low = str(spec or "").strip().lower()
+    return low in (
+        "claude-acp",
+        "acp",
+        "claude",
+        "antigravity-acp",
+        "antigravity",
+        "agy-acp",
+        "agy",
+        "codex-acp",
+        "codex",
+    )
+
+
+def infer_acp_provider(command: str | list[str] | None, provider: str = "") -> str:
+    """Infer ACP provider from explicit `provider` or command tokens (default ``claude``)."""
+    if str(provider or "").strip():
+        return normalize_acp_provider(provider)
+    if command is None:
+        return "claude"
+    if isinstance(command, str):
+        try:
+            tokens = shlex.split(command)
+        except ValueError:
+            tokens = command.split()
+    else:
+        tokens = [str(part) for part in command]
+
+    for tok in tokens:
+        low = tok.strip().lower()
+        name = Path(tok).name.lower() if tok.strip() else ""
+        if (
+            low in ("--agy-bin", "agy", "antigravity", "antigravity-acp", "agy-acp", "agy-print", "antigravity-print")
+            or name in ("agy", "antigravity", "antigravity-acp", "agy-acp", "agy-print", "antigravity-print", "agy_native_acp.py")
+            or "antigravity" in name
+        ):
+            return "antigravity"
+        if (
+            low in ("--codex-bin", "codex", "codex-acp", "codex-exec")
+            or name in ("codex", "codex-acp", "codex-exec", "codex_native_acp.py")
+            or "codex" in name
+        ):
+            return "codex"
+    return "claude"
+
+
+def _auth_error_hint(provider: str, message: str) -> str:
+    if provider == "antigravity":
+        return (
+            f"Antigravity ACP authentication failed ({message}); "
+            "run `openfarm acp login --provider antigravity` or `agy acp --login`."
+        )
+    if provider == "codex":
+        return (
+            f"Codex ACP authentication failed ({message}); "
+            "run `openfarm acp login --provider codex` or `codex login`."
+        )
+    return (
+        f"Claude ACP OAuth authentication failed ({message}); "
+        "run `openfarm acp login` or `claude auth login --claudeai`."
+    )
 _PATH_INPUT_KEYS = (
     "path",
     "file_path",
@@ -153,9 +257,10 @@ def _is_acp_auth_error(code: object, message: str, data: object) -> bool:
 def resolve_acp_command(
     command: str | list[str],
     *,
+    provider: str = "claude",
     python_exe: str | None = None,
 ) -> list[str]:
-    """Resolve an ACP command string/argv (`auto`, `claude`, `claude-agent-acp`, etc.)."""
+    """Resolve an ACP command string/argv across Claude, Antigravity, and Codex."""
     if isinstance(command, str):
         argv = shlex.split(command)
     else:
@@ -165,8 +270,47 @@ def resolve_acp_command(
 
     head = argv[0]
     rest = argv[1:]
+    head_name = Path(head).name
     py = python_exe or sys.executable
-    native_script = str(Path(__file__).resolve().with_name("claude_native_acp.py"))
+
+    prov = normalize_acp_provider(provider or "claude")
+    if prov == "claude" and (
+        head in ("agy", "antigravity", "agy-print", "antigravity-print", "antigravity-acp", "agy-acp")
+        or head_name in ("agy", "antigravity", "agy-print", "antigravity-print", "antigravity-acp", "agy-acp", "agy_native_acp.py")
+        or head in ("codex", "codex-acp", "codex-exec")
+        or head_name in ("codex", "codex-acp", "codex-exec", "codex_native_acp.py")
+    ):
+        prov = infer_acp_provider(argv)
+
+    if prov == "antigravity":
+        if head in ("agy-print", "antigravity-print") or head_name in ("agy-print", "antigravity-print"):
+            agy_path = shutil.which("agy") or "agy"
+            return [py, str(AGY_NATIVE_ACP), "--agy-bin", agy_path, *rest]
+        if head in ("auto", "agy", "antigravity", "antigravity-acp", "agy-acp") or head_name in ("agy", "antigravity"):
+            if rest and rest[0] == "acp":
+                resolved_agy = shutil.which(head) or head
+                return [resolved_agy, *rest]
+            if "/" not in head and "\\" not in head:
+                acp_bin = shutil.which("antigravity-acp")
+                if acp_bin:
+                    return [acp_bin, *rest]
+            target = "agy" if head in ("auto", "antigravity", "antigravity-acp", "agy-acp") else head
+            agy_path = shutil.which(target) or target
+            return [agy_path, "acp", *rest]
+        return argv
+
+    if prov == "codex":
+        if head in ("auto", "codex", "codex-acp", "codex-exec") or head_name == "codex":
+            if head in ("auto", "codex", "codex-acp") and "/" not in head and "\\" not in head:
+                acp_bin = shutil.which("codex-acp")
+                if acp_bin:
+                    return [acp_bin, *rest]
+            target = "codex" if head in ("auto", "codex-acp", "codex-exec") else head
+            codex_path = shutil.which(target) or target
+            return [py, str(CODEX_NATIVE_ACP), "--codex-bin", codex_path, *rest]
+        return argv
+
+    native_script = str(CLAUDE_NATIVE_ACP)
 
     if head == "auto":
         acp_bin = shutil.which("claude-agent-acp")
@@ -177,11 +321,22 @@ def resolve_acp_command(
             return [py, native_script, "--claude-bin", claude_bin, *rest]
         return ["claude-agent-acp", *rest]
 
-    if head in ("claude", "claude-native") or Path(head).name == "claude":
+    if head in ("claude", "claude-native") or head_name == "claude":
         resolved_claude = shutil.which(head) or head
         return [py, native_script, "--claude-bin", resolved_claude, *rest]
 
     return argv
+
+
+def _read_api_key_file(auth_file: Path | str) -> str:
+    auth_path = Path(auth_file).expanduser().resolve()
+    try:
+        key = auth_path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise Infra("acp-auth-file-unreadable", f"cannot read auth_file {auth_path}: {exc}") from exc
+    if not key:
+        raise Infra("acp-auth-file-empty", f"auth_file {auth_path} is empty")
+    return key
 
 
 def _sanitised_env(
@@ -193,8 +348,10 @@ def _sanitised_env(
     auth_mode: str = "oauth",
     never_touch: list[str] | tuple[str, ...] = (),
     forbidden_files: list[str] | tuple[str, ...] = (),
+    provider: str = "claude",
 ) -> tuple[dict[str, str], Path | None]:
     """Build a sanitised subprocess environment and optional isolated HOME dir."""
+    prov = normalize_acp_provider(provider or "claude")
     source = os.environ if base_env is None else base_env
     orig_home = (extra_env or {}).get("HOME") or source.get("HOME", "")
     allow_oauth = auth_file is None and auth_mode in ("oauth", "auto")
@@ -202,10 +359,17 @@ def _sanitised_env(
     def _keep_var(key: str, val: object) -> bool:
         if key in _STRIPPED_ENV_EXACT:
             return False
-        if key == "ANTHROPIC_API_KEY" and auth_mode == "oauth" and auth_file is None:
-            return False
-        if key.startswith("CLAUDE_CODE_"):
-            return allow_oauth and key in _OAUTH_ENV_ALLOW and bool(str(val or "").strip())
+        if prov == "claude":
+            if key == "ANTHROPIC_API_KEY" and auth_mode == "oauth" and auth_file is None:
+                return False
+            if key.startswith("CLAUDE_CODE_"):
+                return allow_oauth and key in _OAUTH_ENV_ALLOW and bool(str(val or "").strip())
+        elif prov == "antigravity":
+            if key in ("GEMINI_API_KEY", "GOOGLE_API_KEY") and (auth_mode == "oauth" or auth_file is not None):
+                return False
+        elif prov == "codex":
+            if key == "OPENAI_API_KEY" and (auth_mode == "oauth" or auth_file is not None):
+                return False
         return True
 
     env: dict[str, str] = {}
@@ -218,83 +382,121 @@ def _sanitised_env(
             if _keep_var(str(key), val):
                 env[str(key)] = str(val)
 
+    if auth_file is not None and prov in ("antigravity", "codex"):
+        api_key = _read_api_key_file(auth_file)
+        if prov == "antigravity":
+            env["GEMINI_API_KEY"] = api_key
+        else:
+            env["OPENAI_API_KEY"] = api_key
+
     isolated_home: Path | None = None
     if isolate_home:
         isolated_home = Path(tempfile.mkdtemp(prefix="openfarm-acp-home-"))
         os.chmod(isolated_home, 0o700)
         _register_isolated_home(isolated_home)
         try:
-            claude_dir = isolated_home / ".claude"
-            claude_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-            os.chmod(claude_dir, 0o700)
+            if prov == "claude":
+                claude_dir = isolated_home / ".claude"
+                claude_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+                os.chmod(claude_dir, 0o700)
 
-            deny_patterns: list[str] = []
-            for raw_pat in (
-                ".openfarm/**",
-                ".claude/**",
-                *(forbidden_files or ()),
-                *(never_touch or ()),
-            ):
-                norm_pat = normalise(str(raw_pat or ""))
-                if norm_pat and norm_pat not in deny_patterns:
-                    deny_patterns.append(norm_pat)
-            deny_rules = [
-                f"{tool}({pat})"
-                for pat in deny_patterns
-                for tool in ("Read", "Edit", "Write")
-            ]
+                deny_patterns: list[str] = []
+                for raw_pat in (
+                    *_DEFAULT_FORBIDDEN_FILES,
+                    *(forbidden_files or ()),
+                    *(never_touch or ()),
+                ):
+                    norm_pat = normalise(str(raw_pat or ""))
+                    if norm_pat and norm_pat not in deny_patterns:
+                        deny_patterns.append(norm_pat)
+                deny_rules = [
+                    f"{tool}({pat})"
+                    for pat in deny_patterns
+                    for tool in ("Read", "Edit", "Write")
+                ]
 
-            settings: dict[str, object] = {
-                "disableAllHooks": True,
-                "hooks": {},
-                "permissions": {"deny": deny_rules},
-            }
-            if auth_file is not None:
-                auth_path = Path(auth_file).expanduser().resolve()
-                helper_path = claude_dir / "api-key-helper.sh"
-                helper_path.write_text(
-                    f"#!/bin/sh\ntr -d '\\r\\n' < {shlex.quote(str(auth_path))}\n",
-                    encoding="utf-8",
+                settings: dict[str, object] = {
+                    "disableAllHooks": True,
+                    "hooks": {},
+                    "permissions": {"deny": deny_rules},
+                }
+                if auth_file is not None:
+                    auth_path = Path(auth_file).expanduser().resolve()
+                    helper_path = claude_dir / "api-key-helper.sh"
+                    helper_path.write_text(
+                        f"#!/bin/sh\ntr -d '\\r\\n' < {shlex.quote(str(auth_path))}\n",
+                        encoding="utf-8",
+                    )
+                    os.chmod(helper_path, 0o700)
+                    settings["apiKeyHelper"] = str(helper_path)
+                else:
+                    if orig_home and allow_oauth:
+                        creds_src = Path(orig_home) / ".claude" / ".credentials.json"
+                        try:
+                            if creds_src.is_file():
+                                creds_dst = claude_dir / ".credentials.json"
+                                shutil.copyfile(creds_src, creds_dst)
+                                os.chmod(creds_dst, 0o600)
+                        except OSError:
+                            pass
+                        claude_json_src = Path(orig_home) / ".claude.json"
+                        try:
+                            if claude_json_src.is_file():
+                                raw_meta = json.loads(
+                                    claude_json_src.read_text(encoding="utf-8")
+                                )
+                                if isinstance(raw_meta, dict) and (
+                                    "oauthAccount" in raw_meta or "userID" in raw_meta
+                                ):
+                                    slim_meta: dict[str, object] = {}
+                                    for k in ("oauthAccount", "userID"):
+                                        if k in raw_meta:
+                                            slim_meta[k] = raw_meta[k]
+                                    slim_meta["hasCompletedOnboarding"] = True
+                                    claude_json_dst = isolated_home / ".claude.json"
+                                    claude_json_dst.write_text(
+                                        json.dumps(slim_meta) + "\n", encoding="utf-8"
+                                    )
+                                    os.chmod(claude_json_dst, 0o600)
+                        except (OSError, ValueError):
+                            pass
+
+                settings_path = claude_dir / "settings.json"
+                settings_path.write_text(
+                    json.dumps(settings, indent=2) + "\n", encoding="utf-8"
                 )
-                os.chmod(helper_path, 0o700)
-                settings["apiKeyHelper"] = str(helper_path)
-            else:
+                os.chmod(settings_path, 0o600)
+            elif prov == "antigravity":
+                gemini_dir = isolated_home / ".gemini"
+                gemini_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+                os.chmod(gemini_dir, 0o700)
+                ag_dir = gemini_dir / "antigravity-cli"
+                ag_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+                os.chmod(ag_dir, 0o700)
                 if orig_home and allow_oauth:
-                    creds_src = Path(orig_home) / ".claude" / ".credentials.json"
+                    tok_src = Path(orig_home) / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
                     try:
-                        if creds_src.is_file():
-                            creds_dst = claude_dir / ".credentials.json"
-                            shutil.copyfile(creds_src, creds_dst)
-                            os.chmod(creds_dst, 0o600)
+                        if tok_src.is_file():
+                            tok_dst = ag_dir / "antigravity-oauth-token"
+                            shutil.copyfile(tok_src, tok_dst)
+                            os.chmod(tok_dst, 0o600)
                     except OSError:
                         pass
-                    claude_json_src = Path(orig_home) / ".claude.json"
+            elif prov == "codex":
+                codex_dir = isolated_home / ".codex"
+                codex_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+                os.chmod(codex_dir, 0o700)
+                env["CODEX_HOME"] = str(codex_dir)
+                if orig_home and allow_oauth:
+                    auth_src = Path(orig_home) / ".codex" / "auth.json"
                     try:
-                        if claude_json_src.is_file():
-                            raw_meta = json.loads(
-                                claude_json_src.read_text(encoding="utf-8")
-                            )
-                            if isinstance(raw_meta, dict) and (
-                                "oauthAccount" in raw_meta or "userID" in raw_meta
-                            ):
-                                slim_meta: dict[str, object] = {}
-                                for k in ("oauthAccount", "userID"):
-                                    if k in raw_meta:
-                                        slim_meta[k] = raw_meta[k]
-                                slim_meta["hasCompletedOnboarding"] = True
-                                claude_json_dst = isolated_home / ".claude.json"
-                                claude_json_dst.write_text(
-                                    json.dumps(slim_meta) + "\n", encoding="utf-8"
-                                )
-                                os.chmod(claude_json_dst, 0o600)
-                    except (OSError, ValueError):
+                        if auth_src.is_file():
+                            auth_dst = codex_dir / "auth.json"
+                            shutil.copyfile(auth_src, auth_dst)
+                            os.chmod(auth_dst, 0o600)
+                    except OSError:
                         pass
 
-            settings_path = claude_dir / "settings.json"
-            settings_path.write_text(
-                json.dumps(settings, indent=2) + "\n", encoding="utf-8"
-            )
-            os.chmod(settings_path, 0o600)
             env["HOME"] = str(isolated_home)
         except Exception:
             shutil.rmtree(isolated_home, ignore_errors=True)
@@ -440,7 +642,7 @@ def _extract_paths_from_tool_call(tool_call: dict) -> list[str]:
 
 
 class ClaudeAcpAdapter:
-    """ACP v1 NDJSON-RPC 2.0 client over stdio targeting Claude ACP."""
+    """ACP v1 NDJSON-RPC 2.0 client over stdio targeting Claude, Antigravity, or Codex ACP."""
 
     name = "claude-acp"
 
@@ -449,6 +651,7 @@ class ClaudeAcpAdapter:
         command: str | list[str] = "claude-agent-acp",
         cwd: Path | str | None = None,
         *,
+        provider: str = "",
         isolate_home: bool = True,
         auth_file: Path | str | None = None,
         auth_mode: str = "oauth",
@@ -464,7 +667,9 @@ class ClaudeAcpAdapter:
                 "acp-bad-auth-mode",
                 f"auth_mode must be 'oauth', 'api-key', or 'auto', got {auth_mode!r}",
             )
-        self.argv = resolve_acp_command(command)
+        self.provider = infer_acp_provider(command, provider)
+        self.name = f"{self.provider}-acp"
+        self.argv = resolve_acp_command(command, provider=self.provider)
 
         self.cwd = Path(cwd or Path.cwd())
         self.allowed_root = Path(allowed_root or self.cwd).resolve()
@@ -474,7 +679,7 @@ class ClaudeAcpAdapter:
         self.extra_env = dict(env) if env is not None else None
         self.never_touch = list(never_touch or ())
         self.forbidden_files = list(forbidden_files or ())
-        for default_forbidden in (".openfarm/**", ".claude/**"):
+        for default_forbidden in _DEFAULT_FORBIDDEN_FILES:
             if default_forbidden not in self.forbidden_files:
                 self.forbidden_files.append(default_forbidden)
         self.max_line_bytes = int(max_line_bytes)
@@ -548,10 +753,11 @@ class ClaudeAcpAdapter:
             auth_mode=self.auth_mode,
             never_touch=self.never_touch,
             forbidden_files=self.forbidden_files,
+            provider=self.provider,
         )
         self._isolated_home = isolated_home
         if isolated_home is not None:
-            iso_creds = isolated_home / ".claude" / ".credentials.json"
+            iso_creds = self._isolated_cred_path(isolated_home)
             if iso_creds.is_file():
                 try:
                     self._initial_creds_bytes = iso_creds.read_bytes()
@@ -761,8 +967,18 @@ class ClaudeAcpAdapter:
         self._stderr_thread = None
         self._proc = None
 
+    def _cred_relpath(self) -> tuple[str, ...]:
+        if self.provider == "antigravity":
+            return (".gemini", "antigravity-cli", "antigravity-oauth-token")
+        if self.provider == "codex":
+            return (".codex", "auth.json")
+        return (".claude", ".credentials.json")
+
+    def _isolated_cred_path(self, home_dir: Path) -> Path:
+        return home_dir.joinpath(*self._cred_relpath())
+
     def _persist_refreshed_oauth_credentials(self) -> None:
-        """Persist refreshed `.credentials.json` back to host HOME safely."""
+        """Persist refreshed OAuth credentials back to host HOME safely."""
         if (
             self._isolated_home is None
             or self.auth_file is not None
@@ -770,7 +986,7 @@ class ClaudeAcpAdapter:
             or not self._orig_home
         ):
             return
-        iso_creds = self._isolated_home / ".claude" / ".credentials.json"
+        iso_creds = self._isolated_cred_path(self._isolated_home)
         if not iso_creds.is_file():
             return
         try:
@@ -779,20 +995,40 @@ class ClaudeAcpAdapter:
             return
         if not raw or raw == self._initial_creds_bytes:
             return
-        try:
-            parsed = json.loads(raw.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
-            return
-        if not isinstance(parsed, dict) or not isinstance(
-            parsed.get("claudeAiOauth"), dict
-        ):
-            return
-        target_dir = Path(self._orig_home) / ".claude"
+
+        if self.provider == "claude":
+            try:
+                parsed = json.loads(raw.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                return
+            if not isinstance(parsed, dict) or not isinstance(
+                parsed.get("claudeAiOauth"), dict
+            ):
+                return
+            prefix = ".credentials-"
+        elif self.provider == "antigravity":
+            try:
+                decoded = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                return
+            if not decoded.strip() or "\x00" in decoded:
+                return
+            prefix = ".antigravity-oauth-token-"
+        else:  # codex
+            try:
+                parsed = json.loads(raw.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                return
+            if not isinstance(parsed, dict):
+                return
+            prefix = ".auth-"
+
+        target = Path(self._orig_home).joinpath(*self._cred_relpath())
+        target_dir = target.parent
         if not target_dir.is_dir():
             return
-        target = target_dir / ".credentials.json"
         try:
-            fd, tmp_name = tempfile.mkstemp(prefix=".credentials-", dir=str(target_dir))
+            fd, tmp_name = tempfile.mkstemp(prefix=prefix, dir=str(target_dir))
             tmp_path = Path(tmp_name)
             try:
                 os.chmod(tmp_path, 0o600)
@@ -944,8 +1180,7 @@ class ClaudeAcpAdapter:
                     if _is_acp_auth_error(code, message, data):
                         raise Refused(
                             "acp-auth-required",
-                            f"Claude ACP OAuth authentication failed ({message}); "
-                            "run `openfarm acp login` or `claude auth login --claudeai`.",
+                            _auth_error_hint(self.provider, message),
                         )
                     raise Infra(f"acp-rpc-{code}", message)
                 result = msg.get("result")
@@ -1015,6 +1250,81 @@ class ClaudeAcpAdapter:
         self._authenticated = True
         return result
 
+    def set_config_option(
+        self,
+        session_id: str,
+        config_id: str,
+        value: str,
+        timeout_s: float = 15.0,
+    ) -> dict:
+        if not self._initialized:
+            self.initialize(timeout_s=timeout_s)
+        req_id = self._next_id()
+        deadline = time.monotonic() + float(timeout_s)
+        self._send_json(
+            {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "method": "session/set_config_option",
+                "params": {
+                    "sessionId": str(session_id),
+                    "configId": str(config_id),
+                    "value": str(value),
+                },
+            },
+            timeout_s=timeout_s,
+        )
+        return self._wait_simple_response(
+            req_id, timeout_s=max(0.05, deadline - time.monotonic())
+        )
+
+    def _apply_antigravity_config_options(
+        self,
+        session_id: str,
+        config_options: list,
+        *,
+        model: str = "",
+        effort: str = "",
+        timeout_s: float = 15.0,
+    ) -> None:
+        targets: list[tuple[str, str]] = []
+        for opt in config_options:
+            if not isinstance(opt, dict):
+                continue
+            opt_id = str(opt.get("id") or "").strip()
+            cat = str(opt.get("category") or "").strip().lower()
+            if not opt_id:
+                continue
+            if model and (opt_id == "model" or cat == "model"):
+                targets.append((opt_id, str(model)))
+            elif effort and (
+                opt_id in ("thought_level", "effort", "reasoning_effort")
+                or cat == "thought_level"
+            ):
+                resolved_eff = str(effort)
+                raw_opts = opt.get("options")
+                allowed_vals: set[str] = set()
+                if isinstance(raw_opts, list):
+                    for choice in raw_opts:
+                        if isinstance(choice, dict) and choice.get("value") is not None:
+                            allowed_vals.add(str(choice["value"]))
+                        elif isinstance(choice, str):
+                            allowed_vals.add(choice)
+                if allowed_vals and resolved_eff not in allowed_vals:
+                    if resolved_eff in ("xhigh", "max") and "high" in allowed_vals:
+                        resolved_eff = "high"
+                    elif resolved_eff == "off" and "low" in allowed_vals:
+                        resolved_eff = "low"
+                targets.append((opt_id, resolved_eff))
+
+        for opt_id, val in targets:
+            try:
+                self.set_config_option(session_id, opt_id, val, timeout_s=timeout_s)
+            except Infra as exc:
+                if exc.code == "acp-rpc--32601":
+                    continue
+                raise
+
     def new_session(
         self,
         cwd: Path | str | None = None,
@@ -1046,19 +1356,30 @@ class ClaudeAcpAdapter:
             if oauth_id:
                 self.authenticate(oauth_id, timeout_s=min(30.0, float(timeout_s)))
 
-        options: dict[str, object] = {}
-        if model:
-            options["model"] = str(model)
-        if effort:
-            options["effort"] = str(effort)
-        if tool_policy == "none":
-            options["disallowedTools"] = list(_DISALLOWED_NONE)
-        else:
-            options["disallowedTools"] = list(_DISALLOWED_READ_ONLY)
-
-        meta: dict[str, object] = {"claudeCode": {"options": options}}
+        meta: dict[str, object] = {}
         if system_prompt:
             meta["systemPrompt"] = {"append": str(system_prompt)}
+
+        if self.provider == "claude":
+            options: dict[str, object] = {}
+            if model:
+                options["model"] = str(model)
+            if effort:
+                options["effort"] = str(effort)
+            if tool_policy == "none":
+                options["disallowedTools"] = list(_DISALLOWED_NONE)
+            else:
+                options["disallowedTools"] = list(_DISALLOWED_READ_ONLY)
+            meta["claudeCode"] = {"options": options}
+        elif self.provider == "antigravity":
+            meta["antigravity"] = {"systemPrompt": {"append": str(system_prompt)}}
+        elif self.provider == "codex":
+            codex_opts: dict[str, object] = {"toolPolicy": tool_policy}
+            if model:
+                codex_opts["model"] = str(model)
+            if effort:
+                codex_opts["effort"] = str(effort)
+            meta["codex"] = {"options": codex_opts}
 
         session_cwd = str(Path(cwd) if cwd is not None else self.cwd)
         req_id = self._next_id()
@@ -1082,6 +1403,16 @@ class ClaudeAcpAdapter:
         session_id = str(result.get("sessionId") or "")
         if not session_id:
             raise Invalid("acp-no-session-id", "session/new returned no sessionId")
+        if self.provider == "antigravity":
+            config_options = result.get("configOptions")
+            if isinstance(config_options, list) and config_options:
+                self._apply_antigravity_config_options(
+                    session_id,
+                    config_options,
+                    model=model,
+                    effort=effort,
+                    timeout_s=min(15.0, float(timeout_s)),
+                )
         self._session_cost_usd = 0.0
         self._session_policies[session_id] = tool_policy
         self._seen_request_ids.setdefault(session_id, set())
@@ -1579,8 +1910,7 @@ class ClaudeAcpAdapter:
                         if _is_acp_auth_error(code, message, data):
                             raise Refused(
                                 "acp-auth-required",
-                                f"Claude ACP OAuth authentication failed ({message}); "
-                                "run `openfarm acp login` or `claude auth login --claudeai`.",
+                                _auth_error_hint(self.provider, message),
                             )
                         raise Infra(f"acp-rpc-{code}", message)
 
@@ -1727,3 +2057,6 @@ def _parse_float_usage(val: object, field: str) -> float:
             "acp-bad-usage", f"invalid non-negative finite float for {field}: {val!r}"
         )
     return parsed
+
+
+AcpAdapter = ClaudeAcpAdapter

@@ -15,6 +15,7 @@ import re
 import tomllib
 from pathlib import Path
 
+from .adapters.acp import ACP_ADAPTER_NAMES, is_acp_adapter
 from .errors import ConfigError
 from .globs import escapes, resolves_within
 
@@ -28,6 +29,7 @@ KNOWN_TABLES = {
 }
 
 DEFAULT_EFFORTS = ("off", "low", "medium", "high", "xhigh", "max")
+_ACP_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 _TIER_KEYS = {"model", "efforts", "effort_param"}
 _FORBIDDEN_TIER_KEYS = ("endpoint", "allowed_endpoints", "key_file", "headers")
 _RESERVED_EFFORT_PARAMS = frozenset({
@@ -416,7 +418,7 @@ class Config:
         self.model_adapter = str(adapters.get("model", "openai-compatible"))
         self.micromanager_adapter = _as_adapter(
             adapters.get("micromanager"), "[adapters] micromanager",
-            "off", ("off", "claude-acp", "scripted"))
+            "off", ("off", *ACP_ADAPTER_NAMES, "scripted"))
         self.telemetry_adapter = _as_adapter(
             adapters.get("telemetry"), "[adapters] telemetry",
             "jsonl", ("jsonl",))
@@ -618,12 +620,19 @@ class Config:
         self.swarm = self._parse_swarm(self._table("swarm"))
         for role_name, role_model in self.role_models.items():
             if role_model.effort:
-                tier = self.tier_for_model(role_model.model)
-                if role_model.effort not in tier.efforts:
-                    raise ConfigError(
-                        f"[model] {role_name}.effort {role_model.effort!r} is not "
-                        f"in tier {tier.name!r} efforts {list(tier.efforts)!r}"
-                    )
+                if is_acp_adapter(self.model_adapter):
+                    if role_model.effort not in _ACP_EFFORTS:
+                        raise ConfigError(
+                            f"[model] {role_name}.effort {role_model.effort!r} is not "
+                            f"one of {list(_ACP_EFFORTS)!r}"
+                        )
+                else:
+                    tier = self.tier_for_model(role_model.model)
+                    if role_model.effort not in tier.efforts:
+                        raise ConfigError(
+                            f"[model] {role_name}.effort {role_model.effort!r} is not "
+                            f"in tier {tier.name!r} efforts {list(tier.efforts)!r}"
+                        )
 
     def _parse_harness(self, h: dict) -> HarnessConfig:
         enabled = _as_bool(h.get("enabled"), "[harness] enabled", True)
@@ -745,7 +754,7 @@ class Config:
             args=_as_str_list(mm.get("args", []), "[micromanager] args"),
             model=str(mm.get("model", "")),
             effort=_as_choice(mm.get("effort"), "[micromanager] effort",
-                              "medium", ("low", "medium", "high")),
+                              "medium", _ACP_EFFORTS),
             tool_policy=_as_choice(mm.get("tool_policy"),
                                    "[micromanager] tool_policy",
                                    "none", ("none", "read-only")),
@@ -932,7 +941,8 @@ class Config:
         if not isinstance(coordinator, str):
             raise ConfigError("[swarm] coordinator must be a string")
         coord_tier: TierConfig | None = None
-        if coordinator in ("code", "external"):
+        coord_acp = coordinator in ACP_ADAPTER_NAMES
+        if coordinator in ("code", "external") or coord_acp:
             pass
         elif coordinator.startswith("tier:"):
             tname = coordinator[5:]
@@ -942,8 +952,9 @@ class Config:
                 )
             coord_tier = self.tiers[tname]
         else:
+            acp_list = ", ".join(repr(n) for n in ACP_ADAPTER_NAMES)
             raise ConfigError(
-                f"[swarm] coordinator {coordinator!r} must be 'code', 'external', or 'tier:<name>'"
+                f"[swarm] coordinator {coordinator!r} must be 'code', 'external', 'tier:<name>', or {acp_list}"
             )
 
         raw_sup = sw.get("supervisor")
@@ -951,7 +962,8 @@ class Config:
         if not isinstance(supervisor, str):
             raise ConfigError("[swarm] supervisor must be a string")
         sup_tier: TierConfig | None = None
-        if supervisor in ("config", "external", "off"):
+        sup_acp = supervisor in ACP_ADAPTER_NAMES
+        if supervisor in ("config", "external", "off") or sup_acp:
             pass
         elif supervisor.startswith("tier:"):
             tname = supervisor[5:]
@@ -961,15 +973,16 @@ class Config:
                 )
             sup_tier = self.tiers[tname]
         else:
+            acp_list = ", ".join(repr(n) for n in ACP_ADAPTER_NAMES)
             raise ConfigError(
-                f"[swarm] supervisor {supervisor!r} must be 'config', 'external', 'off', or 'tier:<name>'"
+                f"[swarm] supervisor {supervisor!r} must be 'config', 'external', 'off', 'tier:<name>', or {acp_list}"
             )
 
         coordinator_effort = self._seat_effort(
-            sw, "coordinator_effort", coord_tier, default_tier_obj
+            sw, "coordinator_effort", coord_tier, default_tier_obj, is_acp=coord_acp
         )
         supervisor_effort = self._seat_effort(
-            sw, "supervisor_effort", sup_tier, default_tier_obj
+            sw, "supervisor_effort", sup_tier, default_tier_obj, is_acp=sup_acp
         )
 
         escalate_after = _as_int(sw.get("escalate_after"), "[swarm] escalate_after", 2)
@@ -1038,6 +1051,8 @@ class Config:
         key: str,
         seat_tier: TierConfig | None,
         default_tier: TierConfig,
+        *,
+        is_acp: bool = False,
     ) -> str:
         explicit = key in sw and sw[key] is not None
         if explicit:
@@ -1051,6 +1066,13 @@ class Config:
             effort = ""
         else:
             effort = "max"
+
+        if is_acp:
+            if explicit and effort and effort not in _ACP_EFFORTS:
+                raise ConfigError(
+                    f"[swarm] {key} {effort!r} is not one of {list(_ACP_EFFORTS)!r}"
+                )
+            return effort
 
         if seat_tier is not None or explicit:
             target = seat_tier if seat_tier is not None else default_tier
@@ -1099,6 +1121,8 @@ class Config:
             role_model = self.role_models.get("implementer")
         if role_model is None or not role_model.effort:
             return ("", "")
+        if is_acp_adapter(self.model_adapter):
+            return (role_model.effort, "effort")
         tier = self.tier_for_model(role_model.model)
         if not tier.effort_param:
             return ("", "")
