@@ -17,6 +17,8 @@ import re
 import shlex
 import shutil
 import sys
+import threading
+import time
 import unicodedata
 from pathlib import Path
 from typing import Any
@@ -2045,34 +2047,32 @@ def _cmd_result(exit_code: int, stdout: str, stderr: str, data: object = None) -
     }
 
 
-def dispatch_cli_command(
-    repo: Path | str,
-    config_path: Path | str | None = None,
-    tokens: list[str] | str | None = None,
-) -> dict:
-    """Execute an ``openfarm`` CLI command in-process and capture its output."""
+def _split_command(tokens: list[str] | str | None) -> tuple[list[str], dict | None]:
+    """The command bar's text as argv tokens, or a refusal result."""
     if tokens is None:
-        return _cmd_result(2, "", "empty command")
+        return [], _cmd_result(2, "", "empty command")
     if isinstance(tokens, str):
         try:
             argv_tokens = shlex.split(tokens)
         except ValueError as exc:
-            return _cmd_result(2, "", f"parse error: {exc}")
+            return [], _cmd_result(2, "", f"parse error: {exc}")
     else:
         argv_tokens = [str(t) for t in tokens if str(t) != ""]
 
     if argv_tokens and argv_tokens[0] == "openfarm":
         argv_tokens = argv_tokens[1:]
     if not argv_tokens:
-        return _cmd_result(2, "", "empty command")
+        return [], _cmd_result(2, "", "empty command")
+    if argv_tokens[0] == "tui" and "--once" not in argv_tokens:
+        return [], _cmd_result(1, "", "cannot launch nested interactive tui from command bar")
+    return argv_tokens, None
 
+
+def _build_cli_argv(
+    repo: Path | str, config_path: Path | str | None, argv_tokens: list[str]
+) -> list[str]:
+    """The full `openfarm` argv for a command typed in the TUI."""
     cmd_name = argv_tokens[0]
-    if cmd_name == "tui" and "--once" not in argv_tokens:
-        return _cmd_result(1, "", "cannot launch nested interactive tui from command bar")
-
-    from . import cli
-
-
     resolved_repo = Path(repo).resolve()
     full_argv: list[str] = []
     if "--repo" not in argv_tokens and not any(t.startswith("--repo=") for t in argv_tokens):
@@ -2097,12 +2097,55 @@ def dispatch_cli_command(
             full_argv.extend(["list", "--dir", str(resolved_repo / "bench")])
         elif argv_tokens[1] in ("list", "run"):
             full_argv.extend(["--dir", str(resolved_repo / "bench")])
+    return full_argv
 
+
+def is_long_command(argv_tokens: list[str] | str) -> bool:
+    """True for a command that can take long, which the TUI runs in the background.
+
+    `run`, `drive` and `supervise` can each take a night; `bench run`, `board
+    wait` and `check --baseline` (two suite runs) can take minutes. Everything
+    else answers at once and stays synchronous.
+    """
+    if isinstance(argv_tokens, str):
+        try:
+            argv_tokens = shlex.split(argv_tokens)
+        except ValueError:
+            return False
+    tokens = [t for t in argv_tokens if t]
+    if tokens and tokens[0] == "openfarm":
+        tokens = tokens[1:]
+    if not tokens:
+        return False
+    name, rest = tokens[0], tokens[1:]
+    sub = rest[0] if rest else ""
+    if name in ("run", "drive", "supervise"):
+        return True
+    if name in ("board", "swarm") and sub == "wait":
+        return True
+    if name == "bench" and sub == "run":
+        return True
+    return name == "check" and "--baseline" in rest
+
+
+def dispatch_cli_command(
+    repo: Path | str,
+    config_path: Path | str | None = None,
+    tokens: list[str] | str | None = None,
+) -> dict:
+    """Execute an ``openfarm`` CLI command in-process and capture its output."""
+    argv_tokens, refused = _split_command(tokens)
+    if refused is not None:
+        return refused
+
+    from . import cli
+
+    full_argv = _build_cli_argv(repo, config_path, argv_tokens)
     out_buf = io.StringIO()
     err_buf = io.StringIO()
     exit_code = 0
     try:
-        with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+        with _capture_streams(out_buf, err_buf):
             exit_code = int(cli.main(full_argv))
     except SystemExit as exc:
         code = exc.code
@@ -2111,6 +2154,354 @@ def dispatch_cli_command(
         err_buf.write(f"error: {exc}\n")
         exit_code = 3
     return _cmd_result(exit_code, out_buf.getvalue(), err_buf.getvalue())
+
+
+# -- Long commands, off the screen thread ------------------------------------
+
+
+class _OutputRouter(io.TextIOBase):
+    """Stands in for `sys.stdout` / `sys.stderr` while the TUI runs commands.
+
+    A command run in-process prints with `print()`, and a long one runs on its
+    own thread (and its cards on more threads) while the screen thread keeps
+    drawing. Swapping `sys.stdout` per command, as `redirect_stdout` does, is
+    global and cannot nest across threads, so instead one router stays installed
+    and sends each write where it belongs: to the capture the writing thread set
+    (a synchronous command on the screen thread, or the background command's own
+    thread), else from any other thread to the background command, else to the
+    stream the router replaced.
+    """
+
+    def __init__(self, original) -> None:
+        super().__init__()
+        self.original = original
+        self._local = threading.local()
+        self._lock = threading.Lock()
+        self.job_sink = None
+
+    @contextlib.contextmanager
+    def capture(self, sink):
+        prev = getattr(self._local, "sink", None)
+        self._local.sink = sink
+        try:
+            yield sink
+        finally:
+            self._local.sink = prev
+
+    def _target(self):
+        sink = getattr(self._local, "sink", None)
+        if sink is not None:
+            return sink
+        if threading.current_thread() is not threading.main_thread():
+            with self._lock:
+                if self.job_sink is not None:
+                    return self.job_sink
+        return self.original
+
+    def write(self, text) -> int:
+        target = self._target()
+        if target is None:
+            return len(text)
+        return target.write(text)
+
+    def flush(self) -> None:
+        target = self._target()
+        flush = getattr(target, "flush", None)
+        if callable(flush):
+            with contextlib.suppress(OSError, ValueError):
+                flush()
+
+    def isatty(self) -> bool:
+        return False
+
+    def writable(self) -> bool:
+        return True
+
+    @property
+    def encoding(self) -> str:
+        return getattr(self.original, "encoding", None) or "utf-8"
+
+
+_ROUTER_LOCK = threading.Lock()
+
+
+def _install_routers() -> tuple[_OutputRouter, _OutputRouter]:
+    """Install (once) the stdout/stderr routers; returns them."""
+    with _ROUTER_LOCK:
+        out, err = sys.stdout, sys.stderr
+        if not isinstance(out, _OutputRouter):
+            out = _OutputRouter(out)
+            sys.stdout = out
+        if not isinstance(err, _OutputRouter):
+            err = _OutputRouter(err)
+            sys.stderr = err
+        return out, err
+
+
+def _uninstall_routers() -> None:
+    """Put the original streams back once nothing routes through them."""
+    with _ROUTER_LOCK:
+        for name in ("stdout", "stderr"):
+            current = getattr(sys, name)
+            if isinstance(current, _OutputRouter) and current.job_sink is None:
+                setattr(sys, name, current.original)
+
+
+@contextlib.contextmanager
+def _capture_streams(out_buf, err_buf):
+    """Capture this thread's command output, routers or not."""
+    if isinstance(sys.stdout, _OutputRouter) and isinstance(sys.stderr, _OutputRouter):
+        with sys.stdout.capture(out_buf), sys.stderr.capture(err_buf):
+            yield
+        return
+    with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+        yield
+
+
+class _LineSink:
+    """A write target that keeps the whole text and a bounded tail of lines."""
+
+    def __init__(self, job: "BackgroundCommand", which: str) -> None:
+        self.job = job
+        self.which = which
+
+    def write(self, text) -> int:
+        self.job._append(self.which, str(text))
+        return len(text)
+
+    def flush(self) -> None:
+        return None
+
+
+_KILL_REASON_PREFIX = "tui: stopping "
+
+
+def _raise_in_thread(thread: threading.Thread, exc_type=KeyboardInterrupt) -> bool:
+    """Raise `exc_type` in `thread` at its next Python step, as Ctrl-C would.
+
+    The command unwinds through its `finally` blocks like any interrupted
+    command. A thread blocked inside one long C call (a child process it waits
+    on) sees it when that call returns.
+    """
+    import ctypes
+
+    ident = thread.ident
+    if ident is None or not thread.is_alive():
+        return False
+    hit = ctypes.pythonapi.PyThreadState_SetAsyncExc(
+        ctypes.c_ulong(ident), ctypes.py_object(exc_type))
+    if hit > 1:  # never expected; undo rather than interrupt the wrong threads
+        ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(ident), None)
+        return False
+    return hit == 1
+
+
+class BackgroundCommand:
+    """One long command, run on its own thread while the TUI keeps drawing.
+
+    It runs the same `cli.main` the command bar runs for short commands, with
+    its output captured (see `_OutputRouter`), and it never touches curses. A
+    `run` is stopped with the kill switch, which the run checks between steps:
+    in-flight cards end blocked `killed`, the run writes its record and
+    releases its lock, and the kill switch is removed again once the run has
+    ended, if this TUI set it. Anything else, or a run asked twice, is
+    interrupted as Ctrl-C would interrupt it, and unwinds the same way.
+    """
+
+    def __init__(self, line: str, argv_tokens: list[str], full_argv: list[str], *,
+                 repo: Path, state: StateDir | None = None, kill_switch: Path | None = None,
+                 max_lines: int = 4000) -> None:
+        self.line = line
+        self.argv_tokens = list(argv_tokens)
+        self.full_argv = list(full_argv)
+        self.repo = Path(repo)
+        self.state = state
+        self.kill_switch = kill_switch
+        self.is_run = bool(argv_tokens) and argv_tokens[0] == "run"
+        self.max_lines = max_lines
+        self.thread: threading.Thread | None = None
+        self.started_at = 0.0
+        self.ended_at = 0.0
+        self.exit_code: int | None = None
+        self.error = ""
+        self.stop_requested = ""   # "", "kill-switch", "interrupt"
+        self._kill_switch_set = False
+        self._lock = threading.Lock()
+        self._stdout: list[str] = []
+        self._stderr: list[str] = []
+        self._tail: list[str] = []
+        self._partial = ""
+        self._done = threading.Event()
+        self._routers: tuple[_OutputRouter, _OutputRouter] | None = None
+
+    # -- life cycle -----------------------------------------------------------
+
+    def start(self) -> "BackgroundCommand":
+        self.started_at = time.monotonic()
+        out_router, err_router = self._routers = _install_routers()
+        sink = _LineSink(self, "stderr")
+        with out_router._lock:
+            out_router.job_sink = sink
+        with err_router._lock:
+            err_router.job_sink = sink
+        # Not a daemon: if the TUI ends first, the process still waits for the
+        # command to unwind, so a run never dies holding its lock.
+        self.thread = threading.Thread(target=self._main, name=f"tui-bg: {self.line}",
+                                       daemon=False)
+        self.thread.start()
+        return self
+
+    def _main(self) -> None:
+        from . import cli
+
+        code = 3
+        try:
+            out_router, err_router = self._routers
+            with out_router.capture(_LineSink(self, "stdout")), \
+                    err_router.capture(_LineSink(self, "stderr")):
+                try:
+                    code = int(cli.main(self.full_argv))
+                except SystemExit as exc:
+                    raw = exc.code
+                    code = int(raw) if isinstance(raw, int) else (0 if raw is None else 2)
+                except KeyboardInterrupt:
+                    self._append("stderr", "openfarm: interrupted\n")
+                    code = 3
+        except Exception as exc:  # the TUI must outlive any command error
+            self.error = f"{type(exc).__name__}: {exc}"
+            code = 3
+        finally:
+            with self._lock:
+                self.exit_code = code
+                self.ended_at = time.monotonic()
+            for router in self._routers or ():
+                with router._lock:
+                    router.job_sink = None
+            self._clear_own_kill_switch()
+            self._done.set()
+
+    def _append(self, which: str, text: str) -> None:
+        with self._lock:
+            (self._stdout if which == "stdout" else self._stderr).append(text)
+            pieces = (self._partial + text).split("\n")
+            self._partial = pieces.pop()
+            self._tail.extend(pieces)
+            if len(self._tail) > self.max_lines:
+                del self._tail[: len(self._tail) - self.max_lines]
+
+    # -- state ----------------------------------------------------------------
+
+    @property
+    def running(self) -> bool:
+        return not self._done.is_set()
+
+    @property
+    def state_label(self) -> str:
+        if self.running:
+            return "stopping" if self.stop_requested else "running"
+        if self.error:
+            return "failed"
+        return "finished" if self.exit_code == 0 else "failed"
+
+    def elapsed_s(self) -> float:
+        end = self.ended_at if not self.running else time.monotonic()
+        return max(0.0, end - self.started_at) if self.started_at else 0.0
+
+    def status_text(self) -> str:
+        """One line for the status area."""
+        label = self.state_label
+        took = f"{self.elapsed_s():.0f}s"
+        if label == "running":
+            return f"▶ {self.line} running {took}"
+        if label == "stopping":
+            how = ("kill switch set, cards stop at their next step"
+                   if self.stop_requested == "kill-switch" else "interrupted")
+            return f"■ stopping {self.line} ({how}) {took}"
+        if self.error:
+            return f"✗ {self.line} failed: {self.error}"
+        if self.exit_code == 0:
+            return f"✓ {self.line} finished (exit 0) in {took}"
+        last = self.last_error_line()
+        return f"✗ {self.line} failed (exit {self.exit_code})" + (f": {last}" if last else "")
+
+    def last_error_line(self) -> str:
+        with self._lock:
+            lines = [ln.strip() for ln in "".join(self._stderr).splitlines() if ln.strip()]
+        return lines[-1] if lines else ""
+
+    def output_lines(self) -> list[str]:
+        with self._lock:
+            return list(self._tail) + ([self._partial] if self._partial else [])
+
+    def result(self) -> dict:
+        """The command's result, in the same shape as a synchronous command's."""
+        with self._lock:
+            stdout, stderr = "".join(self._stdout), "".join(self._stderr)
+            code = self.exit_code
+        if self.error:
+            stderr = (stderr + "\n" + self.error).strip()
+        res = _cmd_result(code if code is not None else 3, stdout, stderr)
+        res.update({"background": True, "running": self.running, "state": self.state_label,
+                    "line": self.line})
+        if self.running:
+            res["exit_code"] = None
+            res["ok"] = False
+        return res
+
+    def wait(self, timeout: float | None = None) -> bool:
+        """Block until the command ends. Not for the screen thread while drawing."""
+        return self._done.wait(timeout)
+
+    # -- stopping -------------------------------------------------------------
+
+    def request_stop(self, *, force: bool = False) -> str:
+        """Ask the command to stop cleanly; `force` interrupts even a run."""
+        if not self.running or self.thread is None:
+            return self.stop_requested
+        if self.is_run and not force and not self.stop_requested:
+            if self._set_kill_switch():
+                self.stop_requested = "kill-switch"
+                return self.stop_requested
+        if _raise_in_thread(self.thread):
+            self.stop_requested = "interrupt"
+        return self.stop_requested
+
+    def shutdown(self, *, grace_s: float = 60.0) -> str:
+        """Stop and wait: the kill switch first for a run, then an interrupt."""
+        if not self.running:
+            return "ended"
+        self.request_stop()
+        if self.wait(grace_s):
+            return "stopped"
+        self.request_stop(force=True)
+        while not self.wait(grace_s):
+            # Keep asking: a thread inside a long call sees it when the call returns.
+            self.request_stop(force=True)
+        return "interrupted"
+
+    def _set_kill_switch(self) -> bool:
+        if self.state is None:
+            return False
+        path = self.state.kill_switch(self.kill_switch)
+        if path.exists():
+            # Someone else armed it already: the run will stop, and it is not ours to clear.
+            return True
+        try:
+            self.state.request_kill(self.kill_switch, f"{_KILL_REASON_PREFIX}{self.line}")
+        except OSError:
+            return False
+        self._kill_switch_set = True
+        return True
+
+    def _clear_own_kill_switch(self) -> None:
+        if not self._kill_switch_set or self.state is None:
+            return
+        path = self.state.kill_switch(self.kill_switch)
+        info = read_json(path, {}) if path.exists() else {}
+        if isinstance(info, dict) and str(info.get("reason", "")).startswith(_KILL_REASON_PREFIX):
+            with contextlib.suppress(OSError):
+                path.unlink()
+        self._kill_switch_set = False
 
 
 # -- Headless & curses interactive controller --------------------------------
@@ -2152,6 +2543,11 @@ class TuiController:
         self.modal_scroll = 0
         self.status_message = ""
         self.last_command_result: dict | None = None
+        # The one long command running off the screen thread, if any, and the
+        # last one that ended (kept so `o` can still show its output).
+        self.job: BackgroundCommand | None = None
+        self._job_reported = True
+        self.quit_pending = False
         self.snapshot: dict = {}
         self.refresh()
 
@@ -2281,6 +2677,8 @@ class TuiController:
             self.selected_index = 0
 
     def execute_command(self, line: str) -> dict:
+        if is_long_command(line):
+            return self.start_background(line)
         res = dispatch_cli_command(self.repo, self.config_path, line)
         self.last_command_result = res
         title = f": {line} (exit {res['exit_code']})"
@@ -2289,6 +2687,111 @@ class TuiController:
         self.status_message = f"cmd exit={res['exit_code']}"
         self.refresh()
         return res
+
+    # -- Long commands in the background --------------------------------------
+
+    def job_running(self) -> bool:
+        return self.job is not None and self.job.running
+
+    def start_background(self, line: str) -> dict:
+        """Start a long command off the screen thread; refuse a second one."""
+        if self.job_running():
+            msg = (f"refused: `{self.job.line}` is still running; wait for it to end, "
+                   f"or quit (q) to stop it, before starting `{line}`")
+            self.status_message = msg
+            res = _cmd_result(1, "", msg)
+            res.update({"background": True, "refused": True})
+            self.last_command_result = res
+            return res
+        argv_tokens, refused = _split_command(line)
+        if refused is not None:
+            self.last_command_result = refused
+            self.status_message = f"cmd exit={refused['exit_code']}"
+            self.open_modal(f": {line} (exit {refused['exit_code']})",
+                            (refused["output"] or "(no output)").splitlines())
+            return refused
+        ctx = _load_tui_context(self.repo, self.config_path)
+        job = BackgroundCommand(
+            line, argv_tokens, _build_cli_argv(self.repo, self.config_path, argv_tokens),
+            repo=self.repo, state=ctx.state,
+            kill_switch=(ctx.cfg.kill_switch if ctx.cfg is not None else None),
+        )
+        self.job = job.start()
+        self._job_reported = False
+        self.status_message = (f"started `{line}` in the background; "
+                               f"o shows its output, q asks before stopping it")
+        res = job.result()
+        self.last_command_result = res
+        return res
+
+    def poll_job(self) -> dict | None:
+        """Report a background command that has ended; call once per screen tick."""
+        job = self.job
+        if job is None or job.running or self._job_reported:
+            return None
+        self._job_reported = True
+        _uninstall_routers()
+        res = job.result()
+        self.last_command_result = res
+        self.status_message = job.status_text()
+        if not self.quit_pending and not self.help_open and not self.modal_lines:
+            title = f": {job.line} ({job.state_label}, exit {res['exit_code']})"
+            self.open_modal(title, (res["output"] or "(no output)").splitlines())
+        self.refresh()
+        return res
+
+    def wait_for_job(self, timeout: float | None = None) -> dict | None:
+        """Headless helper: wait for the background command, then report it."""
+        if self.job is None:
+            return None
+        self.job.wait(timeout)
+        return self.poll_job() or self.job.result()
+
+    def job_status_text(self) -> str:
+        return self.job.status_text() if self.job is not None else ""
+
+    def show_job_output(self) -> None:
+        if self.job is None:
+            self.status_message = "no background command yet"
+            return
+        lines = self.job.output_lines() or ["(no output yet)"]
+        self.open_modal(f"Output: {self.job.line} ({self.job.state_label})", lines)
+        self.modal_scroll = max(0, len(lines) - 1)
+
+    def quit_question(self, *, force: bool = False) -> str:
+        """What a person is asked before quitting stops the running command."""
+        job = self.job
+        if job is None or not job.running:
+            return ""
+        if force or job.stop_requested:
+            return (f"`{job.line}` is still stopping. Interrupt it now (like Ctrl-C)? "
+                    f"It still unwinds and releases its lock. [y/N] ")
+        if job.is_run:
+            return (f"`{job.line}` is still running. Quit and stop it? The kill switch is "
+                    f"set: running cards stop at their next step, the run writes its "
+                    f"record and releases its lock, and the kill switch is cleared once "
+                    f"it has ended. [y/N] ")
+        return (f"`{job.line}` is still running. Quit and stop it? It is interrupted "
+                f"(like Ctrl-C) and unwinds cleanly. [y/N] ")
+
+    def stop_job(self, *, force: bool = False) -> str:
+        """Begin stopping the background command and quit once it has ended."""
+        job = self.job
+        if job is None or not job.running:
+            return ""
+        how = job.request_stop(force=force)
+        self.quit_pending = True
+        self.status_message = job.status_text()
+        return how
+
+    def ready_to_quit(self) -> bool:
+        return self.quit_pending and not self.job_running()
+
+    def shutdown(self, *, grace_s: float = 60.0) -> str:
+        """Last-resort stop when the TUI ends with a command still running."""
+        if not self.job_running():
+            return ""
+        return self.job.shutdown(grace_s=grace_s)
 
     def open_modal(self, title: str, lines: list[str]) -> None:
         self.modal_title = title
@@ -2634,6 +3137,9 @@ class TuiController:
 
         if code == ord("q"):
             return False
+        if code == ord("o"):
+            self.show_job_output()
+            return True
         if code == ord("?"):
             self.help_open = True
             self.help_scroll = 0
@@ -2727,9 +3233,16 @@ def _help_lines() -> list[str]:
         "  [ / ]        Scroll detail inspector pane (or cycle card in dossier)",
         "  /            Live filter items or lines (Esc clears active filter)",
         "  r            Refresh snapshot",
-        "  :            Command bar (run any `openfarm ...` command in-process)",
+        "  :            Command bar (run any `openfarm ...` command)",
+        "  o            Output of the background command (running or last)",
         "  ?            Toggle this help overlay",
-        "  q / Esc      Close help/modal, clear filter, or quit",
+        "  q / Esc      Close help/modal, clear filter, or quit (asks first if a command runs)",
+        "",
+        "Long commands (run, drive, supervise, bench run, board wait, check --baseline)",
+        "run in the background: the views keep refreshing and the status line shows",
+        "running / finished (exit code) / failed. One at a time; a second is refused.",
+        "Quitting while one runs asks first: a run is stopped with the kill switch",
+        "(cleared again once it has ended), anything else with an interrupt.",
         "",
         "View shortcuts:",
         "  Overview:    [p]ause  [u]resume  [x]stop  [n]run",
@@ -3473,6 +3986,24 @@ def _prompt_line(
             curses.curs_set(0)
 
 
+def _confirm(stdscr, question: str, *, theme: dict[str, int] | None = None) -> bool:
+    """A yes/no question on the bottom line; only `y` or `Y` says yes."""
+    if theme is None:
+        theme = _init_curses_theme()
+    stdscr.timeout(-1)
+    while True:
+        max_y, max_x = stdscr.getmaxyx()
+        y = max(0, max_y - 1)
+        attr = theme.get("header", curses.A_REVERSE)
+        _safe_addstr(stdscr, y, 0, " " * max(1, max_x - 1), attr)
+        _safe_addstr(stdscr, y, 0, _truncate(question, max(1, max_x - 2)), attr)
+        stdscr.refresh()
+        ch = stdscr.getch()
+        if ch == curses.ERR or ch == getattr(curses, "KEY_RESIZE", 410):
+            continue
+        return ch in (ord("y"), ord("Y"))
+
+
 def _render_curses_frame(
     stdscr,
     ctrl: TuiController,
@@ -3501,6 +4032,9 @@ def _render_curses_frame(
         ribbon_segs.extend([("  ", ""), (" ⚡ BREAKER ", "err")])
     if sb.get("swarm_enabled"):
         ribbon_segs.extend([("  ", ""), (" ⇄ SWARM ", "accent")])
+    if ctrl.job is not None and ctrl.job.running:
+        job_label = "■ stopping" if ctrl.job.stop_requested else "▶"
+        ribbon_segs.extend([("  ", ""), (f" {job_label} {ctrl.job.line} ", "warn" if ctrl.job.stop_requested else "accent")])
     uq = int(sb.get("unanswered_questions", 0) or 0)
     if uq > 0:
         q_txt = f" ? {uq} question " if uq == 1 else f" ? {uq} questions "
@@ -3577,7 +4111,10 @@ def _render_curses_frame(
         ("?", "Help"),
         ("q", "Quit"),
     ]
-    status_txt = f" {ctrl.status_message} " if ctrl.status_message else ""
+    status_line = ctrl.status_message
+    if ctrl.job is not None and ctrl.job.running:
+        status_line = ctrl.job_status_text()
+    status_txt = f" {status_line} " if status_line else ""
     status_w = _display_width(status_txt)
     caps_budget = max(10, avail_w - status_w)
     cur_x = 0
@@ -3616,7 +4153,10 @@ def _handle_view_hotkey(stdscr, ctrl: TuiController, ch: int, *, theme: dict[str
         if ch == ord("x"):
             reason = _prompt_line(stdscr, "stop (kill switch) reason: ", theme=theme)
             if reason is not None:
-                ctrl.action_stop(reason=reason)
+                if _confirm(stdscr, kill_switch_question(ctrl), theme=theme):
+                    ctrl.action_stop(reason=reason)
+                else:
+                    ctrl.status_message = "kill switch not armed"
             return True
         if ch == ord("n"):
             spec = _prompt_line(stdscr, "run args (e.g. --dry-run --cards 1): ", theme=theme)
@@ -3819,6 +4359,27 @@ def _handle_view_hotkey(stdscr, ctrl: TuiController, ch: int, *, theme: dict[str
     return False
 
 
+def kill_switch_question(ctrl: TuiController) -> str:
+    """The confirmation `x` asks for, naming what arming the kill switch does."""
+    sb = ctrl.snapshot.get("status_bar") or {}
+    run_id = str(sb.get("active_run_id") or "")
+    target = f"run {run_id}" if run_id else "the next run"
+    return (f"Arm the kill switch? {target}: running cards stop at their next step "
+            f"(blocked `killed`) and no run starts until `resume --clear-kill`. [y/N] ")
+
+
+def _ask_quit(stdscr, ctrl: TuiController, theme: dict[str, int]) -> bool:
+    """`q` (or Ctrl-C) pressed: return True when the TUI may end now."""
+    if not ctrl.job_running():
+        return True
+    force = bool(ctrl.job.stop_requested)
+    if _confirm(stdscr, ctrl.quit_question(force=force), theme=theme):
+        ctrl.stop_job(force=force)
+    else:
+        ctrl.status_message = f"still running: {ctrl.job.line}"
+    return False
+
+
 def _curses_main(stdscr, ctrl: TuiController) -> int:
     with contextlib.suppress(curses.error, AttributeError):
         curses.set_escdelay(25)
@@ -3828,11 +4389,25 @@ def _curses_main(stdscr, ctrl: TuiController) -> int:
     theme = _init_curses_theme()
     timeout_ms = max(50, int(ctrl.refresh_s * 1000))
     while True:
-        _render_curses_frame(stdscr, ctrl, theme=theme)
-        stdscr.timeout(timeout_ms)
-        ch = stdscr.getch()
+        try:
+            ctrl.poll_job()
+            if ctrl.ready_to_quit():
+                return 0
+            _render_curses_frame(stdscr, ctrl, theme=theme)
+            # While a command runs, wake at least twice a second so its state shows.
+            tick = min(timeout_ms, 500) if ctrl.job_running() else timeout_ms
+            stdscr.timeout(tick)
+            ch = stdscr.getch()
+        except KeyboardInterrupt:
+            if _ask_quit(stdscr, ctrl, theme):
+                return 0
+            continue
         if ch == curses.ERR:
             ctrl.refresh()
+            continue
+        if ch == ord("q") and not ctrl.help_open and not ctrl.modal_lines:
+            if _ask_quit(stdscr, ctrl, theme):
+                return 0
             continue
         if ch == getattr(curses, "KEY_RESIZE", 410):
             with contextlib.suppress(curses.error):
@@ -3894,4 +4469,13 @@ def run_tui(
         view=view,
         refresh_s=refresh_s,
     )
-    return int(curses.wrapper(lambda stdscr: _curses_main(stdscr, ctrl)))
+    try:
+        return int(curses.wrapper(lambda stdscr: _curses_main(stdscr, ctrl)))
+    finally:
+        # The screen is gone (a crash, or a quit that skipped the question): a
+        # command still running is stopped the clean way before the TUI exits.
+        if ctrl.job_running():
+            line = ctrl.job.line
+            print(f"openfarm tui: stopping `{line}` before exiting...", file=sys.stderr)
+            how = ctrl.shutdown()
+            print(f"openfarm tui: `{line}` {how}", file=sys.stderr)
