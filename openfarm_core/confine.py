@@ -390,23 +390,32 @@ def _under_system(path: str) -> bool:
 
 
 def _install_root(real: Path, guards: list[Path]) -> Path:
-    """The folder to mount for a program file: its package, its version folder, or itself."""
+    """The folder to mount for a program file.
+
+    A program under `node_modules` gets the outermost `node_modules` folder it
+    sits in: npm puts a package's dependencies beside it there, not inside it
+    (the Codex ACP server could not find its own platform package otherwise,
+    seen live). Otherwise its version folder, or the file itself.
+    """
     parts = real.parts
-    root = real
-    if "node_modules" in parts:
+    candidates: list[Path] = []
+    if "node_modules" in parts[:-1]:
+        first = parts.index("node_modules")
+        candidates.append(Path(*parts[:first + 1]))
         idx = len(parts) - 1 - list(reversed(parts)).index("node_modules")
         if idx + 1 < len(parts) - 1:
             end = idx + 2
             if parts[idx + 1].startswith("@") and idx + 2 < len(parts) - 1:
                 end = idx + 3
-            root = Path(*parts[:end])
+            candidates.append(Path(*parts[:end]))
     elif real.parent.name not in ("bin", "sbin", ""):
-        root = real.parent
-    # Never mount a folder that holds the real home, the session or anything hidden.
-    for guard in guards:
-        if root != real and (_within(guard, root) or root == guard):
-            return real
-    return root
+        candidates.append(real.parent)
+    # Never mount a folder that holds the real home, the session or anything hidden:
+    # take the widest folder that holds none of them, else the file alone.
+    for root in candidates:
+        if not any(_within(guard, root) for guard in guards):
+            return root
+    return real
 
 
 def program_mounts(

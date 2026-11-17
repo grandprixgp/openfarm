@@ -68,6 +68,52 @@ class RealBoundaryGitTests(unittest.TestCase):
         self.assertIn("NEVER_TOUCH_CONTENT", plain.stdout)
 
 
+class InstallRootTests(unittest.TestCase):
+    def test_a_node_program_sees_the_packages_installed_beside_it(self) -> None:
+        nm = Path("/opt/tools/lib/node_modules")
+        real = nm / "@zed-industries" / "codex-acp" / "bin" / "codex-acp.js"
+        self.assertEqual(confine._install_root(real, []), nm)
+        nested = nm / "a" / "node_modules" / "b" / "cli.js"
+        self.assertEqual(confine._install_root(nested, []), nm)
+
+    def test_a_guarded_folder_inside_it_narrows_the_mount(self) -> None:
+        nm = Path("/repo/node_modules")
+        real = nm / "@scope" / "tool" / "bin" / "tool.js"
+        # The session folder sits inside node_modules: fall back to the package.
+        self.assertEqual(confine._install_root(real, [nm / "work"]), nm / "@scope" / "tool")
+        # And to the file alone when even the package holds a guard.
+        self.assertEqual(confine._install_root(real, [nm / "@scope" / "tool" / "x"]), real)
+        # Outside node_modules the old rule stands.
+        self.assertEqual(confine._install_root(Path("/opt/app/1.2/app"), []), Path("/opt/app/1.2"))
+        self.assertEqual(confine._install_root(Path("/opt/bin/app"), []), Path("/opt/bin/app"))
+
+    @unittest.skipUnless(confine.bwrap_status()[0] and shutil.which("node"),
+                         "needs a working bwrap and node")
+    def test_real_boundary_a_node_program_can_load_a_sibling_package(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="of-v081-lead-nm-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        nm = tmp / "tools" / "node_modules"
+        (nm / "@vendor" / "srv" / "bin").mkdir(parents=True)
+        (nm / "@vendor" / "srv-linux").mkdir(parents=True)
+        (nm / ".bin").mkdir()
+        (nm / "@vendor" / "srv-linux" / "package.json").write_text(
+            '{"name": "@vendor/srv-linux", "main": "index.js"}')
+        (nm / "@vendor" / "srv-linux" / "index.js").write_text("module.exports = 'SIBLING_OK';\n")
+        (nm / "@vendor" / "srv" / "package.json").write_text('{"name": "@vendor/srv"}')
+        prog = nm / "@vendor" / "srv" / "bin" / "srv.js"
+        prog.write_text("#!/usr/bin/env node\nconsole.log(require('@vendor/srv-linux'));\n")
+        prog.chmod(0o755)
+        (nm / ".bin" / "srv").symlink_to("../@vendor/srv/bin/srv.js")
+        session = tmp / "session"
+        session.mkdir()
+        home = tmp / "home"
+        home.mkdir()
+        argv = confine.boundary_argv([str(nm / ".bin" / "srv")], session_dir=session,
+                                     home_dir=home)
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.stdout.strip(), "SIBLING_OK", done.stderr)
+
+
 class CodexReadOnlyInsideTheBoundaryTests(unittest.TestCase):
     """Codex runs its shell in its own sandbox; where that cannot nest, read-only is refused."""
 

@@ -191,7 +191,8 @@ class BoundaryArgvTests(unittest.TestCase):
         link_dir.mkdir()
         (link_dir / "tool").symlink_to(script)
         roots, links = confine_lib.program_mounts(str(link_dir / "tool"))
-        self.assertIn(pkg, roots)
+        # The whole node_modules folder: npm installs a package's dependencies beside it.
+        self.assertIn(pkg.parent.parent, roots)
         self.assertEqual(links, [(str(script), str(link_dir / "tool"))])
 
 
