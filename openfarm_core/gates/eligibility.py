@@ -45,6 +45,9 @@ class EligibilityResult:
 
     def __init__(self) -> None:
         self.failures: list[dict] = []
+        #: What the gate found out besides its rules, such as the TypeScript
+        #: runner and tools; kept out of the dict when empty.
+        self.info: dict = {}
 
     def fail(self, rule: str, detail: str) -> None:
         self.failures.append({"rule": rule, "detail": detail})
@@ -54,7 +57,10 @@ class EligibilityResult:
         return not self.failures
 
     def as_dict(self) -> dict:
-        return {"eligible": self.ok, "failures": list(self.failures)}
+        out = {"eligible": self.ok, "failures": list(self.failures)}
+        if self.info:
+            out.update(self.info)
+        return out
 
 
 def _check_path_field(entry: str, field_label: str, cfg, root: Path | None,
@@ -241,13 +247,16 @@ def check_eligibility(card: Card, cfg, deps_done: bool = True,
                     "python-tests-in-test-files",
                     f"test {test.name!r} is declared in {test.file!r}; Python card "
                     f"tests go in tests/test_<subject>.py")
-    if any(lang in cfg.languages for lang in ("typescript", "ts", "javascript", "js")):
+    if _uses_typescript(cfg):
+        _check_typescript(card, cfg, root, result)
+        from ..packs.typescript import test_file_problem
+
         for test in card.tests:
-            if test.file and not _is_typescript_test_file(test.file):
+            problem = test_file_problem(normalise(test.file)) if test.file else ""
+            if problem:
                 result.fail(
                     "typescript-tests-in-test-files",
-                    f"test {test.name!r} is declared in {test.file!r}; TypeScript card "
-                    f"tests must be *.test.* / *.spec.* or under tests/ or __tests__/")
+                    f"test {test.name!r} is declared in {problem}")
     allow_multi_new_symbols = type_changes or (
         getattr(cfg, "micromanager_adapter", "off") != "off"
         and getattr(getattr(cfg, "micromanager", None), "scaffold_contracts", False)
@@ -259,6 +268,48 @@ def check_eligibility(card: Card, cfg, deps_done: bool = True,
             "a stub is only safe where the test writer can see the file")
 
     return result
+
+
+def _uses_typescript(cfg) -> bool:
+    return any(lang in cfg.languages for lang in ("typescript", "ts", "javascript", "js"))
+
+
+def _check_typescript(card: Card, cfg, root: Path | None,
+                      result: EligibilityResult) -> None:
+    """The runner and tools the TypeScript pack will judge this card with.
+
+    The same decision the pack makes from the base checkout, so `check` refuses
+    what a run would only find out after spending its calls.
+    """
+    mode = getattr(cfg, "mutation", "off")
+    if mode != "off" and (mode == "required"
+                          or card.category in getattr(cfg, "mutation_required_for", [])):
+        result.fail("typescript-no-mutation",
+                    f"[gates] mutation_required_for includes {card.category!r}, but the "
+                    "TypeScript pack has no mutation tool, so this card would spend its "
+                    "calls and then be blocked at the mutation gate. Take "
+                    f"{card.category!r} out of mutation_required_for, or set [gates] "
+                    'mutation = "off"')
+    if root is None or not root.is_dir():
+        return
+    from ..packs.typescript import resolve_tooling, settings_from_config
+
+    tooling = resolve_tooling(root, settings_from_config(cfg))
+    result.info["typescript"] = {key: tooling[key] for key in
+                                 ("runner", "typecheck", "syntax_only", "tsc", "format",
+                                  "prettier", "notes")}
+    if tooling["test_script"]:
+        result.fail("typescript-test-runner", tooling["test_script"])
+    for problem in tooling["problems"]:
+        result.fail("typescript-tools", problem)
+    if tooling["syntax_only"]:
+        jsx = [path for path in [*card.touches, *(t.file for t in card.tests if t.file)]
+               if normalise(path).endswith((".tsx", ".jsx"))]
+        if jsx:
+            result.fail("typescript-jsx-unchecked",
+                        f"{jsx[0]} is a .tsx/.jsx file and there is no tsc to check it: "
+                        "node cannot parse JSX, so a card there could reach review "
+                        "with code that does not parse. Set up tsc and a tsconfig.json")
 
 
 def _check_done_text(card: Card, result: EligibilityResult) -> None:
@@ -376,22 +427,6 @@ def _is_python_test_file(path: str) -> bool:
     name = text.rsplit("/", 1)[-1]
     return _is_integration_test_file(text) and name.startswith("test_") \
         and name.endswith(".py")
-
-
-_TS_TEST_EXTS = (".ts", ".mts", ".cts", ".tsx", ".js", ".mjs", ".cjs", ".jsx")
-
-
-def _is_typescript_test_file(path: str) -> bool:
-    """`*.test.*`, `*.spec.*`, or under `tests/` / `__tests__/` with TS/JS extension."""
-    text = normalise(path)
-    name = text.rsplit("/", 1)[-1]
-    if not name.endswith(_TS_TEST_EXTS):
-        return False
-    if (text.startswith(("tests/", "__tests__/"))
-            or "/tests/" in text or "/__tests__/" in text):
-        return True
-    stem = name.rsplit(".", 1)[0]
-    return stem.endswith((".test", ".spec", "_test"))
 
 
 def is_eligible(card: Card, cfg, **kwargs) -> bool:

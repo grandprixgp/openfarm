@@ -25,10 +25,13 @@ from openfarm_core.gates.checks import banned_patterns, suite_green, test_loss
 from openfarm_core.gates.eligibility import _units_of, check_eligibility
 from openfarm_core.git import Git
 from openfarm_core.packs.base import pack_for
-from openfarm_core.packs.typescript import TypeScriptPack, detect_runner
+from openfarm_core.packs.typescript import (
+    TypeScriptPack,
+    detect_runner,
+    test_script_problem,
+)
 
 OPENFARM = Path(__file__).resolve().parent.parent / "openfarm"
-ENABLED = os.environ.get("OPENFARM_E2E") == "1"
 
 
 def _project(files: dict[str, str], cleanup_owner: unittest.TestCase | None = None) -> Path:
@@ -247,25 +250,26 @@ class CompileAndListTests(unittest.TestCase):
 
 class RunnerAndToolingTests(unittest.TestCase):
     def test_detect_runner_npm_vs_node(self) -> None:
+        # node --test is the only runner; a script that isn't one is told plainly.
         plain = _project({"package.json": '{"name": "a"}\n'}, self)
         self.assertEqual(detect_runner(plain), "node")
+        self.assertEqual(test_script_problem(plain), "")
 
         node_script = _project({
-            "package.json": '{"scripts": {"test": "node --test"}}\n',
+            "package.json": '{"scripts": {"test": "tsc && node --test"}}\n',
             "node_modules/x/index.js": "",
         }, self)
         self.assertEqual(detect_runner(node_script), "node")
-
-        no_modules = _project({
-            "package.json": '{"scripts": {"test": "vitest run"}}\n',
-        }, self)
-        self.assertEqual(detect_runner(no_modules), "node")
+        self.assertEqual(test_script_problem(node_script), "")
 
         custom_npm = _project({
             "package.json": '{"scripts": {"test": "vitest run"}}\n',
             "node_modules/vitest/index.js": "",
         }, self)
-        self.assertEqual(detect_runner(custom_npm), "npm")
+        self.assertEqual(detect_runner(custom_npm), "node")
+        problem = test_script_problem(custom_npm)
+        self.assertIn("'vitest run'", problem)
+        self.assertIn("only with node --test", problem)
 
     def test_configure_notes_and_local_bins(self) -> None:
         root = _project({"package.json": '{"name": "a"}\n'}, self)
@@ -278,7 +282,7 @@ class RunnerAndToolingTests(unittest.TestCase):
             )
 
         with_bins = _project({
-            "package.json": '{"name": "a"}\n',
+            "package.json": '{"name": "a", "prettier": {}}\n',
             "tsconfig.json": "{}\n",
             "node_modules/.bin/tsc": "#!/bin/sh\n",
             "node_modules/.bin/prettier": "#!/bin/sh\n",
@@ -293,10 +297,9 @@ class RunnerAndToolingTests(unittest.TestCase):
 
     def test_npm_and_tool_commands(self) -> None:
         pack_npm = TypeScriptPack(runner="npm", tsc=True, prettier=True)
-        self.assertEqual(
-            pack_npm.commands("test", tests=["adds"], files=["tests/a.test.ts"])["argv"],
-            ["npm", "test", "--silent", "--", "tests/a.test.ts", "--test-name-pattern=^(?:adds)$"],
-        )
+        with self.assertRaises(Invalid) as npm:
+            pack_npm.commands("test", tests=["adds"], files=["tests/a.test.ts"])
+        self.assertEqual(npm.exception.code, "unsupported-test-runner")
         self.assertEqual(
             pack_npm.commands("format", files=["src/a.ts"])["argv"],
             ["prettier", "--write", "src/a.ts"],
@@ -585,13 +588,16 @@ class WiringTests(unittest.TestCase):
                 },
             )
 
-        bad = check_eligibility(card("src/helper.ts"), cfg)
-        self.assertIn("typescript-tests-in-test-files", [f["rule"] for f in bad.failures])
+        for bad_test in ("src/helper.ts", "src/__tests__/a.ts", "tests/a.test.tsx"):
+            # Never given to node --test, so a test named there could never be proven.
+            bad = check_eligibility(card(bad_test), cfg)
+            self.assertIn("typescript-tests-in-test-files",
+                          [f["rule"] for f in bad.failures], bad_test)
         for valid_test in (
             "tests/a.test.ts",
             "src/a.test.ts",
             "src/a.spec.mts",
-            "src/__tests__/a.ts",
+            "src/__tests__/a.test.ts",
         ):
             good = check_eligibility(card(valid_test), cfg)
             self.assertNotIn(
@@ -613,7 +619,9 @@ class WiringTests(unittest.TestCase):
         }, self)
         task = load_task(task_dir)
         self.assertEqual(task.language, "typescript")
-        self.assertEqual(_suite_cmd("typescript"), ["node", "--test", "--test-reporter=tap"])
+        # Scored by the pack's own run and parser, never by a bare node --test.
+        with self.assertRaises(Invalid):
+            _suite_cmd("typescript")
 
 
 COUNTER_TS = """\
@@ -722,7 +730,8 @@ test("full bundle refuses a push", () => {
 """
 
 
-@unittest.skipUnless(ENABLED, "real node --test E2E; set OPENFARM_E2E=1")
+@unittest.skipUnless(shutil.which("node") and shutil.which("git"),
+                     "real node --test end to end with a scripted model; needs node and git")
 class TypeScriptE2ETests(unittest.TestCase):
     def _build_repo(self) -> tuple[Path, Path, Path]:
         base = Path(tempfile.mkdtemp(prefix="openfarm-ts-e2e-", dir=os.environ.get("TMPDIR")))
@@ -875,7 +884,7 @@ class TypeScriptE2ETests(unittest.TestCase):
                 "tests": [{"name": "adds slug", "file": "tests/slug.test.ts", "asserts": "x == 1"}],
             },
         )
-        pack = TypeScriptPack(worktree=root)
+        pack = TypeScriptPack()
         pack.configure(root)
         brief = test_writer_brief(card, BriefBook(root, [], []), pack).body
         self.assertIn("node:test", brief)

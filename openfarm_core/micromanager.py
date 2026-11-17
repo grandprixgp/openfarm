@@ -1634,14 +1634,17 @@ class Micromanager:
                         "`raise NotImplementedError`",
                     )
             elif norm_path.endswith((".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs")):
-                from .packs.typescript import _has_balanced_braces, _strip_ts_comments_text
+                from .packs.typescript import typescript_scaffold_edit_problem
 
-                stripped_ts = _strip_ts_comments_text(body)
-                if not re.search(r"\bthrow\s+new\s+Error\b", stripped_ts) or not _has_balanced_braces(body):
+                problem = typescript_scaffold_edit_problem(
+                    edit.format, edit.search or "", edit.replace or "", edit.content)
+                if problem:
                     raise Refused(
                         "scaffold-missing-todo",
-                        f"{edit.path}: TypeScript scaffold must contain `throw new Error(...)` "
-                        "stubs with balanced braces",
+                        f"{edit.path}: a TypeScript scaffold may only declare: imports, "
+                        "types, interfaces, classes with typed fields, and functions, "
+                        "methods and arrows whose whole body is one "
+                        f"`throw new Error(...)` ({problem})",
                     )
             elif not _valid_production_scaffold(body):
                 raise Refused(

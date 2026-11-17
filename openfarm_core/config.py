@@ -51,7 +51,8 @@ _TABLE_KEYS = {
                     "python_tests_in_test_files",
                     "allow_type_changes", "max_context_files"},
     "brief": {"test_conventions"},
-    "runner": {"env", "cargo_flags", "python"},
+    "runner": {"env", "cargo_flags", "python", "typescript", "typescript_typecheck",
+               "typescript_format", "link_node_modules"},
     "budget": {"implementer_attempts", "test_writer_attempts",
                "model_build_calls_per_card", "mutation_build_calls_per_card",
                "tokens_per_card", "wall_clock_per_card", "frontier_cost_ratio",
@@ -158,6 +159,10 @@ def _as_bool(value, what: str, default: bool) -> bool:
     if not isinstance(value, bool):
         raise ConfigError(f"{what}: expected true or false")
     return value
+
+
+def _uses_typescript(languages) -> bool:
+    return any(lang in ("typescript", "ts", "javascript", "js") for lang in languages)
 
 
 def _as_choice(value, what: str, default: str, choices: tuple[str, ...]) -> str:
@@ -528,6 +533,21 @@ class Config:
             raise ConfigError("[runner] python must be one interpreter path or name")
         #: The interpreter the Python pack runs under; openfarm's own when empty.
         self.runner_python = python.strip()
+        # The TypeScript pack's runner and tools, recorded by adopt.
+        if runner.get("typescript") not in (None, "node"):
+            raise ConfigError(
+                f"[runner] typescript: {runner.get('typescript')!r} is not supported; this "
+                "version runs TypeScript tests only with node --test, so the value is "
+                '"node"')
+        self.runner_typescript = "node"
+        self.typescript_typecheck = _as_choice(
+            runner.get("typescript_typecheck"), "[runner] typescript_typecheck", "auto",
+            ("auto", "tsc", "syntax"))
+        self.typescript_format = _as_choice(
+            runner.get("typescript_format"), "[runner] typescript_format", "auto",
+            ("auto", "prettier", "off"))
+        self.link_node_modules = _as_bool(
+            runner.get("link_node_modules"), "[runner] link_node_modules", True)
         env_table = runner.get("env") or {}
         if not isinstance(env_table, dict):
             raise ConfigError("[runner.env] must be a table")
@@ -577,6 +597,11 @@ class Config:
         self.mutation_required_for = _as_str_list(
             gates.get("mutation_required_for", ["test-backfill"]),
             "[gates] mutation_required_for")
+        if self.mutation == "required" and _uses_typescript(self.languages):
+            raise ConfigError(
+                '[gates] mutation = "required" cannot be served: the TypeScript pack '
+                'has no mutation tool, so every card would be blocked at its end. Set '
+                '[gates] mutation = "off" (or "report", with mutation_required_for = [])')
         self.mutation_min_kill_rate = _as_float(
             gates.get("mutation_min_kill_rate"),
             "[gates] mutation_min_kill_rate", 0.8)
@@ -1185,6 +1210,9 @@ class Config:
                    "cargo_flags": self.cargo_flags, "languages": self.languages}
         if self.runner_python:
             payload["python"] = self.runner_python
+        if _uses_typescript(self.languages):
+            payload["typescript"] = (self.runner_typescript, self.typescript_typecheck,
+                                     self.typescript_format)
         return hashlib.sha256(
             str(sorted(payload.items())).encode("utf-8")).hexdigest()[:16]
 
