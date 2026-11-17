@@ -44,6 +44,7 @@ from .board import (
     validate_expected_answer,
 )
 from .briefs import _sanitize_text
+from .budget import NightBudget
 from .cards import Card
 from .config import Config
 from .coordinator import _clean_json_payload
@@ -1506,6 +1507,99 @@ class _ManagedCardSourceProxy:
         return {"cards": selected}
 
 
+class _MeteredWorkerBackend:
+    """A card's worker backend that tells the night each call's cost as it lands.
+
+    Everything else goes to the backend it wraps; the card's own budget still
+    counts the cost from the completion, as before.
+    """
+
+    def __init__(self, inner, on_cost) -> None:
+        self._inner = inner
+        self._on_cost = on_cost
+
+    def complete(self, *args, **kwargs):
+        completion = self._inner.complete(*args, **kwargs)
+        try:
+            cost = float(getattr(completion, "cost", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            cost = 0.0
+        if cost > 0:
+            self._on_cost(cost)
+        return completion
+
+    def __getattr__(self, name: str):
+        return getattr(self._inner, name)
+
+
+class _DrivenNightBudget(NightBudget):
+    """The night budget of a run `openfarm drive` drives in this process.
+
+    One spend total for the driven run: the driver's turns are noted as each one
+    ends, and a running card's worker calls as each one lands, so the run's
+    claim checks (`exhausted`) and the driver's own cap check (`live_total`) both
+    see everything spent so far, the cards still in flight included. When a card
+    ends, its live tally gives way to what its record says. `total_spend` and
+    the parts (`spend`, `micromanager_spend`, `coordinator_spend`,
+    `driver_spend`) are what `run.json` records.
+    """
+
+    def __init__(self, spend_cap: float, cards_cap: int | None = None,
+                 mm_budget=None) -> None:
+        super().__init__(spend_cap, cards_cap=cards_cap)
+        self.driver_spend = 0.0
+        self._mm_budget = mm_budget
+        self._live: dict[str, float] = {}
+
+    def note_driver(self, amount: float) -> None:
+        if amount:
+            with self._lock:
+                self.driver_spend += float(amount)
+
+    def note_live(self, card_id: str, amount: float) -> None:
+        with self._lock:
+            self._live[card_id] = self._live.get(card_id, 0.0) + float(amount)
+
+    def metered_backend(self, card_id: str, backend):
+        """`backend`, with each call's cost noted against `card_id` as it lands."""
+        with self._lock:
+            self._live.pop(card_id, None)
+        return _MeteredWorkerBackend(backend, lambda cost: self.note_live(card_id, cost))
+
+    def finish_card(self, card_id: str, spend: float, micromanager_spend: float) -> None:
+        """Swap a card's live tally for what its record says, in one step."""
+        with self._lock:
+            self._live.pop(card_id, None)
+            self.spend += float(spend or 0.0)
+            self.micromanager_spend += float(micromanager_spend or 0.0)
+
+    def total_spend(self) -> float:
+        with self._lock:
+            return (self.spend + self.micromanager_spend + self.coordinator_spend
+                    + self.driver_spend)
+
+    def live_total(self) -> float:
+        """Everything spent so far, the cards in flight and the supervisor's live spend too."""
+        mm_live = 0.0
+        if self._mm_budget is not None:
+            with contextlib.suppress(TypeError, ValueError):
+                mm_live = float(getattr(self._mm_budget, "spend", 0.0) or 0.0)
+        with self._lock:
+            return (self.spend + sum(self._live.values())
+                    + max(self.micromanager_spend, mm_live)
+                    + self.coordinator_spend + self.driver_spend)
+
+    def exhausted(self) -> str | None:
+        if self.spend_cap > 0:
+            used = self.live_total()
+            if used >= self.spend_cap:
+                with self._lock:
+                    driver = self.driver_spend
+                return (f"night spend {used:.4f} (driver {driver:.4f}) reached its cap "
+                        f"of {self.spend_cap:.4f}")
+        return super().exhausted()
+
+
 class _ManagedRunContext:
     """In-process Context proxy capturing `cmd_run` output without touching stdout."""
 
@@ -1522,6 +1616,13 @@ class _ManagedRunContext:
         self.json = True
         self._card_ids = list(card_ids)
         self.captured_payload: dict | None = None
+        self.night: _DrivenNightBudget | None = None
+
+    def make_night_budget(self, spend_cap: float, cards_cap: int | None,
+                          mm_budget=None) -> _DrivenNightBudget:
+        """The run's night budget, kept here so the driver can add its own spend."""
+        self.night = _DrivenNightBudget(spend_cap, cards_cap=cards_cap, mm_budget=mm_budget)
+        return self.night
 
     def emit(self, payload: dict, *, kind: str | None = None) -> None:
         self.captured_payload = dict(payload)
@@ -1841,13 +1942,15 @@ def _review_wave(
 
 
 def _wave_spend_stop(
-    counters: dict, state: StateDir, run_id: str, cap: float, stopped: list[str]
+    counters: dict, state: StateDir, run_id: str, cap: float, stopped: list[str],
+    used_now=None,
 ) -> str:
     if stopped:
         return stopped[0]
     if cap <= 0:
         return ""
-    used = float(counters.get("cost_usd", 0.0) or 0.0) + _run_spend_so_far(state, run_id)
+    used = (used_now() if used_now is not None else
+            float(counters.get("cost_usd", 0.0) or 0.0) + _run_spend_so_far(state, run_id))
     if used >= cap:
         stopped.append(
             f"night spend {used:.4f} (driver {counters['cost_usd']:.4f}) reached its cap of {cap:.4f}"
@@ -2010,9 +2113,13 @@ def _add_driver_to_run_record(state: StateDir, run_id: str, report: dict) -> boo
     record = read_json(run_file)
     if not isinstance(record, dict):
         return False
+    # A driven run's own `spend` already holds the driver's turns up to when the
+    # run wrote it (its `driver_spend`); swap that part for the driver's whole.
+    counted = float(record.get("driver_spend", 0.0) or 0.0)
     record["driver"] = dict(report)
     record["driver_spend"] = report["spend"]
-    record["spend"] = round(float(record.get("spend", 0.0) or 0.0) + float(report["spend"]), 6)
+    record["spend"] = round(
+        float(record.get("spend", 0.0) or 0.0) - counted + float(report["spend"]), 6)
     notes = [str(n) for n in (record.get("notes") or [])]
     for note in report.get("notes") or []:
         if note not in notes:
@@ -2228,6 +2335,29 @@ def drive_run(
         driver_errors: list[dict] = []
         spend_stopped: list[str] = []
         spend_cap = _effective_spend_cap(active_cfg, spend)
+        noted_to_night = [0.0]
+
+        def _night():
+            """The driven run's night budget; None when attached to another process's run."""
+            return getattr(run_ctx, "night", None) if run_ctx is not None else None
+
+        def _sync_night() -> None:
+            """Add the driver's spend not yet in the run's night budget to it."""
+            night = _night()
+            if night is None:
+                return
+            due = float(counters.get("cost_usd", 0.0) or 0.0) - noted_to_night[0]
+            if due > 0:
+                night.note_driver(due)
+                noted_to_night[0] += due
+
+        def _used_now() -> float:
+            """The night's spend so far, the driver's own and the running cards' included."""
+            night = _night()
+            if night is not None:
+                _sync_night()
+                return night.live_total()
+            return counters["cost_usd"] + _run_spend_so_far(state, resolved_rid)
         timeout_policy = str(
             getattr(active_cfg.swarm, "on_external_timeout", "fallback") or "fallback"
         )
@@ -2277,6 +2407,7 @@ def drive_run(
                         return None
                     shares = _turn_shares(clean_seat, sup_work=sup_work, coord_work=coord_work)
                     _count_turn(counters, turn_resp, shares=shares)
+                    _sync_night()
                     _record_driver_member_usage(
                         board,
                         {"coordinator": coord_name, "supervisor": sup_name},
@@ -2290,7 +2421,7 @@ def drive_run(
                     """Why the driver may take no more turns for spend, or ''."""
                     if spend_cap <= 0:
                         return ""
-                    used = counters["cost_usd"] + _run_spend_so_far(state, resolved_rid)
+                    used = _used_now()
                     if used >= spend_cap:
                         return (
                             f"night spend {used:.4f} (driver {counters['cost_usd']:.4f}) "
@@ -2632,7 +2763,8 @@ def drive_run(
                     counters=counters,
                     max_turns=max_turns,
                     spend_stop=lambda: _wave_spend_stop(
-                        counters, state, resolved_rid, spend_cap, spend_stopped
+                        counters, state, resolved_rid, spend_cap, spend_stopped,
+                        used_now=_used_now,
                     ),
                 )
         has_infra = any(o.get("stop_code") == "infra" for o in outcomes) or (
@@ -2647,6 +2779,17 @@ def drive_run(
         run_record_updated = (
             _add_driver_to_run_record(state, resolved_rid, report) if managed else False
         )
+        run_spend = None
+        if run_record_updated:
+            rec = read_json(state.runs / resolved_rid / "run.json")
+            if isinstance(rec, dict):
+                run_spend = float(rec.get("spend", 0.0) or 0.0)
+        if not managed:
+            report["notes"].append(
+                f"attached to run {resolved_rid}, which another process owns: the driver's "
+                f"cost ({report['spend']:.4f}) is not counted against that run's caps "
+                f"(--spend, spend_per_night); only the driver's own turns stop at the cap"
+            )
         return {
             "ok": not has_infra,
             "agent": provider,
@@ -2663,6 +2806,10 @@ def drive_run(
             "spend_cap": spend_cap,
             "spend_stopped": spend_stopped[0] if spend_stopped else "",
             "run_record_updated": run_record_updated,
+            # The run's one total (run.json's `spend`), the driver's share included;
+            # None when attached, where the driver's cost stays outside the run.
+            "run_spend": round(run_spend, 6) if run_spend is not None else None,
+            "driver_counted_in_run": bool(managed),
             "notes": report["notes"],
             "actions_taken": actions_taken,
             "answers_sent": answers_sent,

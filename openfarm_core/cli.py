@@ -459,8 +459,12 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
                 "and pass a positive --spend to lower it")
         cap = (min(args.spend, cfg.spend_per_night) if cfg.spend_per_night > 0
                else args.spend)
-    night = NightBudget(cap, cards_cap=args.cards)
     night_mm_budget = _build_night_mm_budget(cfg)
+    # `openfarm drive` runs this in its own process and hands in a night budget
+    # its own turns are added to, so one total stops both (see driver.py).
+    make_night = getattr(ctx, "make_night_budget", None)
+    night = (make_night(cap, args.cards, night_mm_budget) if callable(make_night)
+             else NightBudget(cap, cards_cap=args.cards))
     deadline = _deadline(args)
     outcomes: list[dict] = []
     consecutive: list[tuple[str, str, str]] = []
@@ -609,24 +613,36 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
             rec_lock = threading.Lock()
 
             def _run_swarm_card(cid: str, *, on_handback=None, on_struggling=None) -> dict:
-                return _run_card(
-                    ctx,
-                    source,
-                    cid,
-                    run_id,
-                    telemetry,
-                    run_dir,
-                    script_path,
-                    mm_script=mm_script_path,
-                    harness_library=harness_lib,
-                    mm_budget=night_mm_budget,
-                    board=board,
-                    build_limiter=build_limiter,
-                    mm_backend=shared_mm_backend,
-                    on_handback=on_handback,
-                    on_struggling=on_struggling,
-                    mm_seat=mm_seat,
-                )
+                # A night that counts running cards (a driven run's) meters the
+                # card's worker calls as they land; any other night sees the
+                # card's spend when it ends, as before.
+                metered = None
+                if callable(getattr(night, "metered_backend", None)):
+                    metered = night.metered_backend(cid, open_backend(cfg, script_path))
+                try:
+                    return _run_card(
+                        ctx,
+                        source,
+                        cid,
+                        run_id,
+                        telemetry,
+                        run_dir,
+                        script_path,
+                        backend=metered,
+                        mm_script=mm_script_path,
+                        harness_library=harness_lib,
+                        mm_budget=night_mm_budget,
+                        board=board,
+                        build_limiter=build_limiter,
+                        mm_backend=shared_mm_backend,
+                        on_handback=on_handback,
+                        on_struggling=on_struggling,
+                        mm_seat=mm_seat,
+                    )
+                finally:
+                    if metered is not None and hasattr(metered, "close"):
+                        with contextlib.suppress(Exception):
+                            metered.close()
 
             def _record_swarm_outcome(cid: str, outcome: dict) -> bool:
                 nonlocal consecutive
@@ -643,10 +659,15 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
                             infra_stop = True
                     elif final_state != "released":
                         consecutive = []
-                    night.note_spend(outcome.get("spend", 0.0) or 0.0)
-                    night.note_micromanager(
-                        outcome.get("micromanager_spend", 0.0) or 0.0
-                    )
+                    finish = getattr(night, "finish_card", None)
+                    if callable(finish):
+                        finish(cid, outcome.get("spend", 0.0) or 0.0,
+                               outcome.get("micromanager_spend", 0.0) or 0.0)
+                    else:
+                        night.note_spend(outcome.get("spend", 0.0) or 0.0)
+                        night.note_micromanager(
+                            outcome.get("micromanager_spend", 0.0) or 0.0
+                        )
                     _update_breaker(ctx, consecutive)
                     return infra_stop
 
@@ -765,6 +786,8 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
               "worker_spend": round(night.spend, 6),
               "micromanager_spend": round(night.micromanager_spend, 6),
               "coordinator_spend": round(night.coordinator_spend, 6),
+              **({"driver_spend": round(float(night.driver_spend), 6)}
+                 if hasattr(night, "driver_spend") else {}),
               "spend_measured": _backend_prices_spend(cfg, script_path),
               "notes": notes,
               "outcomes": outcomes,
