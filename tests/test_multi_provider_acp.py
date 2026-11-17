@@ -413,7 +413,10 @@ class MultiProviderEnvAndSyncTests(unittest.TestCase):
         fake_home = self.tmp / "codex-home"
         (fake_home / ".codex").mkdir(parents=True)
         host_auth = fake_home / ".codex" / "auth.json"
-        host_auth.write_text('{"tokens":{"access_token":"cx-1"}}\n', encoding="utf-8")
+        host_auth.write_text(
+            '{"tokens":{"access_token":"cx-1","refresh_token":"rt-1","account_id":"acct-1"}}\n',
+            encoding="utf-8",
+        )
 
         env, iso = _sanitised_env(
             provider="codex",
@@ -461,7 +464,8 @@ class MultiProviderEnvAndSyncTests(unittest.TestCase):
         acp.initialize()
         assert acp._isolated_home is not None
         (acp._isolated_home / ".codex" / "auth.json").write_text(
-            '{"tokens":{"access_token":"cx-refreshed"}}\n', encoding="utf-8"
+            '{"tokens":{"access_token":"cx-refreshed","refresh_token":"rt-2","account_id":"acct-1"}}\n',
+            encoding="utf-8",
         )
         acp.close()
         self.assertEqual(

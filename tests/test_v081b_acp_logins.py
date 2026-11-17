@@ -76,6 +76,91 @@ class LoginPlaceTests(unittest.TestCase):
         self.assertEqual(logins.isolated_login_env("antigravity", "/iso"), {})
 
 
+class SyncBackUnitTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="of-v081b-sync-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.iso = self.tmp / "iso"
+        (self.iso / ".codex").mkdir(parents=True)
+        self.dest_dir = self.tmp / "real"
+        self.dest_dir.mkdir()
+        self.dest = self.dest_dir / "auth.json"
+        self.initial = json.dumps(CODEX_AUTH).encode()
+        self.dest.write_bytes(self.initial)
+        self.secret = self.tmp / "id_ed25519"
+        self.secret.write_text("PRIVATE KEY\n")
+
+    def _iso_write(self, data: str) -> None:
+        (self.iso / ".codex" / "auth.json").write_text(data)
+
+    def _sync(self) -> logins.SyncResult:
+        return logins.sync_back("codex", isolated_home=self.iso, target=self.dest, initial=self.initial)
+
+    def test_good_refresh_is_written_atomically_with_backup_and_mode_600(self) -> None:
+        new = json.loads(json.dumps(CODEX_AUTH))
+        new["tokens"]["access_token"] = "cx-2"
+        new["last_refresh"] = "2026-11-02T00:00:00Z"
+        self._iso_write(json.dumps(new))
+        res = self._sync()
+        self.assertEqual(res.status, "synced", res.reason)
+        self.assertEqual(json.loads(self.dest.read_text())["tokens"]["access_token"], "cx-2")
+        self.assertEqual(stat.S_IMODE(self.dest.stat().st_mode), 0o600)
+        backup = self.dest_dir / ("auth.json" + logins.BACKUP_SUFFIX)
+        self.assertEqual(backup.read_bytes(), self.initial)
+        self.assertEqual(stat.S_IMODE(backup.stat().st_mode), 0o600)
+        self.assertEqual(sorted(p.name for p in self.dest_dir.iterdir()),
+                         ["auth.json", "auth.json" + logins.BACKUP_SUFFIX])
+
+    def test_bad_content_is_left_alone(self) -> None:
+        other = json.loads(json.dumps(CODEX_AUTH))
+        other["tokens"]["account_id"] = "acct-OTHER"
+        older = json.loads(json.dumps(CODEX_AUTH))
+        older["last_refresh"] = "2025-01-01T00:00:00Z"
+        for bad in ("{}", "not json", '{"tokens": {"access_token": "x"}}', json.dumps(other),
+                    json.dumps(older), "\x00" * 10):
+            self._iso_write(bad)
+            res = self._sync()
+            self.assertEqual(res.status, "refused", bad)
+            self.assertNotIn("cx-1", res.reason)
+            self.assertEqual(self.dest.read_bytes(), self.initial, bad)
+
+    def test_symlinked_credential_is_never_followed(self) -> None:
+        (self.iso / ".codex" / "auth.json").symlink_to(self.secret)
+        res = self._sync()
+        self.assertEqual(res.status, "refused")
+        self.assertIn("symlink", res.reason)
+        self.assertEqual(self.dest.read_bytes(), self.initial)
+
+    def test_symlinked_folder_is_never_followed(self) -> None:
+        shutil.rmtree(self.iso / ".codex")
+        elsewhere = self.tmp / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "auth.json").write_text(json.dumps(CODEX_AUTH).replace("cx-1", "cx-9"))
+        (self.iso / ".codex").symlink_to(elsewhere)
+        self.assertEqual(self._sync().status, "refused")
+        self.assertEqual(self.dest.read_bytes(), self.initial)
+
+    def test_fifo_and_oversize_are_refused(self) -> None:
+        os.mkfifo(self.iso / ".codex" / "auth.json")
+        self.assertEqual(self._sync().status, "refused")
+        (self.iso / ".codex" / "auth.json").unlink()
+        self._iso_write("x" * (2 << 20))
+        self.assertEqual(self._sync().status, "refused")
+
+    def test_claude_and_antigravity_shapes(self) -> None:
+        ok = json.dumps({"claudeAiOauth": {"accessToken": "a2", "refreshToken": "r2", "expiresAt": 2000}})
+        self.assertEqual(logins.check_shape("claude", ok.encode(), json.dumps(CLAUDE_CRED).encode()), "")
+        stale = json.dumps({"claudeAiOauth": {"accessToken": "a2", "refreshToken": "r2", "expiresAt": 1}})
+        self.assertTrue(logins.check_shape("claude", stale.encode(), json.dumps(CLAUDE_CRED).encode()))
+        self.assertTrue(logins.check_shape("claude", b"{}", None))
+        lost = json.dumps({"claudeAiOauth": {"accessToken": "a2", "expiresAt": 2000}})
+        self.assertTrue(logins.check_shape("claude", lost.encode(), json.dumps(CLAUDE_CRED).encode()))
+        self.assertEqual(logins.check_shape("antigravity", b"token-text\n", b"old\n"), "")
+        self.assertTrue(logins.check_shape("antigravity", b"a\x00b", b"old"))
+        self.assertTrue(logins.check_shape("antigravity", b"\xff\xfe", b"old"))
+        self.assertTrue(logins.check_shape("antigravity", b"   \n", b"old"))
+
+
 class AdapterLoginTests(unittest.TestCase):
     """The adapter reads, isolates and writes back through `logins`."""
 
@@ -120,7 +205,20 @@ class AdapterLoginTests(unittest.TestCase):
         self.assertTrue(body["codex_home"].startswith(body["iso"]))
         self.assertEqual(json.loads((self.codex_home / "auth.json").read_text())["tokens"]["access_token"],
                          "cx-refreshed")
+        self.assertEqual(stat.S_IMODE((self.codex_home / "auth.json").stat().st_mode), 0o600)
+        self.assertTrue((self.codex_home / ("auth.json" + logins.BACKUP_SUFFIX)).is_file())
         self.assertIn("HOME-COPY", (self.host_home / ".codex" / "auth.json").read_text())
+
+    def test_child_cannot_make_the_sync_copy_a_symlink_or_junk(self) -> None:
+        (self.host_home / ".codex").mkdir()
+        real = self.host_home / ".codex" / "auth.json"
+        real.write_text(json.dumps(CODEX_AUTH))
+        before = real.read_bytes()
+        env = {"HOME": str(self.host_home), "OF_TEST_SECRET": str(self.secret)}
+        for payload in ("{}", "SYMLINK"):
+            self._run(payload, env)
+            self.assertEqual(real.read_bytes(), before, payload)
+            self.assertFalse(real.is_symlink())
 
     def test_claude_config_dir_is_read_and_written_back(self) -> None:
         cfg_dir = self.tmp / "claude-profile"

@@ -750,6 +750,7 @@ class ClaudeAcpAdapter:
         self.cwd = Path(cwd or Path.cwd())
         self.allowed_root = Path(allowed_root or self.cwd).resolve()
         self._cred_source: Path | None = None
+        self.last_sync = None
         self.isolate_home = bool(isolate_home)
         self.auth_file = Path(auth_file) if auth_file is not None else None
         self.auth_mode = str(auth_mode)
@@ -842,12 +843,9 @@ class ClaudeAcpAdapter:
         )
         self._isolated_home = isolated_home
         if isolated_home is not None:
-            iso_creds = self._isolated_cred_path(isolated_home)
-            if iso_creds.is_file():
-                try:
-                    self._initial_creds_bytes = iso_creds.read_bytes()
-                except OSError:
-                    self._initial_creds_bytes = None
+            iso_rel = self._isolated_cred_path(isolated_home).relative_to(isolated_home).parts
+            initial, _why = logins.read_isolated(isolated_home, iso_rel)
+            self._initial_creds_bytes = initial
         argv = list(self.argv)
         if self.transport == "server":
             self.process_hold = hold
@@ -1156,7 +1154,7 @@ class ClaudeAcpAdapter:
             )
 
     def _persist_refreshed_oauth_credentials(self) -> None:
-        """Persist refreshed OAuth credentials back to host HOME safely."""
+        """Copy a refreshed login back to where it was read from, if it is safe to."""
         if (
             self._isolated_home is None
             or self.auth_file is not None
@@ -1164,63 +1162,20 @@ class ClaudeAcpAdapter:
             or self._cred_source is None
         ):
             return
-        iso_creds = self._isolated_cred_path(self._isolated_home)
-        if not iso_creds.is_file():
-            return
-        try:
-            raw = iso_creds.read_bytes()
-        except OSError:
-            return
-        if not raw or raw == self._initial_creds_bytes:
-            return
-
-        if self.provider == "claude":
-            try:
-                parsed = json.loads(raw.decode("utf-8"))
-            except (ValueError, UnicodeDecodeError):
-                return
-            if not isinstance(parsed, dict) or not isinstance(
-                parsed.get("claudeAiOauth"), dict
-            ):
-                return
-            prefix = ".credentials-"
-        elif self.provider == "antigravity":
-            try:
-                decoded = raw.decode("utf-8")
-            except UnicodeDecodeError:
-                return
-            if not decoded.strip() or "\x00" in decoded:
-                return
-            prefix = ".antigravity-oauth-token-"
-        else:  # codex
-            try:
-                parsed = json.loads(raw.decode("utf-8"))
-            except (ValueError, UnicodeDecodeError):
-                return
-            if not isinstance(parsed, dict):
-                return
-            prefix = ".auth-"
-
-        # Back to the file the login was copied from ($CLAUDE_CONFIG_DIR /
-        # $CODEX_HOME first, $HOME second).
-        target = self._cred_source
-        target_dir = target.parent
-        if not target_dir.is_dir():
-            return
-        try:
-            fd, tmp_name = tempfile.mkstemp(prefix=prefix, dir=str(target_dir))
-            tmp_path = Path(tmp_name)
-            try:
-                os.chmod(tmp_path, 0o600)
-                with os.fdopen(fd, "wb") as handle:
-                    handle.write(raw)
-                os.replace(tmp_path, target)
-                os.chmod(target, 0o600)
-            except Exception:
-                tmp_path.unlink(missing_ok=True)
-                raise
-        except OSError:
-            return
+        result = logins.sync_back(
+            self.provider,
+            isolated_home=self._isolated_home,
+            target=self._cred_source,
+            initial=self._initial_creds_bytes,
+        )
+        self.last_sync = result
+        if result.status == "refused":
+            note = (
+                f"the refreshed {self.provider} login was not copied back to "
+                f"{self._cred_source}: {result.reason}"
+            )
+            self.notes.append(note)
+            print(f"openfarm: {note}", file=sys.stderr)
 
     def _cleanup_isolated_home(self) -> None:
         if self._isolated_home is not None:
