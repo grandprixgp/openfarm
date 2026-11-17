@@ -309,15 +309,33 @@ def swarm_join(
             f"{clean_seat} seat is {configured_seat!r}, not 'external'",
         )
 
+    clean_name = str(name or "").strip()
+    if clean_name in CODE_AUTHOR_NAMES:
+        raise Refused(
+            "reserved-name",
+            f"{clean_name!r} is a name only code uses; join under another name",
+        )
+
     board.ensure()
+    same_name = board.get_member(clean_name)
+    if same_name is not None and same_name.get("kind") != "external":
+        raise Refused(
+            "name-taken",
+            f"{clean_name!r} is already a {same_name.get('kind')!r} member "
+            f"({same_name.get('role')!r}); join under another name",
+        )
     active_members = board.list_members(include_removed=False)
     for existing in active_members:
-        if normalize_role(str(existing.get("role", ""))) == clean_seat and existing["name"] != name:
+        # A code member (the code fallback acting for a silent external
+        # coordinator) never holds a seat against an outside member joining it.
+        if existing.get("kind") == "code":
+            continue
+        if normalize_role(str(existing.get("role", ""))) == clean_seat and existing["name"] != clean_name:
             raise Refused(
                 "seat-occupied",
                 f"{clean_seat} seat is already held by {existing['name']!r}",
             )
-    if not any(m["name"] == name for m in active_members):
+    if not any(m["name"] == clean_name for m in active_members):
         if len(active_members) >= cfg.swarm.max_members:
             raise Refused(
                 "max-members",
@@ -325,7 +343,7 @@ def swarm_join(
             )
 
     member = board.upsert_member(
-        name,
+        clean_name,
         kind="external",
         role=clean_seat,
         state="active",
@@ -336,7 +354,7 @@ def swarm_join(
         author="system",
         to=["all"],
         kind="roster",
-        body=f"{name} joined seat {clean_seat} ({owner_kind})",
+        body=f"{clean_name} joined seat {clean_seat} ({owner_kind})",
         trusted=True,
     )
     return member
