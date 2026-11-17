@@ -295,6 +295,60 @@ def _post_event(
     )
 
 
+#: Effort names that turn reasoning down or off: never a step up from anything.
+_NO_REASONING_EFFORTS = frozenset({"off", "none", "minimal", "disabled", "0", "false"})
+#: The usual effort names, lowest first, for telling a raise from a drop.
+_KNOWN_EFFORT_RANK = {
+    name: i for i, name in enumerate(
+        ("off", "none", "minimal", "low", "medium", "high", "xhigh", "max")
+    )
+}
+#: Where an OpenAI-style `reasoning_effort` endpoint sits when none is sent.
+_ASSUMED_ENDPOINT_DEFAULT = "medium"
+
+
+def escalation_step(efforts, current: str) -> str | None:
+    """The effort one step above `current` on a tier's ladder, or None to do nothing.
+
+    Escalation never lowers effort. With `current` set, the next entry up that is a
+    real raise. With `current` empty no effort parameter is sent and the endpoint's
+    own default applies, so where it sits on the ladder is unknown:
+
+    - when every entry is a usual name (`off` ... `max`), step to the first entry
+      above `medium` (the usual endpoint default), or do nothing if none is;
+    - otherwise drop the reasoning-off entries and take the middle of the rest,
+      rounded up, never the lowest rung; with fewer than two rungs do nothing.
+    """
+    ladder = [str(e) for e in (efforts or ()) if str(e)]
+    if not ladder:
+        return None
+    cur = str(current or "")
+    if cur:
+        if cur not in ladder:
+            return None
+        cur_rank = _KNOWN_EFFORT_RANK.get(cur.lower())
+        for cand in ladder[ladder.index(cur) + 1:]:
+            if cand.lower() in _NO_REASONING_EFFORTS:
+                continue
+            cand_rank = _KNOWN_EFFORT_RANK.get(cand.lower())
+            if cur_rank is not None and cand_rank is not None and cand_rank <= cur_rank:
+                continue
+            return cand
+        return None
+
+    rungs = [e for e in ladder if e.lower() not in _NO_REASONING_EFFORTS]
+    if len(rungs) < 2:
+        return None
+    if all(e.lower() in _KNOWN_EFFORT_RANK for e in rungs):
+        floor = _KNOWN_EFFORT_RANK[_ASSUMED_ENDPOINT_DEFAULT]
+        above = [e for e in rungs if _KNOWN_EFFORT_RANK[e.lower()] > floor]
+        if not above:
+            return None
+        return min(above, key=lambda e: _KNOWN_EFFORT_RANK[e.lower()])
+    idx = len(rungs) // 2  # ceil((n - 1) / 2): the middle, rounded up
+    return rungs[idx] if idx > 0 else None
+
+
 class CodeCoordinator:
     """Deterministic built-in coordinator policy (`[swarm] coordinator = "code"`)."""
 
@@ -344,27 +398,25 @@ class CodeCoordinator:
         if tier_cfg is None or not tier_cfg.efforts:
             return None
         current_effort = str(member.get("effort", "") or "")
-        efforts = tuple(tier_cfg.efforts)
-        if not current_effort:
-            next_effort = efforts[0]
-        elif current_effort in efforts:
-            idx = efforts.index(current_effort)
-            if idx + 1 >= len(efforts):
-                return None
-            next_effort = efforts[idx + 1]
-        else:
+        next_effort = escalation_step(tier_cfg.efforts, current_effort)
+        if next_effort is None:
             return None
 
+        failures = info.get("failed_at_effort", 1)
+        if current_effort:
+            reason = f"escalate {current_effort} -> {next_effort} after {failures} failures"
+        else:
+            reason = (
+                f"escalate from the endpoint's default effort (none sent) to "
+                f"{next_effort} after {failures} failures"
+            )
         swarm_set(
             rt.board,
             rt.cfg,
             caller="coordinator",
             member_name=member_name,
             effort=next_effort,
-            reason=(
-                f"escalate after {info.get('failed_at_effort', 1)} failures "
-                f"at {current_effort or 'default'}"
-            ),
+            reason=reason,
         )
         return {"action": "set", "effort": next_effort}
 
