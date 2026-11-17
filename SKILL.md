@@ -90,4 +90,4 @@ Report:
    ```text
    /openfarm-initialize <project_name> <project_idea>
    ```
-   or stress-test decisions first with `/openfarm-grill-me <project_idea>` (for example: `/openfarm-initialize calorie-log An app to track my calories`), or adopt an existing Rust/Python/TypeScript repository with `openfarm adopt --dir . [--lang rust|python|typescript]`.
+   or stress-test decisions first with `/openfarm-grill-me <project_idea>` (for example: `/openfarm-initialize calorie-log An app to track my calories`), or adopt an existing Rust/Python/TypeScript repository with `openfarm adopt --dir . [--lang rust|python|typescript]` (a repo with both a Rust or Python manifest and a `package.json` adopts as Rust or Python; pass `--lang typescript` for its TypeScript).
