@@ -45,6 +45,9 @@ class EligibilityResult:
 
     def __init__(self) -> None:
         self.failures: list[dict] = []
+        #: What the gate found out besides its rules, such as the TypeScript
+        #: runner and tools; kept out of the dict when empty.
+        self.info: dict = {}
 
     def fail(self, rule: str, detail: str) -> None:
         self.failures.append({"rule": rule, "detail": detail})
@@ -54,7 +57,10 @@ class EligibilityResult:
         return not self.failures
 
     def as_dict(self) -> dict:
-        return {"eligible": self.ok, "failures": list(self.failures)}
+        out = {"eligible": self.ok, "failures": list(self.failures)}
+        if self.info:
+            out.update(self.info)
+        return out
 
 
 def _check_path_field(entry: str, field_label: str, cfg, root: Path | None,
@@ -241,7 +247,8 @@ def check_eligibility(card: Card, cfg, deps_done: bool = True,
                     "python-tests-in-test-files",
                     f"test {test.name!r} is declared in {test.file!r}; Python card "
                     f"tests go in tests/test_<subject>.py")
-    if any(lang in cfg.languages for lang in ("typescript", "ts", "javascript", "js")):
+    if _uses_typescript(cfg):
+        _check_typescript(card, cfg, root, result)
         for test in card.tests:
             if test.file and not _is_typescript_test_file(test.file):
                 result.fail(
@@ -259,6 +266,31 @@ def check_eligibility(card: Card, cfg, deps_done: bool = True,
             "a stub is only safe where the test writer can see the file")
 
     return result
+
+
+def _uses_typescript(cfg) -> bool:
+    return any(lang in cfg.languages for lang in ("typescript", "ts", "javascript", "js"))
+
+
+def _check_typescript(card: Card, cfg, root: Path | None,
+                      result: EligibilityResult) -> None:
+    """The runner and tools the TypeScript pack will judge this card with.
+
+    The same decision the pack makes from the base checkout, so `check` refuses
+    what a run would only find out after spending its calls.
+    """
+    if root is None or not root.is_dir():
+        return
+    from ..packs.typescript import resolve_tooling, settings_from_config
+
+    tooling = resolve_tooling(root, settings_from_config(cfg))
+    result.info["typescript"] = {key: tooling[key] for key in
+                                 ("runner", "typecheck", "tsc", "format", "prettier",
+                                  "notes")}
+    if tooling["test_script"]:
+        result.fail("typescript-test-runner", tooling["test_script"])
+    for problem in tooling["problems"]:
+        result.fail("typescript-tools", problem)
 
 
 def _check_done_text(card: Card, result: EligibilityResult) -> None:

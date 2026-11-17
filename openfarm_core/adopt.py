@@ -104,6 +104,7 @@ def adopt_config_text(
     state_dir: Path,
     key_file: Path,
     proposed_known_failing: list[str] | None = None,
+    typescript_tools: dict | None = None,
 ) -> str:
     """Return the text of `.openfarm/config.toml` for adopting `root` as `language`.
 
@@ -136,7 +137,8 @@ def adopt_config_text(
     return render_config(
         name=resolved_root.name, language=language, base_branch=base_branch,
         state_dir=resolved_state, key_file=resolved_key, cargo_flags=cargo_flags,
-        proposed_known_failing=proposed_known_failing)
+        proposed_known_failing=proposed_known_failing,
+        typescript_tools=typescript_tools)
 
 
 def adopt_project(
@@ -200,6 +202,11 @@ def adopt_project(
     else:
         resolved_key = Path(key_file).expanduser().resolve()
 
+    typescript_tools = None
+    adopt_notes: list[str] = []
+    if resolved_language == "typescript":
+        typescript_tools, adopt_notes = typescript_adopt_checks(root)
+
     baseline = None
     if run_suite:
         # Before anything is written: a suite that does not build refuses adoption.
@@ -214,6 +221,7 @@ def adopt_project(
         state_dir=resolved_state,
         key_file=resolved_key,
         proposed_known_failing=baseline["known_failing"] if baseline else None,
+        typescript_tools=typescript_tools,
     )
 
     resolved_state.mkdir(parents=True, exist_ok=True)
@@ -240,11 +248,34 @@ def adopt_project(
             "cards/.gitkeep",
         ],
     }
+    if typescript_tools is not None:
+        result["typescript"] = {key: typescript_tools[key]
+                                for key in ("runner", "typecheck", "format")}
+    if adopt_notes:
+        result["notes"] = adopt_notes
     if baseline is not None:
         result["suite_ran"] = baseline["ran"]
         result["known_failing_proposed"] = baseline["known_failing"]
         result["suite_notes"] = baseline["notes"]
     return result
+
+
+def typescript_adopt_checks(root: Path) -> tuple[dict, list[str]]:
+    """The runner and tools a TypeScript repo is adopted with, and what to tell.
+
+    Decided here, in the checkout being adopted, and recorded in the config so
+    that `check` and every card use the same. Raises `Refused`
+    "unsupported-test-runner" when the test script is not a `node --test` one.
+    """
+    from .packs.typescript import resolve_tooling
+
+    tooling = resolve_tooling(root, {})
+    if tooling["test_script"]:
+        raise Refused("unsupported-test-runner", tooling["test_script"])
+    notes = [f"tests run with {tooling['runner']}; typecheck: {tooling['typecheck']}; "
+             f"format: {tooling['format']}"]
+    notes += tooling["notes"]
+    return tooling, notes
 
 
 def propose_known_failing(parsed: dict) -> list[str]:

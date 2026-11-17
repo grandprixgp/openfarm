@@ -17,6 +17,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import re
 import shutil
 from pathlib import Path
@@ -380,32 +381,250 @@ _TEST_KIND = "test"
 _PRODUCTION_KIND = "production"
 
 _NOTE_NO_TSC = "tsc is not installed, so typecheck and lint check syntax only"
-_NOTE_NO_PRETTIER = "prettier is not installed, so formatting is not checked"
+_NOTE_NO_TSCONFIG = "there is no tsconfig.json, so typecheck and lint check syntax only"
+_NOTE_SYNTAX_SET = ('[runner] typescript_typecheck is "syntax", so typecheck and lint '
+                    "check syntax only")
+_NOTE_PRETTIER_UNCONFIGURED = ("prettier is not configured in this project, so "
+                               "formatting is not checked")
+_NOTE_NO_PRETTIER = "prettier is configured but not installed, so formatting is not checked"
+_NOTE_FORMAT_OFF = '[runner] typescript_format is "off", so formatting is not checked'
+
+#: Where prettier reads its settings; one of these, or a `prettier` key in
+#: package.json, is what "the project configures prettier" means.
+PRETTIER_CONFIG_FILES = (
+    ".prettierrc", ".prettierrc.json", ".prettierrc.yaml", ".prettierrc.yml",
+    ".prettierrc.json5", ".prettierrc.js", ".prettierrc.cjs", ".prettierrc.mjs",
+    ".prettierrc.ts", ".prettierrc.cts", ".prettierrc.mts", ".prettierrc.toml",
+    "prettier.config.js", "prettier.config.cjs", "prettier.config.mjs",
+    "prettier.config.ts", "prettier.config.cts", "prettier.config.mts",
+)
+
+#: `[runner]` settings this pack reads, with the value used when one is absent.
+DEFAULT_SETTINGS = {"typescript": "node", "typescript_typecheck": "auto",
+                    "typescript_format": "auto", "link_node_modules": True}
+
+_NODE_TEST_SCRIPT_RE = re.compile(r"(?:^|\s|&&|;)node(?:\s+\S+)*\s+--test(?:\s|$)")
+_LINK_MARKER = ".openfarm-linked"
+
+
+def _package_json(root: Path) -> dict:
+    try:
+        data = json.loads((Path(root) / "package.json").read_text(errors="replace"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def test_script_problem(worktree: Path) -> str:
+    """Why `package.json`'s test script can't be served, or "" when it can.
+
+    Only `node --test` runs are understood: the parser reads node's TAP, not
+    jest, vitest or mocha output. A missing script, npm's placeholder and any
+    script that runs `node --test` are fine (the pack runs node itself).
+    """
+    scripts = _package_json(worktree).get("scripts")
+    script = scripts.get("test") if isinstance(scripts, dict) else None
+    if not isinstance(script, str):
+        return ""
+    cleaned = script.strip()
+    if not cleaned or "no test specified" in cleaned:
+        return ""
+    if _NODE_TEST_SCRIPT_RE.search(cleaned):
+        return ""
+    return (f"package.json's test script is {cleaned!r}, which is not a node --test "
+            "command. This version of openfarm runs TypeScript and JavaScript tests "
+            "only with node --test (node:test); it does not understand jest, vitest "
+            "or mocha. If the tests use node:test, set the script to a node --test "
+            "command; otherwise this project cannot be run by openfarm yet")
 
 
 def detect_runner(worktree: Path) -> str:
-    """`"npm"` when `package.json` defines a custom non-`node --test` script and
-    `node_modules` exists, otherwise `"node"`."""
-    root = Path(worktree)
-    pkg = root / "package.json"
-    if pkg.is_file():
-        try:
-            data = json.loads(pkg.read_text(errors="replace"))
-        except (OSError, ValueError):
-            data = {}
-        if isinstance(data, dict):
-            scripts = data.get("scripts")
-            if isinstance(scripts, dict):
-                test_script = scripts.get("test")
-                if isinstance(test_script, str):
-                    cleaned = test_script.strip()
-                    is_placeholder = "no test specified" in cleaned
-                    is_node_test = bool(re.search(
-                        r"(?:^|\s)node(?:\s+\S+)*\s+--test(?:\s|$)", cleaned))
-                    if cleaned and not is_placeholder and not is_node_test:
-                        if (root / "node_modules").is_dir():
-                            return "npm"
+    """Always `"node"`: the only runner this version has. See `test_script_problem`."""
     return "node"
+
+
+def base_checkout(worktree: Path) -> Path:
+    """The main checkout a `git worktree` folder was made from, or `worktree` itself.
+
+    Read from the worktree's `.git` file and its `commondir`, without running git.
+    """
+    root = Path(worktree)
+    dotgit = root / ".git"
+    if not dotgit.is_file():
+        return root
+    try:
+        text = dotgit.read_text(errors="replace").strip()
+    except OSError:
+        return root
+    match = re.match(r"gitdir:\s*(.+)", text)
+    if not match:
+        return root
+    gitdir = Path(match.group(1).strip())
+    if not gitdir.is_absolute():
+        gitdir = (root / gitdir).resolve()
+    common = gitdir.parent.parent
+    try:
+        rel = (gitdir / "commondir").read_text(errors="replace").strip()
+        if rel:
+            common = (gitdir / rel).resolve() if not Path(rel).is_absolute() else Path(rel)
+    except OSError:
+        pass
+    if common.name == ".git" and common.parent.is_dir():
+        return common.parent
+    return root
+
+
+def runner_settings(base: Path) -> dict:
+    """`[runner]` keys this pack reads, from the base checkout's own config."""
+    settings = dict(DEFAULT_SETTINGS)
+    path = Path(base) / ".openfarm" / "config.toml"
+    try:
+        import tomllib
+        data = tomllib.loads(path.read_text(errors="replace"))
+    except (OSError, ValueError):
+        return settings
+    runner = data.get("runner") if isinstance(data, dict) else None
+    if isinstance(runner, dict):
+        for key in DEFAULT_SETTINGS:
+            if key in runner:
+                settings[key] = runner[key]
+    return settings
+
+
+def settings_from_config(cfg) -> dict:
+    """The same settings from a loaded `Config`, for code that has one."""
+    return {
+        "typescript": getattr(cfg, "runner_typescript", "node"),
+        "typescript_typecheck": getattr(cfg, "typescript_typecheck", "auto"),
+        "typescript_format": getattr(cfg, "typescript_format", "auto"),
+        "link_node_modules": getattr(cfg, "link_node_modules", True),
+    }
+
+
+def prettier_configured(root: Path) -> bool:
+    root = Path(root)
+    if "prettier" in _package_json(root):
+        return True
+    return any((root / name).is_file() for name in PRETTIER_CONFIG_FILES)
+
+
+def _tool_bin(base: Path, name: str) -> str:
+    """The base checkout's `node_modules/.bin/<name>`, else `<name>` on PATH, else ""."""
+    local = Path(base) / "node_modules" / ".bin" / name
+    if local.exists():
+        return str(local)
+    return name if shutil.which(name) is not None else ""
+
+
+def resolve_tooling(worktree: Path, settings: dict | None = None) -> dict:
+    """One decision, from the base checkout, on the tools every gate uses.
+
+    adopt makes it in the main checkout and records it; `check` and every card
+    worktree make the same one, because a worktree's tools are looked up in the
+    checkout it came from. Nothing is run.
+    """
+    root = Path(worktree)
+    base = base_checkout(root)
+    chosen = dict(DEFAULT_SETTINGS)
+    chosen.update(settings if settings is not None else runner_settings(base))
+    tsc = _tool_bin(base, "tsc")
+    prettier = _tool_bin(base, "prettier")
+    has_tsconfig = (root / "tsconfig.json").is_file()
+    configured = prettier_configured(root)
+    check_notes: list[str] = []
+    format_notes: list[str] = []
+    problems: list[str] = []
+
+    want_check = str(chosen.get("typescript_typecheck") or "auto")
+    if want_check == "tsc":
+        typecheck = "tsc"
+        if not tsc:
+            problems.append('[runner] typescript_typecheck is "tsc" but no tsc was '
+                            "found in node_modules/.bin or on PATH")
+        if not has_tsconfig:
+            problems.append('[runner] typescript_typecheck is "tsc" but there is no '
+                            "tsconfig.json")
+    elif want_check == "syntax":
+        typecheck = "syntax"
+        check_notes.append(_NOTE_SYNTAX_SET)
+    else:
+        typecheck = "tsc" if (tsc and has_tsconfig) else "syntax"
+        if not tsc:
+            check_notes.append(_NOTE_NO_TSC)
+        elif not has_tsconfig:
+            check_notes.append(_NOTE_NO_TSCONFIG)
+
+    want_format = str(chosen.get("typescript_format") or "auto")
+    if want_format == "prettier":
+        fmt = "prettier"
+        if not prettier:
+            problems.append('[runner] typescript_format is "prettier" but no prettier '
+                            "was found in node_modules/.bin or on PATH")
+    elif want_format == "off":
+        fmt = "off"
+        format_notes.append(_NOTE_FORMAT_OFF)
+    else:
+        fmt = "prettier" if (configured and prettier) else "off"
+        if not configured:
+            format_notes.append(_NOTE_PRETTIER_UNCONFIGURED)
+        elif not prettier:
+            format_notes.append(_NOTE_NO_PRETTIER)
+
+    return {
+        "runner": "node --test",
+        "typecheck": typecheck,
+        "tsc": tsc if typecheck == "tsc" else "",
+        "format": fmt,
+        "prettier": prettier if fmt == "prettier" else "",
+        "link_node_modules": bool(chosen.get("link_node_modules", True)),
+        "base": str(base),
+        "test_script": test_script_problem(root),
+        "typecheck_notes": check_notes,
+        "format_notes": format_notes,
+        "notes": check_notes + format_notes,
+        "problems": problems,
+    }
+
+
+def link_node_modules(worktree: Path, base: Path) -> str:
+    """Give a card worktree the base checkout's `node_modules`, or say why not.
+
+    The worktree gets a real `node_modules/` folder holding one link per entry
+    of the base's folder. A real folder, not one link, because git's common
+    `node_modules/` ignore rule matches folders only: a link named
+    `node_modules` would be an untracked file in every diff. It is made only
+    when git ignores the base's folder, and checked to be ignored in the
+    worktree too, or removed. `git worktree remove` deletes the links, never
+    what they point at. Returns "" when linked (or nothing to link).
+    """
+    root = Path(worktree)
+    base = Path(base)
+    source = base / "node_modules"
+    target = root / "node_modules"
+    if root.resolve() == base.resolve() or not source.is_dir():
+        return ""
+    if target.is_symlink() or (target.exists() and not (target / _LINK_MARKER).exists()):
+        return ""
+    try:
+        from ..git import Git
+        if Git(base).untracked_files(["node_modules"]):
+            return ("node_modules is not linked into card worktrees: git does not "
+                    "ignore it in the base checkout")
+        target.mkdir(exist_ok=True)
+        (target / _LINK_MARKER).write_text("links made by openfarm\n")
+        for entry in sorted(source.iterdir()):
+            link = target / entry.name
+            if not (link.exists() or link.is_symlink()):
+                os.symlink(entry, link)
+        if Git(root).untracked_files(["node_modules"]):
+            shutil.rmtree(target)
+            return ("node_modules is not linked into card worktrees: git does not "
+                    "ignore it in the worktree")
+    except Exception as exc:  # noqa: BLE001 - a link that can't be made is a note
+        if target.exists() and (target / _LINK_MARKER).exists():
+            shutil.rmtree(target, ignore_errors=True)
+        return f"node_modules is not linked into card worktrees: {exc}"
+    return ""
 
 
 class TypeScriptPack(Pack):
@@ -421,13 +640,15 @@ class TypeScriptPack(Pack):
         self._runner_fixed = bool(runner)
         self._tsc_arg = tsc
         self._prettier_arg = prettier
+        self._settings: dict | None = None
         self.has_tsc = (bool(tsc) if tsc is not None
                         else (shutil.which("tsc") is not None))
         self.tsc_cmd = "tsc"
-        self.has_prettier = (bool(prettier) if prettier is not None
-                             else (shutil.which("prettier") is not None))
+        # prettier only when a project configures it, which configure() reads.
+        self.has_prettier = bool(prettier)
         self.prettier_cmd = "prettier"
         self.worktree: Path | None = None
+        self.tooling: dict = {}
         self.notes: list[str] = []
         self._refresh_notes()
 
@@ -436,37 +657,42 @@ class TypeScriptPack(Pack):
         if not self.has_tsc:
             notes.append(_NOTE_NO_TSC)
         if not self.has_prettier:
-            notes.append(_NOTE_NO_PRETTIER)
+            notes.append(_NOTE_PRETTIER_UNCONFIGURED)
         self.notes = notes
+
+    def apply_settings(self, cfg) -> None:
+        """Use a loaded config's `[runner]` settings instead of reading the file."""
+        self._settings = settings_from_config(cfg)
 
     def configure(self, worktree: Path) -> None:
         root = Path(worktree)
         self.worktree = root
-        if not self._runner_fixed:
-            self.runner = detect_runner(root)
+        tooling = resolve_tooling(root, self._settings)
+        self.tooling = tooling
+        notes: list[str] = []
         if self._tsc_arg is None:
-            local_tsc = root / "node_modules" / ".bin" / "tsc"
-            if shutil.which("tsc") is not None:
-                self.has_tsc = True
-                self.tsc_cmd = "tsc"
-            elif local_tsc.is_file():
-                self.has_tsc = True
-                self.tsc_cmd = str(local_tsc)
-            else:
-                self.has_tsc = False
-                self.tsc_cmd = "tsc"
+            self.has_tsc = tooling["typecheck"] == "tsc"
+            self.tsc_cmd = tooling["tsc"] or "tsc"
+            notes += tooling["typecheck_notes"]
+        elif not self.has_tsc:
+            notes.append(_NOTE_NO_TSC)
         if self._prettier_arg is None:
-            local_prettier = root / "node_modules" / ".bin" / "prettier"
-            if shutil.which("prettier") is not None:
-                self.has_prettier = True
-                self.prettier_cmd = "prettier"
-            elif local_prettier.is_file():
-                self.has_prettier = True
-                self.prettier_cmd = str(local_prettier)
-            else:
-                self.has_prettier = False
-                self.prettier_cmd = "prettier"
-        self._refresh_notes()
+            self.has_prettier = tooling["format"] == "prettier"
+            self.prettier_cmd = tooling["prettier"] or "prettier"
+            notes += tooling["format_notes"]
+        elif not self.has_prettier:
+            notes.append(_NOTE_PRETTIER_UNCONFIGURED)
+        if tooling["link_node_modules"]:
+            why = link_node_modules(root, Path(tooling["base"]))
+            if why:
+                notes.append(why)
+        elif (Path(tooling["base"]) / "node_modules").is_dir() and \
+                Path(tooling["base"]).resolve() != root.resolve():
+            notes.append("node_modules is not linked into card worktrees: "
+                         "[runner] link_node_modules is false")
+        if tooling["test_script"]:
+            notes.append(tooling["test_script"])
+        self.notes = notes
 
     # -- commands -------------------------------------------------------------
 
@@ -511,16 +737,11 @@ class TypeScriptPack(Pack):
 
         if purpose == "test":
             name_pattern = _test_name_regex(tests)
-            if self.runner == "npm":
-                argv = ["npm", "test", "--silent"]
-                fwd = [str(f) for f in (files or [])]
-                if name_pattern:
-                    fwd.append(f"--test-name-pattern={name_pattern}")
-                fwd.extend(extra)
-                if fwd:
-                    argv += ["--", *fwd]
-                return {"argv": argv}
-
+            if self.runner != "node":
+                raise Invalid(
+                    "unsupported-test-runner",
+                    f"the TypeScript pack runs tests only with node --test, not "
+                    f"{self.runner!r}")
             argv = [self.node, "--test",
                     "--test-reporter=tap", "--test-reporter-destination=stdout",
                     f"--test-reporter={_REPORTER_URL}",

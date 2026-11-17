@@ -47,7 +47,8 @@ def render_config(*, name: str, language: str, base_branch: str, state_dir: Path
                   mutation: str = "off", mm_adapter: str = "claude-acp",
                   mm_mode: str = "active", mm_auth: str = "oauth",
                   mm_binary: str = "auto",
-                  proposed_known_failing: list[str] | None = None) -> str:
+                  proposed_known_failing: list[str] | None = None,
+                  typescript_tools: dict | None = None) -> str:
     if language == "rust":
         forbidden_files = ["**/Cargo.toml", "Cargo.lock", ".openfarm/**", ".claude/**"]
         flagged_patterns = ["std::env::set_var", "sleep("]
@@ -55,10 +56,23 @@ def render_config(*, name: str, language: str, base_branch: str, state_dir: Path
         runner = [f"cargo_flags = {toml_list(cargo_flags or [])}"]
     elif language == "typescript":
         forbidden_files = ["**/package.json", "**/package-lock.json",
-                           "**/tsconfig.json", ".openfarm/**", ".claude/**"]
+                           "**/tsconfig.json", "**/node_modules/**",
+                           ".openfarm/**", ".claude/**"]
         flagged_patterns = []
         tests_rule = ""
-        runner = ["# Node runs TypeScript natively via node --test."]
+        tools = typescript_tools or {}
+        runner = [
+            "# Tests run with node --test (node:test), the only runner this version has.",
+            'typescript = "node"',
+            '# "tsc" or "syntax" (node\'s own parse only): decided from this checkout by',
+            "# adopt, and used the same way by check and by every card.",
+            f"typescript_typecheck = {toml_str(tools.get('typecheck', 'auto'))}",
+            '# "prettier" only when the project configures prettier, else "off".',
+            f"typescript_format = {toml_str(tools.get('format', 'auto'))}",
+            "# Card worktrees reach this checkout's git-ignored node_modules through",
+            "# links, so tsc, prettier, @types and imported packages resolve the same.",
+            "link_node_modules = true",
+        ]
     else:
         forbidden_files = ["pyproject.toml", "setup.py", ".openfarm/**", ".claude/**"]
         flagged_patterns = []
