@@ -994,6 +994,18 @@ class PrettifiedTuiThemeAndControllerTests(unittest.TestCase):
         self.assertIn("py-sample", "\n".join(ctrl.modal_lines))
         ctrl.close_modal()
 
+        # Bare `bench` and humanized subcommands in command bar render cleanly without ANSI leaks.
+        for cmd in ("bench", "status", "swarm", "board", "harness status"):
+            res = ctrl.execute_command(cmd)
+            self.assertEqual(res["exit_code"], 0, f"{cmd}: {res['output']}")
+            self.assertNotIn("\x1b[", res["output"])
+            self.assertTrue(bool(ctrl.modal_lines))
+            ctrl.close_modal()
+        res_bench_json = ctrl.execute_command("bench --json")
+        self.assertEqual(res_bench_json["exit_code"], EXIT_USAGE)
+        self.assertEqual(res_bench_json["data"]["kind"], "usage error")
+        ctrl.close_modal()
+
         with mock.patch("openfarm_core.cli.probe_acp", return_value={"ok": True, "action": "probe"}):
             self.assertTrue(_handle_view_hotkey(None, ctrl, ord("P")))
             self.assertEqual(ctrl.last_command_result["exit_code"], 0)

@@ -2690,7 +2690,10 @@ def dispatch_cli_command(
         and not any(t.startswith("--dir=") for t in argv_tokens)
         and (resolved_repo / "bench").is_dir()
     ):
-        full_argv.extend(["--dir", str(resolved_repo / "bench")])
+        if len(argv_tokens) == 1:
+            full_argv.extend(["list", "--dir", str(resolved_repo / "bench")])
+        elif argv_tokens[1] in ("list", "run"):
+            full_argv.extend(["--dir", str(resolved_repo / "bench")])
 
     out_buf = io.StringIO()
     err_buf = io.StringIO()

@@ -2137,7 +2137,9 @@ def cmd_bench(args) -> int:
         return cmd_bench_run(args)
     if not action and not want_json:
         if not hasattr(args, "dir") or not args.dir:
-            args.dir = "bench"
+            repo_arg = getattr(args, "repo", ".") or "."
+            repo_bench = Path(repo_arg) / "bench"
+            args.dir = str(repo_bench) if repo_arg != "." and repo_bench.is_dir() else "bench"
         return cmd_bench_list(args)
     raise UsageError("bench requires a subcommand")
 
