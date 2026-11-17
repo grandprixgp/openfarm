@@ -17,6 +17,9 @@ import argparse
 import concurrent.futures
 import contextlib
 import datetime as _dt
+import difflib
+import inspect
+import io
 import json
 import re
 import sys
@@ -62,6 +65,7 @@ from .globs import matches_any, normalise, resolves_within
 from .harness_global import GlobalLibrary, global_dir_for
 from .harness_memory import HarnessLibrary
 from .harness_scope import project_markers
+from .human_cli import Style, error_hint, format_human
 from .micromanager import MicromanagerBudget, open_micromanager
 from .packs.base import pack_for
 from .state import (StateDir, _safe_id, baseline_lock_for, read_json, utc_now,
@@ -95,15 +99,11 @@ class Context:
         self.cfg = load_config(self.repo, config_path)
         self.state = StateDir(self.cfg.state_dir)
 
-    def emit(self, payload: dict) -> None:
+    def emit(self, payload: dict, *, kind: str | None = None) -> None:
         if self.json:
             print(json.dumps(payload, indent=2, ensure_ascii=False))
             return
-        for key, value in payload.items():
-            if isinstance(value, (dict, list)):
-                print(f"{key}: {json.dumps(value, ensure_ascii=False)}")
-            else:
-                print(f"{key}: {value}")
+        print(format_human(kind or "", payload, style=Style(sys.stdout)))
 
     def cards(self, worktree: Path | None = None) -> FileCardSource:
         source = open_card_source(self.cfg, self.state.root)
@@ -116,6 +116,25 @@ class Context:
         return open_runner(
             self.cfg, worktree, output_dir, limiter=limiter, budget=budget
         )
+
+
+def _emit_ctx(ctx, payload: dict, kind: str) -> None:
+    if isinstance(ctx, Context):
+        ctx.emit(payload, kind=kind)
+        return
+    emit_fn = getattr(ctx, "emit", None)
+    if not callable(emit_fn):
+        return
+    try:
+        params = inspect.signature(emit_fn).parameters
+    except (TypeError, ValueError):
+        params = {}
+    if "kind" in params or any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+    ):
+        emit_fn(payload, kind=kind)
+    else:
+        emit_fn(payload)
 
 
 def _check_id(value: str, what: str = "card id") -> str:
@@ -187,8 +206,8 @@ def cmd_check(ctx: Context, args) -> int:
     try:
         card = Card.from_dict(source.read(card_id)["card"])
     except Refused as exc:
-        ctx.emit({"card": card_id, "eligible": False,
-                  "failures": [{"rule": "read", "detail": exc.message}]})
+        _emit_ctx(ctx, {"card": card_id, "eligible": False,
+                        "failures": [{"rule": "read", "detail": exc.message}]}, "check")
         return EXIT_REFUSED
 
     deps_done = _deps_done(source, card)
@@ -210,7 +229,7 @@ def cmd_check(ctx: Context, args) -> int:
 
     write_json(ctx.state.check_dir(card.id) / f"{utc_now().replace(':', '')}.json",
                payload)
-    ctx.emit(payload)
+    _emit_ctx(ctx, payload, "check")
     return EXIT_OK if payload["eligible"] else EXIT_REFUSED
 
 
@@ -338,14 +357,14 @@ def _baseline_check(ctx: Context, source: FileCardSource, card: Card) -> dict:
 def cmd_run(ctx: Context, args) -> int:
     """Start a run: claim, drive, and move each card."""
     if ctx.state.kill_requested(ctx.cfg.kill_switch):
-        ctx.emit({"refused": True, "reason": "the kill switch exists"})
+        _emit_ctx(ctx, {"refused": True, "reason": "the kill switch exists"}, "run")
         return EXIT_REFUSED
     if ctx.state.is_paused():
-        ctx.emit({"refused": True, "reason": "the queue is paused"})
+        _emit_ctx(ctx, {"refused": True, "reason": "the queue is paused"}, "run")
         return EXIT_REFUSED
     breaker = ctx.state.read_breaker()
     if breaker.get("tripped"):
-        ctx.emit({"refused": True, "reason": "the circuit breaker is tripped"})
+        _emit_ctx(ctx, {"refused": True, "reason": "the circuit breaker is tripped"}, "run")
         return EXIT_REFUSED
 
     if not args.dry_run:
@@ -353,8 +372,8 @@ def cmd_run(ctx: Context, args) -> int:
         from .selfhost import unpinned_reason
         reason = unpinned_reason(ctx.repo, getattr(ctx.cfg, "state_dir", None))
         if reason:
-            ctx.emit({"refused": True, "reason": reason,
-                      "code": "self-host-unpinned"})
+            _emit_ctx(ctx, {"refused": True, "reason": reason,
+                            "code": "self-host-unpinned"}, "run")
             return EXIT_REFUSED
 
     if getattr(args, "learn_from", None):
@@ -364,8 +383,8 @@ def cmd_run(ctx: Context, args) -> int:
     run_id = args.run_id or f"run-{utc_now().replace('-', '').replace(':', '')}"
     if not ctx.state.acquire_run_lock(run_id):
         holder = ctx.state.lock_holder() or {}
-        ctx.emit({"refused": True,
-                  "reason": f"another run holds the lock: {holder.get('run_id')}"})
+        _emit_ctx(ctx, {"refused": True,
+                        "reason": f"another run holds the lock: {holder.get('run_id')}"}, "run")
         return EXIT_REFUSED
 
     try:
@@ -385,8 +404,8 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
     cfg = ctx.cfg
     handshake = _handshake(ctx, source, args, telemetry_raw=telemetry_raw)
     if handshake["refused"]:
-        ctx.emit({"refused": True, "reason": handshake["reason"],
-                  "adapters": handshake["adapters"]})
+        _emit_ctx(ctx, {"refused": True, "reason": handshake["reason"],
+                        "adapters": handshake["adapters"]}, "run")
         return EXIT_REFUSED
 
     if cfg.state_dir.exists():
@@ -645,7 +664,7 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
     write_json(run_dir / "run.json", record)
     telemetry.write("run", record)
     telemetry.flush()
-    ctx.emit(record)
+    _emit_ctx(ctx, record, "run")
     return EXIT_OK if not any(o.get("stop_code") == "infra" for o in outcomes) \
         else EXIT_TROUBLE
 
@@ -998,7 +1017,7 @@ def cmd_status(ctx: Context, args) -> int:
              "stop_code": (read_json(path) or {}).get("stop_code", "")}
             for path in sorted(ctx.state.cards.glob(f"{card_id}/*/card-record.json"))
         ]
-    ctx.emit(payload)
+    _emit_ctx(ctx, payload, "status")
     return EXIT_OK
 
 
@@ -1017,34 +1036,34 @@ def _last_run(ctx: Context) -> dict:
 
 def cmd_pause(ctx: Context, args) -> int:
     ctx.state.pause(args.reason or "")
-    ctx.emit({"paused": True, "reason": args.reason or ""})
+    _emit_ctx(ctx, {"paused": True, "reason": args.reason or ""}, "pause")
     return EXIT_OK
 
 
 def cmd_resume(ctx: Context, args) -> int:
     breaker = ctx.state.read_breaker()
     if breaker.get("tripped") and not args.clear_breaker:
-        ctx.emit({"refused": True,
-                  "reason": "the circuit breaker is tripped; pass --clear-breaker "
-                            "to clear it"})
+        _emit_ctx(ctx, {"refused": True,
+                        "reason": "the circuit breaker is tripped; pass --clear-breaker "
+                                  "to clear it"}, "resume")
         return EXIT_REFUSED
     if ctx.state.kill_requested(ctx.cfg.kill_switch) and not args.clear_kill:
-        ctx.emit({"refused": True,
-                  "reason": "the kill switch exists; pass --clear-kill to clear it"})
+        _emit_ctx(ctx, {"refused": True,
+                        "reason": "the kill switch exists; pass --clear-kill to clear it"}, "resume")
         return EXIT_REFUSED
     if args.clear_breaker:
         ctx.state.write_breaker(False, [])
     if args.clear_kill:
         ctx.state.clear_kill(ctx.cfg.kill_switch)
     ctx.state.resume()
-    ctx.emit({"paused": False, "breaker_cleared": bool(args.clear_breaker),
-              "kill_cleared": bool(args.clear_kill)})
+    _emit_ctx(ctx, {"paused": False, "breaker_cleared": bool(args.clear_breaker),
+                    "kill_cleared": bool(args.clear_kill)}, "resume")
     return EXIT_OK
 
 
 def cmd_stop(ctx: Context, args) -> int:
     path = ctx.state.request_kill(ctx.cfg.kill_switch, args.reason or "")
-    ctx.emit({"kill_switch": str(path), "reason": args.reason or ""})
+    _emit_ctx(ctx, {"kill_switch": str(path), "reason": args.reason or ""}, "stop")
     return EXIT_OK
 
 
@@ -1057,8 +1076,8 @@ def cmd_release(ctx: Context, args) -> int:
         source.release(card_id, reason=args.reason,
                        stop_code=StopCode.RELEASED.value)
     except Refused as exc:
-        ctx.emit({"released": False, "reason": exc.message,
-                  "archived": []})
+        _emit_ctx(ctx, {"released": False, "reason": exc.message,
+                        "archived": []}, "release")
         return EXIT_REFUSED
 
     card_dir = ctx.state.cards / card_id
@@ -1076,7 +1095,7 @@ def cmd_release(ctx: Context, args) -> int:
                 archived.append(str(target))
             except OSError:
                 pass
-    ctx.emit({"released": True, "card": card_id, "archived": archived})
+    _emit_ctx(ctx, {"released": True, "card": card_id, "archived": archived}, "release")
     return EXIT_OK
 
 
@@ -1091,7 +1110,7 @@ def cmd_done(ctx: Context, args) -> int:
     source.prepare()
     card = next((c for c in source.all_cards() if c.id == card_id), None)
     if card is None:
-        ctx.emit({"card": card_id, "done": False, "reason": "no such card"})
+        _emit_ctx(ctx, {"card": card_id, "done": False, "reason": "no such card"}, "done")
         return EXIT_REFUSED
     git = Git(ctx.repo)
     base = ctx.cfg.base_branch
@@ -1106,14 +1125,14 @@ def cmd_done(ctx: Context, args) -> int:
         if unmerged:
             reason = f"{branch} has {unmerged} commit(s) not merged into {base}"
     if reason:
-        ctx.emit({"card": card_id, "done": False, "reason": reason})
+        _emit_ctx(ctx, {"card": card_id, "done": False, "reason": reason}, "done")
         return EXIT_REFUSED
     try:
         source.mark_done(card_id, note=args.note or "")
     except Refused as exc:
-        ctx.emit({"card": card_id, "done": False, "reason": exc.message})
+        _emit_ctx(ctx, {"card": card_id, "done": False, "reason": exc.message}, "done")
         return EXIT_REFUSED
-    ctx.emit({"card": card_id, "done": True, "branch": branch, "base": base})
+    _emit_ctx(ctx, {"card": card_id, "done": True, "branch": branch, "base": base}, "done")
     return EXIT_OK
 
 
@@ -1132,7 +1151,7 @@ def cmd_dossier(ctx: Context, args) -> int:
         candidates = sorted(ctx.state.cards.glob(f"{card_id}/*/dossier.json"))
         path = candidates[-1] if candidates else None
     if not path or not Path(path).exists():
-        ctx.emit({"card": card_id, "error": "no dossier yet"})
+        _emit_ctx(ctx, {"card": card_id, "error": "no dossier yet"}, "dossier")
         return EXIT_REFUSED
     payload = read_json(path) or {}
 
@@ -1140,10 +1159,11 @@ def cmd_dossier(ctx: Context, args) -> int:
         gates = [entry for entry in payload.get("2_gates", [])
                  if entry.get("attempt") == args.attempt]
         if not gates:
-            ctx.emit({"card": card_id,
-                      "error": f"no gate ran on attempt {args.attempt}",
-                      "attempts_run": sorted({entry.get("attempt")
-                                              for entry in payload.get("2_gates", [])})})
+            _emit_ctx(ctx, {"card": card_id,
+                            "error": f"no gate ran on attempt {args.attempt}",
+                            "attempts_run": sorted({entry.get("attempt")
+                                                    for entry in payload.get("2_gates", [])})},
+                      "dossier")
             return EXIT_REFUSED
         payload["2_gates"] = gates
         payload["attempt"] = args.attempt
@@ -1157,7 +1177,10 @@ def cmd_dossier(ctx: Context, args) -> int:
             payload["9_diffs"] = diffs
 
     if args.format == "json" or ctx.json:
-        ctx.emit(payload)
+        if ctx.json:
+            _emit_ctx(ctx, payload, "dossier")
+        else:
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
     else:
         print(render_markdown(payload))
     return EXIT_OK
@@ -1168,7 +1191,7 @@ def cmd_verdict(ctx: Context, args) -> int:
     card_id = _check_id(args.card, "card id")
     candidates = sorted(ctx.state.cards.glob(f"{card_id}/*/card-record.json"))
     if not candidates:
-        ctx.emit({"card": card_id, "error": "no run for this card"})
+        _emit_ctx(ctx, {"card": card_id, "error": "no run for this card"}, "verdict")
         return EXIT_REFUSED
     card_dir = candidates[-1].parent
     payload = {"card": card_id, "verdict": args.verdict,
@@ -1176,7 +1199,7 @@ def cmd_verdict(ctx: Context, args) -> int:
                "minutes": args.minutes, "note": args.note or "",
                "at": utc_now()}
     write_json(card_dir / "verdict.json", payload)
-    ctx.emit(payload)
+    _emit_ctx(ctx, payload, "verdict")
     return EXIT_OK
 
 
@@ -1185,13 +1208,13 @@ def cmd_escape(ctx: Context, args) -> int:
     card_id = _check_id(args.card, "card id")
     candidates = sorted(ctx.state.cards.glob(f"{card_id}/*/card-record.json"))
     if not candidates:
-        ctx.emit({"card": card_id, "error": "no run for this card"})
+        _emit_ctx(ctx, {"card": card_id, "error": "no run for this card"}, "escape")
         return EXIT_REFUSED
     from .state import append_jsonl
     path = candidates[-1].parent / "escapes.jsonl"
     payload = {"card": card_id, "note": args.note, "at": utc_now()}
     append_jsonl(path, payload)
-    ctx.emit(payload)
+    _emit_ctx(ctx, payload, "escape")
     return EXIT_OK
 
 
@@ -1341,7 +1364,7 @@ def cmd_supervise(ctx: Context, args) -> int:
     report_path = supervision_dir / f"{run_stamp}-supervise.json"
     write_json(report_path, payload)
     payload["report_path"] = str(report_path)
-    ctx.emit(payload)
+    _emit_ctx(ctx, payload, "supervise")
     return EXIT_OK
 
 
@@ -1374,7 +1397,7 @@ def cmd_harness(ctx: Context, args) -> int:
     if use_global:
         global_lib = GlobalLibrary(global_dir_for(ctx.cfg.harness))
         if action == "status":
-            ctx.emit(global_lib.status())
+            _emit_ctx(ctx, global_lib.status(), "harness_global_status")
             return EXIT_OK
         if action == "promote":
             if not target:
@@ -1386,10 +1409,10 @@ def cmd_harness(ctx: Context, args) -> int:
                     res = _open_harness_library(ctx, require_enabled=False).force_to_global(
                         global_lib, target, _project_label(ctx), _project_markers(ctx))
             except (Refused, Invalid) as exc:
-                ctx.emit({"error": exc.message, "kind": "refused",
-                          "code": exc.code})
+                _emit_ctx(ctx, {"error": exc.message, "kind": "refused",
+                                "code": exc.code}, "harness_promote")
                 return EXIT_REFUSED
-            ctx.emit(res)
+            _emit_ctx(ctx, res, "harness_promote")
             return EXIT_OK
         if action == "demote":
             if not target:
@@ -1402,21 +1425,22 @@ def cmd_harness(ctx: Context, args) -> int:
                         raise Refused("not-global", f"{target} is not in the global library")
                 res = global_lib.retire(gid, reason=reason)
             except (Refused, Invalid) as exc:
-                ctx.emit({"error": exc.message, "kind": "refused",
-                          "code": exc.code})
+                _emit_ctx(ctx, {"error": exc.message, "kind": "refused",
+                                "code": exc.code}, "harness_demote")
                 return EXIT_REFUSED
-            ctx.emit(res)
+            _emit_ctx(ctx, res, "harness_demote")
             return EXIT_OK
 
     harness_lib = _open_harness_library(ctx, require_enabled=False)
     assert harness_lib is not None
 
     if action == "status":
-        ctx.emit(harness_lib.status())
+        _emit_ctx(ctx, harness_lib.status(), "harness_status")
         return EXIT_OK
 
     if action == "index":
-        ctx.emit({"index": harness_lib.format_index(), "status": harness_lib.status()})
+        _emit_ctx(ctx, {"index": harness_lib.format_index(), "status": harness_lib.status()},
+                  "harness_index")
         return EXIT_OK
 
     if action == "show":
@@ -1429,9 +1453,10 @@ def cmd_harness(ctx: Context, args) -> int:
                 raise Refused("unknown-harness-entry",
                               f"harness entry {safe!r} does not exist")
         except (Refused, Invalid) as exc:
-            ctx.emit({"error": exc.message, "kind": "refused", "code": exc.code})
+            _emit_ctx(ctx, {"error": exc.message, "kind": "refused", "code": exc.code},
+                      "harness_show")
             return EXIT_REFUSED
-        ctx.emit(entry)
+        _emit_ctx(ctx, entry, "harness_show")
         return EXIT_OK
 
     if action == "promote":
@@ -1440,9 +1465,10 @@ def cmd_harness(ctx: Context, args) -> int:
         try:
             res = harness_lib.promote_entry(target, reason=reason)
         except (Refused, Invalid) as exc:
-            ctx.emit({"error": exc.message, "kind": "refused", "code": exc.code})
+            _emit_ctx(ctx, {"error": exc.message, "kind": "refused", "code": exc.code},
+                      "harness_promote")
             return EXIT_REFUSED
-        ctx.emit(res)
+        _emit_ctx(ctx, res, "harness_promote")
         return EXIT_OK
 
     if action == "demote":
@@ -1451,16 +1477,17 @@ def cmd_harness(ctx: Context, args) -> int:
         try:
             res = harness_lib.demote_entry_or_revision(target, reason=reason)
         except (Refused, Invalid) as exc:
-            ctx.emit({"error": exc.message, "kind": "refused", "code": exc.code})
+            _emit_ctx(ctx, {"error": exc.message, "kind": "refused", "code": exc.code},
+                      "harness_demote")
             return EXIT_REFUSED
-        ctx.emit(res)
+        _emit_ctx(ctx, res, "harness_demote")
         return EXIT_OK
 
     if action == "reset":
         if not getattr(args, "yes", False):
             raise UsageError("harness reset requires --yes to confirm")
         res = harness_lib.reset()
-        ctx.emit(res)
+        _emit_ctx(ctx, res, "harness_reset")
         return EXIT_OK
 
     raise UsageError(f"unknown harness action: {action}")
@@ -1505,25 +1532,27 @@ def cmd_board(ctx: Context, args) -> int:
     """Read, post, answer, or wait on a run's board."""
     action = getattr(args, "board_command", None)
     if not action:
-        raise UsageError("board requires a subcommand: read, post, answer, or wait")
+        if ctx.json:
+            raise UsageError("board requires a subcommand: read, post, answer, or wait")
+        action = "read"
     rid, board = _resolve_board(ctx, getattr(args, "run", None))
 
     if action == "read":
-        if args.status:
-            ctx.emit({
+        if getattr(args, "status", False):
+            _emit_ctx(ctx, {
                 "run_id": rid,
                 **board.status(),
                 "roster": board.list_members(),
-            })
+            }, "board_status")
             return EXIT_OK
-        seqs = _parse_seqs_arg(args.seqs)
+        seqs = _parse_seqs_arg(getattr(args, "seqs", None))
         posts = board.read(
-            as_name=args.as_name,
-            since=args.since,
-            limit=args.limit,
+            as_name=getattr(args, "as_name", None),
+            since=getattr(args, "since", None),
+            limit=getattr(args, "limit", 20),
             seqs=seqs,
         )
-        ctx.emit({"run_id": rid, "posts": posts, "count": len(posts)})
+        _emit_ctx(ctx, {"run_id": rid, "posts": posts, "count": len(posts)}, "board_read")
         return EXIT_OK
 
     if action == "post":
@@ -1545,7 +1574,7 @@ def cmd_board(ctx: Context, args) -> int:
             attempt=args.attempt,
             ref=args.ref,
         )
-        ctx.emit({"run_id": rid, "post": post})
+        _emit_ctx(ctx, {"run_id": rid, "post": post}, "board_post")
         return EXIT_OK
 
     if action == "answer":
@@ -1567,7 +1596,7 @@ def cmd_board(ctx: Context, args) -> int:
             data=data,
             body=args.body,
         )
-        ctx.emit({"run_id": rid, "post": post})
+        _emit_ctx(ctx, {"run_id": rid, "post": post}, "board_answer")
         return EXIT_OK
 
     if action == "wait":
@@ -1601,17 +1630,25 @@ def cmd_swarm(ctx: Context, args) -> int:
     """Inspect tiers/roster and execute checked swarm actions."""
     action = getattr(args, "swarm_command", None)
     if not action:
-        raise UsageError(
-            "swarm requires a subcommand: status, tiers, join, start, set, hint, block, or remove"
-        )
+        if ctx.json:
+            raise UsageError(
+                "swarm requires a subcommand: status, tiers, join, start, set, hint, block, or remove"
+            )
+        holder = ctx.state.lock_holder()
+        if holder and holder.get("run_id"):
+            rid, board = _resolve_board(ctx, None)
+            _emit_ctx(ctx, {"run_id": rid, **swarm_status(board, ctx.cfg)}, "swarm_status")
+            return EXIT_OK
+        _emit_ctx(ctx, {"swarm": ctx.cfg.swarm.as_dict(), **swarm_tiers(ctx.cfg)}, "swarm_overview")
+        return EXIT_OK
     if action == "tiers":
-        ctx.emit(swarm_tiers(ctx.cfg))
+        _emit_ctx(ctx, swarm_tiers(ctx.cfg), "swarm_tiers")
         return EXIT_OK
 
     rid, board = _resolve_board(ctx, getattr(args, "run", None))
 
     if action == "status":
-        ctx.emit({"run_id": rid, **swarm_status(board, ctx.cfg)})
+        _emit_ctx(ctx, {"run_id": rid, **swarm_status(board, ctx.cfg)}, "swarm_status")
         return EXIT_OK
 
     if action == "join":
@@ -1622,7 +1659,7 @@ def cmd_swarm(ctx: Context, args) -> int:
             seat=args.seat,
             owner_kind=args.kind,
         )
-        ctx.emit({"run_id": rid, "member": member})
+        _emit_ctx(ctx, {"run_id": rid, "member": member}, "swarm_join")
         return EXIT_OK
 
     if action == "start":
@@ -1637,7 +1674,7 @@ def cmd_swarm(ctx: Context, args) -> int:
             team=team,
             source=source,
         )
-        ctx.emit({"run_id": rid, **res})
+        _emit_ctx(ctx, {"run_id": rid, **res}, "swarm_start")
         return EXIT_OK
 
     if action == "set":
@@ -1650,7 +1687,7 @@ def cmd_swarm(ctx: Context, args) -> int:
             effort=args.effort,
             reason=args.reason,
         )
-        ctx.emit({"run_id": rid, **res})
+        _emit_ctx(ctx, {"run_id": rid, **res}, "swarm_set")
         return EXIT_OK
 
     if action == "hint":
@@ -1661,7 +1698,7 @@ def cmd_swarm(ctx: Context, args) -> int:
             member_name=args.member,
             body=args.body,
         )
-        ctx.emit({"run_id": rid, **res})
+        _emit_ctx(ctx, {"run_id": rid, **res}, "swarm_hint")
         return EXIT_OK
 
     if action == "block":
@@ -1675,7 +1712,7 @@ def cmd_swarm(ctx: Context, args) -> int:
             reason=args.reason,
             source=source,
         )
-        ctx.emit({"run_id": rid, **res})
+        _emit_ctx(ctx, {"run_id": rid, **res}, "swarm_block")
         return EXIT_OK
 
     if action == "remove":
@@ -1687,7 +1724,7 @@ def cmd_swarm(ctx: Context, args) -> int:
             member_name=args.member,
             source=source,
         )
-        ctx.emit({"run_id": rid, **res})
+        _emit_ctx(ctx, {"run_id": rid, **res}, "swarm_remove")
         return EXIT_OK
 
     raise UsageError(f"unknown swarm subcommand: {action}")
@@ -1695,10 +1732,37 @@ def cmd_swarm(ctx: Context, args) -> int:
 
 # -- the parser ----------------------------------------------------------------
 
+_CLI_EPILOG = """\
+Command groups (21 commands):
+  Setup & Auth         init, adopt, install-skill, acp
+  Run & Monitor        check, run, status, pause, resume, stop, tui
+  Review & Harness     dossier, verdict, done, release, escape, supervise, harness
+  Swarm, Board & Bench swarm, board, bench
+
+Common workflows:
+  Bootstrap & auth     openfarm init my-app --idea "track habits"
+                       openfarm adopt --dir .
+                       openfarm acp status && openfarm acp login
+  Check & run          openfarm check CARD-1 --baseline
+                       openfarm run --dry-run --cards 3
+                       openfarm run --cards 3 --spend 1.00
+  Review & merge       openfarm dossier CARD-1
+                       openfarm verdict CARD-1 clean --review-tokens 1200
+                       git merge --no-ff openfarm/CARD-1-<slug> && openfarm done CARD-1
+  Swarm, board & TUI   openfarm swarm && openfarm board && openfarm tui
+
+Pass --json with any command for machine-readable JSON output.
+"""
+
+
 def build_parser() -> argparse.ArgumentParser:
+    raw_fmt = argparse.RawDescriptionHelpFormatter
     parser = argparse.ArgumentParser(
         prog="openfarm",
-        description="A plain-code orchestrator for narrowly scoped model work.")
+        description="A plain-code orchestrator for narrowly scoped model work.",
+        formatter_class=raw_fmt,
+        epilog=_CLI_EPILOG,
+    )
     parser.add_argument("--version", action="version",
                         version=f"openfarm {__version__}")
     parser.add_argument("--repo", default=".", help="the repository root")
@@ -1707,7 +1771,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help="print the result as one JSON object")
     sub = parser.add_subparsers(dest="command")
 
-    run = sub.add_parser("run", help="start a run (a night)")
+    run = sub.add_parser(
+        "run",
+        help="start a run (a night)",
+        formatter_class=raw_fmt,
+        epilog="Examples:\n  openfarm run --dry-run --cards 3\n  openfarm run --card CARD-1 --spend 1.00\n  openfarm run --cards 4 --for 2h",
+    )
     run.add_argument("--cards", type=int, default=3,
                      help="most cards to claim")
     run.add_argument("--spend", type=float, default=None,
@@ -1727,7 +1796,12 @@ def build_parser() -> argparse.ArgumentParser:
                      choices=("both", "project", "global"),
                      help="which lessons this run applies, over [harness] learn_from")
 
-    status = sub.add_parser("status", help="read-only state")
+    status = sub.add_parser(
+        "status",
+        help="read-only state",
+        formatter_class=raw_fmt,
+        epilog="Examples:\n  openfarm status\n  openfarm status --card CARD-1",
+    )
     status.add_argument("--card", default=None)
 
     pause = sub.add_parser("pause", help="stop new claims")
@@ -1740,25 +1814,50 @@ def build_parser() -> argparse.ArgumentParser:
     stop = sub.add_parser("stop", help="the kill switch")
     stop.add_argument("--reason", default=None)
 
-    release = sub.add_parser("release", help="free a stuck card")
+    release = sub.add_parser(
+        "release",
+        help="free a stuck card",
+        formatter_class=raw_fmt,
+        epilog='Example:\n  openfarm release CARD-1 --reason "needs revised spec"',
+    )
     release.add_argument("card")
     release.add_argument("--reason", required=True)
 
-    done = sub.add_parser("done", help="mark a reviewed, merged card done")
+    done = sub.add_parser(
+        "done",
+        help="mark a reviewed, merged card done",
+        formatter_class=raw_fmt,
+        epilog='Example:\n  git merge --no-ff openfarm/CARD-1-slug && openfarm done CARD-1 --note "lgtm"',
+    )
     done.add_argument("card")
     done.add_argument("--note", default=None)
 
-    dossier = sub.add_parser("dossier", help="print a card's dossier")
+    dossier = sub.add_parser(
+        "dossier",
+        help="print a card's dossier",
+        formatter_class=raw_fmt,
+        epilog="Examples:\n  openfarm dossier CARD-1\n  openfarm dossier CARD-1 --attempt 1 --format json",
+    )
     dossier.add_argument("card")
     dossier.add_argument("--run", default=None)
     dossier.add_argument("--attempt", type=int, default=None)
     dossier.add_argument("--format", choices=("md", "json"), default="md")
 
-    check = sub.add_parser("check", help="eligibility on one card")
+    check = sub.add_parser(
+        "check",
+        help="eligibility on one card",
+        formatter_class=raw_fmt,
+        epilog="Examples:\n  openfarm check CARD-1\n  openfarm check CARD-1 --baseline",
+    )
     check.add_argument("card")
     check.add_argument("--baseline", action="store_true")
 
-    verdict = sub.add_parser("verdict", help="record the reviewer's verdict")
+    verdict = sub.add_parser(
+        "verdict",
+        help="record the reviewer's verdict",
+        formatter_class=raw_fmt,
+        epilog='Example:\n  openfarm verdict CARD-1 clean --review-tokens 1200 --note "verified locally"',
+    )
     verdict.add_argument("card")
     verdict.add_argument("verdict",
                          choices=("clean", "minor-fix", "bounced", "scrapped"))
@@ -1770,14 +1869,24 @@ def build_parser() -> argparse.ArgumentParser:
     escape.add_argument("card")
     escape.add_argument("--note", required=True)
 
-    supervise = sub.add_parser("supervise", help="run micromanager triage/queue prep")
+    supervise = sub.add_parser(
+        "supervise",
+        help="run micromanager triage/queue prep",
+        formatter_class=raw_fmt,
+        epilog="Examples:\n  openfarm supervise --triage-blocked\n  openfarm supervise --prepare-queue --apply",
+    )
     supervise.add_argument("--triage-blocked", action="store_true")
     supervise.add_argument("--prepare-queue", action="store_true")
     supervise.add_argument("--card", default=None)
     supervise.add_argument("--apply", action="store_true")
     supervise.add_argument("--mm-script", dest="mm_script", default=None)
 
-    harness = sub.add_parser("harness", help="inspect and manage harness adaptations")
+    harness = sub.add_parser(
+        "harness",
+        help="inspect and manage harness adaptations",
+        formatter_class=raw_fmt,
+        epilog="Examples:\n  openfarm harness status\n  openfarm harness index\n  openfarm harness status --global\n  openfarm harness show exp-0001",
+    )
     harness.add_argument(
         "action",
         nargs="?",
@@ -1790,7 +1899,12 @@ def build_parser() -> argparse.ArgumentParser:
     harness.add_argument("--reason", default="manual")
     harness.add_argument("--yes", action="store_true")
 
-    board = sub.add_parser("board", help="read, post, answer, or wait on a run's board")
+    board = sub.add_parser(
+        "board",
+        help="read, post, answer, or wait on a run's board",
+        formatter_class=raw_fmt,
+        epilog='Examples:\n  openfarm board\n  openfarm board read --status\n  openfarm board post --as alice --to all --kind note --body "checking status"',
+    )
     board_sub = board.add_subparsers(dest="board_command")
 
     board_read = board_sub.add_parser("read", help="read posts or status from the board")
@@ -1827,7 +1941,12 @@ def build_parser() -> argparse.ArgumentParser:
     board_wait.add_argument("--limit", type=int, default=None)
     board_wait.add_argument("--run", default=None)
 
-    swarm = sub.add_parser("swarm", help="inspect and control swarm roster and seats")
+    swarm = sub.add_parser(
+        "swarm",
+        help="inspect and control swarm roster and seats",
+        formatter_class=raw_fmt,
+        epilog="Examples:\n  openfarm swarm\n  openfarm swarm tiers\n  openfarm swarm status --run RUN_ID\n  openfarm swarm join --name alice --seat coordinator --kind human",
+    )
     swarm_sub = swarm.add_subparsers(dest="swarm_command")
 
     swarm_status_p = swarm_sub.add_parser("status", help="show roster, tiers, and board status")
@@ -1872,7 +1991,12 @@ def build_parser() -> argparse.ArgumentParser:
     swarm_remove_p.add_argument("--as", dest="as_name", default="")
     swarm_remove_p.add_argument("--run", default=None)
 
-    bench = sub.add_parser("bench", help="run the efficacy bench")
+    bench = sub.add_parser(
+        "bench",
+        help="run the efficacy bench",
+        formatter_class=raw_fmt,
+        epilog="Examples:\n  openfarm bench\n  openfarm bench list --dir bench\n  openfarm bench run --dry-run --task py-bounded-full",
+    )
     bench_sub = bench.add_subparsers(dest="bench_command")
     bench_list = bench_sub.add_parser("list", help="list bench tasks")
     bench_list.add_argument("--dir", default="bench",
@@ -1893,7 +2017,12 @@ def build_parser() -> argparse.ArgumentParser:
     bench_run.add_argument("--dry-run", action="store_true",
                            help="scripted answers from each task's script.json; costs nothing")
 
-    init = sub.add_parser("init", help="scaffold a new openfarm Rust project")
+    init = sub.add_parser(
+        "init",
+        help="scaffold a new openfarm Rust project",
+        formatter_class=raw_fmt,
+        epilog='Example:\n  openfarm init calorie-log --idea "track daily meals" --commit',
+    )
     init.add_argument("name", help="project name or slug (e.g. calorie-log)")
     init.add_argument("--dir", default=None,
                       help="target directory (default: <repo>/<project_slug> or current repo)")
@@ -1916,7 +2045,12 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--force", action="store_true",
                       help="overwrite scaffold files in non-empty directory")
 
-    adopt = sub.add_parser("adopt", help="add openfarm to an existing repository")
+    adopt = sub.add_parser(
+        "adopt",
+        help="add openfarm to an existing repository",
+        formatter_class=raw_fmt,
+        epilog="Examples:\n  openfarm adopt --dir .\n  openfarm adopt --dir . --lang python --no-suite",
+    )
     adopt.add_argument("--dir", default=None,
                        help="repository directory (default: the current directory)")
     adopt.add_argument("--lang", choices=("rust", "python"), default=None,
@@ -1941,6 +2075,8 @@ def build_parser() -> argparse.ArgumentParser:
     acp = sub.add_parser(
         "acp",
         help="inspect, log in via OAuth, configure, or probe Frontier Claude ACP",
+        formatter_class=raw_fmt,
+        epilog="Examples:\n  openfarm acp status\n  openfarm acp login\n  openfarm acp configure --mode active --auth oauth\n  openfarm acp probe",
     )
     acp.add_argument("action", nargs="?", default="status", choices=ACP_ACTIONS)
     acp.add_argument("--mode", choices=("active", "advisory", "off"), default=None)
@@ -1965,6 +2101,8 @@ def build_parser() -> argparse.ArgumentParser:
     tui_p = sub.add_parser(
         "tui",
         help="open interactive terminal UI or render one snapshot",
+        formatter_class=raw_fmt,
+        epilog="Examples:\n  openfarm tui\n  openfarm tui --once --view overview\n  openfarm tui --once --view board --run RUN_ID",
     )
     tui_p.add_argument("--run", dest="run_id", default=None,
                        help="pin TUI to a specific run id")
@@ -1978,28 +2116,29 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _emit_standalone(payload: dict, want_json: bool) -> None:
+def _emit_standalone(payload: dict, want_json: bool, *, kind: str | None = None) -> None:
     if want_json:
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return
-    for key, value in payload.items():
-        if isinstance(value, (dict, list)):
-            print(f"{key}: {json.dumps(value, ensure_ascii=False)}")
-        else:
-            print(f"{key}: {value}")
+    print(format_human(kind or "", payload, style=Style(sys.stdout)))
 
 
 def _emit_bench_error(message: str, want_json: bool) -> int:
-    _emit_standalone({"error": message, "kind": "invalid"}, want_json)
+    _emit_standalone({"error": message, "kind": "invalid"}, want_json, kind="error")
     return EXIT_TROUBLE
 
 
 def cmd_bench(args) -> int:
     action = getattr(args, "bench_command", None)
+    want_json = bool(getattr(args, "json", False))
     if action == "list":
         return cmd_bench_list(args)
     if action == "run":
         return cmd_bench_run(args)
+    if not action and not want_json:
+        if not hasattr(args, "dir") or not args.dir:
+            args.dir = "bench"
+        return cmd_bench_list(args)
     raise UsageError("bench requires a subcommand")
 
 
@@ -2029,11 +2168,7 @@ def cmd_bench_list(args) -> int:
         })
 
     tasks.sort(key=lambda task: task["id"])
-    if want_json:
-        _emit_standalone({"tasks": tasks}, True)
-    else:
-        for task in tasks:
-            print(f"{task['id']}  {task['language']}  {task['category']}")
+    _emit_standalone({"tasks": tasks}, want_json, kind="bench_list")
     return EXIT_OK
 
 
@@ -2105,7 +2240,7 @@ def cmd_init(args) -> int:
         commit=bool(args.commit),
         force=bool(args.force),
     )
-    _emit_standalone(payload, bool(getattr(args, "json", False)))
+    _emit_standalone(payload, bool(getattr(args, "json", False)), kind="init")
     return EXIT_OK
 
 
@@ -2121,7 +2256,7 @@ def cmd_adopt(args) -> int:
         )
     except Refused as exc:
         _emit_standalone({"error": exc.message, "kind": "refused"},
-                         bool(getattr(args, "json", False)))
+                         bool(getattr(args, "json", False)), kind="adopt")
         return EXIT_REFUSED
     if payload.get("known_failing_proposed"):
         payload["next"] = ("the suite has failing tests; they are proposed in a "
@@ -2130,7 +2265,7 @@ def cmd_adopt(args) -> int:
                            "commit .openfarm/ and cards/")
     else:
         payload["next"] = "commit .openfarm/ and cards/, then write cards"
-    _emit_standalone(payload, bool(getattr(args, "json", False)))
+    _emit_standalone(payload, bool(getattr(args, "json", False)), kind="adopt")
     return EXIT_OK
 
 
@@ -2141,7 +2276,7 @@ def cmd_install_skill(args) -> int:
         install_bin=Path(args.install_bin) if args.install_bin else None,
         dry_run=bool(args.dry_run),
     )
-    _emit_standalone(payload, bool(getattr(args, "json", False)))
+    _emit_standalone(payload, bool(getattr(args, "json", False)), kind="install_skill")
     return EXIT_OK
 
 
@@ -2178,7 +2313,7 @@ def cmd_acp(args) -> int:
         )
     else:
         raise UsageError(f"unknown acp action: {action}")
-    _emit_standalone(payload, bool(getattr(args, "json", False)))
+    _emit_standalone(payload, bool(getattr(args, "json", False)), kind=f"acp_{action}")
     return EXIT_OK
 
 
@@ -2262,6 +2397,29 @@ def _normalise_argv(argv: list[str]) -> list[str]:
     return early + rest
 
 
+_CHOICE_RE = re.compile(
+    r"invalid choice:\s*'([^']+)'\s*\(choose from ([^)]+)\)",
+    re.DOTALL,
+)
+
+
+def _suggest_subcommand(err_text: str) -> str:
+    match = _CHOICE_RE.search(err_text or "")
+    if not match:
+        return ""
+    bad = match.group(1).strip()
+    raw_choices = [c.strip().strip("'\"") for c in match.group(2).split(",")]
+    choices = [c for c in raw_choices if c]
+    if not bad or not choices:
+        return ""
+    matches = difflib.get_close_matches(bad, choices, n=3, cutoff=0.5)
+    if not matches and len(bad) >= 2:
+        matches = [c for c in choices if c.startswith(bad)][:3]
+    if not matches:
+        matches = difflib.get_close_matches(bad, choices, n=2, cutoff=0.35)
+    return ", ".join(matches)
+
+
 def main(argv: list[str] | None = None) -> int:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     want_json = False
@@ -2278,6 +2436,10 @@ def main(argv: list[str] | None = None) -> int:
                              indent=2, ensure_ascii=False))
         else:
             print(f"openfarm: {kind}: {message}", file=sys.stderr)
+            hint = error_hint(kind, message)
+            if hint:
+                st_err = Style(sys.stderr)
+                print(st_err.dim(f"  hint: {hint}"), file=sys.stderr)
         return code
 
     parser = build_parser()
@@ -2286,18 +2448,25 @@ def main(argv: list[str] | None = None) -> int:
     except UsageError as exc:
         return _emit_error("usage error", str(exc), EXIT_USAGE)
 
-    if want_json:
-        import contextlib
-        import io
-        err_buf = io.StringIO()
-        try:
-            with contextlib.redirect_stderr(err_buf):
-                args = parser.parse_args(normalised)
-        except SystemExit as exc:
+    err_buf = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err_buf):
+            args = parser.parse_args(normalised)
+    except SystemExit as exc:
+        if want_json:
             msg = err_buf.getvalue().strip().splitlines()[-1] if err_buf.getvalue().strip() else "invalid arguments"
             return _emit_error("usage error", msg, int(exc.code) if isinstance(exc.code, int) else EXIT_USAGE)
-    else:
-        args = parser.parse_args(normalised)
+        code = int(exc.code) if isinstance(exc.code, int) else (EXIT_OK if exc.code is None else EXIT_USAGE)
+        if code == 0:
+            raise
+        err_text = err_buf.getvalue()
+        if err_text:
+            sys.stderr.write(err_text)
+        suggestion = _suggest_subcommand(err_text)
+        if suggestion:
+            st_err = Style(sys.stderr)
+            print(st_err.yellow(f"Did you mean: {suggestion}?"), file=sys.stderr)
+        return code
     if not args.command:
         if want_json:
             return _emit_error("usage error", "no subcommand specified", EXIT_USAGE)
