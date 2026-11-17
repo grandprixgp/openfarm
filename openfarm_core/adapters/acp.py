@@ -357,7 +357,7 @@ def _sanitised_env(
     allow_oauth = auth_file is None and auth_mode in ("oauth", "auto")
 
     def _keep_var(key: str, val: object) -> bool:
-        if key in _STRIPPED_ENV_EXACT:
+        if key in _STRIPPED_ENV_EXACT or key.startswith("ANTIGRAVITY_"):
             return False
         if prov == "claude":
             if key == "ANTHROPIC_API_KEY" and auth_mode == "oauth" and auth_file is None:

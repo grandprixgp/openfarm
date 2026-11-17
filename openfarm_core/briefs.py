@@ -337,6 +337,27 @@ def test_writer_brief(card: Card, book: BriefBook, pack,
             if target is not None:
                 parts.append(f"\n### Reference tests: {reference}\n{target.read_text()}")
 
+    pack_name = str(getattr(pack, "name", "") or "")
+    pack_runner = str(getattr(pack, "runner", "") or "")
+    if not pack_runner and getattr(book, "root", None) is not None:
+        if pack_name == "typescript":
+            from .packs.typescript import detect_runner as _detect_ts_runner
+            pack_runner = _detect_ts_runner(book.root)
+        elif pack_name == "python":
+            from .packs.python import detect_runner as _detect_py_runner
+            pack_runner = _detect_py_runner(book.root)
+    if pack_name == "typescript" and pack_runner == "node":
+        parts.append(
+            "\nTest runner: Node built-in `node:test` (`import test from \"node:test\"; "
+            "import assert from \"node:assert/strict\";` with explicit `.ts` extensions on "
+            "relative imports; do not import `vitest` or `jest`)."
+        )
+    elif pack_name == "python" and pack_runner == "unittest":
+        parts.append(
+            "\nTest runner: Python stdlib `unittest` (`unittest.TestCase` subclasses; "
+            "`pytest` is not installed)."
+        )
+
     if conventions:
         parts.append("\nTest conventions (authoritative):\n" + conventions)
 
@@ -354,7 +375,8 @@ def test_writer_brief(card: Card, book: BriefBook, pack,
     if card.new_symbols:
         parts.append(
             "\nThis card declares new symbols. You may append stubs that fail when\n"
-            "called (Rust: `todo!()`; Python: `raise NotImplementedError`) with\n"
+            "called (Rust: `todo!()`; Python: `raise NotImplementedError`; "
+            "TypeScript: `throw new Error(\"not implemented\")`) with\n"
             "`append_stub` in files in your touches, additions only.")
         parts.append("\n" + STUB_FORMAT)
 

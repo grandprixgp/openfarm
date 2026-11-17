@@ -560,7 +560,8 @@ _OP_RULES = {
         "and nothing else. Edit only production files listed in card.touches, "
         "never a test file: the test writer writes those. Every new function's "
         "body is only a stub that fails when called: Rust `todo!()` or "
-        "`unimplemented!()`, Python `raise NotImplementedError`. Imports, types, "
+        "`unimplemented!()`, Python `raise NotImplementedError`, TypeScript "
+        "`throw new Error(\"not implemented\")`. Imports, types, "
         "classes and typed fields are fine; no other logic, no default values "
         "computed from input. Return {\"edits\": []} if nothing is needed."
     ),
@@ -1530,6 +1531,16 @@ class Micromanager:
                         f"{edit.path}: a Python scaffold may only declare: imports, "
                         "classes, typed fields and functions whose body is "
                         "`raise NotImplementedError`",
+                    )
+            elif norm_path.endswith((".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs")):
+                from .packs.typescript import _has_balanced_braces, _strip_ts_comments_text
+
+                stripped_ts = _strip_ts_comments_text(body)
+                if not re.search(r"\bthrow\s+new\s+Error\b", stripped_ts) or not _has_balanced_braces(body):
+                    raise Refused(
+                        "scaffold-missing-todo",
+                        f"{edit.path}: TypeScript scaffold must contain `throw new Error(...)` "
+                        "stubs with balanced braces",
                     )
             elif not _valid_production_scaffold(body):
                 raise Refused(

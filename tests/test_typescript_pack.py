@@ -854,6 +854,58 @@ class TypeScriptE2ETests(unittest.TestCase):
         self.assertEqual(out_unprovable["final_state"], "blocked")
         self.assertEqual(out_unprovable["stop_code"], "tests-unprovable")
 
+    def test_typescript_brief_runner_hint_and_scaffold_validation(self) -> None:
+        from openfarm_core.briefs import BriefBook, test_writer_brief
+        from openfarm_core.micromanager import Micromanager, ScriptedMicromanager
+
+        root = _project({
+            "package.json": json.dumps({"name": "app", "type": "module", "scripts": {"test": "node --test --test-reporter=tap"}}),
+            "src/slug.ts": "export const x = 1;\n",
+        }, self)
+        card = Card(
+            id="TS-1",
+            title="Add slug",
+            state="ready",
+            done_text="adds slug",
+            touches=["src/slug.ts"],
+            fields={
+                "category": "small-feature",
+                "unit": ".",
+                "new_symbols": True,
+                "tests": [{"name": "adds slug", "file": "tests/slug.test.ts", "asserts": "x == 1"}],
+            },
+        )
+        pack = TypeScriptPack(worktree=root)
+        pack.configure(root)
+        brief = test_writer_brief(card, BriefBook(root, [], []), pack).body
+        self.assertIn("node:test", brief)
+        self.assertIn('throw new Error("not implemented")', brief)
+
+        mm = Micromanager(ScriptedMicromanager({
+            "scaffold_contract": {
+                "edits": [{
+                    "format": "whole_file",
+                    "path": "src/slug.ts",
+                    "content": 'export function s(): string {\n  throw new Error("not implemented");\n}\n',
+                }],
+            },
+        }))
+        edits = mm.scaffold_contract(card, {}, {})
+        self.assertEqual([e.path for e in edits], ["src/slug.ts"])
+
+        mm_bad = Micromanager(ScriptedMicromanager({
+            "scaffold_contract": {
+                "edits": [{
+                    "format": "whole_file",
+                    "path": "src/slug.ts",
+                    "content": 'export function s(): string { return "implemented"; }\n',
+                }],
+            },
+        }))
+        with self.assertRaises(Refused) as caught:
+            mm_bad.scaffold_contract(card, {}, {})
+        self.assertEqual(caught.exception.code, "scaffold-missing-todo")
+
 
 if __name__ == "__main__":
     unittest.main()

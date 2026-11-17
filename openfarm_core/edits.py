@@ -123,8 +123,11 @@ def parse_edits(text: str) -> list[Edit]:
             continue
 
         if fmt == FORMAT_APPEND_STUB:
-            name_match = re.match(r"\s*(?P<name>\S+)\s*\n", body)
-            if not name_match:
+            name_match = re.match(
+                r"[ \t]*(?:\r?\n)*[ \t]*(?P<name>[^\r\n]+?)[ \t]*\r?\n",
+                body,
+            )
+            if not name_match or not body[name_match.end():].strip():
                 raise Invalid("bad-block",
                               f"{path}: append_stub needs the test's name on the "
                               f"first line, then the stub body")
@@ -156,7 +159,10 @@ _TRAILING_JUNK = re.compile(
 # Any bare closing tag (`</test>`, `</answer>`). No Python or Rust file can end on
 # one, so for those it is always leaked markup; elsewhere `</html>` is real.
 _CLOSING_TAG = re.compile(r"^\s*</[A-Za-z_][\w-]*>\s*$")
-_TAGLESS_SUFFIXES = (".py", ".pyi", ".rs")
+_TAGLESS_SUFFIXES = (
+    ".py", ".pyi", ".rs",
+    ".ts", ".mts", ".cts", ".js", ".mjs", ".cjs",
+)
 
 
 def _unfence(body: str, path: str = "") -> str:

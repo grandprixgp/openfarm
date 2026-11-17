@@ -56,7 +56,13 @@ provider = {provider!r}
 mode = {mode!r}
 log_file = {log_str!r}
 args = sys.argv[1:]
-prompt_raw = sys.stdin.read()
+if provider == "antigravity" and "-p" in args:
+    p_idx = args.index("-p")
+    prompt_raw = args[p_idx + 1] if p_idx + 1 < len(args) else ""
+    stdin_raw = sys.stdin.read()
+else:
+    prompt_raw = sys.stdin.read()
+    stdin_raw = prompt_raw
 
 if log_file:
     entry = {{"args": args, "prompt": prompt_raw, "home": os.environ.get("HOME", "")}}
@@ -107,7 +113,8 @@ if mode == "inspect":
     info = {{
         "args": args,
         "has_bare": "--bare" in args,
-        "stdin": prompt_raw,
+        "stdin": stdin_raw,
+        "prompt": prompt_raw,
         "home": os.environ.get("HOME", ""),
         "codex_home": os.environ.get("CODEX_HOME", ""),
         "cwd": os.getcwd(),
@@ -369,7 +376,10 @@ class DriverAgentUnitTests(unittest.TestCase):
             "medium",
         ):
             self.assertIn(req_flag, a_info["args"])
-        self.assertIn("SYS_AG", a_info["stdin"])
+        self.assertEqual(a_info["args"][-2], "-p")
+        self.assertIn("SYS_AG", a_info["args"][-1])
+        self.assertIn("hello agy", a_info["args"][-1])
+        self.assertEqual(a_info["stdin"], "")
         self.assertNotEqual(a_info["home"], str(fake_host_home))
         self.assertEqual(a_info["gemini_key"], "")
         self.assertEqual(a_info["google_key"], "")
@@ -785,6 +795,33 @@ class DriverModeEndToEndTests(unittest.TestCase):
         for op in ("shape_and_plan", "scaffold_contract", "coach", "adjudicate_checker", "pre_review", "reflect_harness"):
             ans = _minimal_valid_answer_for_question({"expects": {"op": op}})
             self.assertIsInstance(ans, dict)
+
+    def test_drive_cleans_up_run_lock_on_driver_error(self) -> None:
+        self._add_card_1()
+        sp = self._worker_script()
+        bad_bin = self.tmp / "bin-fail"
+        bad_bin.mkdir()
+        fail_script = bad_bin / "claude"
+        fail_script.write_text(
+            "#!/usr/bin/env python3\nimport json\n"
+            "print(json.dumps({'type': 'result', 'is_error': True, 'result': 'weekly quota hit'}))\n",
+            encoding="utf-8",
+        )
+        fail_script.chmod(0o755)
+        with self.assertRaises(Exception):
+            drive_run(
+                self.toy.root,
+                load_config(self.toy.root),
+                StateDir(self.toy.state_dir),
+                agent="claude",
+                seat="both",
+                cards=1,
+                driver_bin=str(fail_script),
+                script=sp,
+            )
+        self.assertFalse((self.toy.state_dir / "run.lock").exists())
+        cfg = load_config(self.toy.root)
+        self.assertFalse(Path(cfg.kill_switch).exists())
 
     def test_python_pack_patterns_clean_on_stage2_files(self) -> None:
         pack = PythonPack()

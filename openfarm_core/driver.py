@@ -198,11 +198,13 @@ def _extract_usage_counts(parsed: dict, *, provider: str) -> tuple[int, int, flo
         "input_tokens" in usage
         or "cache_creation_input_tokens" in usage
         or "cache_read_input_tokens" in usage
+        or "cache_read_tokens" in usage
     ):
         tokens_in = (
             int(usage.get("input_tokens", 0) or 0)
             + int(usage.get("cache_creation_input_tokens", 0) or 0)
             + int(usage.get("cache_read_input_tokens", 0) or 0)
+            + int(usage.get("cache_read_tokens", 0) or 0)
         )
     else:
         tokens_in = int(
@@ -212,13 +214,14 @@ def _extract_usage_counts(parsed: dict, *, provider: str) -> tuple[int, int, flo
             or usage.get("inputTokens")
             or 0
         )
-    tokens_out = int(
+    base_out = int(
         usage.get("output_tokens")
         or usage.get("completion_tokens")
         or usage.get("candidatesTokenCount")
         or usage.get("outputTokens")
         or 0
     )
+    tokens_out = base_out + int(usage.get("thinking_tokens", 0) or 0)
     cost_usd = float(parsed.get("total_cost_usd") or usage.get("cost_usd") or 0.0)
     return tokens_in, tokens_out, cost_usd
 
@@ -292,7 +295,11 @@ def _parse_driver_output(
                     raw_res = parsed.get("text")
                 text = "" if raw_res is None else str(raw_res)
                 tokens_in, tokens_out, cost_usd = _extract_usage_counts(parsed, provider="codex")
-                is_error = bool(parsed.get("is_error")) or bool(parsed.get("error"))
+                is_error = (
+                    bool(parsed.get("is_error"))
+                    or bool(parsed.get("error"))
+                    or str(parsed.get("status") or "").upper() == "ERROR"
+                )
                 if is_error:
                     err_msg = text or str(parsed.get("error") or "")
             else:
@@ -301,7 +308,11 @@ def _parse_driver_output(
         parsed = _parse_single_json_dict(stdout_clean)
         if parsed is not None:
             raw_err = parsed.get("error")
-            is_error = bool(parsed.get("is_error")) or bool(raw_err)
+            is_error = (
+                bool(parsed.get("is_error"))
+                or bool(raw_err)
+                or str(parsed.get("status") or "").upper() == "ERROR"
+            )
             raw_res = (
                 parsed.get("result")
                 if parsed.get("result") is not None
@@ -392,7 +403,7 @@ class DriverAgent:
         default_name = {"claude": "claude", "antigravity": "agy", "codex": "codex"}[self.provider]
         return shutil.which(default_name) or default_name
 
-    def build_argv(self, *, system_prompt: str = "") -> list[str]:
+    def build_argv(self, *, system_prompt: str = "", prompt: str = "") -> list[str]:
         """Build read-only / no-write headless CLI invocation argv."""
         bin_path = self.resolve_bin()
         if self.provider == "claude":
@@ -423,7 +434,6 @@ class DriverAgent:
         if self.provider == "antigravity":
             argv = [
                 bin_path,
-                "-p",
                 "--output-format",
                 "json",
                 "--sandbox",
@@ -433,6 +443,12 @@ class DriverAgent:
                 argv.extend(["--model", self.model])
             if self.effort:
                 argv.extend(["--effort", self.effort])
+            full_prompt = (
+                f"{system_prompt}\n\n{prompt}"
+                if (system_prompt and prompt)
+                else (system_prompt or prompt)
+            )
+            argv.extend(["-p", full_prompt])
             return argv
 
         argv = [
@@ -543,15 +559,17 @@ class DriverAgent:
         if self._script is not None:
             return self._complete_scripted(prompt, turn_key=turn_key)
 
-        argv = self.build_argv(system_prompt=system_prompt)
+        argv = self.build_argv(system_prompt=system_prompt, prompt=prompt)
         if self.provider == "claude":
             stdin_text = prompt
+            sub_input = stdin_text
         else:
             stdin_text = (
                 f"{system_prompt}\n\n{prompt}"
                 if (system_prompt and prompt)
                 else (system_prompt or prompt)
             )
+            sub_input = "" if self.provider == "antigravity" else stdin_text
 
         orig_home = (self.extra_env or {}).get("HOME") or os.environ.get("HOME", "")
         env, isolated_home = _sanitised_env(
@@ -575,7 +593,7 @@ class DriverAgent:
                     argv,
                     cwd=str(self.cwd),
                     env=env,
-                    input=stdin_text,
+                    input=sub_input,
                     capture_output=True,
                     text=True,
                     timeout=self.timeout_s,
@@ -1883,281 +1901,81 @@ def drive_run(
         forbidden_files=active_cfg.forbidden_files,
         script=driver_script,
     ) as drv:
-        if not board.is_ended():
-            if clean_seat in ("both", "coordinator"):
-                swarm_join(
-                    board, active_cfg, name=coord_name, seat="coordinator", owner_kind="agent"
-                )
-            if clean_seat in ("both", "supervisor"):
-                swarm_join(
-                    board, active_cfg, name=sup_name, seat="supervisor", owner_kind="agent"
-                )
+        ks_path = Path(active_cfg.kill_switch) if getattr(active_cfg, "kill_switch", None) else None
+        ks_existed = ks_path.exists() if ks_path is not None else False
+        try:
+            if not board.is_ended():
+                if clean_seat in ("both", "coordinator"):
+                    swarm_join(
+                        board, active_cfg, name=coord_name, seat="coordinator", owner_kind="agent"
+                    )
+                if clean_seat in ("both", "supervisor"):
+                    swarm_join(
+                        board, active_cfg, name=sup_name, seat="supervisor", owner_kind="agent"
+                    )
 
-            sys_prompt = _build_driver_system_prompt(clean_seat, coord_name, sup_name)
-            scan_seq = 0
-            all_posts: list[dict] = []
+                sys_prompt = _build_driver_system_prompt(clean_seat, coord_name, sup_name)
+                scan_seq = 0
+                all_posts: list[dict] = []
 
-            while not board.is_ended():
-                if state.kill_requested(active_cfg.kill_switch):
-                    break
-                if run_thread is not None and not run_thread.is_alive() and board.is_ended():
-                    break
-
-                new_posts = board.read(
-                    as_name="*", since=scan_seq, limit=None, for_model=True, advance_cursor=False
-                )
-                if new_posts:
-                    all_posts.extend(new_posts)
-                    scan_seq = max(scan_seq, *(int(p.get("seq", 0) or 0) for p in new_posts))
-                    if target_ids is None:
-                        plan_ids = _plan_cards_from_posts(new_posts)
-                        if plan_ids:
-                            target_ids = plan_ids
-                    for m_seat, m_name in (("coordinator", coord_name), ("supervisor", sup_name)):
-                        if clean_seat in ("both", m_seat) and board.get_member(m_name) is not None:
-                            with contextlib.suppress(Refused):
-                                board.update_member(m_name, last_read_seq=scan_seq)
-
-                snap = _parse_board_state(
-                    board,
-                    all_posts=all_posts,
-                    card_map=card_map,
-                    target_ids=target_ids,
-                    sup_name=sup_name,
-                    answered_seqs=answered_seqs,
-                    resolved_event_seqs=resolved_event_seqs,
-                )
-                max_slots = max(1, int(active_cfg.concurrent_cards or 1))
-                free_slots = max(0, max_slots - len(snap["running_cards"]))
-                if managed and cards is not None:
-                    started_or_done = len(snap["running_cards"] | snap["finished_cards"])
-                    free_slots = min(free_slots, max(0, cards - started_or_done))
-
-                startable = (
-                    _startable_cards(snap["pending_ready"], snap["running_cards"], card_map, free_slots)
-                    if clean_seat in ("both", "coordinator")
-                    else []
-                )
-                coord_events = (
-                    snap["unresolved_events"]
-                    + (snap["finished_members"] if snap["pending_ready"] else [])
-                    if clean_seat in ("both", "coordinator")
-                    else []
-                )
-                open_qs = snap["open_questions"] if clean_seat in ("both", "supervisor") else []
-                actionable = bool(open_qs or startable or coord_events)
-
-                if not actionable:
-                    if run_thread is not None and not run_thread.is_alive():
+                while not board.is_ended():
+                    if state.kill_requested(active_cfg.kill_switch):
                         break
-                    board.wait_after(scan_seq, 0.2)
-                    continue
+                    if run_thread is not None and not run_thread.is_alive() and board.is_ended():
+                        break
 
-                if counters["turns"] >= max_turns:
-                    if clean_seat in ("both", "coordinator"):
-                        _apply_coordinator_fallback(
-                            board=board,
-                            cfg=active_cfg,
-                            source=source,
-                            card_map=card_map,
-                            coord_name=coord_name,
-                            turn_num=counters["turns"],
-                            state_snap=snap,
-                            free_slots=free_slots,
-                            resolved_event_seqs=resolved_event_seqs,
-                            actions_taken=actions_taken,
-                        )
-                    if clean_seat in ("both", "supervisor"):
-                        _apply_supervisor_fallback(
-                            board=board,
-                            sup_name=sup_name,
-                            turn_num=counters["turns"],
-                            open_questions=open_qs,
-                            answered_seqs=answered_seqs,
-                            answers_sent=answers_sent,
-                        )
-                    board.wait_after(scan_seq, 0.1)
-                    continue
-
-                open_qs_by_seq = {int(q["seq"]): q for q in open_qs}
-                turn_key = _pick_turn_key(open_qs, startable, coord_events)
-                prompt_payload = {
-                    "run_id": resolved_rid,
-                    "seat": clean_seat,
-                    "free_slots": free_slots,
-                    "pending_ready_cards": [
-                        {
-                            "id": c.id,
-                            "title": _sanitize_text(c.title),
-                            "category": c.category,
-                            "touches": list(c.touches),
-                            "depends": list(c.deps),
-                        }
-                        for c in startable
-                    ],
-                    "running_cards": sorted(snap["running_cards"]),
-                    "finished_cards_with_active_members": snap["finished_members"],
-                    "unresolved_events": [
-                        {
-                            **ev,
-                            "body": _sanitize_text(str(ev.get("body") or "")),
-                        }
-                        for ev in (snap["unresolved_events"] if clean_seat in ("both", "coordinator") else [])
-                    ],
-                    "tiers": {
-                        tname: {"model": t.model, "efforts": list(t.efforts)}
-                        for tname, t in (active_cfg.tiers or {}).items()
-                    },
-                    "roster": [
-                        {
-                            "name": m.get("name"),
-                            "role": m.get("role"),
-                            "kind": m.get("kind"),
-                            "state": m.get("state"),
-                            "card": m.get("card"),
-                            "tier": m.get("tier"),
-                            "effort": m.get("effort"),
-                        }
-                        for m in snap["members"]
-                    ],
-                    "recent_posts": [
-                        {
-                            "seq": p.get("seq"),
-                            "from": p.get("from"),
-                            "to": p.get("to"),
-                            "kind": p.get("kind"),
-                            "card": p.get("card"),
-                            "body": clean_post_body(str(p.get("body") or "")),
-                        }
-                        for p in all_posts[-15:]
-                    ],
-                    "open_questions": [_question_details(board, q) for q in open_qs],
-                }
-                user_prompt = json.dumps(prompt_payload, indent=2, ensure_ascii=False)
-
-                resp = drv.complete(user_prompt, system_prompt=sys_prompt, turn_key=turn_key)
-                counters["turns"] += 1
-                counters["tokens_in"] += resp.tokens_in
-                counters["tokens_out"] += resp.tokens_out
-                _record_driver_member_usage(
-                    board,
-                    clean_seat,
-                    coord_name,
-                    sup_name,
-                    resp.tokens_in,
-                    resp.tokens_out,
-                    "",
-                )
-
-                actions, answers, parse_errs = _parse_driver_turn(resp.text, seat=clean_seat)
-                exec_errs, started_n, _ans_n = _execute_driver_turn(
-                    board=board,
-                    cfg=active_cfg,
-                    source=source,
-                    card_map=card_map,
-                    seat=clean_seat,
-                    coord_name=coord_name,
-                    sup_name=sup_name,
-                    turn_num=counters["turns"],
-                    actions=actions,
-                    answers=answers,
-                    open_qs_by_seq=open_qs_by_seq,
-                    answered_seqs=answered_seqs,
-                    resolved_event_seqs=resolved_event_seqs,
-                    unresolved_events=snap["unresolved_events"],
-                    finished_cards=snap["finished_cards"],
-                    running_cards=snap["running_cards"],
-                    free_slots=free_slots,
-                    actions_taken=actions_taken,
-                    answers_sent=answers_sent,
-                )
-
-                unanswered_qs = [q for q in open_qs if int(q["seq"]) not in answered_seqs]
-                still_blocking_coord = (
-                    clean_seat in ("both", "coordinator")
-                    and (
-                        bool([
-                            ev for ev in snap["unresolved_events"]
-                            if int(ev["seq"]) not in resolved_event_seqs and ev.get("type") != "stall"
-                        ])
-                        or (bool(startable) and len(snap["running_cards"]) == 0 and started_n == 0)
+                    new_posts = board.read(
+                        as_name="*", since=scan_seq, limit=None, for_model=True, advance_cursor=False
                     )
-                )
-                all_errs = parse_errs + exec_errs
-                if unanswered_qs:
-                    all_errs.append(
-                        "missing answers for question(s): "
-                        + ", ".join(f"#{q['seq']}" for q in unanswered_qs)
-                    )
-                if still_blocking_coord and not all_errs:
-                    all_errs.append(
-                        "pending ready card(s) or handback/struggling event still need action"
-                    )
+                    if new_posts:
+                        all_posts.extend(new_posts)
+                        scan_seq = max(scan_seq, *(int(p.get("seq", 0) or 0) for p in new_posts))
+                        if target_ids is None:
+                            plan_ids = _plan_cards_from_posts(new_posts)
+                            if plan_ids:
+                                target_ids = plan_ids
+                        for m_seat, m_name in (("coordinator", coord_name), ("supervisor", sup_name)):
+                            if clean_seat in ("both", m_seat) and board.get_member(m_name) is not None:
+                                with contextlib.suppress(Refused):
+                                    board.update_member(m_name, last_read_seq=scan_seq)
 
-                if all_errs:
-                    if counters["turns"] < max_turns:
-                        corr_prompt = (
-                            "Previous JSON turn had issue(s): "
-                            + "; ".join(all_errs)
-                            + ".\nReply ONLY with corrected JSON {\"actions\": [...], \"answers\": [...]}."
-                        )
-                        corr_resp = drv.complete(
-                            corr_prompt,
-                            system_prompt=sys_prompt,
-                            turn_key=f"driver/correction/{counters['turns']}",
-                        )
-                        counters["turns"] += 1
-                        counters["tokens_in"] += corr_resp.tokens_in
-                        counters["tokens_out"] += corr_resp.tokens_out
-                        _record_driver_member_usage(
-                            board,
-                            clean_seat,
-                            coord_name,
-                            sup_name,
-                            corr_resp.tokens_in,
-                            corr_resp.tokens_out,
-                            "",
-                        )
-                        c_actions, c_answers, c_parse_errs = _parse_driver_turn(
-                            corr_resp.text, seat=clean_seat
-                        )
-                        c_exec_errs, c_started_n, _ = _execute_driver_turn(
-                            board=board,
-                            cfg=active_cfg,
-                            source=source,
-                            card_map=card_map,
-                            seat=clean_seat,
-                            coord_name=coord_name,
-                            sup_name=sup_name,
-                            turn_num=counters["turns"],
-                            actions=c_actions,
-                            answers=c_answers,
-                            open_qs_by_seq=open_qs_by_seq,
-                            answered_seqs=answered_seqs,
-                            resolved_event_seqs=resolved_event_seqs,
-                            unresolved_events=snap["unresolved_events"],
-                            finished_cards=snap["finished_cards"],
-                            running_cards=snap["running_cards"],
-                            free_slots=free_slots,
-                            actions_taken=actions_taken,
-                            answers_sent=answers_sent,
-                        )
-                        started_n += c_started_n
-                        all_errs = c_parse_errs + c_exec_errs
-                    still_qs = [q for q in open_qs if int(q["seq"]) not in answered_seqs]
-                    still_coord = (
-                        clean_seat in ("both", "coordinator")
-                        and (
-                            bool([
-                                ev for ev in snap["unresolved_events"]
-                                if int(ev["seq"]) not in resolved_event_seqs and ev.get("type") != "stall"
-                            ])
-                            or (bool(startable) and len(snap["running_cards"]) == 0)
-                            or bool(snap["finished_members"])
-                        )
+                    snap = _parse_board_state(
+                        board,
+                        all_posts=all_posts,
+                        card_map=card_map,
+                        target_ids=target_ids,
+                        sup_name=sup_name,
+                        answered_seqs=answered_seqs,
+                        resolved_event_seqs=resolved_event_seqs,
                     )
-                    if all_errs or still_qs or still_coord:
-                        if clean_seat in ("both", "coordinator") and (all_errs or still_coord):
+                    max_slots = max(1, int(active_cfg.concurrent_cards or 1))
+                    free_slots = max(0, max_slots - len(snap["running_cards"]))
+                    if managed and cards is not None:
+                        started_or_done = len(snap["running_cards"] | snap["finished_cards"])
+                        free_slots = min(free_slots, max(0, cards - started_or_done))
+
+                    startable = (
+                        _startable_cards(snap["pending_ready"], snap["running_cards"], card_map, free_slots)
+                        if clean_seat in ("both", "coordinator")
+                        else []
+                    )
+                    coord_events = (
+                        snap["unresolved_events"]
+                        + (snap["finished_members"] if snap["pending_ready"] else [])
+                        if clean_seat in ("both", "coordinator")
+                        else []
+                    )
+                    open_qs = snap["open_questions"] if clean_seat in ("both", "supervisor") else []
+                    actionable = bool(open_qs or startable or coord_events)
+
+                    if not actionable:
+                        if run_thread is not None and not run_thread.is_alive():
+                            break
+                        board.wait_after(scan_seq, 0.2)
+                        continue
+
+                    if counters["turns"] >= max_turns:
+                        if clean_seat in ("both", "coordinator"):
                             _apply_coordinator_fallback(
                                 board=board,
                                 cfg=active_cfg,
@@ -2170,51 +1988,266 @@ def drive_run(
                                 resolved_event_seqs=resolved_event_seqs,
                                 actions_taken=actions_taken,
                             )
-                        if clean_seat in ("both", "supervisor") and still_qs:
+                        if clean_seat in ("both", "supervisor"):
                             _apply_supervisor_fallback(
                                 board=board,
                                 sup_name=sup_name,
                                 turn_num=counters["turns"],
-                                open_questions=still_qs,
+                                open_questions=open_qs,
                                 answered_seqs=answered_seqs,
                                 answers_sent=answers_sent,
                             )
+                        board.wait_after(scan_seq, 0.1)
+                        continue
 
-                if clean_seat in ("both", "coordinator") and snap["finished_members"]:
-                    for fm in snap["finished_members"]:
-                        m = board.get_member(fm["member"])
-                        if m is not None and m.get("state") != "removed":
-                            with contextlib.suppress(Refused):
-                                swarm_remove(
-                                    board,
-                                    active_cfg,
-                                    caller=coord_name,
-                                    member_name=fm["member"],
-                                    finished_cards=snap["finished_cards"],
-                                    cards_by_id=card_map,
+                    open_qs_by_seq = {int(q["seq"]): q for q in open_qs}
+                    turn_key = _pick_turn_key(open_qs, startable, coord_events)
+                    prompt_payload = {
+                        "run_id": resolved_rid,
+                        "seat": clean_seat,
+                        "free_slots": free_slots,
+                        "pending_ready_cards": [
+                            {
+                                "id": c.id,
+                                "title": _sanitize_text(c.title),
+                                "category": c.category,
+                                "touches": list(c.touches),
+                                "depends": list(c.deps),
+                            }
+                            for c in startable
+                        ],
+                        "running_cards": sorted(snap["running_cards"]),
+                        "finished_cards_with_active_members": snap["finished_members"],
+                        "unresolved_events": [
+                            {
+                                **ev,
+                                "body": _sanitize_text(str(ev.get("body") or "")),
+                            }
+                            for ev in (snap["unresolved_events"] if clean_seat in ("both", "coordinator") else [])
+                        ],
+                        "tiers": {
+                            tname: {"model": t.model, "efforts": list(t.efforts)}
+                            for tname, t in (active_cfg.tiers or {}).items()
+                        },
+                        "roster": [
+                            {
+                                "name": m.get("name"),
+                                "role": m.get("role"),
+                                "kind": m.get("kind"),
+                                "state": m.get("state"),
+                                "card": m.get("card"),
+                                "tier": m.get("tier"),
+                                "effort": m.get("effort"),
+                            }
+                            for m in snap["members"]
+                        ],
+                        "recent_posts": [
+                            {
+                                "seq": p.get("seq"),
+                                "from": p.get("from"),
+                                "to": p.get("to"),
+                                "kind": p.get("kind"),
+                                "card": p.get("card"),
+                                "body": clean_post_body(str(p.get("body") or "")),
+                            }
+                            for p in all_posts[-15:]
+                        ],
+                        "open_questions": [_question_details(board, q) for q in open_qs],
+                    }
+                    user_prompt = json.dumps(prompt_payload, indent=2, ensure_ascii=False)
+
+                    resp = drv.complete(user_prompt, system_prompt=sys_prompt, turn_key=turn_key)
+                    counters["turns"] += 1
+                    counters["tokens_in"] += resp.tokens_in
+                    counters["tokens_out"] += resp.tokens_out
+                    _record_driver_member_usage(
+                        board,
+                        clean_seat,
+                        coord_name,
+                        sup_name,
+                        resp.tokens_in,
+                        resp.tokens_out,
+                        "",
+                    )
+
+                    actions, answers, parse_errs = _parse_driver_turn(resp.text, seat=clean_seat)
+                    exec_errs, started_n, _ans_n = _execute_driver_turn(
+                        board=board,
+                        cfg=active_cfg,
+                        source=source,
+                        card_map=card_map,
+                        seat=clean_seat,
+                        coord_name=coord_name,
+                        sup_name=sup_name,
+                        turn_num=counters["turns"],
+                        actions=actions,
+                        answers=answers,
+                        open_qs_by_seq=open_qs_by_seq,
+                        answered_seqs=answered_seqs,
+                        resolved_event_seqs=resolved_event_seqs,
+                        unresolved_events=snap["unresolved_events"],
+                        finished_cards=snap["finished_cards"],
+                        running_cards=snap["running_cards"],
+                        free_slots=free_slots,
+                        actions_taken=actions_taken,
+                        answers_sent=answers_sent,
+                    )
+
+                    unanswered_qs = [q for q in open_qs if int(q["seq"]) not in answered_seqs]
+                    still_blocking_coord = (
+                        clean_seat in ("both", "coordinator")
+                        and (
+                            bool([
+                                ev for ev in snap["unresolved_events"]
+                                if int(ev["seq"]) not in resolved_event_seqs and ev.get("type") != "stall"
+                            ])
+                            or (bool(startable) and len(snap["running_cards"]) == 0 and started_n == 0)
+                        )
+                    )
+                    all_errs = parse_errs + exec_errs
+                    if unanswered_qs:
+                        all_errs.append(
+                            "missing answers for question(s): "
+                            + ", ".join(f"#{q['seq']}" for q in unanswered_qs)
+                        )
+                    if still_blocking_coord and not all_errs:
+                        all_errs.append(
+                            "pending ready card(s) or handback/struggling event still need action"
+                        )
+
+                    if all_errs:
+                        if counters["turns"] < max_turns:
+                            corr_prompt = (
+                                "Previous JSON turn had issue(s): "
+                                + "; ".join(all_errs)
+                                + ".\nReply ONLY with corrected JSON {\"actions\": [...], \"answers\": [...]}."
+                            )
+                            corr_resp = drv.complete(
+                                corr_prompt,
+                                system_prompt=sys_prompt,
+                                turn_key=f"driver/correction/{counters['turns']}",
+                            )
+                            counters["turns"] += 1
+                            counters["tokens_in"] += corr_resp.tokens_in
+                            counters["tokens_out"] += corr_resp.tokens_out
+                            _record_driver_member_usage(
+                                board,
+                                clean_seat,
+                                coord_name,
+                                sup_name,
+                                corr_resp.tokens_in,
+                                corr_resp.tokens_out,
+                                "",
+                            )
+                            c_actions, c_answers, c_parse_errs = _parse_driver_turn(
+                                corr_resp.text, seat=clean_seat
+                            )
+                            c_exec_errs, c_started_n, _ = _execute_driver_turn(
+                                board=board,
+                                cfg=active_cfg,
+                                source=source,
+                                card_map=card_map,
+                                seat=clean_seat,
+                                coord_name=coord_name,
+                                sup_name=sup_name,
+                                turn_num=counters["turns"],
+                                actions=c_actions,
+                                answers=c_answers,
+                                open_qs_by_seq=open_qs_by_seq,
+                                answered_seqs=answered_seqs,
+                                resolved_event_seqs=resolved_event_seqs,
+                                unresolved_events=snap["unresolved_events"],
+                                finished_cards=snap["finished_cards"],
+                                running_cards=snap["running_cards"],
+                                free_slots=free_slots,
+                                actions_taken=actions_taken,
+                                answers_sent=answers_sent,
+                            )
+                            started_n += c_started_n
+                            all_errs = c_parse_errs + c_exec_errs
+                        still_qs = [q for q in open_qs if int(q["seq"]) not in answered_seqs]
+                        still_coord = (
+                            clean_seat in ("both", "coordinator")
+                            and (
+                                bool([
+                                    ev for ev in snap["unresolved_events"]
+                                    if int(ev["seq"]) not in resolved_event_seqs and ev.get("type") != "stall"
+                                ])
+                                or (bool(startable) and len(snap["running_cards"]) == 0)
+                                or bool(snap["finished_members"])
+                            )
+                        )
+                        if all_errs or still_qs or still_coord:
+                            if clean_seat in ("both", "coordinator") and (all_errs or still_coord):
+                                _apply_coordinator_fallback(
+                                    board=board,
+                                    cfg=active_cfg,
                                     source=source,
+                                    card_map=card_map,
+                                    coord_name=coord_name,
+                                    turn_num=counters["turns"],
+                                    state_snap=snap,
+                                    free_slots=free_slots,
+                                    resolved_event_seqs=resolved_event_seqs,
+                                    actions_taken=actions_taken,
+                                )
+                            if clean_seat in ("both", "supervisor") and still_qs:
+                                _apply_supervisor_fallback(
+                                    board=board,
+                                    sup_name=sup_name,
+                                    turn_num=counters["turns"],
+                                    open_questions=still_qs,
+                                    answered_seqs=answered_seqs,
+                                    answers_sent=answers_sent,
                                 )
 
-        if run_thread is not None:
-            run_thread.join(timeout=30.0)
-        if run_exc:
-            raise run_exc[0]
+                    if clean_seat in ("both", "coordinator") and snap["finished_members"]:
+                        for fm in snap["finished_members"]:
+                            m = board.get_member(fm["member"])
+                            if m is not None and m.get("state") != "removed":
+                                with contextlib.suppress(Refused):
+                                    swarm_remove(
+                                        board,
+                                        active_cfg,
+                                        caller=coord_name,
+                                        member_name=fm["member"],
+                                        finished_cards=snap["finished_cards"],
+                                        cards_by_id=card_map,
+                                        source=source,
+                                    )
 
-        managed_payload = run_ctx.captured_payload if run_ctx is not None else None
-        outcomes = _collect_outcomes(state, resolved_rid, managed_payload)
-        reviews: list[dict] = []
-        if wave:
-            reviews = _review_wave(
-                repo=repo,
-                cfg=active_cfg,
-                state=state,
-                run_id=resolved_rid,
-                outcomes=outcomes,
-                agent=drv,
-                record_verdict=record_verdict,
-                counters=counters,
-                max_turns=max_turns,
-            )
+            if run_thread is not None:
+                run_thread.join(timeout=30.0)
+            if run_exc:
+                raise run_exc[0]
+
+            managed_payload = run_ctx.captured_payload if run_ctx is not None else None
+            outcomes = _collect_outcomes(state, resolved_rid, managed_payload)
+            reviews: list[dict] = []
+            if wave:
+                reviews = _review_wave(
+                    repo=repo,
+                    cfg=active_cfg,
+                    state=state,
+                    run_id=resolved_rid,
+                    outcomes=outcomes,
+                    agent=drv,
+                    record_verdict=record_verdict,
+                    counters=counters,
+                    max_turns=max_turns,
+                )
+        finally:
+            if managed and run_thread is not None and run_thread.is_alive():
+                with contextlib.suppress(Exception):
+                    board.end(reason="driver-aborted")
+                if ks_path is not None and not ks_existed:
+                    with contextlib.suppress(OSError):
+                        ks_path.parent.mkdir(parents=True, exist_ok=True)
+                        ks_path.write_text("driver-aborted\n", encoding="utf-8")
+                run_thread.join(timeout=15.0)
+                if ks_path is not None and not ks_existed:
+                    with contextlib.suppress(OSError):
+                        ks_path.unlink(missing_ok=True)
 
     has_infra = any(o.get("stop_code") == "infra" for o in outcomes) or (
         bool(run_rc) and run_rc[0] != 0

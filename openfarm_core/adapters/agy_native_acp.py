@@ -74,11 +74,13 @@ def _extract_usage(parsed: dict) -> tuple[int, int, float]:
         "input_tokens" in usage
         or "cache_creation_input_tokens" in usage
         or "cache_read_input_tokens" in usage
+        or "cache_read_tokens" in usage
     ):
         tokens_in = (
             int(usage.get("input_tokens", 0) or 0)
             + int(usage.get("cache_creation_input_tokens", 0) or 0)
             + int(usage.get("cache_read_input_tokens", 0) or 0)
+            + int(usage.get("cache_read_tokens", 0) or 0)
         )
     else:
         tokens_in = int(
@@ -87,13 +89,14 @@ def _extract_usage(parsed: dict) -> tuple[int, int, float]:
             or usage.get("inputTokens")
             or 0
         )
-    tokens_out = int(
+    base_out = int(
         usage.get("output_tokens")
         or usage.get("completion_tokens")
         or usage.get("candidatesTokenCount")
         or usage.get("outputTokens")
         or 0
     )
+    tokens_out = base_out + int(usage.get("thinking_tokens", 0) or 0)
     turn_cost = float(parsed.get("total_cost_usd", 0.0) or 0.0)
     return tokens_in, tokens_out, turn_cost
 
@@ -255,10 +258,9 @@ class NativeAgyAcpServer:
             return
         self._send_result(req_id, {})
 
-    def _build_agy_argv(self, session: dict) -> list[str]:
+    def _build_agy_argv(self, session: dict, full_prompt: str = "") -> list[str]:
         argv = [
             self.agy_bin,
-            "-p",
             "--output-format",
             "json",
             "--sandbox",
@@ -268,6 +270,7 @@ class NativeAgyAcpServer:
             argv.extend(["--model", session["model"]])
         if session["effort"]:
             argv.extend(["--effort", session["effort"]])
+        argv.extend(["-p", full_prompt])
         return argv
 
     def _run_prompt(self, req_id: object, params: dict) -> None:
@@ -287,7 +290,7 @@ class NativeAgyAcpServer:
         with self._proc_lock:
             self._cancelled_sessions.discard(sid)
 
-        argv = self._build_agy_argv(session)
+        argv = self._build_agy_argv(session, full_prompt)
         try:
             proc = subprocess.Popen(
                 argv,
@@ -308,7 +311,7 @@ class NativeAgyAcpServer:
             self._terminate_session_proc(sid)
 
         try:
-            stdout_b, stderr_b = proc.communicate(input=full_prompt.encode("utf-8"))
+            stdout_b, stderr_b = proc.communicate(input=b"")
         finally:
             with self._proc_lock:
                 self._active_procs.pop(sid, None)
@@ -342,7 +345,11 @@ class NativeAgyAcpServer:
             return
 
         raw_err = parsed.get("error")
-        is_error = bool(parsed.get("is_error")) or bool(raw_err)
+        is_error = (
+            bool(parsed.get("is_error"))
+            or bool(raw_err)
+            or str(parsed.get("status") or "").upper() == "ERROR"
+        )
         raw_res = (
             parsed.get("result")
             if parsed.get("result") is not None

@@ -167,6 +167,24 @@ class StubTests(unittest.TestCase):
         self.assertEqual(edits[0].test_name, "a_named_test")
         self.assertIn("pub fn missing", edits[0].content)
 
+    def test_multiword_stub_name_ts_closing_tag_and_empty_body_refused(self) -> None:
+        from openfarm_core.errors import Invalid
+
+        ts_text = (
+            "=== append_stub: src/slug.ts\n"
+            "boundedSlug trims and drops trailing dash\n"
+            "export function boundedSlug(): string {\n"
+            '  throw new Error("not implemented");\n'
+            "}\n"
+            "</test>\n"
+        )
+        edits = parse_edits(ts_text)
+        self.assertEqual(edits[0].test_name, "boundedSlug trims and drops trailing dash")
+        self.assertNotIn("</test>", edits[0].content)
+
+        with self.assertRaises(Invalid):
+            parse_edits("=== append_stub: src/slug.ts\nonly_test_name\n")
+
 
 if __name__ == "__main__":
     unittest.main()

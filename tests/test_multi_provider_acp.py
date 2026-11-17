@@ -99,7 +99,11 @@ if mode == "sleep":
     time.sleep(15.0)
     raise SystemExit(0)
 
-prompt_text = sys.stdin.read()
+if "-p" in args:
+    _p_idx = args.index("-p")
+    prompt_text = args[_p_idx + 1] if _p_idx + 1 < len(args) else sys.stdin.read()
+else:
+    prompt_text = sys.stdin.read()
 if mode == "logged-out":
     print(json.dumps({{"type": "turn.failed", "error": {{"message": "Not logged in; run codex login"}}}}))
     raise SystemExit(1)
@@ -214,7 +218,11 @@ if args and args[0] == "acp":
             break
     raise SystemExit(0)
 
-prompt_text = sys.stdin.read()
+if "-p" in args:
+    _p_idx = args.index("-p")
+    prompt_text = args[_p_idx + 1] if _p_idx + 1 < len(args) else sys.stdin.read()
+else:
+    prompt_text = sys.stdin.read()
 if mode == "logged-out":
     print(json.dumps({{
         "is_error": True,
@@ -338,6 +346,22 @@ class MultiProviderEnvAndSyncTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, iso, ignore_errors=True)
         self.assertNotIn("GEMINI_API_KEY", env)
         self.assertNotIn("GOOGLE_API_KEY", env)
+
+        env_ag_strip, iso_ag_strip = _sanitised_env(
+            provider="claude",
+            base_env={
+                "HOME": str(fake_home),
+                "PATH": os.environ.get("PATH", "/usr/bin"),
+                "ANTIGRAVITY_APP_DATA_DIR": "/tmp/leaked",
+                "ANTIGRAVITY_CSRF_TOKEN": "csrf-secret",
+            },
+            isolate_home=True,
+            auth_mode="oauth",
+        )
+        if iso_ag_strip is not None:
+            self.addCleanup(shutil.rmtree, iso_ag_strip, ignore_errors=True)
+        self.assertNotIn("ANTIGRAVITY_APP_DATA_DIR", env_ag_strip)
+        self.assertNotIn("ANTIGRAVITY_CSRF_TOKEN", env_ag_strip)
         iso_tok = iso / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
         self.assertTrue(iso_tok.is_file())
         self.assertEqual(stat.S_IMODE(iso_tok.stat().st_mode), 0o600)
@@ -582,7 +606,6 @@ class NativeBridgesAndHandshakeTests(unittest.TestCase):
             self.assertEqual(
                 body["seen_args"],
                 [
-                    "-p",
                     "--output-format",
                     "json",
                     "--sandbox",
@@ -591,6 +614,8 @@ class NativeBridgesAndHandshakeTests(unittest.TestCase):
                     "gemini-3-pro",
                     "--effort",
                     "max",
+                    "-p",
+                    "SYS_AGY\n\nshape card",
                 ],
             )
             self.assertIn("SYS_AGY", body["prompt"])
