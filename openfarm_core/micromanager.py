@@ -579,6 +579,16 @@ _OP_RULES = {
         "projects, so when in doubt say \"project\". Notes about openfarm's own "
         "harness bookkeeping are always \"project\"."
     ),
+    "handback_triage": (
+        "A worker handed its card back instead of answering with edits. Read the "
+        "worker's reason (`handback_reason`), the failing detail and the card, and "
+        "choose one action. \"hint\": a short note the worker sees in its next brief "
+        "(put it in `body`; prose only, never code or edit blocks). \"set\": run the "
+        "worker again at another tier and/or effort (`tier`, `effort`; each must be one "
+        "listed under `tiers`). \"block\": stop the card for the owner (say why in "
+        "`reason`), for example when the card or its frozen tests are wrong, which only "
+        "the owner may change. Nobody but the owner changes the card or its tests."
+    ),
 }
 
 
@@ -620,6 +630,10 @@ def _build_op_prompt(op: str, payload: dict) -> str:
             '"cue": "...", "lesson": "...", "evidence": "...", '
             '"confidence": 0.75, "tags": ["..."], "proposed_patch": {}, '
             '"scope": "project|general", "scope_reason": "..."}]}'
+        ),
+        "handback_triage": (
+            '{"action": "hint|set|block", "body": "...", "tier": "...", '
+            '"effort": "...", "reason": "..."}'
         ),
     }
     schema = schemas.get(op, "{}")
@@ -898,7 +912,52 @@ SUPERVISOR_OP_EXPECTS: dict[str, dict] = {
             "adaptations": {"type": "list", "items": "dict"},
         },
     },
+    "handback_triage": {
+        "op": "handback_triage",
+        "required": ["action"],
+        "properties": {
+            "action": {"type": "str", "enum": ["hint", "set", "block"]},
+            "body": {"type": "str"},
+            "tier": {"type": "str"},
+            "effort": {"type": "str"},
+            "reason": {"type": "str"},
+        },
+    },
 }
+
+
+def normalise_handback_triage(raw) -> dict:
+    """Check a `handback_triage` answer and return `{action, body, tier, effort, reason}`.
+
+    Raises `Invalid` for an answer nobody can act on: not an object, an unknown
+    action, a `hint` with no body, or a `set` naming neither tier nor effort.
+    Hint and reason text lose any raw edit blocks: the worker stays the only author.
+    """
+    if not isinstance(raw, dict):
+        raise Invalid("bad-handback-triage", "handback_triage answer must be a JSON object")
+    action = str(raw.get("action", "") or "").strip().lower()
+    if action not in ("hint", "set", "block"):
+        raise Invalid(
+            "bad-handback-triage",
+            f"handback_triage action must be hint, set or block, got {raw.get('action')!r}",
+        )
+
+    def _text(key: str) -> str:
+        value = raw.get(key)
+        return value.strip() if isinstance(value, str) else ""
+
+    out = {
+        "action": action,
+        "body": _strip_edit_blocks(_text("body")),
+        "tier": _text("tier"),
+        "effort": _text("effort"),
+        "reason": _strip_edit_blocks(_text("reason")),
+    }
+    if action == "hint" and not out["body"]:
+        raise Invalid("bad-handback-triage", "handback_triage hint needs a non-empty body")
+    if action == "set" and not (out["tier"] or out["effort"]):
+        raise Invalid("bad-handback-triage", "handback_triage set needs a tier or an effort")
+    return out
 
 
 def expects_for_supervisor_op(op: str) -> dict:
@@ -1110,6 +1169,31 @@ class TierMicromanagerBackend(_ThreadLocalUsageMixin):
             self.backend.close()
 
 
+#: Body prefix of the code post that ends a card's wait on a silent seat early.
+SEAT_TIMEOUT_PREFIX = "timeout: "
+
+
+def seat_timeout_post(board, *, card_id: str, since_seq: int = 0) -> dict | None:
+    """A code post after `since_seq` telling `card_id`'s wait on a silent seat to time out.
+
+    The coordinator's stall rule writes it (author a `code` member, kind `action`,
+    body starting with `SEAT_TIMEOUT_PREFIX`). Posts by anyone else are ignored.
+    """
+    clean = str(card_id or "").strip()
+    if board is None or not clean or not board.board_dir.exists():
+        return None
+    for post in board.read(as_name="*", since=int(since_seq or 0), limit=None, for_model=False):
+        if post.get("kind") != "action" or str(post.get("card", "") or "") != clean:
+            continue
+        if not str(post.get("body", "") or "").startswith(SEAT_TIMEOUT_PREFIX):
+            continue
+        author = board.get_member(str(post.get("from", "") or ""))
+        if author is None or author.get("kind") != "code":
+            continue
+        return post
+    return None
+
+
 class ExternalMicromanagerBackend(_ThreadLocalUsageMixin):
     """Supervisor seat held outside openfarm over the shared board."""
 
@@ -1194,6 +1278,7 @@ class ExternalMicromanagerBackend(_ThreadLocalUsageMixin):
         )
 
         cursor = int(q["seq"])
+        timed_out_by_stall = False
         pause_ctx = (
             self.budget.pause_clock()
             if self.budget is not None and hasattr(self.budget, "pause_clock")
@@ -1238,6 +1323,15 @@ class ExternalMicromanagerBackend(_ThreadLocalUsageMixin):
                             except (OSError, ValueError):
                                 data = None  # fall back to answer body below
                         return parse_json_answer(str(ans.get("body", "") or ""))
+                if card_id:
+                    # The coordinator asked this card to stop: end the wait now.
+                    stop_reason = self.board.stop_requested(card_id)
+                    if stop_reason:
+                        raise GateFailure(StopCode.REFUSED, stop_reason)
+                    # The stall rule timed this silent seat out early.
+                    if seat_timeout_post(self.board, card_id=card_id, since_seq=int(q["seq"])):
+                        timed_out_by_stall = True
+                        break
                 if self.heartbeat_fn is not None:
                     self.heartbeat_fn()
                 if res.get("reason") == "run-ended" or time.monotonic() >= deadline:
@@ -1246,7 +1340,8 @@ class ExternalMicromanagerBackend(_ThreadLocalUsageMixin):
         if self.on_timeout == "block":
             raise GateFailure(
                 StopCode.SEAT_SILENT,
-                f"external supervisor did not answer question #{q['seq']} ({op})",
+                f"external supervisor did not answer question #{q['seq']} ({op})"
+                + (" before the run stalled" if timed_out_by_stall else ""),
             )
         raise Infra(
             "acp-timeout",
@@ -1749,6 +1844,28 @@ class Micromanager:
             recommendations=cleaned_recs,
             findings=_normalise_findings(raw.get("findings")),
         )
+
+    def handback_triage(self, card_id: str, payload: dict) -> dict:
+        """Ask the supervisor's seat how to resolve a worker's hand-back.
+
+        One op for every kind of supervisor (config, tier, ACP, external): the
+        backend gets the op's rules and answer shape, an external seat answers on the
+        board, and the call's tokens go to the supervisor's budget like any other op.
+        Returns the checked answer (see `normalise_handback_triage`), or `{}` when the
+        seat is off. Raises `Invalid` for an unusable answer, `Refused` past the
+        supervisor's caps, and whatever the backend raises (`Infra`, `GateFailure`).
+        In advisory mode a `set` is dropped: advice only, the card's effort is not
+        changed by the supervisor.
+        """
+        if not self.enabled:
+            return {}
+        req_payload = dict(payload)
+        req_payload["card_id"] = str(card_id or req_payload.get("card_id", "") or "")
+        raw = self._call_backend("handback_triage", req_payload["card_id"], req_payload)
+        answer = normalise_handback_triage(raw)
+        if self.mode == "advisory" and answer["action"] == "set":
+            return {}
+        return answer
 
     # -- 6. reflect_harness ---------------------------------------------------
 
