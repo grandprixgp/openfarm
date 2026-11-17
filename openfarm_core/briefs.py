@@ -166,6 +166,14 @@ false, hand back instead of trying a third way (in place of edits or JSON):
 <reason explaining what failed twice or which assumption is false>
 >>>"""
 
+#: The planner answers in JSON mode, where a `<<<HANDBACK` block cannot be sent, so
+#: its hand-back is a JSON object. The flow reads this shape (and the block form).
+PLANNER_HANDBACK_INSTRUCTIONS = """When to hand a card back:
+When something the card assumes is false, so no honest plan can be written, hand
+back instead of returning steps. Return this JSON object in place of the plan:
+
+{"handback": "<reason explaining which assumption is false>"}"""
+
 # Hand-back text goes into a brief only when the swarm is on (`handback=True`). With
 # the swarm off a run is v0.7's, so its briefs are v0.7's: no hand-back invitation
 # and no `replan_if` signs.
@@ -263,7 +271,7 @@ def planner_brief(card: Card, book: BriefBook, harness_guidance: str = "",
         parts.append("\nHarness adaptations (data):\n"
                      + fence(harness_guidance, "harness adaptations"))
     if handback:
-        parts.append("\n" + HANDBACK_INSTRUCTIONS)
+        parts.append("\n" + PLANNER_HANDBACK_INSTRUCTIONS)
     return Brief("planner", "\n".join(parts))
 
 

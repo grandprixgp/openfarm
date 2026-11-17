@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import json
 import shutil
 from pathlib import Path
 
@@ -1114,7 +1115,10 @@ class CardRun:
             self.budget.implementer_attempts = max(
                 0, self.budget.implementer_attempts - 1
             )
-        self._refund_member_attempt(board_role)
+        if role != "checker_pass2":
+            # `_call_board_role` counts no member attempt for pass 2, so there is
+            # nothing to give back.
+            self._refund_member_attempt(board_role)
 
         resolution = None
         if self.on_handback is not None:
@@ -1156,16 +1160,72 @@ class CardRun:
         hb_entry["outcome"] = "blocked"
         raise GateFailure(StopCode.HANDED_BACK, block_reason)
 
-    def _handback_reason(self, call) -> str | None:
+    def _handback_reason(self, call, *, json_form: bool = False) -> str | None:
         """The hand-back reason in a worker's answer, or None.
 
         Only with the swarm on. With it off no brief invites a hand-back, so the
         answer goes down v0.7's path like any other answer without usable edits.
-        A cut-off answer is never a hand-back.
+        A cut-off answer is never a hand-back. `json_form` also reads the planner's
+        JSON-mode shape, `{"handback": "<reason>"}`.
         """
         if not self.swarm_on or call.cut_off:
             return None
-        return parse_handback(call.content)
+        reason = parse_handback(call.content)
+        if reason is None and json_form:
+            reason = _json_handback(call.content)
+        return reason
+
+    def _call_role_with_handbacks(
+        self,
+        role: str,
+        brief: Brief,
+        *,
+        first_attempt: int,
+        response_name: str,
+        response_format: str | None = None,
+        json_handback: bool = False,
+        unavailable: tuple = (),
+    ):
+        """Call the planner or a checker pass, giving a hand-back the spec's handling.
+
+        These roles have no attempt budget of their own. A hand-back goes through
+        `_handle_handback` like the implementer's: a hint or set within
+        `handbacks_per_card` sends the brief again (`_call_board_role` adds the
+        hint), a block raises `handed-back`. Returns `(answer, None)` for an answer
+        that is not a hand-back, `(hand-back answer, detail)` once a hand-back went
+        past the limit, and `(None, None)` when the call raised one of `unavailable`.
+        """
+        call_seq = 0
+        while True:
+            call_seq += 1
+            try:
+                call = self._call_board_role(
+                    role,
+                    brief,
+                    attempt=first_attempt + call_seq - 1,
+                    response_format=response_format,
+                    response_path=self.card_layout / "responses" / (
+                        f"{response_name}.json" if call_seq == 1
+                        else f"{response_name}-{call_seq}.json"
+                    ),
+                )
+            except unavailable:
+                return None, None
+            self.budget.note_tokens(call.tokens_in, call.tokens_out, call.spend)
+            reason = self._handback_reason(call, json_form=json_handback)
+            if reason is None:
+                return call, None
+            # Every pass through here records a hand-back, so the loop ends at the
+            # limit at the latest.
+            limit_err = self._handle_handback(
+                role=role,
+                call=call,
+                attempt_no=1,
+                call_seq=call_seq,
+                reason=reason,
+            )
+            if limit_err is not None:
+                return call, limit_err
 
     def _member_call_settings(self, role: str, member: dict) -> tuple[str, str | None, str, str]:
         tiers = getattr(self.cfg, "tiers", {}) or {}
@@ -1868,41 +1928,19 @@ class CardRun:
             self.card, self.book, harness_guidance=planner_harness,
             handback=self.swarm_on,
         )
-        max_hb = int(
-            getattr(self.swarm, "handbacks_per_card", 2)
-            if self.swarm is not None
-            else 2
-        )
-        call = None
-        for call_seq in range(1, max_hb + 2):
-            try:
-                call = self._call_board_role(
-                    "planner",
-                    brief,
-                    attempt=call_seq,
-                    response_format="json",
-                    response_path=self.card_layout / "responses" / (
-                        "planner.json" if call_seq == 1 else f"planner-{call_seq}.json"
-                    ),
-                )
-            except (Infra, Invalid):
-                self.planner_used = False
-                self.log(f"{self.card.id}: planner unavailable, running unsplit")
-                return
-            self.budget.note_tokens(call.tokens_in, call.tokens_out, call.spend)
-            hb_reason = self._handback_reason(call)
-            if hb_reason is None:
-                break
-            limit_err = self._handle_handback(
-                role="planner",
-                call=call,
-                attempt_no=1,
-                call_seq=call_seq,
-                reason=hb_reason,
-            )
-            if limit_err is not None:
-                raise GateFailure(StopCode.HANDED_BACK, limit_err)
+        call, limit_err = self._call_role_with_handbacks(
+            "planner", brief, first_attempt=1, response_name="planner",
+            response_format="json", json_handback=True,
+            unavailable=(Infra, Invalid))
+        if call is None:
+            self.planner_used = False
+            self.log(f"{self.card.id}: planner unavailable, running unsplit")
+            return
         try:
+            if limit_err is not None:
+                # Past `handbacks_per_card` a hand-back counts as a failed attempt,
+                # and a planner's failed attempt is an unusable plan.
+                raise Invalid("planner-handback-limit", limit_err)
             plan = parse_plan(call.content, card=self.card)
         except Invalid as exc:
             if getattr(self.cfg, "planner", "auto") == "on":
@@ -3421,13 +3459,12 @@ class CardRun:
             [path for path in changed if self._is_test_path(path)],
             ref=self.base_commit or "HEAD")
         brief1 = checker_pass1_brief(self.card, test_diff, handback=self.swarm_on)
-        call1 = self._call_board_role(
-            "checker_pass1",
-            brief1,
-            attempt=1,
-            response_path=self.card_layout / "responses" / "checker-pass1.json",
-        )
-        self.budget.note_tokens(call1.tokens_in, call1.tokens_out, call1.spend)
+        # A checker's answer is checked for a hand-back before anything reads it: a
+        # hand-back is never a restatement and never a passing checker gate.
+        call1, limit_err = self._call_role_with_handbacks(
+            "checker_pass1", brief1, first_attempt=1, response_name="checker-pass1")
+        if limit_err is not None:
+            self._checker_handback_limit("checker-pass1", limit_err)
         restatement = parse_restatement(call1.content, self.card)
         self.checker_restatement = restatement
         gate1 = self._record_gate(GateResult(
@@ -3444,13 +3481,10 @@ class CardRun:
         brief2 = checker_pass2_brief(
             self.card, full_diff, [g.as_dict() for g in self.gates], modified,
             handback=self.swarm_on)
-        call2 = self._call_board_role(
-            "checker_pass2",
-            brief2,
-            attempt=2,
-            response_path=self.card_layout / "responses" / "checker-pass2.json",
-        )
-        self.budget.note_tokens(call2.tokens_in, call2.tokens_out, call2.spend)
+        call2, limit_err = self._call_role_with_handbacks(
+            "checker_pass2", brief2, first_attempt=2, response_name="checker-pass2")
+        if limit_err is not None:
+            self._checker_handback_limit("checker-pass2", limit_err)
 
         counters = parse_counter_tests(call2.content)
         self.counter_summary = {
@@ -3544,6 +3578,15 @@ class CardRun:
                 StopCode.CHECKER_REJECT,
                 f"{self.counter_summary['failed']} counter-test(s) fail on the diff")
         return None
+
+    def _checker_handback_limit(self, gate_name: str, detail: str) -> None:
+        """A checker hand-back past `handbacks_per_card` is a failed checker gate.
+
+        The checker has no attempts to spend, so the failed attempt fails the gate:
+        the card blocks with `checker-reject`, never passing on a hand-back.
+        """
+        self._record_gate(GateResult(gate_name, FAIL, detail))
+        raise GateFailure(StopCode.CHECKER_REJECT, detail)
 
     def _extension(self) -> str:
         """The pack's source extension; `.rs` for packs that predate the field."""
@@ -4000,6 +4043,27 @@ class CardRun:
 
 
 # -- helpers -------------------------------------------------------------------
+
+def _json_handback(content: str) -> str | None:
+    """A planner's JSON-mode hand-back, `{"handback": "<reason>"}`, or None.
+
+    An object that also carries `steps` is a plan, not a hand-back.
+    """
+    text = str(content or "").strip()
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end <= start:
+        return None
+    try:
+        payload = json.loads(text[start:end + 1])
+    except ValueError:
+        return None
+    if not isinstance(payload, dict) or "steps" in payload:
+        return None
+    reason = payload.get("handback")
+    if not isinstance(reason, str) or not reason.strip():
+        return None
+    return reason.strip()
+
 
 def _tests_hash(hashes: dict[str, str]) -> str:
     """One hash for a whole set of frozen test files, so two can be compared."""

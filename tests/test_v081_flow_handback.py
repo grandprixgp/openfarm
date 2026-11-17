@@ -1,9 +1,13 @@
-"""v0.8.1 fix F1: hand-backs only with the swarm on.
+"""v0.8.1 fixes F1 and F2: hand-backs only with the swarm on, and for every role.
 
 F1: with `[swarm] enabled = false` a run is v0.7's. No brief carries hand-back text
 or `replan_if` signs, and an answer is never read as a hand-back: it goes down the
 path any other answer without usable edits went in v0.7.
 
+F2: every role whose brief invites a hand-back has its answer checked for one
+before anything else reads it, and the hand-back goes through `_handle_handback`.
+A checker hand-back is never a passing checker gate. The planner, called in JSON
+mode, hands back with `{"handback": "<reason>"}`.
 """
 
 from __future__ import annotations
@@ -24,6 +28,7 @@ from openfarm_core.adapters.openai_compat import ScriptedBackend
 from openfarm_core.board import Board, board_dir_for
 from openfarm_core.briefs import (
     HANDBACK_INSTRUCTIONS,
+    PLANNER_HANDBACK_INSTRUCTIONS,
     BriefBook,
     checker_pass1_brief,
     checker_pass2_brief,
@@ -124,7 +129,7 @@ class SwarmOffBriefTests(unittest.TestCase):
         with_signs = _card(replan_if=[REPLAN_SIGN])
         without = _card()
         suffix = {
-            "planner": "\n\n" + HANDBACK_INSTRUCTIONS,
+            "planner": "\n\n" + PLANNER_HANDBACK_INSTRUCTIONS,
             "test_writer": "\n\n" + HANDBACK_INSTRUCTIONS,
             "implementer": "\n\n" + HANDBACK_INSTRUCTIONS,
             "checker_pass1": "\n\n" + HANDBACK_INSTRUCTIONS,
@@ -284,6 +289,157 @@ class SwarmOffFlowTests(_FlowHarness):
         self.assertEqual(caught.exception.code, StopCode.CANNOT_SPLIT)
         self.assertEqual(run.handbacks, [])
         self._assert_no_handback_text_sent(run)
+
+
+class CheckerHandbackTests(_FlowHarness):
+    """F2: a checker hand-back is handled, never recorded as a passing gate."""
+
+    def _assert_handback_posted(self, run: CardRun, role_member: str) -> None:
+        hb_posts = [p for p in self._board_posts(run) if p["kind"] == "handback"]
+        self.assertEqual(len(hb_posts), 1)
+        self.assertEqual(hb_posts[0]["from"], worker_member_name("CARD-1", role_member))
+        self.assertEqual(hb_posts[0]["to"], ["coordinator"])
+
+    def test_pass1_handback_blocks_without_a_passing_checker_gate(self) -> None:
+        run = self._card_run(self._script({"CARD-1/checker_pass1": HB}), swarm_on=True)
+        result = run.run()
+        self.assertEqual(result["final_state"], "blocked")
+        self.assertEqual(result["stop_code"], StopCode.HANDED_BACK.value)
+        self.assertIn("FullError exists", result["detail"])
+        self.assertEqual(self._gate(run, "checker-pass1"), [])
+        self.assertEqual(self._gate(run, "checker-pass2"), [])
+        self.assertIsNone(run.checker_restatement)
+        self.assertEqual(len(run.handbacks), 1)
+        self.assertEqual(run.handbacks[0]["role"], "checker_pass1")
+        self.assertEqual(run.handbacks[0]["outcome"], "blocked")
+        self._assert_handback_posted(run, "checker")
+        self.assertFalse([c for c in run.backend.calls if c["role"] == "checker_pass2"])
+
+    def test_pass1_handback_with_hint_asks_the_checker_again(self) -> None:
+        seen: list[dict] = []
+
+        def on_hb(info: dict) -> dict:
+            seen.append(info)
+            return {"action": "hint", "body": "FullError is added by this card."}
+
+        run = self._card_run(self._script({"CARD-1/checker_pass1/1": HB}),
+                             swarm_on=True, on_handback=on_hb)
+        result = run.run()
+        self.assertEqual(result["final_state"], "in-review", result.get("detail"))
+        self.assertEqual([i["role"] for i in seen], ["checker_pass1"])
+        pass1 = [c for c in run.backend.calls if c["role"] == "checker_pass1"]
+        self.assertEqual(len(pass1), 2)
+        self.assertIn("FullError is added by this card.",
+                      pass1[1]["messages"][0]["content"])
+        gate1 = self._gate(run, "checker-pass1")
+        self.assertEqual(len(gate1), 1)
+        self.assertEqual(gate1[0].result, "pass")
+        self.assertIn("FullError", run.checker_restatement.text)
+        self.assertEqual(run.handbacks[0]["outcome"], "hint")
+        # A checker hand-back spends no implementer attempt.
+        self.assertEqual(run.budget.implementer_attempts, 1)
+
+    def test_pass2_handback_blocks_without_a_passing_checker_gate(self) -> None:
+        run = self._card_run(self._script({"CARD-1/checker_pass2": HB}), swarm_on=True)
+        result = run.run()
+        self.assertEqual(result["final_state"], "blocked")
+        self.assertEqual(result["stop_code"], StopCode.HANDED_BACK.value)
+        self.assertEqual(self._gate(run, "checker-pass2"), [])
+        self.assertEqual(run.handbacks[0]["role"], "checker_pass2")
+        self._assert_handback_posted(run, "checker")
+
+    def test_pass2_handback_with_hint_asks_pass2_again(self) -> None:
+        run = self._card_run(
+            self._script({"CARD-1/checker_pass2/2": HB}),
+            swarm_on=True,
+            on_handback=lambda _i: {"action": "hint", "body": "Trace push only."})
+        result = run.run()
+        self.assertEqual(result["final_state"], "in-review", result.get("detail"))
+        pass2 = [c for c in run.backend.calls if c["role"] == "checker_pass2"]
+        self.assertEqual([c["attempt"] for c in pass2], [2, 3])
+        self.assertIn("Trace push only.", pass2[1]["messages"][0]["content"])
+        self.assertEqual(len(self._gate(run, "checker-pass2")), 1)
+        member = run.board.get_member(worker_member_name("CARD-1", "checker"))
+        # pass 1 counted one attempt; pass 2 counts none and refunds none.
+        self.assertEqual(member["attempts"], 1)
+        self.assertEqual(member["calls"], 3)
+
+    def test_checker_handback_past_the_limit_fails_the_checker_gate(self) -> None:
+        run = self._card_run(self._script({"CARD-1/checker_pass1": HB}), swarm_on=True,
+                             handbacks_per_card=0)
+        result = run.run()
+        self.assertEqual(result["final_state"], "blocked")
+        self.assertEqual(result["stop_code"], StopCode.CHECKER_REJECT.value)
+        self.assertIn("hand-back limit (0) exceeded", result["detail"])
+        gate1 = self._gate(run, "checker-pass1")
+        self.assertEqual([g.result for g in gate1], ["fail"])
+        self.assertEqual(run.handbacks[0]["outcome"], "limit-exceeded")
+
+
+class PlannerHandbackTests(_FlowHarness):
+    """F2: the planner hands back in JSON, and that hand-back really works."""
+
+    PLAN = json.dumps({"steps": [
+        {"n": 1, "does": "raise FullError", "tests": ["test_a_full_bundle_refuses_a_push"]},
+        {"n": 2, "does": "keep the segment", "tests": [SECOND_TEST]},
+    ]})
+    JSON_HB = json.dumps({"handback": "FullError is not defined anywhere."})
+
+    def test_planner_brief_invites_the_json_handback(self) -> None:
+        run = self._card_run({"CARD-1/planner": self.PLAN}, swarm_on=True, planner="on")
+        run._step_plan()
+        self.assertTrue(run.planner_used)
+        brief = run.backend.calls[0]["messages"][0]["content"]
+        self.assertIn(PLANNER_HANDBACK_INSTRUCTIONS, brief)
+        self.assertIn(REPLAN_SIGN, brief)
+
+    def test_json_handback_blocks_the_card(self) -> None:
+        run = self._card_run({"CARD-1/planner": self.JSON_HB}, swarm_on=True,
+                             planner="on")
+        with self.assertRaises(GateFailure) as caught:
+            run._step_plan()
+        self.assertEqual(caught.exception.code, StopCode.HANDED_BACK)
+        self.assertIn("FullError is not defined anywhere.", caught.exception.detail)
+        self.assertEqual(run.handbacks[0]["role"], "planner")
+        hb_posts = [p for p in self._board_posts(run) if p["kind"] == "handback"]
+        self.assertEqual([p["from"] for p in hb_posts],
+                         [worker_member_name("CARD-1", "planner")])
+
+    def test_block_form_also_counts_for_the_planner(self) -> None:
+        run = self._card_run({"CARD-1/planner": HB}, swarm_on=True, planner="on")
+        with self.assertRaises(GateFailure) as caught:
+            run._step_plan()
+        self.assertEqual(caught.exception.code, StopCode.HANDED_BACK)
+
+    def test_json_handback_with_hint_asks_the_planner_again(self) -> None:
+        run = self._card_run(
+            {"CARD-1/planner/1": self.JSON_HB, "CARD-1/planner/2": self.PLAN},
+            swarm_on=True, planner="on",
+            on_handback=lambda _i: {"action": "hint", "body": "This card adds FullError."})
+        run._step_plan()
+        self.assertTrue(run.planner_used)
+        self.assertEqual(len(run.plan.steps), 2)
+        calls = [c for c in run.backend.calls if c["role"] == "planner"]
+        self.assertEqual(len(calls), 2)
+        self.assertIn("This card adds FullError.", calls[1]["messages"][0]["content"])
+        self.assertEqual(run.handbacks[0]["outcome"], "hint")
+
+    def test_a_plan_with_a_handback_key_is_still_a_plan(self) -> None:
+        both = json.dumps({**json.loads(self.PLAN), "handback": "ignored"})
+        run = self._card_run({"CARD-1/planner": both}, swarm_on=True, planner="on")
+        run._step_plan()
+        self.assertTrue(run.planner_used)
+        self.assertEqual(run.handbacks, [])
+
+    def test_planner_handback_past_the_limit_is_a_failed_plan(self) -> None:
+        run = self._card_run({"CARD-1/planner": self.JSON_HB}, swarm_on=True,
+                             planner="on", handbacks_per_card=0)
+        with self.assertRaises(GateFailure) as caught:
+            run._step_plan()
+        # planner = "on": an unusable plan is cannot-split, as in v0.7.
+        self.assertEqual(caught.exception.code, StopCode.CANNOT_SPLIT)
+        self.assertIn("hand-back limit (0) exceeded", caught.exception.detail)
+        self.assertEqual(run.handbacks[0]["outcome"], "limit-exceeded")
 
 
 if __name__ == "__main__":
