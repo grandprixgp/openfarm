@@ -37,7 +37,7 @@ DESIGN_WORDS = ("decide how", "design", "choose an approach", "figure out how")
 
 _SOURCE_CONTAINERS = ("src", "tests", "benches", "examples")
 #: A folder holding one of these is a unit: a crate, a Python project, a package.
-_UNIT_MANIFESTS = ("Cargo.toml", "package.json", "pyproject.toml", "setup.py")
+_UNIT_MANIFESTS = ("Cargo.toml", "package.json", "tsconfig.json", "pyproject.toml", "setup.py")
 
 
 class EligibilityResult:
@@ -238,6 +238,13 @@ def check_eligibility(card: Card, cfg, deps_done: bool = True,
                     "python-tests-in-test-files",
                     f"test {test.name!r} is declared in {test.file!r}; Python card "
                     f"tests go in tests/test_<subject>.py")
+    if any(lang in cfg.languages for lang in ("typescript", "ts", "javascript", "js")):
+        for test in card.tests:
+            if test.file and not _is_typescript_test_file(test.file):
+                result.fail(
+                    "typescript-tests-in-test-files",
+                    f"test {test.name!r} is declared in {test.file!r}; TypeScript card "
+                    f"tests must be *.test.* / *.spec.* or under tests/ or __tests__/")
     allow_multi_new_symbols = type_changes or (
         getattr(cfg, "micromanager_adapter", "off") != "off"
         and getattr(getattr(cfg, "micromanager", None), "scaffold_contracts", False)
@@ -366,6 +373,22 @@ def _is_python_test_file(path: str) -> bool:
     name = text.rsplit("/", 1)[-1]
     return _is_integration_test_file(text) and name.startswith("test_") \
         and name.endswith(".py")
+
+
+_TS_TEST_EXTS = (".ts", ".mts", ".cts", ".tsx", ".js", ".mjs", ".cjs", ".jsx")
+
+
+def _is_typescript_test_file(path: str) -> bool:
+    """`*.test.*`, `*.spec.*`, or under `tests/` / `__tests__/` with TS/JS extension."""
+    text = normalise(path)
+    name = text.rsplit("/", 1)[-1]
+    if not name.endswith(_TS_TEST_EXTS):
+        return False
+    if (text.startswith(("tests/", "__tests__/"))
+            or "/tests/" in text or "/__tests__/" in text):
+        return True
+    stem = name.rsplit(".", 1)[0]
+    return stem.endswith((".test", ".spec", "_test"))
 
 
 def is_eligible(card: Card, cfg, **kwargs) -> bool:

@@ -198,7 +198,6 @@ def pack_for(language: str, cargo_flags: list[str] | None = None,
         from .python import PythonPack
         return PythonPack(python or None)
     if language in ("typescript", "ts", "javascript", "js"):
-        raise Invalid(
-            "no-typescript-pack",
-            "the TypeScript pack comes after the pilot and is not implemented")
+        from .typescript import TypeScriptPack
+        return TypeScriptPack()
     return UnsupportedPack(language)

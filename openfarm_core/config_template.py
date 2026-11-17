@@ -53,6 +53,12 @@ def render_config(*, name: str, language: str, base_branch: str, state_dir: Path
         flagged_patterns = ["std::env::set_var", "sleep("]
         tests_rule = "rust_tests_in_separate_files = true"
         runner = [f"cargo_flags = {toml_list(cargo_flags or [])}"]
+    elif language == "typescript":
+        forbidden_files = ["**/package.json", "**/package-lock.json",
+                           "**/tsconfig.json", ".openfarm/**", ".claude/**"]
+        flagged_patterns = []
+        tests_rule = ""
+        runner = ["# Node runs TypeScript natively via node --test."]
     else:
         forbidden_files = ["pyproject.toml", "setup.py", ".openfarm/**", ".claude/**"]
         flagged_patterns = []
@@ -104,7 +110,7 @@ def render_config(*, name: str, language: str, base_branch: str, state_dir: Path
         "max_units = 1",
         'require_reference = ["pattern", "small-feature"]',
         'refuse_touches_prefixes = ["seam:"]',
-        tests_rule,
+        *([tests_rule] if tests_rule else []),
         "allow_type_changes = true",
         "max_context_files = 8",
         "",

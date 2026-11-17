@@ -16,36 +16,39 @@ from .git import Git
 
 
 def detect_language(root: Path) -> str:
-    """Return "rust" or "python" from the manifests at the top level of `root`.
+    """Return `"rust"`, `"python"`, or `"typescript"` from top-level manifests.
 
-    Raises `openfarm_core.errors.Refused` with code "ambiguous-language" when both
-    kinds of manifest are present, or "unsupported-language" when neither is.
-    Only the top level of `root` is looked at; nothing is written.
+    Raises `openfarm_core.errors.Refused` with code "ambiguous-language" when
+    multiple kinds of manifest are present, or "unsupported-language" when none
+    is. Only the top level of `root` is looked at; nothing is written.
     """
     root = Path(root)
     has_cargo = (root / "Cargo.toml").is_file()
     has_python = ((root / "pyproject.toml").is_file()
                   or (root / "setup.py").is_file())
+    has_ts = ((root / "package.json").is_file()
+              or (root / "tsconfig.json").is_file())
 
-    if has_cargo and has_python:
+    detected: list[str] = []
+    if has_cargo:
+        detected.append("rust")
+    if has_python:
+        detected.append("python")
+    if has_ts:
+        detected.append("typescript")
+
+    if len(detected) > 1:
         raise Refused(
             "ambiguous-language",
-            "both a Rust and a Python manifest are present; pass --lang rust or "
-            "--lang python",
+            f"multiple language manifests are present ({', '.join(detected)}); "
+            f"pass --lang {' or --lang '.join(detected)}",
         )
-    if has_cargo:
-        return "rust"
-    if has_python:
-        return "python"
-    if (root / "package.json").is_file():
-        raise Refused(
-            "unsupported-language",
-            "no supported language manifest found; TypeScript has no pack yet",
-        )
+    if len(detected) == 1:
+        return detected[0]
     raise Refused(
         "unsupported-language",
         "no supported language manifest found: expected Cargo.toml, pyproject.toml, "
-        "or setup.py",
+        "setup.py, package.json, or tsconfig.json",
     )
 
 
@@ -108,10 +111,10 @@ def adopt_config_text(
     `state_dir` or `key_file` is inside `root`, or "unsupported-language" when
     `language` is not "rust" or "python". Nothing is written.
     """
-    if language not in ("rust", "python"):
+    if language not in ("rust", "python", "typescript"):
         raise Refused(
             "unsupported-language",
-            f"unsupported language {language!r}: expected 'rust' or 'python'",
+            f"unsupported language {language!r}: expected 'rust', 'python', or 'typescript'",
         )
 
     resolved_root = Path(root).expanduser().resolve()

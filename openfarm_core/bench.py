@@ -24,7 +24,7 @@ from pathlib import Path
 from .errors import Invalid
 from .git import Git
 
-_ALLOWED_LANGUAGES = frozenset({"rust", "python"})
+_ALLOWED_LANGUAGES = frozenset({"rust", "python", "typescript"})
 _ALLOWED_CATEGORIES = frozenset(
     {"small-feature", "pinned-bugfix", "pattern", "refactor"}
 )
@@ -398,6 +398,8 @@ def _openfarm_env(global_dir: Path | None = None) -> dict:
 def _suite_cmd(language: str) -> list[str]:
     if language == "rust":
         return ["cargo", "test", "--quiet"]
+    if language == "typescript":
+        return ["node", "--test", "--test-reporter=tap"]
     return [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-t", "."]
 
 
