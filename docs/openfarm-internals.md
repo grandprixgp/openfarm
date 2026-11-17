@@ -121,7 +121,7 @@ It writes atomically at mode 600 and keeps the previous credential as `<name>.op
 
 ### Spend
 
-`provider_prices_spend` is true only when the provider reports a cost (Claude does; `codex exec --json` and `agy` report none) or a per-1k rate is set. Without one, the run says `spend_measured: false` and adds the note that the spend caps cannot fire.
+`provider_prices_spend` is true only when the provider reports a cost (Claude does; `codex exec --json` and `agy` report none) or a per-1k rate is set. For the worker backend (`cli._backend_prices_spend`, `[model]` rates), a run without one says `spend_measured: false` and adds the note that the spend caps cannot fire. A Codex or Antigravity micromanager's spend is priced from `[micromanager] cost_per_1k_in` / `cost_per_1k_out`; without them it reads zero, its `spend_per_night` cannot fire, and no note says so. A drive with an unpriced driver notes that the caps cannot fire for the driver.
 
 ## Driver mode
 
