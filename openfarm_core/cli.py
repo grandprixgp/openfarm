@@ -62,6 +62,17 @@ from .micromanager import MicromanagerBudget, open_micromanager
 from .packs.base import pack_for
 from .state import (StateDir, _safe_id, read_json, utc_now, utc_after,
                     write_json)
+from .swarm import (
+    parse_team_spec,
+    swarm_block,
+    swarm_hint,
+    swarm_join,
+    swarm_remove,
+    swarm_set,
+    swarm_start,
+    swarm_status,
+    swarm_tiers,
+)
 
 EXIT_OK = 0
 EXIT_REFUSED = 1
@@ -1399,6 +1410,110 @@ def cmd_board(ctx: Context, args) -> int:
     raise UsageError(f"unknown board subcommand: {action}")
 
 
+def _maybe_prepare_source(ctx: Context):
+    source = ctx.cards()
+    if getattr(source, "worktree", None) is not None and not (ctx.repo / ".git").exists():
+        return None
+    source.prepare()
+    return source
+
+
+def cmd_swarm(ctx: Context, args) -> int:
+    """Inspect tiers/roster and execute checked swarm actions."""
+    action = getattr(args, "swarm_command", None)
+    if not action:
+        raise UsageError(
+            "swarm requires a subcommand: status, tiers, join, start, set, hint, block, or remove"
+        )
+    if action == "tiers":
+        ctx.emit(swarm_tiers(ctx.cfg))
+        return EXIT_OK
+
+    rid, board = _resolve_board(ctx, getattr(args, "run", None))
+
+    if action == "status":
+        ctx.emit({"run_id": rid, **swarm_status(board, ctx.cfg)})
+        return EXIT_OK
+
+    if action == "join":
+        member = swarm_join(
+            board,
+            ctx.cfg,
+            name=args.name,
+            seat=args.seat,
+            owner_kind=args.kind,
+        )
+        ctx.emit({"run_id": rid, "member": member})
+        return EXIT_OK
+
+    if action == "start":
+        card_id = _check_id(args.card, "card id")
+        team = parse_team_spec(args.team)
+        source = _maybe_prepare_source(ctx)
+        res = swarm_start(
+            board,
+            ctx.cfg,
+            caller=args.as_name,
+            card_id=card_id,
+            team=team,
+            source=source,
+        )
+        ctx.emit({"run_id": rid, **res})
+        return EXIT_OK
+
+    if action == "set":
+        res = swarm_set(
+            board,
+            ctx.cfg,
+            caller=args.as_name,
+            member_name=args.member,
+            tier=args.tier,
+            effort=args.effort,
+            reason=args.reason,
+        )
+        ctx.emit({"run_id": rid, **res})
+        return EXIT_OK
+
+    if action == "hint":
+        res = swarm_hint(
+            board,
+            ctx.cfg,
+            caller=args.as_name,
+            member_name=args.member,
+            body=args.body,
+        )
+        ctx.emit({"run_id": rid, **res})
+        return EXIT_OK
+
+    if action == "block":
+        card_id = _check_id(args.card, "card id")
+        source = _maybe_prepare_source(ctx)
+        res = swarm_block(
+            board,
+            ctx.cfg,
+            caller=args.as_name,
+            card_id=card_id,
+            reason=args.reason,
+            source=source,
+        )
+        ctx.emit({"run_id": rid, **res})
+        return EXIT_OK
+
+    if action == "remove":
+        source = _maybe_prepare_source(ctx)
+        res = swarm_remove(
+            board,
+            ctx.cfg,
+            caller=args.as_name,
+            member_name=args.member,
+            source=source,
+        )
+        ctx.emit({"run_id": rid, **res})
+        return EXIT_OK
+
+    raise UsageError(f"unknown swarm subcommand: {action}")
+
+
 # -- the parser ----------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1532,6 +1647,51 @@ def build_parser() -> argparse.ArgumentParser:
     board_wait.add_argument("--timeout", default="30m")
     board_wait.add_argument("--limit", type=int, default=None)
     board_wait.add_argument("--run", default=None)
+
+    swarm = sub.add_parser("swarm", help="inspect and control swarm roster and seats")
+    swarm_sub = swarm.add_subparsers(dest="swarm_command")
+
+    swarm_status_p = swarm_sub.add_parser("status", help="show roster, tiers, and board status")
+    swarm_status_p.add_argument("--run", default=None)
+
+    swarm_sub.add_parser("tiers", help="list configured tiers and efforts")
+
+    swarm_join_p = swarm_sub.add_parser("join", help="join an external seat")
+    swarm_join_p.add_argument("--name", required=True)
+    swarm_join_p.add_argument("--seat", choices=("coordinator", "supervisor"), required=True)
+    swarm_join_p.add_argument("--kind", choices=("human", "agent"), default="human")
+    swarm_join_p.add_argument("--run", default=None)
+
+    swarm_start_p = swarm_sub.add_parser("start", help="start a ready card with a team")
+    swarm_start_p.add_argument("card")
+    swarm_start_p.add_argument("--team", default=None, help="role=tier:effort,...")
+    swarm_start_p.add_argument("--as", dest="as_name", default="")
+    swarm_start_p.add_argument("--run", default=None)
+
+    swarm_set_p = swarm_sub.add_parser("set", help="change a member's tier or effort")
+    swarm_set_p.add_argument("member")
+    swarm_set_p.add_argument("--tier", default=None)
+    swarm_set_p.add_argument("--effort", default=None)
+    swarm_set_p.add_argument("--reason", default="")
+    swarm_set_p.add_argument("--as", dest="as_name", default="")
+    swarm_set_p.add_argument("--run", default=None)
+
+    swarm_hint_p = swarm_sub.add_parser("hint", help="send a hint note to a member")
+    swarm_hint_p.add_argument("member")
+    swarm_hint_p.add_argument("--body", required=True)
+    swarm_hint_p.add_argument("--as", dest="as_name", default="")
+    swarm_hint_p.add_argument("--run", default=None)
+
+    swarm_block_p = swarm_sub.add_parser("block", help="block a card with a reason")
+    swarm_block_p.add_argument("card")
+    swarm_block_p.add_argument("--reason", required=True)
+    swarm_block_p.add_argument("--as", dest="as_name", default="")
+    swarm_block_p.add_argument("--run", default=None)
+
+    swarm_remove_p = swarm_sub.add_parser("remove", help="remove a finished card's member")
+    swarm_remove_p.add_argument("member")
+    swarm_remove_p.add_argument("--as", dest="as_name", default="")
+    swarm_remove_p.add_argument("--run", default=None)
 
     bench = sub.add_parser("bench", help="run the efficacy bench")
     bench_sub = bench.add_subparsers(dest="bench_command")
@@ -1854,6 +2014,7 @@ COMMANDS = {
     "supervise": cmd_supervise,
     "harness": cmd_harness,
     "board": cmd_board,
+    "swarm": cmd_swarm,
 }
 
 
