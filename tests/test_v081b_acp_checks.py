@@ -144,6 +144,24 @@ class SessionRootPermissionTests(_Tmp):
         self.assertFalse(acp._is_path_allowed_readonly(str(self.tmp / "elsewhere"))[0])
 
 
+class SpendMeasuredTests(_Tmp):
+    """A4: spend counts as measured only when the provider reports cost or rates are set."""
+
+    def test_backend_prices_spend(self) -> None:
+        for adapter, want in (("claude-acp", True), ("codex-acp", False), ("antigravity-acp", False)):
+            cfg = types.SimpleNamespace(model_adapter=adapter, cost_per_1k_in=0.0, cost_per_1k_out=0.0)
+            self.assertEqual(_backend_prices_spend(cfg, None), want, adapter)
+            cfg.cost_per_1k_out = 0.002
+            self.assertTrue(_backend_prices_spend(cfg, None), adapter)
+
+    def test_worker_prices_spend(self) -> None:
+        for prov, want in (("claude", True), ("codex", False), ("antigravity", False)):
+            w = ClaudeAcpWorkerBackend(command="auto", provider=prov, cwd=self.tmp)
+            self.assertEqual(w.prices_spend, want, prov)
+            w = ClaudeAcpWorkerBackend(command="auto", provider=prov, cwd=self.tmp, cost_per_1k_in=0.01)
+            self.assertTrue(w.prices_spend, prov)
+
+
 class StatusModeTests(_Tmp):
     def test_off_mode_says_so_in_status(self) -> None:
         repo = self.tmp / "repo"

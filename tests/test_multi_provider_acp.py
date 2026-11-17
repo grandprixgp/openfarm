@@ -706,7 +706,10 @@ class ConfigWiringCoordinatorAndCliTests(unittest.TestCase):
             self.assertEqual(cfg.swarm.coordinator_effort, "medium")
             self.assertEqual(cfg.swarm.supervisor_effort, "xhigh")
             self.assertEqual(worker_kind_for_config(cfg), "acp")
-            self.assertTrue(_backend_prices_spend(cfg, None))
+            # Only Claude reports a cost; Codex and Antigravity need per-1k rates.
+            self.assertEqual(_backend_prices_spend(cfg, None), adapter == "claude-acp")
+            data["model"]["cost_per_1k_in"] = 0.001
+            self.assertTrue(_backend_prices_spend(Config(data, self.repo), None))
 
         bad = _base_config(self.state)
         bad["swarm"] = {"coordinator": "antigravity-acp", "coordinator_effort": "turbo"}
@@ -768,7 +771,8 @@ class ConfigWiringCoordinatorAndCliTests(unittest.TestCase):
         coord_cfg = Config(coord_data, self.repo)
         coord_backend = AcpCoordinatorBackend(coord_cfg, provider="codex", effort="high")
         self.assertEqual(coord_backend.name, "codex-acp")
-        self.assertTrue(coord_backend.prices_spend)
+        # Codex reports no cost and no per-1k rates are set: spend is not measured.
+        self.assertFalse(coord_backend.prices_spend)
         self.addCleanup(coord_backend.close)
 
         board = Board(self.state / "board", state_dir=self.state)

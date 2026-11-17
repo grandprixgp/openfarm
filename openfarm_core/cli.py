@@ -1114,7 +1114,13 @@ def _backend_prices_spend(cfg, script: Path | None) -> bool:
     if script is not None or cfg.model_adapter in ("scripted", "stub"):
         return False
     if is_acp_adapter(cfg.model_adapter):
-        return True  # ACP providers report cost per turn or support fallback pricing.
+        # Claude reports a cost per turn; Codex and Antigravity report none, so
+        # their spend is measured only when per-1k rates are configured.
+        from .adapters.acp import provider_prices_spend
+        return provider_prices_spend(
+            normalize_acp_provider(cfg.model_adapter),
+            float(getattr(cfg, "cost_per_1k_in", 0.0) or 0.0),
+            float(getattr(cfg, "cost_per_1k_out", 0.0) or 0.0))
     return bool(getattr(cfg, "cost_per_1k_in", 0.0)
                 or getattr(cfg, "cost_per_1k_out", 0.0))
 

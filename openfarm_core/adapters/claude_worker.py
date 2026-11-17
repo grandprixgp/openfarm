@@ -25,6 +25,7 @@ from .acp import (
     infer_acp_provider,
     is_acp_adapter,
     normalize_acp_provider,
+    provider_prices_spend,
 )
 from .openai_compat import Completion
 
@@ -89,8 +90,9 @@ class ClaudeAcpWorkerBackend:
 
     @property
     def prices_spend(self) -> bool:
-        # ACP providers report vendor cost or allow per-1k pricing fallback.
-        return True
+        # Claude reports a cost per turn; Codex and Antigravity report none, so
+        # their spend is measured only when per-1k rates are configured.
+        return provider_prices_spend(self.provider, self.cost_per_1k_in, self.cost_per_1k_out)
 
     def hello(self) -> dict:
         return {"name": self.name, "versions": [1], "ops": ["hello", "complete"]}

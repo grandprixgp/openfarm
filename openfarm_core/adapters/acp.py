@@ -151,6 +151,22 @@ _BRIDGE_SCRIPTS = {
     AGY_NATIVE_ACP: "antigravity",
     CODEX_NATIVE_ACP: "codex",
 }
+# Providers whose children report a cost per turn (claude -p and claude-agent-acp do;
+# codex exec --json and agy report none).
+_COST_REPORTING_PROVIDERS = frozenset({"claude"})
+
+
+def provider_reports_cost(provider: str) -> bool:
+    """True when this provider's child reports a vendor cost per turn."""
+    return normalize_acp_provider(provider) in _COST_REPORTING_PROVIDERS
+
+
+def provider_prices_spend(provider: str, cost_per_1k_in: float = 0.0,
+                          cost_per_1k_out: float = 0.0) -> bool:
+    """Spend is measured when the provider reports cost or per-1k rates are set."""
+    return provider_reports_cost(provider) or bool(cost_per_1k_in or cost_per_1k_out)
+
+
 class AcpCommand(list):
     """An ACP command argv that carries its confinement settings along.
 
