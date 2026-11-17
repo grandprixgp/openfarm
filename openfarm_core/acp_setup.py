@@ -860,7 +860,11 @@ def _probe_single_provider(
     effective_auth_file: Path | str | None,
     timeout_s: float,
     confine: confine_lib.ConfineSettings | None = None,
+    never_touch: list[str] | tuple[str, ...] = (),
+    forbidden_files: list[str] | tuple[str, ...] = (),
 ) -> dict[str, object]:
+    # The probe's child sits in the repository, so it is held as a run's child
+    # is: the project's own never-touch and forbidden files are hidden from it.
     adapter = ClaudeAcpAdapter(
         command=cmd,
         cwd=repo_path,
@@ -869,6 +873,8 @@ def _probe_single_provider(
         auth_file=effective_auth_file,
         auth_mode=effective_auth,
         confine=confine,
+        never_touch=never_touch,
+        forbidden_files=forbidden_files,
     )
     try:
         init_res = adapter.initialize(timeout_s=float(timeout_s))
@@ -922,9 +928,13 @@ def probe_acp(
             raise UsageError(exc.message) from exc
 
     confine_settings = confine_lib.ConfineSettings()
+    hidden_never: list[str] = []
+    hidden_forbidden: list[str] = []
     if (repo_path / CONFIG_PATH).is_file():
         cfg = load_config(repo_path)
         confine_settings = _repo_confine(cfg)
+        hidden_never = list(getattr(cfg, "never_touch", None) or ())
+        hidden_forbidden = list(getattr(cfg, "forbidden_files", None) or ())
         repo_provider = _repo_acp_provider(cfg)
         effective_auth = cfg.micromanager.auth
         effective_iso = cfg.micromanager.isolate_home
@@ -972,6 +982,8 @@ def probe_acp(
                     effective_auth_file=effective_auth_file,
                     timeout_s=timeout_s,
                     confine=confine_settings,
+                    never_touch=hidden_never,
+                    forbidden_files=hidden_forbidden,
                 )
             except (AdapterError, OSError) as exc:
                 results[item] = {
@@ -1015,6 +1027,8 @@ def probe_acp(
         effective_auth_file=effective_auth_file,
         timeout_s=timeout_s,
         confine=confine_settings,
+        never_touch=hidden_never,
+        forbidden_files=hidden_forbidden,
     )
     status = inspect_acp_status(repo_path, provider=prov)
     return {

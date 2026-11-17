@@ -329,5 +329,33 @@ class OtherPeoplesSecretsStayOutTests(unittest.TestCase):
         self.assertEqual(env.get("TOOL_TOKEN"), "explicit")
 
 
+class ProbeHidesTheProjectsFilesTests(unittest.TestCase):
+    """From the outside review (m9): the probe's child is held as a run's child is."""
+
+    def test_the_configs_never_touch_and_forbidden_files_reach_the_probe(self) -> None:
+        from unittest import mock
+        from openfarm_core import acp_setup
+        from tests.test_python_e2e import build_python_toy
+        toy = build_python_toy()
+        self.addCleanup(toy.cleanup)
+        cfg_path = toy.root / ".openfarm" / "config.toml"
+        text = cfg_path.read_text().replace(
+            'model = "scripted"\n', 'model = "scripted"\nmicromanager = "claude-acp"\n')
+        cfg_path.write_text(text)
+        seen: dict = {}
+
+        def fake(repo_path, **kwargs):
+            seen.update(kwargs)
+            return {"ok": True, "provider": kwargs["provider"]}
+
+        with mock.patch.object(acp_setup, "_probe_single_provider", side_effect=fake), \
+                mock.patch.object(acp_setup, "inspect_acp_status", return_value={}):
+            acp_setup.probe_acp(toy.root, provider="claude", timeout_s=5)
+        cfg = acp_setup.load_config(toy.root)
+        self.assertTrue(cfg.never_touch, "the toy config names never-touch files")
+        self.assertEqual(seen["never_touch"], list(cfg.never_touch))
+        self.assertEqual(seen["forbidden_files"], list(cfg.forbidden_files))
+
+
 if __name__ == "__main__":
     unittest.main()
