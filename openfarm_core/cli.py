@@ -1617,7 +1617,10 @@ def cmd_board(ctx: Context, args) -> int:
                 ) from exc
         else:
             body = args.body if args.body is not None else ""
-        post = board.post(
+        # An outside voice: a registered, non-code member writing a note,
+        # question, defect or result. Steering kinds go through `swarm`,
+        # answers through `board answer`, and code's kinds are code's alone.
+        post = board.outside_post(
             author=args.as_name,
             to=args.to,
             kind=args.kind,
