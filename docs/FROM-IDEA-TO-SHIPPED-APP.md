@@ -1,6 +1,6 @@
-# From Empty Folder to Shipped App (Openfarm v0.6.0 Starter Guide)
+# From Empty Folder to Shipped App (Openfarm v0.8.0 Starter Guide)
 
-This guide shows **both human owners and prospective frontier AI agents** how to go from an **empty folder** and a **plain-English idea** (`"An app to track my calories"`) to a gate-verified, human-reviewed application using **Openfarm v0.6.0**.
+This guide shows **both human owners and prospective frontier AI agents** how to go from an **empty folder** and a **plain-English idea** (`"An app to track my calories"`) to a gate-verified, human-reviewed application using **Openfarm v0.8.0**.
 
 > **For related docs:** See [README.md](../README.md) for architecture overview, [docs/USAGE-AND-FIRST-DEPLOYMENT.md](USAGE-AND-FIRST-DEPLOYMENT.md) for detailed configuration & operator runbooks on existing repositories (`tallybox`), and [docs/openfarm-internals.md](openfarm-internals.md) for module internals.
 
@@ -8,7 +8,7 @@ This guide shows **both human owners and prospective frontier AI agents** how to
 
 ## Part 1 — For Human Owners: The Two-Step Workflow
 
-You do **not** need to hand-write `.openfarm/config.toml`, memorize card schemas, or copy Rust boilerplate by hand. Openfarm v0.6.0 packages the CLI, slash commands (`/openfarm-grill-me` and `/openfarm-initialize`), native Claude ACP OAuth setup (`openfarm acp`), plugin rules, and frontier architect/operator skills into a **single repository or package target**.
+You do **not** need to hand-write `.openfarm/config.toml`, memorize card schemas, or copy Rust boilerplate by hand. Openfarm v0.8.0 packages the CLI, slash commands (`/openfarm-grill-me` and `/openfarm-initialize`), native Claude ACP OAuth setup (`openfarm acp`), plugin rules, and frontier architect/operator skills into a **single repository or package target**.
 
 ### Your Two Prompts
 
@@ -60,7 +60,7 @@ Ensure `~/.local/bin` is on your `PATH`, then verify:
 openfarm --help
 ```
 
-You should see all **15 subcommands**: `init`, `install-skill`, `acp`, `run`, `status`, `pause`, `resume`, `stop`, `release`, `dossier`, `check`, `verdict`, `escape`, `supervise`, `harness`.
+You should see all **21 subcommands**: `init`, `adopt`, `bench`, `install-skill`, `acp`, `tui`, `run`, `status`, `pause`, `resume`, `stop`, `release`, `done`, `dossier`, `check`, `verdict`, `escape`, `supervise`, `harness`, `board`, `swarm`.
 
 Sign in once with your Claude OAuth subscription for Frontier ACP supervision (no Frontier API key needed; Workers remain API-key authenticated):
 
@@ -118,7 +118,7 @@ Useful optional flags on `openfarm init`:
 - `--force` — allow scaffolding into a non-empty directory (without `--force`, `openfarm init` refuses non-empty dirs with exit code `1`).
 
 `openfarm init` creates and validates (via `load_config`):
-- `.openfarm/config.toml` (all **13** strict TOML tables with `src/invariants.rs` protected in `never_touch` and `.openfarm/**`, `.claude/**`, `**/Cargo.toml`, `Cargo.lock` in `forbidden_files`)
+- `.openfarm/config.toml` (validated strict TOML tables with `[swarm] enabled = false` default, optional `[tiers.*]`, `src/invariants.rs` protected in `never_touch`, and `.openfarm/**`, `.claude/**`, `**/Cargo.toml`, `Cargo.lock` in `forbidden_files`)
 - `.openfarm/test-conventions.md`
 - `.openfarm/PROJECT_SPEC.md`
 - `AGENTS.md`
@@ -578,7 +578,7 @@ Verified automatically in Openfarm's local test suite (including `tests/test_v05
 - PEP 621 offline wheel packaging (`pyproject.toml`, `dependencies = []`, bundling all 9 `openfarm_core/skill_assets/` files).
 - Byte-for-byte parity between repo `skills/` and `openfarm_core/skill_assets/skills/`, YAML frontmatter, `$ARGUMENTS` slash command, and plugin JSON.
 - `openfarm install-skill` (`--target all|claude|antigravity|agents|workspace`, `--install-bin` executable `openfarm` launcher, `--dry-run`).
-- `openfarm init calorie-log` (`Git.init`, strict 13-table `load_config`, `0o700` state/key dirs, non-empty refusal, path traversal & Rust keyword guards, compiling `cargo test` + `cargo clippy -- -D warnings` + `rustfmt --check`).
+- `openfarm init calorie-log` (`Git.init`, strict 15-table `load_config`, `0o700` state/key dirs, non-empty refusal, path traversal & Rust keyword guards, compiling `cargo test` + `cargo clippy -- -D warnings` + `rustfmt --check`).
 - The exact `calorie-log` domain skeleton (`invariants.rs` + `goals.rs` + `lib.rs` + `baseline_tests.rs`), `openfarm check CARD-001` (`exit 0`), negative seam `CARD-900` (`exit 1`), `openfarm run --dry-run`, and single-card `--script` execution to `in-review`.
 
 Explicitly **untested** offline in this repository:

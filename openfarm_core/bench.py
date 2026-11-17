@@ -143,12 +143,15 @@ def score(records: list[dict]) -> dict:
         passed = bool(record["passed"])
 
         arm_stats = arm_totals.setdefault(
-            arm, {"runs": 0, "passed": 0, "spend": 0.0}
+            arm, {"runs": 0, "passed": 0, "spend": 0.0, "tokens": 0, "worker_tokens": 0}
         )
         arm_stats["runs"] += 1
         if passed:
             arm_stats["passed"] += 1
         arm_stats["spend"] += record["spend"]
+        arm_stats["tokens"] += int(record["tokens"])
+        # Older records have no split; count all their tokens as the worker's.
+        arm_stats["worker_tokens"] += int(record.get("worker_tokens", record["tokens"]))
 
         category_arms = category_totals.setdefault(category, {})
         category_stats = category_arms.setdefault(arm, {"runs": 0, "passed": 0})
@@ -161,10 +164,15 @@ def score(records: list[dict]) -> dict:
         runs = stats["runs"]
         passed = stats["passed"]
         spend = round(stats["spend"], 4)
+        tokens = stats["tokens"]
         arms[arm] = {
             "runs": runs,
             "passed": passed,
             "pass_rate": round(passed / runs, 4),
+            "tokens": tokens,
+            "tokens_per_pass": round(tokens / passed) if passed else None,
+            "worker_share": round(stats["worker_tokens"] / tokens, 4) if tokens else 0.0,
+            # Dollars at API list prices; on a subscription they are not a cost.
             "spend": spend,
             "cost_per_pass": round(spend / passed, 4) if passed else None,
         }
@@ -183,23 +191,23 @@ def render_report(summary: dict) -> str:
     def percent(value: float) -> str:
         return f"{value * 100:.1f}%"
 
-    def money(value: float | None) -> str:
+    def count(value: int | None) -> str:
         if value is None:
             return "—"
-        return f"${value:.2f}"
+        return f"{value:,}"
 
     lines = [
         "# openfarm bench report",
         "",
-        "| Arm | Runs | Passed | Pass rate | Spend | Cost per pass |",
-        "| --- | --- | --- | --- | --- | --- |",
+        "| Arm | Runs | Passed | Pass rate | Tokens | Tokens per pass | Worker share |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
     ]
     for arm in sorted(summary.get("arms", {})):
         stats = summary["arms"][arm]
         lines.append(
             f"| {arm} | {stats['runs']} | {stats['passed']} | "
-            f"{percent(stats['pass_rate'])} | {money(stats['spend'])} | "
-            f"{money(stats['cost_per_pass'])} |"
+            f"{percent(stats['pass_rate'])} | {count(stats['tokens'])} | "
+            f"{count(stats['tokens_per_pass'])} | {percent(stats['worker_share'])} |"
         )
 
     lines += [
@@ -273,9 +281,13 @@ def _arm_owns(table: str) -> bool:
         ("model.", "micromanager."))
 
 
+ARM_HARNESS_KEYS = frozenset({"learn_from", "share", "global_dir"})
+
+
 def load_arm(path: Path) -> str:
     """An arm file's text, checked: only `[adapters]` model/micromanager, `[model]`
-    and `[micromanager]` (with their sub-tables) are allowed in it."""
+    and `[micromanager]` (with their sub-tables), and `[harness]` learn_from, share
+    and global_dir are allowed in it."""
     try:
         text = Path(path).read_text(encoding="utf-8")
         data = tomllib.loads(text)
@@ -283,11 +295,16 @@ def load_arm(path: Path) -> str:
         raise Invalid("bad-bench-arm", f"cannot read arm file {path}: {exc}") from exc
     except tomllib.TOMLDecodeError as exc:
         raise Invalid("bad-bench-arm", f"invalid TOML in arm file {path}: {exc}") from exc
-    extra = sorted(set(data) - {"adapters", "model", "micromanager"})
+    extra = sorted(set(data) - {"adapters", "model", "micromanager", "harness"})
     if extra:
         raise Invalid("bad-bench-arm",
-                      f"{path}: an arm sets only [adapters], [model] and "
-                      f"[micromanager], not {extra}")
+                      f"{path}: an arm sets only [adapters], [model], "
+                      f"[micromanager] and [harness], not {extra}")
+    stray_harness = sorted(set(data.get("harness", {})) - ARM_HARNESS_KEYS)
+    if stray_harness:
+        raise Invalid("bad-bench-arm",
+                      f"{path}: an arm's [harness] sets only learn_from, share and "
+                      f"global_dir, not {stray_harness}")
     adapters = data.get("adapters", {})
     stray = sorted(set(adapters) - ARM_ADAPTER_KEYS)
     if stray:
@@ -297,6 +314,29 @@ def load_arm(path: Path) -> str:
     return text
 
 
+def _toml_value(value) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return json.dumps(str(value))
+
+
+def _merge_harness_lines(lines: list[str], arm_harness: dict) -> list[str]:
+    """The base's `[harness]` lines with the arm's keys replaced or added at the end."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for line in lines:
+        key = line.split("=", 1)[0].strip() if "=" in line else ""
+        if key in arm_harness:
+            line = f"{key} = {_toml_value(arm_harness[key])}"
+            seen.add(key)
+        out.append(line)
+    while out and not out[-1].strip():
+        out.pop()
+    out.extend(f"{key} = {_toml_value(value)}" for key, value in arm_harness.items()
+               if key not in seen)
+    return out
+
+
 def arm_config_text(base: str, arm: str) -> str:
     """`base` (a full config) with the arm's adapters, `[model]` and `[micromanager]`.
 
@@ -304,7 +344,9 @@ def arm_config_text(base: str, arm: str) -> str:
     matching lines and leave the rest of the base's `[adapters]` alone.
     """
     arm_sections = _sections(arm)
-    arm_adapters = tomllib.loads(arm).get("adapters", {})
+    arm_data = tomllib.loads(arm)
+    arm_adapters = arm_data.get("adapters", {})
+    arm_harness = arm_data.get("harness", {})
     arm_tables = [(name, lines) for name, lines in arm_sections if _arm_owns(name)]
     replaced = {name.split(".")[0] for name, _lines in arm_tables}
 
@@ -318,6 +360,9 @@ def arm_config_text(base: str, arm: str) -> str:
                 if key in arm_adapters:
                     line = f"{key} = {json.dumps(str(arm_adapters[key]))}"
                 out.append(line)
+            continue
+        if name == "harness" and arm_harness:
+            out.extend(_merge_harness_lines(lines, arm_harness))
             continue
         out.extend(lines)
     for _name, lines in arm_tables:
@@ -339,8 +384,11 @@ def _openfarm_cmd() -> list[str]:
     return [sys.executable, "-m", "openfarm_core.cli"]
 
 
-def _openfarm_env() -> dict:
+def _openfarm_env(global_dir: Path | None = None) -> dict:
     env = dict(os.environ)
+    if global_dir is not None:
+        # A bench run never reads or writes the owner's global lessons.
+        env["OPENFARM_GLOBAL_HARNESS"] = str(global_dir)
     root = str(Path(__file__).resolve().parent.parent)
     env["PYTHONPATH"] = root + (os.pathsep + env["PYTHONPATH"]
                                 if env.get("PYTHONPATH") else "")
@@ -410,7 +458,8 @@ def run_once(task: BenchTask, arm: str, arm_text: str | None, repeat: int,
         cmd += ["--script", str(task.script)]
     started = time.monotonic()
     done = subprocess.run(cmd, cwd=repo, capture_output=True, text=True,
-                          env=_openfarm_env(), timeout=timeout_s, check=False)
+                          env=_openfarm_env(run_dir / "global" / "harness"),
+                          timeout=timeout_s, check=False)
     seconds = round(time.monotonic() - started, 1)
     (run_dir / "run.out.json").write_text(done.stdout, encoding="utf-8")
     (run_dir / "run.err.log").write_text(done.stderr, encoding="utf-8")
@@ -430,8 +479,11 @@ def run_once(task: BenchTask, arm: str, arm_text: str | None, repeat: int,
     record["stop_code"] = str(outcome.get("stop_code", "") or "")
     record["spend"] = round(float(outcome.get("spend", 0.0) or 0.0)
                             + float(outcome.get("micromanager_spend", 0.0) or 0.0), 6)
-    record["tokens"] = sum(int(outcome.get(k, 0) or 0) for k in (
-        "tokens_in", "tokens_out", "micromanager_tokens_in", "micromanager_tokens_out"))
+    record["worker_tokens"] = sum(int(outcome.get(k, 0) or 0)
+                                  for k in ("tokens_in", "tokens_out"))
+    record["supervisor_tokens"] = sum(int(outcome.get(k, 0) or 0) for k in (
+        "micromanager_tokens_in", "micromanager_tokens_out"))
+    record["tokens"] = record["worker_tokens"] + record["supervisor_tokens"]
     record["diff_lines"] = (int(outcome.get("lines_added", 0) or 0)
                             + int(outcome.get("lines_removed", 0) or 0))
     if record["final_state"] != "in-review":

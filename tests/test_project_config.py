@@ -52,6 +52,12 @@ SPEC_KEYS = {
                 "max_active_adaptations", "min_confidence", "probe_window",
                 "auto_demote", "allow_micromanager_reflection",
                 "editable_surfaces"},
+    "swarm": {"enabled", "coordinator", "supervisor", "coordinator_effort",
+              "supervisor_effort", "default_tier", "escalate_after",
+              "handbacks_per_card", "max_members", "coordinator_calls_per_run",
+              "coordinator_tokens_per_run", "external_wait",
+              "on_external_timeout", "stall_after"},
+    "tiers": {"model", "efforts", "effort_param"},
 }
 
 
@@ -64,7 +70,7 @@ class ConfigFileTests(unittest.TestCase):
         # (`v0.6` while in development, `master` once merged).
         cfg = load_config(REPO)
         self.assertEqual(cfg.name, "openfarm")
-        self.assertIn(cfg.base_branch, ("master", "v0.6"))
+        self.assertIn(cfg.base_branch, ("master",))
         self.assertEqual(cfg.languages, ["python"])
         self.assertEqual(cfg.mutation, "off")
 

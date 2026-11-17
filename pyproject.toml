@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "openfarm"
-version = "0.6.0"
+version = "0.8.0"
 description = "Deterministic local-only orchestrator, ACP micromanager, recursive harness memory, and frontier skill bundle for narrowly scoped model work."
 readme = "README.md"
 requires-python = ">=3.11"

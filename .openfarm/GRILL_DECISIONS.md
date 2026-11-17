@@ -1,4 +1,53 @@
-# openfarm v0.6 Design Decisions (openfarm-grill-me)
+# openfarm v0.8 Design Decisions (openfarm-grill-me, cut short)
+
+- **Idea:** openfarm v0.8. A shared board, a team whose members a coordinator picks (tier and effort), parallel cards, and seats an outside agent or person can hold.
+- **Grill mode:** one question asked, then the owner said "draft it up" (16 Nov 2026). Only the three decisions below are the owner's. Everything else in `openfarm spec v0.8.md` is my default, listed there under "Open for the owner", and not yet confirmed.
+
+## Decisions (the owner's)
+
+1. **Scope.** The full version in one release: a coordinator that picks its own members, and parallel cards. Not the smaller board-and-one-seat version I recommended.
+2. **Effort.** The coordinator sets effort per member. It matters most for now, because every member is the same model.
+3. **Members.** DeepSeek V4.1 Flash only for now, at `low`, `medium`, `high` or `max`.
+
+## Build route
+
+By hand on branch `v0.8`, by another agent overnight, from `docs/v0.8-BUILD-HANDOFF.md`. No live model calls during the build; the owner runs the first live test.
+
+---
+
+# Earlier: openfarm v0.7 Design Decisions (openfarm-grill-me)
+
+- **Idea:** openfarm v0.7. Learning extraction can mark lessons as project-independent, proven ones become global across every openfarm project, and each project chooses whether it applies its own lessons, global ones, or both.
+- **Grill mode:** serial, Q1 to Q8, every recommendation taken. Confirmed 16 Nov 2026.
+- **Execution setup:** as v0.6. Frontier = Claude ACP (`auth = "oauth"`, `mode = "active"`) | Workers = DeepSeek V4.1 Flash on Command Code's Provider API with `x-cmd-zdr: 1` (key outside the repo).
+
+## Facts found before asking
+
+- Each project keeps one harness library at `<state_dir>/harness` (or `[harness] dir`, outside the repo): entries, the active overlay, revisions, a ledger and metrics. Nothing records which project a lesson came from.
+- Entries are already scoped by language, card kind, role and failure class, each of which may be `*`.
+- Pointing two projects' `[harness] dir` at one folder shares a library crudely: one probe cycle, one score set, and each project's `never_touch` judging the other's lessons.
+- openfarm's own library holds 34 lessons, 24 of them supervisor notes on harness bookkeeping, most of the rest template cues ("double-check constraints related to `runtime-assert`"). anyhow's holds none.
+
+## Decisions
+
+1. **Storage.** A second, global library at `[harness] global_dir` (default `~/.openfarm/global/harness`, refused inside any repo), in the same format. Each project keeps its own library. A lesson enters the global library only by promotion and records its source project. Projects read both libraries and write only their own.
+2. **Scope at extraction.** Every new lesson gets `scope = "project" | "general"`. The supervisor's reflection chooses, with a reason. Plain code forces `project` when the lesson's text names one of this repo's tracked file paths, a module or symbol name from them, a card ID, or the project name.
+3. **Promotion.** A `general` lesson is copied to the global library automatically once it is `active` in its home project, has `helped >= 3`, and `hurt < helped`. `openfarm harness promote <id> --global` and `openfarm harness demote <id> --global` force either way. Every move is a global ledger event naming the source project.
+4. **Applying.** `[harness] learn_from = "both" | "project" | "global"` (default `"both"`) and `[harness] share = true | false` (default `true`, whether this project's proven lessons may go global). `openfarm run --learn-from X` overrides `learn_from` for one run. On equal fit a project lesson ranks above a global one, and `max_cues_per_brief` caps both together.
+5. **Judging.** Each project scores global lessons in its own ledger. A global lesson with `hurt > helped` in a project is vetoed for that project only. It is retired globally once 2 or more projects veto it, or when its help minus hurt summed across projects goes below 0. A new global lesson enters a project's probe cycle like the project's own new lessons.
+6. **Eligibility.** Only worker-surface lessons (planner, test writer, implementer, context hints) and supervisor coaching about code may go global. Supervisor notes on harness bookkeeping stay local, spotted by plain code from harness terms. Template cues from the deterministic extractor stay local. The 34 existing lessons are marked `project`, so the global library starts empty.
+7. **Privacy.** Promotion re-runs the existing scans (gate-bypass text, assertion leaks, unsafe paths) and the project-name check from 2, and refuses a lesson over 400 characters or holding a code block. `openfarm harness status --global` lists global lessons with their source projects.
+8. **Build route.** The frontier lead builds the protected core: config keys, flow wiring, and the two-library read in `harness_memory.py`. The farm works the contained cards live on openfarm itself (scope check, promotion, veto and retire, CLI, bench arm option, docs). Everything lands on branch `v0.7`. Nothing is pushed without the owner's ask.
+
+## Done
+
+- Offline tests: a lesson proven in project A appears in project B's brief; B vetoes it; two vetoes retire it; `learn_from` and `share` are obeyed; a lesson naming project A's file is never promoted.
+- Full suite green, end-to-end tests included.
+- Global learning across two real projects stays **untested** until it has happened.
+
+---
+
+# Earlier: openfarm v0.6 Design Decisions (openfarm-grill-me)
 
 - **Idea:** openfarm v0.6. openfarm works on itself, works on or initializes into an existing project, ships an efficacy test suite anyone can run with their own frontier and worker choice, and gains a batch mode for grill-me.
 - **Grill mode:** Q1 and Q2 serial, then batch (the owner switched at Q2). Batch list confirmed 16 Nov 2026 with no challenges.

@@ -14,10 +14,16 @@ Every command takes `--json` and then prints its result as one JSON object on st
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
+import contextlib
 import datetime as _dt
+import difflib
+import inspect
+import io
 import json
 import re
 import sys
+import threading
 import time as _time
 from pathlib import Path
 
@@ -31,10 +37,11 @@ from .acp_setup import (
 )
 from .adopt import adopt_project
 from .bench import load_task
+from .board import Board, VALID_POST_KINDS, board_dir_for
 from .adapters.files import FileCardSource, open_card_source
 from .adapters.jsonl import TelemetrySink, open_telemetry
 from .adapters.openai_compat import open_backend
-from .adapters.direct import open_runner
+from .adapters.direct import BuildLimiter, open_runner
 from .bootstrap import (
     INSTALL_TARGETS,
     MUTATION_MODES,
@@ -43,9 +50,10 @@ from .bootstrap import (
     install_skill_bundle,
 )
 from .briefs import BriefBook
-from .budget import NightBudget
+from .budget import NightBudget, token_split
 from .cards import Card
 from .config import load_config, parse_duration
+from .coordinator import SwarmRunner
 from .dossier import build_dossier, render_markdown
 from .errors import (AdapterError, ConfigError, GateFailure, Infra, Invalid,
                      Refused, StopCode, UsageError)
@@ -54,11 +62,26 @@ from .gates.checks import suite_green
 from .gates.eligibility import check_eligibility, derive_cargo_unit
 from .git import Git, GitRefused
 from .globs import matches_any, normalise, resolves_within
+from .harness_global import GlobalLibrary, global_dir_for
 from .harness_memory import HarnessLibrary
+from .harness_scope import project_markers
+from .human_cli import Style, error_hint, format_human
 from .micromanager import MicromanagerBudget, open_micromanager
 from .packs.base import pack_for
-from .state import (StateDir, _safe_id, read_json, utc_now, utc_after,
-                    write_json)
+from .state import (StateDir, _safe_id, baseline_lock_for, read_json, utc_now,
+                    utc_after, write_json)
+from .swarm import (
+    parse_team_spec,
+    swarm_block,
+    swarm_hint,
+    swarm_join,
+    swarm_remove,
+    swarm_set,
+    swarm_start,
+    swarm_status,
+    swarm_tiers,
+)
+from .tui import VIEWS as TUI_VIEWS, run_tui
 
 EXIT_OK = 0
 EXIT_REFUSED = 1
@@ -76,15 +99,11 @@ class Context:
         self.cfg = load_config(self.repo, config_path)
         self.state = StateDir(self.cfg.state_dir)
 
-    def emit(self, payload: dict) -> None:
+    def emit(self, payload: dict, *, kind: str | None = None) -> None:
         if self.json:
             print(json.dumps(payload, indent=2, ensure_ascii=False))
             return
-        for key, value in payload.items():
-            if isinstance(value, (dict, list)):
-                print(f"{key}: {json.dumps(value, ensure_ascii=False)}")
-            else:
-                print(f"{key}: {value}")
+        print(format_human(kind or "", payload, style=Style(sys.stdout)))
 
     def cards(self, worktree: Path | None = None) -> FileCardSource:
         source = open_card_source(self.cfg, self.state.root)
@@ -92,8 +111,30 @@ class Context:
             source.worktree = worktree
         return source
 
-    def runner(self, worktree: Path, output_dir: Path | None = None):
-        return open_runner(self.cfg, worktree, output_dir)
+    def runner(self, worktree: Path, output_dir: Path | None = None,
+               limiter: BuildLimiter | None = None, budget=None):
+        return open_runner(
+            self.cfg, worktree, output_dir, limiter=limiter, budget=budget
+        )
+
+
+def _emit_ctx(ctx, payload: dict, kind: str) -> None:
+    if isinstance(ctx, Context):
+        ctx.emit(payload, kind=kind)
+        return
+    emit_fn = getattr(ctx, "emit", None)
+    if not callable(emit_fn):
+        return
+    try:
+        params = inspect.signature(emit_fn).parameters
+    except (TypeError, ValueError):
+        params = {}
+    if "kind" in params or any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+    ):
+        emit_fn(payload, kind=kind)
+    else:
+        emit_fn(payload)
 
 
 def _check_id(value: str, what: str = "card id") -> str:
@@ -165,8 +206,8 @@ def cmd_check(ctx: Context, args) -> int:
     try:
         card = Card.from_dict(source.read(card_id)["card"])
     except Refused as exc:
-        ctx.emit({"card": card_id, "eligible": False,
-                  "failures": [{"rule": "read", "detail": exc.message}]})
+        _emit_ctx(ctx, {"card": card_id, "eligible": False,
+                        "failures": [{"rule": "read", "detail": exc.message}]}, "check")
         return EXIT_REFUSED
 
     deps_done = _deps_done(source, card)
@@ -188,7 +229,7 @@ def cmd_check(ctx: Context, args) -> int:
 
     write_json(ctx.state.check_dir(card.id) / f"{utc_now().replace(':', '')}.json",
                payload)
-    ctx.emit(payload)
+    _emit_ctx(ctx, payload, "check")
     return EXIT_OK if payload["eligible"] else EXIT_REFUSED
 
 
@@ -226,6 +267,13 @@ def _baseline_check(ctx: Context, source: FileCardSource, card: Card) -> dict:
             base_commit or "unknown", unit or "workspace",
             ctx.cfg.known_failing_hash(), ctx.cfg.env_hash(unit),
         )
+        cache_lock = (
+            baseline_lock_for(cache_path) if ctx.cfg.baseline_cache else None
+        )
+        lock_held = False
+        if cache_lock is not None:
+            cache_lock.acquire()
+            lock_held = True
         cached = read_json(cache_path) if ctx.cfg.baseline_cache else None
         if not (isinstance(cached, dict)
                 and cached.get("known_failing_hash") == ctx.cfg.known_failing_hash()
@@ -264,6 +312,9 @@ def _baseline_check(ctx: Context, source: FileCardSource, card: Card) -> dict:
                     "env_hash": ctx.cfg.env_hash(unit),
                     "agreed": True, "list": listing, "at": utc_now(),
                 })
+        if lock_held and cache_lock is not None:
+            cache_lock.release()
+            lock_held = False
 
         if not card.test_names:
             return {"ok": True, "class": "pass", "named": {},
@@ -298,20 +349,22 @@ def _baseline_check(ctx: Context, source: FileCardSource, card: Card) -> dict:
             "passing_on_base": passing,
         }
     finally:
+        if lock_held and cache_lock is not None:
+            cache_lock.release()
         git.worktree_remove(worktree)
 
 
 def cmd_run(ctx: Context, args) -> int:
     """Start a run: claim, drive, and move each card."""
     if ctx.state.kill_requested(ctx.cfg.kill_switch):
-        ctx.emit({"refused": True, "reason": "the kill switch exists"})
+        _emit_ctx(ctx, {"refused": True, "reason": "the kill switch exists"}, "run")
         return EXIT_REFUSED
     if ctx.state.is_paused():
-        ctx.emit({"refused": True, "reason": "the queue is paused"})
+        _emit_ctx(ctx, {"refused": True, "reason": "the queue is paused"}, "run")
         return EXIT_REFUSED
     breaker = ctx.state.read_breaker()
     if breaker.get("tripped"):
-        ctx.emit({"refused": True, "reason": "the circuit breaker is tripped"})
+        _emit_ctx(ctx, {"refused": True, "reason": "the circuit breaker is tripped"}, "run")
         return EXIT_REFUSED
 
     if not args.dry_run:
@@ -319,15 +372,19 @@ def cmd_run(ctx: Context, args) -> int:
         from .selfhost import unpinned_reason
         reason = unpinned_reason(ctx.repo, getattr(ctx.cfg, "state_dir", None))
         if reason:
-            ctx.emit({"refused": True, "reason": reason,
-                      "code": "self-host-unpinned"})
+            _emit_ctx(ctx, {"refused": True, "reason": reason,
+                            "code": "self-host-unpinned"}, "run")
             return EXIT_REFUSED
+
+    if getattr(args, "learn_from", None):
+        import dataclasses
+        ctx.cfg.harness = dataclasses.replace(ctx.cfg.harness, learn_from=args.learn_from)
 
     run_id = args.run_id or f"run-{utc_now().replace('-', '').replace(':', '')}"
     if not ctx.state.acquire_run_lock(run_id):
         holder = ctx.state.lock_holder() or {}
-        ctx.emit({"refused": True,
-                  "reason": f"another run holds the lock: {holder.get('run_id')}"})
+        _emit_ctx(ctx, {"refused": True,
+                        "reason": f"another run holds the lock: {holder.get('run_id')}"}, "run")
         return EXIT_REFUSED
 
     try:
@@ -347,8 +404,8 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
     cfg = ctx.cfg
     handshake = _handshake(ctx, source, args, telemetry_raw=telemetry_raw)
     if handshake["refused"]:
-        ctx.emit({"refused": True, "reason": handshake["reason"],
-                  "adapters": handshake["adapters"]})
+        _emit_ctx(ctx, {"refused": True, "reason": handshake["reason"],
+                        "adapters": handshake["adapters"]}, "run")
         return EXIT_REFUSED
 
     if cfg.state_dir.exists():
@@ -385,74 +442,216 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
     mm_script_path = (Path(args.mm_script)
                       if getattr(args, "mm_script", None) else None)
     harness_lib = _open_harness_library(ctx, require_enabled=True)
+    swarm_cfg = getattr(cfg, "swarm", None)
+    board: Board | None = None
+    if swarm_cfg is not None and swarm_cfg.enabled and not args.dry_run:
+        board = Board(board_dir_for(ctx.state, run_id), state_dir=ctx.state)
+        board.ensure()
+        board.upsert_member("gates", kind="code", role="gates", added_by="system")
+        board.upsert_member("monitor", kind="code", role="monitor", added_by="system")
+        if swarm_cfg.coordinator == "code":
+            board.upsert_member(
+                "coordinator", kind="code", role="coordinator", added_by="system"
+            )
+        if swarm_cfg.supervisor.startswith("tier:"):
+            sup_tier = cfg.tiers[swarm_cfg.supervisor[5:]]
+            from .swarm import worker_kind_for_config
+            board.upsert_member(
+                "supervisor",
+                kind=worker_kind_for_config(cfg),
+                role="supervisor",
+                tier=sup_tier.name,
+                model=sup_tier.model,
+                effort=swarm_cfg.supervisor_effort,
+                added_by="system",
+            )
 
-    for card_id in identifiers:
-        if ctx.state.kill_requested(cfg.kill_switch):
-            # Cards in flight were stopped by CardRun itself, which blocks them with
-            # `killed`. A card not yet claimed is simply left alone.
-            outcomes.append({"card": card_id,
-                             "skipped": "the kill switch was set"})
-            break
-        # A pause stops new claims, and cards already in flight finish their attempt:
-        # that is the spec's rule, and it is checked here rather than only at entry so
-        # `openfarm pause` means something during a night.
-        if ctx.state.is_paused():
-            outcomes.append({"card": card_id,
-                             "skipped": "the queue was paused"})
-            continue
-        # `_deadline` answers in `time.monotonic()`, so it must be compared to the
-        # same clock. Comparing it to `time.time()` would skip every card at once.
-        if deadline is not None and _time.monotonic() >= deadline:
-            outcomes.append({"card": card_id,
-                             "skipped": "the run's time ran out"})
-            continue
-        reason = night.exhausted()
-        if reason:
-            outcomes.append({"card": card_id, "skipped": reason})
-            continue
-        ctx.state.check_disk_space(getattr(cfg, "min_free_mb", 0))
-        if args.dry_run:
-            outcomes.append(_dry_run(ctx, source, card_id))
-            continue
+    swarm_parallel = bool(
+        swarm_cfg is not None and swarm_cfg.enabled and not args.dry_run
+    )
+    shared_mm_backend = None
+    coord_backend = None
+    if (
+        swarm_parallel
+        and mm_script_path is None
+        and getattr(cfg, "concurrent_cards", 1) > 1
+        and swarm_cfg.supervisor == "config"
+        and cfg.micromanager_adapter.lower() in ("claude-acp", "acp", "claude")
+        and getattr(getattr(cfg, "micromanager", None), "mode", "active") != "off"
+    ):
+        shared_mm = open_micromanager(
+            cfg, ctx.state.root, ctx.repo, worktree=ctx.repo, budget=night_mm_budget
+        )
+        shared_mm_backend = getattr(shared_mm, "backend", None)
+    if swarm_parallel and str(getattr(swarm_cfg, "coordinator", "code") or "").startswith("tier:"):
+        coord_backend = open_backend(cfg, script_path)
+    build_limiter = (
+        BuildLimiter(getattr(cfg, "concurrent_builds", 2))
+        if swarm_parallel
+        else None
+    )
 
-        outcome = _run_card(ctx, source, card_id, run_id, telemetry,
-                            run_dir, script_path, mm_script=mm_script_path,
-                            harness_library=harness_lib,
-                            mm_budget=night_mm_budget)
-        outcomes.append(outcome)
-        final_state = outcome.get("final_state")
-        if final_state == "blocked":
-            code = outcome.get("stop_code", "")
-            consecutive.append((card_id, code, outcome.get("detail", "")))
-            if code == StopCode.INFRA.value:
-                ctx.state.pause(
-                    f"infra error on {card_id}: {outcome.get('detail', '')}")
+    try:
+        if not swarm_parallel:
+            for card_id in identifiers:
+                if ctx.state.kill_requested(cfg.kill_switch):
+                    # Cards in flight were stopped by CardRun itself, which blocks them with
+                    # `killed`. A card not yet claimed is simply left alone.
+                    outcomes.append({"card": card_id,
+                                     "skipped": "the kill switch was set"})
+                    break
+                # A pause stops new claims, and cards already in flight finish their attempt:
+                # that is the spec's rule, and it is checked here rather than only at entry so
+                # `openfarm pause` means something during a night.
+                if ctx.state.is_paused():
+                    outcomes.append({"card": card_id,
+                                     "skipped": "the queue was paused"})
+                    continue
+                # `_deadline` answers in `time.monotonic()`, so it must be compared to the
+                # same clock. Comparing it to `time.time()` would skip every card at once.
+                if deadline is not None and _time.monotonic() >= deadline:
+                    outcomes.append({"card": card_id,
+                                     "skipped": "the run's time ran out"})
+                    continue
+                reason = night.exhausted()
+                if reason:
+                    outcomes.append({"card": card_id, "skipped": reason})
+                    continue
+                ctx.state.check_disk_space(getattr(cfg, "min_free_mb", 0))
+                if args.dry_run:
+                    outcomes.append(_dry_run(ctx, source, card_id))
+                    continue
+
+                outcome = _run_card(ctx, source, card_id, run_id, telemetry,
+                                    run_dir, script_path, mm_script=mm_script_path,
+                                    harness_library=harness_lib,
+                                    mm_budget=night_mm_budget, board=board)
+                outcomes.append(outcome)
+                final_state = outcome.get("final_state")
+                if final_state == "blocked":
+                    code = outcome.get("stop_code", "")
+                    consecutive.append((card_id, code, outcome.get("detail", "")))
+                    if code == StopCode.INFRA.value:
+                        ctx.state.pause(
+                            f"infra error on {card_id}: {outcome.get('detail', '')}")
+                        night.note_card()
+                        night.note_spend(outcome.get("spend", 0.0) or 0.0)
+                        night.note_micromanager(
+                            outcome.get("micromanager_spend", 0.0) or 0.0)
+                        _update_breaker(ctx, consecutive)
+                        break
+                elif final_state != "released":
+                    consecutive = []
                 night.note_card()
                 night.note_spend(outcome.get("spend", 0.0) or 0.0)
-                night.note_micromanager(
-                    outcome.get("micromanager_spend", 0.0) or 0.0)
+                night.note_micromanager(outcome.get("micromanager_spend", 0.0) or 0.0)
                 _update_breaker(ctx, consecutive)
-                break
-        elif final_state != "released":
-            consecutive = []
-        night.note_card()
-        night.note_spend(outcome.get("spend", 0.0) or 0.0)
-        night.note_micromanager(outcome.get("micromanager_spend", 0.0) or 0.0)
-        _update_breaker(ctx, consecutive)
+        else:
+            rec_lock = threading.Lock()
+
+            def _run_swarm_card(cid: str, *, on_handback=None, on_struggling=None) -> dict:
+                return _run_card(
+                    ctx,
+                    source,
+                    cid,
+                    run_id,
+                    telemetry,
+                    run_dir,
+                    script_path,
+                    mm_script=mm_script_path,
+                    harness_library=harness_lib,
+                    mm_budget=night_mm_budget,
+                    board=board,
+                    build_limiter=build_limiter,
+                    mm_backend=shared_mm_backend,
+                    on_handback=on_handback,
+                    on_struggling=on_struggling,
+                )
+
+            def _record_swarm_outcome(cid: str, outcome: dict) -> bool:
+                nonlocal consecutive
+                with rec_lock:
+                    final_state = outcome.get("final_state")
+                    infra_stop = False
+                    if final_state == "blocked":
+                        code = outcome.get("stop_code", "")
+                        consecutive.append((cid, code, outcome.get("detail", "")))
+                        if code == StopCode.INFRA.value:
+                            ctx.state.pause(
+                                f"infra error on {cid}: {outcome.get('detail', '')}"
+                            )
+                            infra_stop = True
+                    elif final_state != "released":
+                        consecutive = []
+                    night.note_spend(outcome.get("spend", 0.0) or 0.0)
+                    night.note_micromanager(
+                        outcome.get("micromanager_spend", 0.0) or 0.0
+                    )
+                    _update_breaker(ctx, consecutive)
+                    return infra_stop
+
+            swarm_runner = SwarmRunner(
+                cfg=cfg,
+                state=ctx.state,
+                source=source,
+                board=board,
+                identifiers=identifiers,
+                night=night,
+                deadline=deadline,
+                run_card_fn=_run_swarm_card,
+                record_outcome_fn=_record_swarm_outcome,
+                backend=coord_backend,
+            )
+            outcomes = swarm_runner.run()
+    finally:
+        if coord_backend is not None and hasattr(coord_backend, "close"):
+            try:
+                coord_backend.close()
+            except Exception as exc:
+                print(f"coordinator backend close error ignored: {exc}", file=sys.stderr)
+        if shared_mm_backend is not None and hasattr(shared_mm_backend, "close"):
+            try:
+                shared_mm_backend.close()
+            except Exception as exc:
+                print(f"micromanager close error ignored: {exc}", file=sys.stderr)
+        if board is not None:
+            board.end_run("finished")
 
     notes: list[str] = []
     if not _backend_prices_spend(cfg, script_path):
         notes.append(
             "the backend reports no prices, so every spend is zero and the spend "
             "caps cannot fire: set [model] cost_per_1k_in and cost_per_1k_out")
-    if cfg.concurrent_cards > 1:
+    if cfg.concurrent_cards > 1 and not swarm_parallel:
         notes.append(
             f"concurrent_cards is {cfg.concurrent_cards} but cards run one at a "
             f"time: the per-card state is ready for a pool, the loop is not")
 
+    tokens_payload = token_split(
+        sum(int(o.get("tokens_in", 0) or 0) + int(o.get("tokens_out", 0) or 0)
+            for o in outcomes),
+        sum(int(o.get("micromanager_tokens_in", 0) or 0)
+            + int(o.get("micromanager_tokens_out", 0) or 0) for o in outcomes),
+    )
+    if board is not None:
+        by_member: dict[str, int] = {}
+        by_effort: dict[str, int] = {}
+        for m in board.list_members(include_removed=True):
+            mtokens = int(m.get("tokens_in", 0) or 0) + int(m.get("tokens_out", 0) or 0)
+            if mtokens > 0 or m.get("role") in (
+                "planner", "test-writer", "implementer", "checker"
+            ):
+                by_member[m["name"]] = mtokens
+            for eff_key, eff_tok in (m.get("tokens_by_effort") or {}).items():
+                by_effort[eff_key] = by_effort.get(eff_key, 0) + int(eff_tok or 0)
+        tokens_payload["by_member"] = by_member
+        tokens_payload["by_effort"] = by_effort
+
     record = {"run_id": run_id, "started_at": utc_now(),
               "finished_at": utc_now(), "caps": {"spend": night.spend_cap,
                                                 "cards": args.cards},
+              "tokens": tokens_payload,
+              # Dollars at API list prices: what the spend caps count, not a cost.
               "spend": round(night.total_spend(), 6),
               "micromanager_spend": round(night.micromanager_spend, 6),
               "spend_measured": _backend_prices_spend(cfg, script_path),
@@ -465,7 +664,7 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
     write_json(run_dir / "run.json", record)
     telemetry.write("run", record)
     telemetry.flush()
-    ctx.emit(record)
+    _emit_ctx(ctx, record, "run")
     return EXIT_OK if not any(o.get("stop_code") == "infra" for o in outcomes) \
         else EXIT_TROUBLE
 
@@ -524,7 +723,12 @@ def _run_card(ctx: Context, source: FileCardSource, card_id: str, run_id: str,
               backend=None, mm_script: Path | None = None,
               micromanager=None,
               harness_library: HarnessLibrary | None = None,
-              mm_budget: MicromanagerBudget | None = None) -> dict:
+              mm_budget: MicromanagerBudget | None = None,
+              board: Board | None = None,
+              build_limiter: BuildLimiter | None = None,
+              mm_backend=None,
+              on_handback=None,
+              on_struggling=None) -> dict:
     """Claim one card and drive it. `backend` overrides the configured one."""
     cfg = ctx.cfg
     holder = f"openfarm:{run_id}"
@@ -552,14 +756,17 @@ def _run_card(ctx: Context, source: FileCardSource, card_id: str, run_id: str,
     owns_backend = backend is None
     backend = backend if backend is not None else open_backend(cfg, script)
     runner = ctx.runner(worktree, output_dir=card_dir / "gates" / "output")
+    if build_limiter is not None and hasattr(runner, "limiter") and runner.limiter is None:
+        runner.limiter = build_limiter
     book = BriefBook(worktree, cfg.never_touch, cfg.forbidden_files)
     book.pack = pack
     conventions = _load_test_conventions(cfg, worktree)
 
-    owns_mm = micromanager is None
+    owns_mm = micromanager is None and mm_backend is None
     mm = (micromanager if micromanager is not None else open_micromanager(
         cfg, card_dir, ctx.repo, script=mm_script,
-        worktree=worktree, card_dir=card_dir,
+        worktree=worktree, card_dir=card_dir, budget=mm_budget,
+        board=board, worker_backend=backend, backend_override=mm_backend,
     ))
     if mm_budget is not None and hasattr(mm, "budget"):
         mm.budget = mm_budget
@@ -574,7 +781,9 @@ def _run_card(ctx: Context, source: FileCardSource, card_id: str, run_id: str,
         book=book, run_id=run_id, telemetry=telemetry,
         deps_done=_deps_done(source, card), conventions=conventions,
         log=lambda message: print(message, file=sys.stderr),
-        micromanager=mm, harness_library=resolved_harness)
+        micromanager=mm, harness_library=resolved_harness,
+        board=board, swarm=getattr(cfg, "swarm", None),
+        on_handback=on_handback, on_struggling=on_struggling)
     run.card_source = source
     try:
         record = run.run(claim=claim)
@@ -722,7 +931,18 @@ def _handshake(ctx: Context, source, args, telemetry_raw=None) -> dict:
 
     mm_script_raw = getattr(args, "mm_script", None)
     mm_cfg = getattr(ctx.cfg, "micromanager", None)
-    if (mm_cfg and getattr(mm_cfg, "mode", "off") != "off") or mm_script_raw:
+    swarm_cfg = getattr(ctx.cfg, "swarm", None)
+    swarm_sup = (
+        swarm_cfg.supervisor
+        if (swarm_cfg is not None and swarm_cfg.enabled)
+        else "config"
+    )
+    should_check_mm = bool(mm_script_raw) or (
+        swarm_sup == "config"
+        and mm_cfg is not None
+        and getattr(mm_cfg, "mode", "off") != "off"
+    )
+    if should_check_mm:
         mm_script = Path(mm_script_raw) if mm_script_raw else None
         mm = None
         try:
@@ -741,6 +961,8 @@ def _handshake(ctx: Context, source, args, telemetry_raw=None) -> dict:
                     mm.close()
                 except Exception:
                     pass
+    elif swarm_sup != "config":
+        names["micromanager"] = swarm_sup
 
     return {"refused": False, "reason": "", "adapters": names}
 
@@ -795,7 +1017,7 @@ def cmd_status(ctx: Context, args) -> int:
              "stop_code": (read_json(path) or {}).get("stop_code", "")}
             for path in sorted(ctx.state.cards.glob(f"{card_id}/*/card-record.json"))
         ]
-    ctx.emit(payload)
+    _emit_ctx(ctx, payload, "status")
     return EXIT_OK
 
 
@@ -814,34 +1036,34 @@ def _last_run(ctx: Context) -> dict:
 
 def cmd_pause(ctx: Context, args) -> int:
     ctx.state.pause(args.reason or "")
-    ctx.emit({"paused": True, "reason": args.reason or ""})
+    _emit_ctx(ctx, {"paused": True, "reason": args.reason or ""}, "pause")
     return EXIT_OK
 
 
 def cmd_resume(ctx: Context, args) -> int:
     breaker = ctx.state.read_breaker()
     if breaker.get("tripped") and not args.clear_breaker:
-        ctx.emit({"refused": True,
-                  "reason": "the circuit breaker is tripped; pass --clear-breaker "
-                            "to clear it"})
+        _emit_ctx(ctx, {"refused": True,
+                        "reason": "the circuit breaker is tripped; pass --clear-breaker "
+                                  "to clear it"}, "resume")
         return EXIT_REFUSED
     if ctx.state.kill_requested(ctx.cfg.kill_switch) and not args.clear_kill:
-        ctx.emit({"refused": True,
-                  "reason": "the kill switch exists; pass --clear-kill to clear it"})
+        _emit_ctx(ctx, {"refused": True,
+                        "reason": "the kill switch exists; pass --clear-kill to clear it"}, "resume")
         return EXIT_REFUSED
     if args.clear_breaker:
         ctx.state.write_breaker(False, [])
     if args.clear_kill:
         ctx.state.clear_kill(ctx.cfg.kill_switch)
     ctx.state.resume()
-    ctx.emit({"paused": False, "breaker_cleared": bool(args.clear_breaker),
-              "kill_cleared": bool(args.clear_kill)})
+    _emit_ctx(ctx, {"paused": False, "breaker_cleared": bool(args.clear_breaker),
+                    "kill_cleared": bool(args.clear_kill)}, "resume")
     return EXIT_OK
 
 
 def cmd_stop(ctx: Context, args) -> int:
     path = ctx.state.request_kill(ctx.cfg.kill_switch, args.reason or "")
-    ctx.emit({"kill_switch": str(path), "reason": args.reason or ""})
+    _emit_ctx(ctx, {"kill_switch": str(path), "reason": args.reason or ""}, "stop")
     return EXIT_OK
 
 
@@ -854,8 +1076,8 @@ def cmd_release(ctx: Context, args) -> int:
         source.release(card_id, reason=args.reason,
                        stop_code=StopCode.RELEASED.value)
     except Refused as exc:
-        ctx.emit({"released": False, "reason": exc.message,
-                  "archived": []})
+        _emit_ctx(ctx, {"released": False, "reason": exc.message,
+                        "archived": []}, "release")
         return EXIT_REFUSED
 
     card_dir = ctx.state.cards / card_id
@@ -873,7 +1095,7 @@ def cmd_release(ctx: Context, args) -> int:
                 archived.append(str(target))
             except OSError:
                 pass
-    ctx.emit({"released": True, "card": card_id, "archived": archived})
+    _emit_ctx(ctx, {"released": True, "card": card_id, "archived": archived}, "release")
     return EXIT_OK
 
 
@@ -888,7 +1110,7 @@ def cmd_done(ctx: Context, args) -> int:
     source.prepare()
     card = next((c for c in source.all_cards() if c.id == card_id), None)
     if card is None:
-        ctx.emit({"card": card_id, "done": False, "reason": "no such card"})
+        _emit_ctx(ctx, {"card": card_id, "done": False, "reason": "no such card"}, "done")
         return EXIT_REFUSED
     git = Git(ctx.repo)
     base = ctx.cfg.base_branch
@@ -903,14 +1125,14 @@ def cmd_done(ctx: Context, args) -> int:
         if unmerged:
             reason = f"{branch} has {unmerged} commit(s) not merged into {base}"
     if reason:
-        ctx.emit({"card": card_id, "done": False, "reason": reason})
+        _emit_ctx(ctx, {"card": card_id, "done": False, "reason": reason}, "done")
         return EXIT_REFUSED
     try:
         source.mark_done(card_id, note=args.note or "")
     except Refused as exc:
-        ctx.emit({"card": card_id, "done": False, "reason": exc.message})
+        _emit_ctx(ctx, {"card": card_id, "done": False, "reason": exc.message}, "done")
         return EXIT_REFUSED
-    ctx.emit({"card": card_id, "done": True, "branch": branch, "base": base})
+    _emit_ctx(ctx, {"card": card_id, "done": True, "branch": branch, "base": base}, "done")
     return EXIT_OK
 
 
@@ -929,7 +1151,7 @@ def cmd_dossier(ctx: Context, args) -> int:
         candidates = sorted(ctx.state.cards.glob(f"{card_id}/*/dossier.json"))
         path = candidates[-1] if candidates else None
     if not path or not Path(path).exists():
-        ctx.emit({"card": card_id, "error": "no dossier yet"})
+        _emit_ctx(ctx, {"card": card_id, "error": "no dossier yet"}, "dossier")
         return EXIT_REFUSED
     payload = read_json(path) or {}
 
@@ -937,10 +1159,11 @@ def cmd_dossier(ctx: Context, args) -> int:
         gates = [entry for entry in payload.get("2_gates", [])
                  if entry.get("attempt") == args.attempt]
         if not gates:
-            ctx.emit({"card": card_id,
-                      "error": f"no gate ran on attempt {args.attempt}",
-                      "attempts_run": sorted({entry.get("attempt")
-                                              for entry in payload.get("2_gates", [])})})
+            _emit_ctx(ctx, {"card": card_id,
+                            "error": f"no gate ran on attempt {args.attempt}",
+                            "attempts_run": sorted({entry.get("attempt")
+                                                    for entry in payload.get("2_gates", [])})},
+                      "dossier")
             return EXIT_REFUSED
         payload["2_gates"] = gates
         payload["attempt"] = args.attempt
@@ -954,7 +1177,10 @@ def cmd_dossier(ctx: Context, args) -> int:
             payload["9_diffs"] = diffs
 
     if args.format == "json" or ctx.json:
-        ctx.emit(payload)
+        if ctx.json:
+            _emit_ctx(ctx, payload, "dossier")
+        else:
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
     else:
         print(render_markdown(payload))
     return EXIT_OK
@@ -965,7 +1191,7 @@ def cmd_verdict(ctx: Context, args) -> int:
     card_id = _check_id(args.card, "card id")
     candidates = sorted(ctx.state.cards.glob(f"{card_id}/*/card-record.json"))
     if not candidates:
-        ctx.emit({"card": card_id, "error": "no run for this card"})
+        _emit_ctx(ctx, {"card": card_id, "error": "no run for this card"}, "verdict")
         return EXIT_REFUSED
     card_dir = candidates[-1].parent
     payload = {"card": card_id, "verdict": args.verdict,
@@ -973,7 +1199,7 @@ def cmd_verdict(ctx: Context, args) -> int:
                "minutes": args.minutes, "note": args.note or "",
                "at": utc_now()}
     write_json(card_dir / "verdict.json", payload)
-    ctx.emit(payload)
+    _emit_ctx(ctx, payload, "verdict")
     return EXIT_OK
 
 
@@ -982,13 +1208,13 @@ def cmd_escape(ctx: Context, args) -> int:
     card_id = _check_id(args.card, "card id")
     candidates = sorted(ctx.state.cards.glob(f"{card_id}/*/card-record.json"))
     if not candidates:
-        ctx.emit({"card": card_id, "error": "no run for this card"})
+        _emit_ctx(ctx, {"card": card_id, "error": "no run for this card"}, "escape")
         return EXIT_REFUSED
     from .state import append_jsonl
     path = candidates[-1].parent / "escapes.jsonl"
     payload = {"card": card_id, "note": args.note, "at": utc_now()}
     append_jsonl(path, payload)
-    ctx.emit(payload)
+    _emit_ctx(ctx, payload, "escape")
     return EXIT_OK
 
 
@@ -1138,24 +1364,83 @@ def cmd_supervise(ctx: Context, args) -> int:
     report_path = supervision_dir / f"{run_stamp}-supervise.json"
     write_json(report_path, payload)
     payload["report_path"] = str(report_path)
-    ctx.emit(payload)
+    _emit_ctx(ctx, payload, "supervise")
     return EXIT_OK
+
+
+_GLOBAL_ID_RE = re.compile(r"^g-[0-9a-f]{10}$")
+
+
+def _project_label(ctx: Context) -> str:
+    return str(getattr(ctx.cfg, "name", "") or "").strip() or Path(ctx.repo).name
+
+
+def _project_markers(ctx: Context) -> set[str] | None:
+    """What ties a lesson to this project, or None when git can't list its files."""
+    try:
+        tracked = Git(ctx.repo).tracked_files()
+    except (GitRefused, Infra, OSError):
+        return None
+    return project_markers(Path(ctx.repo), _project_label(ctx), tracked)
 
 
 def cmd_harness(ctx: Context, args) -> int:
     """Inspect and manage the adaptive harness cue library."""
-    harness_lib = _open_harness_library(ctx, require_enabled=False)
-    assert harness_lib is not None
     action = getattr(args, "action", "status") or "status"
     target = getattr(args, "target", None)
     reason = getattr(args, "reason", None) or "manual"
+    use_global = bool(getattr(args, "global_", False))
+
+    if use_global and action not in ("status", "promote", "demote"):
+        raise UsageError(f"harness {action} does not take --global")
+
+    if use_global:
+        global_lib = GlobalLibrary(global_dir_for(ctx.cfg.harness))
+        if action == "status":
+            _emit_ctx(ctx, global_lib.status(), "harness_global_status")
+            return EXIT_OK
+        if action == "promote":
+            if not target:
+                raise UsageError("harness promote requires <id>")
+            try:
+                if _GLOBAL_ID_RE.match(target):
+                    res = global_lib.restore(target, reason=reason)
+                else:
+                    res = _open_harness_library(ctx, require_enabled=False).force_to_global(
+                        global_lib, target, _project_label(ctx), _project_markers(ctx))
+            except (Refused, Invalid) as exc:
+                _emit_ctx(ctx, {"error": exc.message, "kind": "refused",
+                                "code": exc.code}, "harness_promote")
+                return EXIT_REFUSED
+            _emit_ctx(ctx, res, "harness_promote")
+            return EXIT_OK
+        if action == "demote":
+            if not target:
+                raise UsageError("harness demote requires <id>")
+            try:
+                gid = target
+                if not _GLOBAL_ID_RE.match(target):
+                    gid = _open_harness_library(ctx, require_enabled=False).global_id_of(target)
+                    if not gid:
+                        raise Refused("not-global", f"{target} is not in the global library")
+                res = global_lib.retire(gid, reason=reason)
+            except (Refused, Invalid) as exc:
+                _emit_ctx(ctx, {"error": exc.message, "kind": "refused",
+                                "code": exc.code}, "harness_demote")
+                return EXIT_REFUSED
+            _emit_ctx(ctx, res, "harness_demote")
+            return EXIT_OK
+
+    harness_lib = _open_harness_library(ctx, require_enabled=False)
+    assert harness_lib is not None
 
     if action == "status":
-        ctx.emit(harness_lib.status())
+        _emit_ctx(ctx, harness_lib.status(), "harness_status")
         return EXIT_OK
 
     if action == "index":
-        ctx.emit({"index": harness_lib.format_index(), "status": harness_lib.status()})
+        _emit_ctx(ctx, {"index": harness_lib.format_index(), "status": harness_lib.status()},
+                  "harness_index")
         return EXIT_OK
 
     if action == "show":
@@ -1168,9 +1453,10 @@ def cmd_harness(ctx: Context, args) -> int:
                 raise Refused("unknown-harness-entry",
                               f"harness entry {safe!r} does not exist")
         except (Refused, Invalid) as exc:
-            ctx.emit({"error": exc.message, "kind": "refused", "code": exc.code})
+            _emit_ctx(ctx, {"error": exc.message, "kind": "refused", "code": exc.code},
+                      "harness_show")
             return EXIT_REFUSED
-        ctx.emit(entry)
+        _emit_ctx(ctx, entry, "harness_show")
         return EXIT_OK
 
     if action == "promote":
@@ -1179,9 +1465,10 @@ def cmd_harness(ctx: Context, args) -> int:
         try:
             res = harness_lib.promote_entry(target, reason=reason)
         except (Refused, Invalid) as exc:
-            ctx.emit({"error": exc.message, "kind": "refused", "code": exc.code})
+            _emit_ctx(ctx, {"error": exc.message, "kind": "refused", "code": exc.code},
+                      "harness_promote")
             return EXIT_REFUSED
-        ctx.emit(res)
+        _emit_ctx(ctx, res, "harness_promote")
         return EXIT_OK
 
     if action == "demote":
@@ -1190,27 +1477,292 @@ def cmd_harness(ctx: Context, args) -> int:
         try:
             res = harness_lib.demote_entry_or_revision(target, reason=reason)
         except (Refused, Invalid) as exc:
-            ctx.emit({"error": exc.message, "kind": "refused", "code": exc.code})
+            _emit_ctx(ctx, {"error": exc.message, "kind": "refused", "code": exc.code},
+                      "harness_demote")
             return EXIT_REFUSED
-        ctx.emit(res)
+        _emit_ctx(ctx, res, "harness_demote")
         return EXIT_OK
 
     if action == "reset":
         if not getattr(args, "yes", False):
             raise UsageError("harness reset requires --yes to confirm")
         res = harness_lib.reset()
-        ctx.emit(res)
+        _emit_ctx(ctx, res, "harness_reset")
         return EXIT_OK
 
     raise UsageError(f"unknown harness action: {action}")
 
 
+def _resolve_board(ctx: Context, run_id: str | None) -> tuple[str, Board]:
+    if run_id:
+        rid = _check_id(run_id, "run id")
+    else:
+        holder = ctx.state.lock_holder()
+        if not holder or not holder.get("run_id"):
+            raise Refused(
+                "no-active-run",
+                "no active run holds the lock; pass --run ID",
+            )
+        rid = _check_id(str(holder["run_id"]), "run id")
+    bdir = board_dir_for(ctx.state, rid)
+    if run_id and not bdir.exists() and not ctx.state.run_dir(rid).exists():
+        raise Refused("unknown-run", f"run {rid!r} does not exist")
+    return rid, Board(bdir, state_dir=ctx.state)
+
+
+def _parse_seqs_arg(raw: str | None) -> list[int] | None:
+    if raw is None:
+        return None
+    parts = [part.strip() for part in raw.split(",") if part.strip()]
+    if not parts:
+        raise UsageError("--seqs expects comma-separated integers")
+    out: list[int] = []
+    for part in parts:
+        try:
+            seq = int(part)
+        except ValueError as exc:
+            raise UsageError(f"--seqs: {part!r} is not an integer") from exc
+        if seq < 1:
+            raise UsageError(f"--seqs: sequence numbers must be >= 1, got {seq}")
+        out.append(seq)
+    return out
+
+
+def cmd_board(ctx: Context, args) -> int:
+    """Read, post, answer, or wait on a run's board."""
+    action = getattr(args, "board_command", None)
+    if not action:
+        if ctx.json:
+            raise UsageError("board requires a subcommand: read, post, answer, or wait")
+        action = "read"
+    rid, board = _resolve_board(ctx, getattr(args, "run", None))
+
+    if action == "read":
+        if getattr(args, "status", False):
+            _emit_ctx(ctx, {
+                "run_id": rid,
+                **board.status(),
+                "roster": board.list_members(),
+            }, "board_status")
+            return EXIT_OK
+        seqs = _parse_seqs_arg(getattr(args, "seqs", None))
+        posts = board.read(
+            as_name=getattr(args, "as_name", None),
+            since=getattr(args, "since", None),
+            limit=getattr(args, "limit", 20),
+            seqs=seqs,
+        )
+        _emit_ctx(ctx, {"run_id": rid, "posts": posts, "count": len(posts)}, "board_read")
+        return EXIT_OK
+
+    if action == "post":
+        if args.file is not None:
+            try:
+                body = Path(args.file).read_text(encoding="utf-8")
+            except OSError as exc:
+                raise Refused(
+                    "unreadable-file", f"cannot read {args.file}: {exc}"
+                ) from exc
+        else:
+            body = args.body if args.body is not None else ""
+        post = board.post(
+            author=args.as_name,
+            to=args.to,
+            kind=args.kind,
+            body=body,
+            card=args.card,
+            attempt=args.attempt,
+            ref=args.ref,
+        )
+        _emit_ctx(ctx, {"run_id": rid, "post": post}, "board_post")
+        return EXIT_OK
+
+    if action == "answer":
+        try:
+            raw_text = Path(args.file).read_text(encoding="utf-8")
+        except OSError as exc:
+            raise Refused(
+                "unreadable-file", f"cannot read {args.file}: {exc}"
+            ) from exc
+        try:
+            data = json.loads(raw_text)
+        except ValueError as exc:
+            raise Refused(
+                "bad-json", f"{args.file} is not valid JSON: {exc}"
+            ) from exc
+        post = board.answer(
+            args.seq,
+            as_name=args.as_name,
+            data=data,
+            body=args.body,
+        )
+        _emit_ctx(ctx, {"run_id": rid, "post": post}, "board_answer")
+        return EXIT_OK
+
+    if action == "wait":
+        try:
+            timeout_s = parse_duration(args.timeout, "--timeout")
+        except ConfigError as exc:
+            raise UsageError(str(exc)) from exc
+        if timeout_s < 0:
+            raise UsageError("--timeout must be >= 0")
+        result = board.wait(
+            args.as_name,
+            since=args.since,
+            timeout_s=timeout_s,
+            limit=args.limit,
+        )
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return EXIT_OK
+
+    raise UsageError(f"unknown board subcommand: {action}")
+
+
+def _maybe_prepare_source(ctx: Context):
+    source = ctx.cards()
+    if getattr(source, "worktree", None) is not None and not (ctx.repo / ".git").exists():
+        return None
+    source.prepare()
+    return source
+
+
+def cmd_swarm(ctx: Context, args) -> int:
+    """Inspect tiers/roster and execute checked swarm actions."""
+    action = getattr(args, "swarm_command", None)
+    if not action:
+        if ctx.json:
+            raise UsageError(
+                "swarm requires a subcommand: status, tiers, join, start, set, hint, block, or remove"
+            )
+        holder = ctx.state.lock_holder()
+        if holder and holder.get("run_id"):
+            rid, board = _resolve_board(ctx, None)
+            _emit_ctx(ctx, {"run_id": rid, **swarm_status(board, ctx.cfg)}, "swarm_status")
+            return EXIT_OK
+        _emit_ctx(ctx, {"swarm": ctx.cfg.swarm.as_dict(), **swarm_tiers(ctx.cfg)}, "swarm_overview")
+        return EXIT_OK
+    if action == "tiers":
+        _emit_ctx(ctx, swarm_tiers(ctx.cfg), "swarm_tiers")
+        return EXIT_OK
+
+    rid, board = _resolve_board(ctx, getattr(args, "run", None))
+
+    if action == "status":
+        _emit_ctx(ctx, {"run_id": rid, **swarm_status(board, ctx.cfg)}, "swarm_status")
+        return EXIT_OK
+
+    if action == "join":
+        member = swarm_join(
+            board,
+            ctx.cfg,
+            name=args.name,
+            seat=args.seat,
+            owner_kind=args.kind,
+        )
+        _emit_ctx(ctx, {"run_id": rid, "member": member}, "swarm_join")
+        return EXIT_OK
+
+    if action == "start":
+        card_id = _check_id(args.card, "card id")
+        team = parse_team_spec(args.team)
+        source = _maybe_prepare_source(ctx)
+        res = swarm_start(
+            board,
+            ctx.cfg,
+            caller=args.as_name,
+            card_id=card_id,
+            team=team,
+            source=source,
+        )
+        _emit_ctx(ctx, {"run_id": rid, **res}, "swarm_start")
+        return EXIT_OK
+
+    if action == "set":
+        res = swarm_set(
+            board,
+            ctx.cfg,
+            caller=args.as_name,
+            member_name=args.member,
+            tier=args.tier,
+            effort=args.effort,
+            reason=args.reason,
+        )
+        _emit_ctx(ctx, {"run_id": rid, **res}, "swarm_set")
+        return EXIT_OK
+
+    if action == "hint":
+        res = swarm_hint(
+            board,
+            ctx.cfg,
+            caller=args.as_name,
+            member_name=args.member,
+            body=args.body,
+        )
+        _emit_ctx(ctx, {"run_id": rid, **res}, "swarm_hint")
+        return EXIT_OK
+
+    if action == "block":
+        card_id = _check_id(args.card, "card id")
+        source = _maybe_prepare_source(ctx)
+        res = swarm_block(
+            board,
+            ctx.cfg,
+            caller=args.as_name,
+            card_id=card_id,
+            reason=args.reason,
+            source=source,
+        )
+        _emit_ctx(ctx, {"run_id": rid, **res}, "swarm_block")
+        return EXIT_OK
+
+    if action == "remove":
+        source = _maybe_prepare_source(ctx)
+        res = swarm_remove(
+            board,
+            ctx.cfg,
+            caller=args.as_name,
+            member_name=args.member,
+            source=source,
+        )
+        _emit_ctx(ctx, {"run_id": rid, **res}, "swarm_remove")
+        return EXIT_OK
+
+    raise UsageError(f"unknown swarm subcommand: {action}")
+
+
 # -- the parser ----------------------------------------------------------------
 
+_CLI_EPILOG = """\
+Command groups (21 commands):
+  Setup & Auth         init, adopt, install-skill, acp
+  Run & Monitor        check, run, status, pause, resume, stop, tui
+  Review & Harness     dossier, verdict, done, release, escape, supervise, harness
+  Swarm, Board & Bench swarm, board, bench
+
+Common workflows:
+  Bootstrap & auth     openfarm init my-app --idea "track habits"
+                       openfarm adopt --dir .
+                       openfarm acp status && openfarm acp login
+  Check & run          openfarm check CARD-1 --baseline
+                       openfarm run --dry-run --cards 3
+                       openfarm run --cards 3 --spend 1.00
+  Review & merge       openfarm dossier CARD-1
+                       openfarm verdict CARD-1 clean --review-tokens 1200
+                       git merge --no-ff openfarm/CARD-1-<slug> && openfarm done CARD-1
+  Swarm, board & TUI   openfarm swarm && openfarm board && openfarm tui
+
+Pass --json with any command for machine-readable JSON output.
+"""
+
+
 def build_parser() -> argparse.ArgumentParser:
+    raw_fmt = argparse.RawDescriptionHelpFormatter
     parser = argparse.ArgumentParser(
         prog="openfarm",
-        description="A plain-code orchestrator for narrowly scoped model work.")
+        description="A plain-code orchestrator for narrowly scoped model work.",
+        formatter_class=raw_fmt,
+        epilog=_CLI_EPILOG,
+    )
     parser.add_argument("--version", action="version",
                         version=f"openfarm {__version__}")
     parser.add_argument("--repo", default=".", help="the repository root")
@@ -1219,7 +1771,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help="print the result as one JSON object")
     sub = parser.add_subparsers(dest="command")
 
-    run = sub.add_parser("run", help="start a run (a night)")
+    run = sub.add_parser(
+        "run",
+        help="start a run (a night)",
+        formatter_class=raw_fmt,
+        epilog="Examples:\n  openfarm run --dry-run --cards 3\n  openfarm run --card CARD-1 --spend 1.00\n  openfarm run --cards 4 --for 2h",
+    )
     run.add_argument("--cards", type=int, default=3,
                      help="most cards to claim")
     run.add_argument("--spend", type=float, default=None,
@@ -1235,8 +1792,16 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--mm-script", dest="mm_script", default=None,
                      help="a scripted micromanager backend, for tests")
     run.add_argument("--run-id", default=None, help="name this run")
+    run.add_argument("--learn-from", dest="learn_from", default=None,
+                     choices=("both", "project", "global"),
+                     help="which lessons this run applies, over [harness] learn_from")
 
-    status = sub.add_parser("status", help="read-only state")
+    status = sub.add_parser(
+        "status",
+        help="read-only state",
+        formatter_class=raw_fmt,
+        epilog="Examples:\n  openfarm status\n  openfarm status --card CARD-1",
+    )
     status.add_argument("--card", default=None)
 
     pause = sub.add_parser("pause", help="stop new claims")
@@ -1249,25 +1814,50 @@ def build_parser() -> argparse.ArgumentParser:
     stop = sub.add_parser("stop", help="the kill switch")
     stop.add_argument("--reason", default=None)
 
-    release = sub.add_parser("release", help="free a stuck card")
+    release = sub.add_parser(
+        "release",
+        help="free a stuck card",
+        formatter_class=raw_fmt,
+        epilog='Example:\n  openfarm release CARD-1 --reason "needs revised spec"',
+    )
     release.add_argument("card")
     release.add_argument("--reason", required=True)
 
-    done = sub.add_parser("done", help="mark a reviewed, merged card done")
+    done = sub.add_parser(
+        "done",
+        help="mark a reviewed, merged card done",
+        formatter_class=raw_fmt,
+        epilog='Example:\n  git merge --no-ff openfarm/CARD-1-slug && openfarm done CARD-1 --note "lgtm"',
+    )
     done.add_argument("card")
     done.add_argument("--note", default=None)
 
-    dossier = sub.add_parser("dossier", help="print a card's dossier")
+    dossier = sub.add_parser(
+        "dossier",
+        help="print a card's dossier",
+        formatter_class=raw_fmt,
+        epilog="Examples:\n  openfarm dossier CARD-1\n  openfarm dossier CARD-1 --attempt 1 --format json",
+    )
     dossier.add_argument("card")
     dossier.add_argument("--run", default=None)
     dossier.add_argument("--attempt", type=int, default=None)
     dossier.add_argument("--format", choices=("md", "json"), default="md")
 
-    check = sub.add_parser("check", help="eligibility on one card")
+    check = sub.add_parser(
+        "check",
+        help="eligibility on one card",
+        formatter_class=raw_fmt,
+        epilog="Examples:\n  openfarm check CARD-1\n  openfarm check CARD-1 --baseline",
+    )
     check.add_argument("card")
     check.add_argument("--baseline", action="store_true")
 
-    verdict = sub.add_parser("verdict", help="record the reviewer's verdict")
+    verdict = sub.add_parser(
+        "verdict",
+        help="record the reviewer's verdict",
+        formatter_class=raw_fmt,
+        epilog='Example:\n  openfarm verdict CARD-1 clean --review-tokens 1200 --note "verified locally"',
+    )
     verdict.add_argument("card")
     verdict.add_argument("verdict",
                          choices=("clean", "minor-fix", "bounced", "scrapped"))
@@ -1279,14 +1869,24 @@ def build_parser() -> argparse.ArgumentParser:
     escape.add_argument("card")
     escape.add_argument("--note", required=True)
 
-    supervise = sub.add_parser("supervise", help="run micromanager triage/queue prep")
+    supervise = sub.add_parser(
+        "supervise",
+        help="run micromanager triage/queue prep",
+        formatter_class=raw_fmt,
+        epilog="Examples:\n  openfarm supervise --triage-blocked\n  openfarm supervise --prepare-queue --apply",
+    )
     supervise.add_argument("--triage-blocked", action="store_true")
     supervise.add_argument("--prepare-queue", action="store_true")
     supervise.add_argument("--card", default=None)
     supervise.add_argument("--apply", action="store_true")
     supervise.add_argument("--mm-script", dest="mm_script", default=None)
 
-    harness = sub.add_parser("harness", help="inspect and manage harness adaptations")
+    harness = sub.add_parser(
+        "harness",
+        help="inspect and manage harness adaptations",
+        formatter_class=raw_fmt,
+        epilog="Examples:\n  openfarm harness status\n  openfarm harness index\n  openfarm harness status --global\n  openfarm harness show exp-0001",
+    )
     harness.add_argument(
         "action",
         nargs="?",
@@ -1294,10 +1894,109 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("status", "index", "show", "promote", "demote", "reset"),
     )
     harness.add_argument("target", nargs="?", default=None)
+    harness.add_argument("--global", dest="global_", action="store_true",
+                         help="use the global harness library")
     harness.add_argument("--reason", default="manual")
     harness.add_argument("--yes", action="store_true")
 
-    bench = sub.add_parser("bench", help="run the efficacy bench")
+    board = sub.add_parser(
+        "board",
+        help="read, post, answer, or wait on a run's board",
+        formatter_class=raw_fmt,
+        epilog='Examples:\n  openfarm board\n  openfarm board read --status\n  openfarm board post --as alice --to all --kind note --body "checking status"',
+    )
+    board_sub = board.add_subparsers(dest="board_command")
+
+    board_read = board_sub.add_parser("read", help="read posts or status from the board")
+    board_read.add_argument("--as", dest="as_name", default=None)
+    board_read.add_argument("--since", type=int, default=None)
+    board_read.add_argument("--limit", type=int, default=20)
+    board_read.add_argument("--seqs", default=None)
+    board_read.add_argument("--status", action="store_true")
+    board_read.add_argument("--run", default=None)
+
+    board_post = board_sub.add_parser("post", help="post a message to the board")
+    board_post.add_argument("--as", dest="as_name", required=True)
+    board_post.add_argument("--to", required=True)
+    board_post.add_argument("--kind", choices=VALID_POST_KINDS, default="note")
+    board_post.add_argument("--card", default="")
+    board_post.add_argument("--attempt", type=int, default=0)
+    board_post.add_argument("--ref", type=int, default=None)
+    body_group = board_post.add_mutually_exclusive_group(required=True)
+    body_group.add_argument("--body", default=None)
+    body_group.add_argument("--file", default=None)
+    board_post.add_argument("--run", default=None)
+
+    board_answer = board_sub.add_parser("answer", help="answer a board question")
+    board_answer.add_argument("seq", type=int)
+    board_answer.add_argument("--as", dest="as_name", required=True)
+    board_answer.add_argument("--file", required=True)
+    board_answer.add_argument("--body", default="")
+    board_answer.add_argument("--run", default=None)
+
+    board_wait = board_sub.add_parser("wait", help="wait for matching posts on the board")
+    board_wait.add_argument("--as", dest="as_name", required=True)
+    board_wait.add_argument("--since", type=int, default=None)
+    board_wait.add_argument("--timeout", default="30m")
+    board_wait.add_argument("--limit", type=int, default=None)
+    board_wait.add_argument("--run", default=None)
+
+    swarm = sub.add_parser(
+        "swarm",
+        help="inspect and control swarm roster and seats",
+        formatter_class=raw_fmt,
+        epilog="Examples:\n  openfarm swarm\n  openfarm swarm tiers\n  openfarm swarm status --run RUN_ID\n  openfarm swarm join --name alice --seat coordinator --kind human",
+    )
+    swarm_sub = swarm.add_subparsers(dest="swarm_command")
+
+    swarm_status_p = swarm_sub.add_parser("status", help="show roster, tiers, and board status")
+    swarm_status_p.add_argument("--run", default=None)
+
+    swarm_sub.add_parser("tiers", help="list configured tiers and efforts")
+
+    swarm_join_p = swarm_sub.add_parser("join", help="join an external seat")
+    swarm_join_p.add_argument("--name", required=True)
+    swarm_join_p.add_argument("--seat", choices=("coordinator", "supervisor"), required=True)
+    swarm_join_p.add_argument("--kind", choices=("human", "agent"), default="human")
+    swarm_join_p.add_argument("--run", default=None)
+
+    swarm_start_p = swarm_sub.add_parser("start", help="start a ready card with a team")
+    swarm_start_p.add_argument("card")
+    swarm_start_p.add_argument("--team", default=None, help="role=tier:effort,...")
+    swarm_start_p.add_argument("--as", dest="as_name", default="")
+    swarm_start_p.add_argument("--run", default=None)
+
+    swarm_set_p = swarm_sub.add_parser("set", help="change a member's tier or effort")
+    swarm_set_p.add_argument("member")
+    swarm_set_p.add_argument("--tier", default=None)
+    swarm_set_p.add_argument("--effort", default=None)
+    swarm_set_p.add_argument("--reason", default="")
+    swarm_set_p.add_argument("--as", dest="as_name", default="")
+    swarm_set_p.add_argument("--run", default=None)
+
+    swarm_hint_p = swarm_sub.add_parser("hint", help="send a hint note to a member")
+    swarm_hint_p.add_argument("member")
+    swarm_hint_p.add_argument("--body", required=True)
+    swarm_hint_p.add_argument("--as", dest="as_name", default="")
+    swarm_hint_p.add_argument("--run", default=None)
+
+    swarm_block_p = swarm_sub.add_parser("block", help="block a card with a reason")
+    swarm_block_p.add_argument("card")
+    swarm_block_p.add_argument("--reason", required=True)
+    swarm_block_p.add_argument("--as", dest="as_name", default="")
+    swarm_block_p.add_argument("--run", default=None)
+
+    swarm_remove_p = swarm_sub.add_parser("remove", help="remove a finished card's member")
+    swarm_remove_p.add_argument("member")
+    swarm_remove_p.add_argument("--as", dest="as_name", default="")
+    swarm_remove_p.add_argument("--run", default=None)
+
+    bench = sub.add_parser(
+        "bench",
+        help="run the efficacy bench",
+        formatter_class=raw_fmt,
+        epilog="Examples:\n  openfarm bench\n  openfarm bench list --dir bench\n  openfarm bench run --dry-run --task py-bounded-full",
+    )
     bench_sub = bench.add_subparsers(dest="bench_command")
     bench_list = bench_sub.add_parser("list", help="list bench tasks")
     bench_list.add_argument("--dir", default="bench",
@@ -1318,7 +2017,12 @@ def build_parser() -> argparse.ArgumentParser:
     bench_run.add_argument("--dry-run", action="store_true",
                            help="scripted answers from each task's script.json; costs nothing")
 
-    init = sub.add_parser("init", help="scaffold a new openfarm Rust project")
+    init = sub.add_parser(
+        "init",
+        help="scaffold a new openfarm Rust project",
+        formatter_class=raw_fmt,
+        epilog='Example:\n  openfarm init calorie-log --idea "track daily meals" --commit',
+    )
     init.add_argument("name", help="project name or slug (e.g. calorie-log)")
     init.add_argument("--dir", default=None,
                       help="target directory (default: <repo>/<project_slug> or current repo)")
@@ -1341,7 +2045,12 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--force", action="store_true",
                       help="overwrite scaffold files in non-empty directory")
 
-    adopt = sub.add_parser("adopt", help="add openfarm to an existing repository")
+    adopt = sub.add_parser(
+        "adopt",
+        help="add openfarm to an existing repository",
+        formatter_class=raw_fmt,
+        epilog="Examples:\n  openfarm adopt --dir .\n  openfarm adopt --dir . --lang python --no-suite",
+    )
     adopt.add_argument("--dir", default=None,
                        help="repository directory (default: the current directory)")
     adopt.add_argument("--lang", choices=("rust", "python"), default=None,
@@ -1366,6 +2075,8 @@ def build_parser() -> argparse.ArgumentParser:
     acp = sub.add_parser(
         "acp",
         help="inspect, log in via OAuth, configure, or probe Frontier Claude ACP",
+        formatter_class=raw_fmt,
+        epilog="Examples:\n  openfarm acp status\n  openfarm acp login\n  openfarm acp configure --mode active --auth oauth\n  openfarm acp probe",
     )
     acp.add_argument("action", nargs="?", default="status", choices=ACP_ACTIONS)
     acp.add_argument("--mode", choices=("active", "advisory", "off"), default=None)
@@ -1387,31 +2098,49 @@ def build_parser() -> argparse.ArgumentParser:
     acp.add_argument("--setup-token", action="store_true",
                      help="run `claude setup-token` for long-lived CLAUDE_CODE_OAUTH_TOKEN")
 
+    tui_p = sub.add_parser(
+        "tui",
+        help="open interactive terminal UI or render one snapshot",
+        formatter_class=raw_fmt,
+        epilog="Examples:\n  openfarm tui\n  openfarm tui --once --view overview\n  openfarm tui --once --view board --run RUN_ID",
+    )
+    tui_p.add_argument("--run", dest="run_id", default=None,
+                       help="pin TUI to a specific run id")
+    tui_p.add_argument("--refresh", type=float, default=1.0,
+                       help="refresh interval in seconds (default: 1.0)")
+    tui_p.add_argument("--once", action="store_true",
+                       help="render a single view snapshot and exit")
+    tui_p.add_argument("--view", choices=TUI_VIEWS, default="overview",
+                       help="initial TUI view (default: overview)")
+
     return parser
 
 
-def _emit_standalone(payload: dict, want_json: bool) -> None:
+def _emit_standalone(payload: dict, want_json: bool, *, kind: str | None = None) -> None:
     if want_json:
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return
-    for key, value in payload.items():
-        if isinstance(value, (dict, list)):
-            print(f"{key}: {json.dumps(value, ensure_ascii=False)}")
-        else:
-            print(f"{key}: {value}")
+    print(format_human(kind or "", payload, style=Style(sys.stdout)))
 
 
 def _emit_bench_error(message: str, want_json: bool) -> int:
-    _emit_standalone({"error": message, "kind": "invalid"}, want_json)
+    _emit_standalone({"error": message, "kind": "invalid"}, want_json, kind="error")
     return EXIT_TROUBLE
 
 
 def cmd_bench(args) -> int:
     action = getattr(args, "bench_command", None)
+    want_json = bool(getattr(args, "json", False))
     if action == "list":
         return cmd_bench_list(args)
     if action == "run":
         return cmd_bench_run(args)
+    if not action and not want_json:
+        if not hasattr(args, "dir") or not args.dir:
+            repo_arg = getattr(args, "repo", ".") or "."
+            repo_bench = Path(repo_arg) / "bench"
+            args.dir = str(repo_bench) if repo_arg != "." and repo_bench.is_dir() else "bench"
+        return cmd_bench_list(args)
     raise UsageError("bench requires a subcommand")
 
 
@@ -1441,11 +2170,7 @@ def cmd_bench_list(args) -> int:
         })
 
     tasks.sort(key=lambda task: task["id"])
-    if want_json:
-        _emit_standalone({"tasks": tasks}, True)
-    else:
-        for task in tasks:
-            print(f"{task['id']}  {task['language']}  {task['category']}")
+    _emit_standalone({"tasks": tasks}, want_json, kind="bench_list")
     return EXIT_OK
 
 
@@ -1517,7 +2242,7 @@ def cmd_init(args) -> int:
         commit=bool(args.commit),
         force=bool(args.force),
     )
-    _emit_standalone(payload, bool(getattr(args, "json", False)))
+    _emit_standalone(payload, bool(getattr(args, "json", False)), kind="init")
     return EXIT_OK
 
 
@@ -1533,7 +2258,7 @@ def cmd_adopt(args) -> int:
         )
     except Refused as exc:
         _emit_standalone({"error": exc.message, "kind": "refused"},
-                         bool(getattr(args, "json", False)))
+                         bool(getattr(args, "json", False)), kind="adopt")
         return EXIT_REFUSED
     if payload.get("known_failing_proposed"):
         payload["next"] = ("the suite has failing tests; they are proposed in a "
@@ -1542,7 +2267,7 @@ def cmd_adopt(args) -> int:
                            "commit .openfarm/ and cards/")
     else:
         payload["next"] = "commit .openfarm/ and cards/, then write cards"
-    _emit_standalone(payload, bool(getattr(args, "json", False)))
+    _emit_standalone(payload, bool(getattr(args, "json", False)), kind="adopt")
     return EXIT_OK
 
 
@@ -1553,7 +2278,7 @@ def cmd_install_skill(args) -> int:
         install_bin=Path(args.install_bin) if args.install_bin else None,
         dry_run=bool(args.dry_run),
     )
-    _emit_standalone(payload, bool(getattr(args, "json", False)))
+    _emit_standalone(payload, bool(getattr(args, "json", False)), kind="install_skill")
     return EXIT_OK
 
 
@@ -1590,8 +2315,24 @@ def cmd_acp(args) -> int:
         )
     else:
         raise UsageError(f"unknown acp action: {action}")
-    _emit_standalone(payload, bool(getattr(args, "json", False)))
+    _emit_standalone(payload, bool(getattr(args, "json", False)), kind=f"acp_{action}")
     return EXIT_OK
+
+
+def cmd_tui(args) -> int:
+    if args.refresh is not None and args.refresh <= 0:
+        raise UsageError("--refresh must be positive")
+    repo = Path(args.repo) if getattr(args, "repo", None) else Path.cwd()
+    config_path = Path(args.config) if getattr(args, "config", None) else None
+    return run_tui(
+        repo=repo,
+        config_path=config_path,
+        run_id=args.run_id,
+        refresh_s=float(args.refresh or 1.0),
+        once=bool(args.once),
+        view=args.view,
+        json_output=bool(getattr(args, "json", False)),
+    )
 
 
 PRE_CONFIG_COMMANDS = {
@@ -1600,6 +2341,7 @@ PRE_CONFIG_COMMANDS = {
     "init": cmd_init,
     "install-skill": cmd_install_skill,
     "acp": cmd_acp,
+    "tui": cmd_tui,
 }
 
 
@@ -1617,6 +2359,8 @@ COMMANDS = {
     "escape": cmd_escape,
     "supervise": cmd_supervise,
     "harness": cmd_harness,
+    "board": cmd_board,
+    "swarm": cmd_swarm,
 }
 
 
@@ -1655,6 +2399,29 @@ def _normalise_argv(argv: list[str]) -> list[str]:
     return early + rest
 
 
+_CHOICE_RE = re.compile(
+    r"invalid choice:\s*'([^']+)'\s*\(choose from ([^)]+)\)",
+    re.DOTALL,
+)
+
+
+def _suggest_subcommand(err_text: str) -> str:
+    match = _CHOICE_RE.search(err_text or "")
+    if not match:
+        return ""
+    bad = match.group(1).strip()
+    raw_choices = [c.strip().strip("'\"") for c in match.group(2).split(",")]
+    choices = [c for c in raw_choices if c]
+    if not bad or not choices:
+        return ""
+    matches = difflib.get_close_matches(bad, choices, n=3, cutoff=0.5)
+    if not matches and len(bad) >= 2:
+        matches = [c for c in choices if c.startswith(bad)][:3]
+    if not matches:
+        matches = difflib.get_close_matches(bad, choices, n=2, cutoff=0.35)
+    return ", ".join(matches)
+
+
 def main(argv: list[str] | None = None) -> int:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     want_json = False
@@ -1671,6 +2438,10 @@ def main(argv: list[str] | None = None) -> int:
                              indent=2, ensure_ascii=False))
         else:
             print(f"openfarm: {kind}: {message}", file=sys.stderr)
+            hint = error_hint(kind, message)
+            if hint:
+                st_err = Style(sys.stderr)
+                print(st_err.dim(f"  hint: {hint}"), file=sys.stderr)
         return code
 
     parser = build_parser()
@@ -1679,18 +2450,25 @@ def main(argv: list[str] | None = None) -> int:
     except UsageError as exc:
         return _emit_error("usage error", str(exc), EXIT_USAGE)
 
-    if want_json:
-        import contextlib
-        import io
-        err_buf = io.StringIO()
-        try:
-            with contextlib.redirect_stderr(err_buf):
-                args = parser.parse_args(normalised)
-        except SystemExit as exc:
+    err_buf = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err_buf):
+            args = parser.parse_args(normalised)
+    except SystemExit as exc:
+        if want_json:
             msg = err_buf.getvalue().strip().splitlines()[-1] if err_buf.getvalue().strip() else "invalid arguments"
             return _emit_error("usage error", msg, int(exc.code) if isinstance(exc.code, int) else EXIT_USAGE)
-    else:
-        args = parser.parse_args(normalised)
+        code = int(exc.code) if isinstance(exc.code, int) else (EXIT_OK if exc.code is None else EXIT_USAGE)
+        if code == 0:
+            raise
+        err_text = err_buf.getvalue()
+        if err_text:
+            sys.stderr.write(err_text)
+        suggestion = _suggest_subcommand(err_text)
+        if suggestion:
+            st_err = Style(sys.stderr)
+            print(st_err.yellow(f"Did you mean: {suggestion}?"), file=sys.stderr)
+        return code
     if not args.command:
         if want_json:
             return _emit_error("usage error", "no subcommand specified", EXIT_USAGE)

@@ -14,9 +14,50 @@ from __future__ import annotations
 
 import os
 import subprocess
+import threading
 from pathlib import Path
 
 from .errors import Infra
+
+_GIT_LOCKS_GUARD = threading.Lock()
+_GIT_LOCKS: dict[Path, threading.RLock] = {}
+
+
+def _common_git_dir(cwd: Path) -> Path:
+    cur = Path(cwd).resolve()
+    for candidate in (cur, *cur.parents):
+        dot_git = candidate / ".git"
+        if dot_git.is_dir():
+            return dot_git.resolve()
+        if dot_git.is_file():
+            try:
+                text = dot_git.read_text(encoding="utf-8").strip()
+            except OSError:
+                break
+            if text.startswith("gitdir:"):
+                raw = text.split(":", 1)[1].strip()
+                gitdir = Path(raw)
+                if not gitdir.is_absolute():
+                    gitdir = (candidate / gitdir).resolve()
+                common = gitdir / "commondir"
+                if common.is_file():
+                    try:
+                        rel = common.read_text(encoding="utf-8").strip()
+                        return (gitdir / rel).resolve()
+                    except OSError:
+                        return gitdir.resolve()
+                return gitdir.resolve()
+    return cur
+
+
+def _git_lock_for(cwd: Path) -> threading.RLock:
+    key = _common_git_dir(cwd)
+    with _GIT_LOCKS_GUARD:
+        lock = _GIT_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _GIT_LOCKS[key] = lock
+        return lock
 
 #: Every git subcommand the core is allowed to run.
 ALLOWED_SUBCOMMANDS = frozenset({
@@ -174,7 +215,8 @@ class Git:
     # -- queries --------------------------------------------------------------
 
     def init(self, branch: str = "main") -> None:
-        self._run(["init", "-q", "-b", branch])
+        with _git_lock_for(self.cwd):
+            self._run(["init", "-q", "-b", branch])
 
     def head(self, ref: str = "HEAD") -> str:
         return self._run(["rev-parse", ref]).stdout.strip()
@@ -184,13 +226,15 @@ class Git:
 
     def branches(self, pattern: str) -> list[str]:
         """Local branch names matching a `refs/heads/` glob such as `openfarm/CARD-1-*`."""
-        out = self._run(["for-each-ref", "--format=%(refname:short)",
-                         f"refs/heads/{pattern}"]).stdout
+        with _git_lock_for(self.cwd):
+            out = self._run(["for-each-ref", "--format=%(refname:short)",
+                             f"refs/heads/{pattern}"]).stdout
         return sorted(line for line in out.splitlines() if line)
 
     def branch_exists(self, name: str) -> bool:
-        result = self._run(["rev-parse", "--verify", "--quiet", f"refs/heads/{name}"],
-                           check=False)
+        with _git_lock_for(self.cwd):
+            result = self._run(["rev-parse", "--verify", "--quiet", f"refs/heads/{name}"],
+                               check=False)
         return result.returncode == 0
 
     def ref_exists(self, ref: str) -> bool:
@@ -241,14 +285,16 @@ class Git:
                 self._run(["ls-files"]).stdout.splitlines() if line.strip()]
 
     def commit(self, message: str) -> str:
-        self._run(["commit", "-q", "-m", message])
-        return self.head()
+        with _git_lock_for(self.cwd):
+            self._run(["commit", "-q", "-m", message])
+            return self.head()
 
     def commit_all(self, message: str) -> str:
-        self._run(["add", "-A"])
-        if not self.has_staged_changes():
-            return self.head()
-        return self.commit(message)
+        with _git_lock_for(self.cwd):
+            self._run(["add", "-A"])
+            if not self.has_staged_changes():
+                return self.head()
+            return self.commit(message)
 
     def merge_base(self, other: str) -> str:
         return self._run(["merge-base", "HEAD", other]).stdout.strip()
@@ -268,7 +314,8 @@ class Git:
 
     def checkout(self, ref: str, detach: bool = False) -> None:
         args = ["checkout"] + (["--detach"] if detach else []) + [ref]
-        self._run(args)
+        with _git_lock_for(self.cwd):
+            self._run(args)
 
     def create_branch(self, name: str, start: str) -> None:
         """Make or move a branch to `start`.
@@ -278,32 +325,37 @@ class Git:
         to move a branch that a worktree has checked out, so any worktree holding it
         is removed first rather than leaving the branch silently on an old commit.
         """
-        commit = self.head(start)
-        result = self._run(["branch", "--force", name, commit], check=False)
-        if result.returncode == 0:
-            return
-        holder = self._worktree_holding(name)
-        if holder is not None:
-            self.worktree_remove(holder)
-            self._run(["branch", "--force", name, commit])
+        with _git_lock_for(self.cwd):
+            commit = self.head(start)
+            result = self._run(["branch", "--force", name, commit], check=False)
+            if result.returncode == 0:
+                return
+            holder = self._worktree_holding(name)
+            if holder is not None:
+                self.worktree_remove(holder)
+                self._run(["branch", "--force", name, commit])
 
     def worktree_add(self, path: Path, ref: str) -> None:
         path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self._run(["worktree", "add", "--force", str(path), ref])
+        with _git_lock_for(self.cwd):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self._run(["worktree", "add", "--force", str(path), ref])
 
     def worktree_remove(self, path: Path) -> None:
-        self._run(["worktree", "remove", "--force", str(path)], check=False)
-        self._run(["worktree", "prune"], check=False)
+        with _git_lock_for(self.cwd):
+            self._run(["worktree", "remove", "--force", str(path)], check=False)
+            self._run(["worktree", "prune"], check=False)
 
     def worktree_list(self) -> list[str]:
-        return [line[len("worktree "):] for line in
-                self._run(["worktree", "list", "--porcelain"]).stdout.splitlines()
+        with _git_lock_for(self.cwd):
+            out = self._run(["worktree", "list", "--porcelain"]).stdout
+        return [line[len("worktree "):] for line in out.splitlines()
                 if line.startswith("worktree ")]
 
     def _worktree_holding(self, branch: str) -> Path | None:
         """The worktree that has `branch` checked out, if any."""
-        out = self._run(["worktree", "list", "--porcelain"]).stdout
+        with _git_lock_for(self.cwd):
+            out = self._run(["worktree", "list", "--porcelain"]).stdout
         current = None
         for line in out.splitlines():
             if line.startswith("worktree "):
@@ -317,15 +369,17 @@ class Git:
 
     def merge_no_commit(self, ref: str) -> tuple[bool, str]:
         """Trial merge: stops before committing. Never leaves a merge commit."""
-        result = self._run(["merge", "--no-commit", "--no-ff", ref], check=False)
-        output = (result.stdout or "") + (result.stderr or "")
-        if result.returncode != 0:
-            self._run(["merge", "--abort"], check=False)
-            return False, output.strip()
-        return True, output.strip()
+        with _git_lock_for(self.cwd):
+            result = self._run(["merge", "--no-commit", "--no-ff", ref], check=False)
+            output = (result.stdout or "") + (result.stderr or "")
+            if result.returncode != 0:
+                self._run(["merge", "--abort"], check=False)
+                return False, output.strip()
+            return True, output.strip()
 
     def abort_merge(self) -> None:
-        self._run(["merge", "--abort"], check=False)
+        with _git_lock_for(self.cwd):
+            self._run(["merge", "--abort"], check=False)
 
     def diff(self, paths: list[str] | None = None, ref: str = "HEAD") -> str:
         """A unified diff against `ref`, optionally limited to paths."""
@@ -356,4 +410,5 @@ class Git:
         self._run(["add", "-A"])
 
     def branch_head(self, name: str) -> str:
-        return self.head(f"refs/heads/{name}")
+        with _git_lock_for(self.cwd):
+            return self.head(f"refs/heads/{name}")

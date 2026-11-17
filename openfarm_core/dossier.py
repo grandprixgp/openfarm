@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from .budget import describe_split, token_split
 from .state import write_json
 
 
@@ -96,6 +97,11 @@ def build_dossier(card_run, final_state: str,
             "test_writer_attempts": card_run.budget.test_writer_attempts,
             "planner_split": card_run.planner_used,
             "failed_attempts": _failed_attempts(card_run),
+            "tokens": token_split(
+                int(getattr(card_run.budget, "tokens_in", 0) or 0)
+                + int(getattr(card_run.budget, "tokens_out", 0) or 0),
+                int(mm_summary.get("tokens_in", 0) or 0)
+                + int(mm_summary.get("tokens_out", 0) or 0)),
         },
         "6_checker": {
             "restatement": restatement,
@@ -111,6 +117,22 @@ def build_dossier(card_run, final_state: str,
             "production_diff": _production_diff(card_run),
         },
         "harness": _harness_summary(card_run, harness),
+        "team": list(
+            card_run.team_summary()
+            if hasattr(card_run, "team_summary")
+            else (getattr(card_run, "team", []) or [])
+        ),
+        "sets": list(
+            card_run.board_sets_summary()
+            if hasattr(card_run, "board_sets_summary")
+            else (getattr(card_run, "team_sets", []) or [])
+        ),
+        "handbacks": list(getattr(card_run, "handbacks", []) or []),
+        "board_path": (
+            str(card_run.board.board_dir)
+            if getattr(card_run, "board", None) is not None
+            else ""
+        ),
     }
 
 
@@ -332,6 +354,8 @@ def render_markdown(payload: dict) -> str:
               f"- Attempts: {struggle['attempts']} implementer, "
               f"{struggle['test_writer_attempts']} test writer",
               f"- Planner split it: {'yes' if struggle['planner_split'] else 'no'}"]
+    if struggle.get("tokens"):
+        lines.append(f"- Tokens: {describe_split(struggle['tokens'])}")
     for failure in struggle["failed_attempts"]:
         lines.append(f"- {failure}")
 
@@ -394,6 +418,44 @@ def render_markdown(payload: dict) -> str:
             f"- Efficiency score: {float(harness.get('efficiency_score', 0.0) or 0.0):.4f}",
             "",
         ]
+    team = payload.get("team") or []
+    sets = payload.get("sets") or []
+    handbacks = payload.get("handbacks") or []
+    board_path = str(payload.get("board_path", "") or "")
+    if team or sets or handbacks or board_path:
+        lines += ["## Team and board", ""]
+        if board_path:
+            lines.append(f"- Board: `{board_path}`")
+        if team:
+            lines += [
+                "",
+                "| Member | Role | Tier | Effort | Attempts | Tokens |",
+                "| --- | --- | --- | --- | --- | --- |",
+            ]
+            for row in team:
+                lines.append(
+                    f"| {row.get('member', '')} | {row.get('role', '')} | "
+                    f"{row.get('tier', '')} | {row.get('effort', '') or 'default'} | "
+                    f"{row.get('attempts', 0)} | {row.get('tokens', 0)} |"
+                )
+        if sets:
+            lines += ["", "### Tier and effort changes", ""]
+            for entry in sets:
+                if isinstance(entry, dict):
+                    lines.append(f"- {entry.get('detail') or entry}")
+                else:
+                    lines.append(f"- {entry}")
+        if handbacks:
+            lines += ["", "### Hand-backs", ""]
+            for hb in handbacks:
+                if isinstance(hb, dict):
+                    lines.append(
+                        f"- {hb.get('role', 'worker')} (attempt {hb.get('attempt', 0)}): "
+                        f"{hb.get('reason', '')}"
+                    )
+                else:
+                    lines.append(f"- {hb}")
+        lines.append("")
     return "\n".join(lines)
 
 

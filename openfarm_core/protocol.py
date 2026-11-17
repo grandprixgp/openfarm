@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import shlex
 import subprocess
+import threading
 from pathlib import Path
 
 from .errors import AdapterError, Infra, Invalid, Refused, Unsupported
@@ -133,10 +134,13 @@ class CmdAdapter:
         self.cwd = Path(cwd)
         self.timeout_s = timeout_s
         self._counter = 0
+        self._lock = threading.Lock()
 
     def call(self, adapter: str, op: str, args: dict) -> dict:
-        self._counter += 1
-        request = make_request(op, args, adapter, f"r-{self._counter:04d}")
+        with self._lock:
+            self._counter += 1
+            seq = self._counter
+        request = make_request(op, args, adapter, f"r-{seq:04d}")
         try:
             result = subprocess.run(
                 self.argv, cwd=self.cwd, input=json.dumps(request),
@@ -193,63 +197,75 @@ class CmdCardSource:
         self.adapter = CmdAdapter(spec, cwd, timeout_s=timeout_s)
         self.cwd = Path(cwd)
         self.worktree: Path | None = self.cwd
+        self._lock = threading.RLock()
 
     def hello(self) -> dict:
-        return self.adapter.hello("cards", REQUIRED_OPS["cards"])
+        with self._lock:
+            return self.adapter.hello("cards", REQUIRED_OPS["cards"])
 
     def prepare(self) -> Path:
         return self.worktree or self.cwd
 
     def next(self, lane: str = "", limit: int = 10) -> dict:
-        return self.adapter.call("cards", "next", {"lane": lane, "limit": limit})
+        with self._lock:
+            return self.adapter.call("cards", "next", {"lane": lane, "limit": limit})
 
     def read(self, card_id: str) -> dict:
-        return self.adapter.call("cards", "read", {"id": card_id})
+        with self._lock:
+            return self.adapter.call("cards", "read", {"id": card_id})
 
     def hash(self, card_id: str) -> dict:
-        return {"hash": card_hash(self.adapter.call, card_id)}
+        with self._lock:
+            return {"hash": card_hash(self.adapter.call, card_id)}
 
     def claim(self, card_id: str, holder: str,
               lease_ttl_s: float = 1200) -> dict:
-        return self.adapter.call("cards", "claim", {
-            "id": card_id, "holder": holder, "lease_ttl_s": lease_ttl_s})
+        with self._lock:
+            return self.adapter.call("cards", "claim", {
+                "id": card_id, "holder": holder, "lease_ttl_s": lease_ttl_s})
 
     def heartbeat(self, card_id: str, lease_id: str,
                   lease_ttl_s: float = 1200) -> dict:
-        try:
-            return self.adapter.call("cards", "heartbeat", {
-                "id": card_id, "lease_id": lease_id, "lease_ttl_s": lease_ttl_s})
-        except Unsupported:
-            return {}
+        with self._lock:
+            try:
+                return self.adapter.call("cards", "heartbeat", {
+                    "id": card_id, "lease_id": lease_id, "lease_ttl_s": lease_ttl_s})
+            except Unsupported:
+                return {}
 
     def move(self, card_id: str, lease_id: str, to: str, note_md: str = "",
              stop_code: str = "") -> dict:
-        return self.adapter.call("cards", "move", {
-            "id": card_id, "lease_id": lease_id, "to": to,
-            "note_md": note_md, "stop_code": stop_code})
+        with self._lock:
+            return self.adapter.call("cards", "move", {
+                "id": card_id, "lease_id": lease_id, "to": to,
+                "note_md": note_md, "stop_code": stop_code})
 
     def release(self, card_id: str, lease_id: str = "", reason: str = "",
                 stop_code: str = "") -> dict:
-        return self.adapter.call("cards", "release", {
-            "id": card_id, "lease_id": lease_id, "reason": reason,
-            "stop_code": stop_code})
+        with self._lock:
+            return self.adapter.call("cards", "release", {
+                "id": card_id, "lease_id": lease_id, "reason": reason,
+                "stop_code": stop_code})
 
     def finding(self, from_card: str, title: str, body_md: str = "") -> dict:
-        return self.adapter.call("cards", "finding", {
-            "from_card": from_card, "title": title, "body_md": body_md})
+        with self._lock:
+            return self.adapter.call("cards", "finding", {
+                "from_card": from_card, "title": title, "body_md": body_md})
 
     def stale(self, lane: str = "") -> dict:
-        try:
-            return self.adapter.call("cards", "stale", {"lane": lane})
-        except Unsupported:
-            return {"cards": []}
+        with self._lock:
+            try:
+                return self.adapter.call("cards", "stale", {"lane": lane})
+            except Unsupported:
+                return {"cards": []}
 
     def all_cards(self) -> list:
         from .cards import Card
-        try:
-            result = self.adapter.call("cards", "all", {})
-        except Unsupported:
-            return []
+        with self._lock:
+            try:
+                result = self.adapter.call("cards", "all", {})
+            except Unsupported:
+                return []
         cards = []
         for entry in result.get("cards") or []:
             if isinstance(entry, Card):
@@ -282,9 +298,10 @@ class CmdModelBackend:
                  messages: list[dict], seed: int | None = None,
                  max_tokens: int = 4096,
                  response_format: str | None = None,
-                 card_id: str = "", attempt: int = 1):
+                 card_id: str = "", attempt: int = 1,
+                 effort: str = "", effort_param: str = ""):
         from .adapters.openai_compat import Completion
-        result = self.adapter.call("model", "complete", {
+        params = {
             "role": role,
             "model": model,
             "temperature": temperature,
@@ -294,7 +311,12 @@ class CmdModelBackend:
             "response_format": response_format,
             "card_id": card_id,
             "attempt": attempt,
-        })
+        }
+        if effort:
+            params["effort"] = effort
+        if effort_param:
+            params["effort_param"] = effort_param
+        result = self.adapter.call("model", "complete", params)
         tokens_in = _safe_int(result.get("tokens_in"))
         tokens_out = _safe_int(result.get("tokens_out"))
         raw_cost = result.get("cost")

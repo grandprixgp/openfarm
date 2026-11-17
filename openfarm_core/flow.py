@@ -6,11 +6,13 @@ implementer while attempts remain, with only the diff and the failure output.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import shutil
 from pathlib import Path
 
-from .briefs import BriefBook
+from .board import normalize_role
+from .briefs import Brief, BriefBook, fence
 from .budget import Budget, BudgetExceeded, NightBudget
 from .cards import Card
 from .edits import (apply_edits, diff_text, line_counts, parse_edits,
@@ -27,15 +29,18 @@ from .gates.eligibility import (check_eligibility, derive_cargo_unit,
                                 file_is_blocked)
 from .git import Git, GitRefused
 from .globs import matches_any, normalise, resolves_within
+from .harness_global import GlobalLibrary, global_dir_for
+from .harness_scope import project_markers
 from .harness_memory import (GuidanceSelection, HarnessLibrary, _classify_failure,
                              _is_unsafe_path)
 from .micromanager import open_micromanager
 from .roles import (Plan, Roles, parse_answer_edits, build_checker_pass1_brief,
                     build_checker_pass2_brief, build_implementer_brief,
                     build_planner_brief, build_test_writer_brief,
-                    parse_counter_tests, parse_plan, parse_restatement,
-                    wants_planner)
-from .state import append_jsonl, utc_now, utc_after, write_json
+                    parse_counter_tests, parse_handback, parse_plan,
+                    parse_restatement, wants_planner)
+from .state import append_jsonl, baseline_lock_for, utc_now, utc_after, write_json
+from .swarm import WORKER_ROLES, swarm_set, worker_kind_for_config, worker_member_name
 
 _HARNESS_ISOLATED_STOP_CODES = frozenset({
     StopCode.INFRA,
@@ -47,6 +52,8 @@ _HARNESS_ISOLATED_STOP_CODES = frozenset({
     StopCode.STALE_CONFLICT,
     StopCode.CARD_CHANGED,
     StopCode.LEASE_EXPIRED,
+    StopCode.HANDED_BACK,
+    StopCode.SEAT_SILENT,
 })
 #: succeeded and the flow should checkpoint and continue to the next step.
 _STEP_ADVANCED = "__STEP_ADVANCED__"
@@ -84,7 +91,9 @@ class CardRun:
                  telemetry, budget: Budget | None = None,
                  deps_done: bool = True, conventions: str = "",
                  log=None, micromanager=None,
-                 harness_library: HarnessLibrary | None = None) -> None:
+                 harness_library: HarnessLibrary | None = None,
+                 board=None, swarm=None, on_handback=None,
+                 on_struggling=None) -> None:
         self.card = card
         self.cfg = cfg
         self.state = state
@@ -108,28 +117,62 @@ class CardRun:
         self.target_dir = self.card_layout / "target"
         self.target_dir.mkdir(parents=True, exist_ok=True)
 
+        self.board = board
+        self.swarm = swarm if swarm is not None else getattr(cfg, "swarm", None)
+        self.on_handback = on_handback
+        self.on_struggling = on_struggling
+        self.team_sets: list[dict] = []
+        self.handbacks: list[dict] = []
+        self.effort_tokens: dict[str, int] = {}
+        self._member_stats: dict[str, dict] = {}
+        self._pending_hints: dict[str, list[str]] = {}
+        self._role_overrides: dict[str, tuple[str | None, str | None, str | None]] = {}
+        self._effort_failures: dict[str, tuple[str, int]] = {}
+        self._board_members_ready = False
+
         self._owns_micromanager = micromanager is None
+        cancel_fn = lambda: bool(
+            self.state.kill_requested(getattr(self.cfg, "kill_switch", None))
+        )
         if micromanager is None:
             self.micromanager = open_micromanager(
                 cfg, self.card_layout, self.worktree,
                 worktree=self.worktree, card_dir=self.card_layout,
+                board=board, worker_backend=backend,
+                card_budget=self.budget, heartbeat_fn=self._heartbeat,
+                cancel_check=cancel_fn,
             )
         else:
             self.micromanager = micromanager
             if hasattr(self.micromanager, "card_dir"):
                 self.micromanager.card_dir = self.card_layout
+        mm_backend = getattr(self.micromanager, "backend", None)
+        if mm_backend is not None:
+            if hasattr(mm_backend, "board") and getattr(mm_backend, "board", None) is None:
+                mm_backend.board = board
+            if hasattr(mm_backend, "budget") and getattr(mm_backend, "budget", None) is None:
+                mm_backend.budget = self.budget
+            if hasattr(mm_backend, "heartbeat_fn") and getattr(mm_backend, "heartbeat_fn", None) is None:
+                mm_backend.heartbeat_fn = self._heartbeat
+            if hasattr(mm_backend, "cancel_check") and getattr(mm_backend, "cancel_check", None) is None:
+                mm_backend.cancel_check = cancel_fn
+        if hasattr(self.runner, "budget") and getattr(self.runner, "budget", None) is None:
+            self.runner.budget = self.budget
         if hasattr(self.micromanager, "harness_context"):
             self.micromanager.harness_context = {}
         mm_budget = getattr(self.micromanager, "budget", None)
-        self._mm_start = {
-            "calls": int(getattr(mm_budget, "calls", 0) or 0),
-            "tokens_in": int(getattr(mm_budget, "tokens_in", 0) or 0),
-            "tokens_out": int(getattr(mm_budget, "tokens_out", 0) or 0),
-            "spend": float(getattr(mm_budget, "spend", 0.0) or 0.0),
-            "false_rejects_dismissed": int(
-                getattr(mm_budget, "false_rejects_dismissed", 0) or 0
-            ),
-        }
+        if mm_budget is not None and hasattr(mm_budget, "usage_for"):
+            self._mm_start = dict(mm_budget.usage_for(self.card.id))
+        else:
+            self._mm_start = {
+                "calls": int(getattr(mm_budget, "calls", 0) or 0),
+                "tokens_in": int(getattr(mm_budget, "tokens_in", 0) or 0),
+                "tokens_out": int(getattr(mm_budget, "tokens_out", 0) or 0),
+                "spend": float(getattr(mm_budget, "spend", 0.0) or 0.0),
+                "false_rejects_dismissed": int(
+                    getattr(mm_budget, "false_rejects_dismissed", 0) or 0
+                ),
+            }
 
         if hasattr(self.book, "allowed_extra_reads") and getattr(self.card, "context_files", None):
             self.book.allowed_extra_reads.update(
@@ -214,6 +257,20 @@ class CardRun:
             self.harness_library = HarnessLibrary(hdir, config=cfg)
         else:
             self.harness_library = None
+        # v0.7: the global library. Each card first imports new global lessons
+        # and drops retired ones; after the card, scores go back and proven
+        # lessons go out (when `[harness] share`).
+        self.global_library: GlobalLibrary | None = None
+        self.global_summary: dict = {}
+        if self.harness_library is not None and harness_enabled:
+            try:
+                self.global_library = GlobalLibrary(global_dir_for(harness_cfg))
+                self.global_summary = {
+                    "dir": str(self.global_library.root),
+                    "learn_from": self.harness_library.learn_from,
+                    **self.harness_library.sync_from_global(self.global_library)}
+            except Exception as exc:  # noqa: BLE001 — global learning never stops a card
+                self.global_summary = {"error": f"{type(exc).__name__}: {exc}"}
         self.harness_cues_applied: list[str] = []
         self.harness_lessons_added: list[str] = []
         self.harness_revision: int = int(
@@ -335,21 +392,33 @@ class CardRun:
                 "false_rejects_dismissed": 0,
             }
         start = getattr(self, "_mm_start", None) or {}
+        if hasattr(mm_budget, "usage_for"):
+            cur = mm_budget.usage_for(self.card.id)
+        else:
+            cur = {
+                "calls": int(getattr(mm_budget, "calls", 0) or 0),
+                "tokens_in": int(getattr(mm_budget, "tokens_in", 0) or 0),
+                "tokens_out": int(getattr(mm_budget, "tokens_out", 0) or 0),
+                "spend": float(getattr(mm_budget, "spend", 0.0) or 0.0),
+                "false_rejects_dismissed": int(
+                    getattr(mm_budget, "false_rejects_dismissed", 0) or 0
+                ),
+            }
         return {
-            "calls": max(0, int(getattr(mm_budget, "calls", 0) or 0) - int(start.get("calls", 0))),
+            "calls": max(0, int(cur.get("calls", 0)) - int(start.get("calls", 0))),
             "tokens_in": max(
-                0, int(getattr(mm_budget, "tokens_in", 0) or 0) - int(start.get("tokens_in", 0))
+                0, int(cur.get("tokens_in", 0)) - int(start.get("tokens_in", 0))
             ),
             "tokens_out": max(
-                0, int(getattr(mm_budget, "tokens_out", 0) or 0) - int(start.get("tokens_out", 0))
+                0, int(cur.get("tokens_out", 0)) - int(start.get("tokens_out", 0))
             ),
             "spend": round(
-                max(0.0, float(getattr(mm_budget, "spend", 0.0) or 0.0) - float(start.get("spend", 0.0))),
+                max(0.0, float(cur.get("spend", 0.0)) - float(start.get("spend", 0.0))),
                 6,
             ),
             "false_rejects_dismissed": max(
                 0,
-                int(getattr(mm_budget, "false_rejects_dismissed", 0) or 0)
+                int(cur.get("false_rejects_dismissed", 0))
                 - int(start.get("false_rejects_dismissed", 0)),
             ),
         }
@@ -524,7 +593,772 @@ class CardRun:
         write_json(path, gate.as_dict())
         self.log(f"{self.card.id}: {gate.name} {gate.result}"
                  + (f" — {gate.detail}" if gate.detail else ""))
+        if self.board is not None:
+            self._ensure_board_members()
+            to = [] if gate.result == PASS else self._gate_target(gate.name)
+            body = (
+                f"{gate.name}: {gate.result}"
+                + (f" — {gate.detail}" if gate.detail else "")
+            )
+            self._post_board(
+                author="gates",
+                to=to,
+                kind="gate",
+                attempt=attempt,
+                body=body,
+                evidence=[str(path)],
+                trusted=True,
+            )
         return gate
+
+    def _gate_target(self, gate_name: str) -> list[str]:
+        if (
+            gate_name in ("eligibility", "baseline", "harness-efficiency")
+            or gate_name.startswith("micromanager-")
+        ):
+            return []
+        if (
+            self.phase in ("test-writer", "prove-tests")
+            or gate_name in ("named-tests-exist", "fail-before", "revert-check")
+        ):
+            return [worker_member_name(self.card.id, "test-writer")]
+        return [worker_member_name(self.card.id, "implementer")]
+
+    def _ensure_board_members(self) -> None:
+        if self.board is None or self._board_members_ready:
+            return
+        self.board.ensure()
+        if self.board.get_member("gates") is None:
+            self.board.upsert_member(
+                "gates", kind="code", role="gates", added_by="system"
+            )
+        if (
+            self.board.get_member("coordinator") is None
+            and getattr(self.swarm, "coordinator", "code") == "code"
+        ):
+            self.board.upsert_member(
+                "coordinator", kind="code", role="coordinator", added_by="system"
+            )
+        tiers = getattr(self.cfg, "tiers", {}) or {}
+        default_tier_name = str(
+            getattr(self.swarm, "default_tier", "") or (next(iter(tiers), "default"))
+        )
+        kind = worker_kind_for_config(self.cfg)
+        for role in WORKER_ROLES:
+            mname = worker_member_name(self.card.id, role)
+            if self.board.get_member(mname) is None:
+                tier_cfg = tiers.get(default_tier_name) or next(iter(tiers.values()), None)
+                tier_name = tier_cfg.name if tier_cfg is not None else default_tier_name
+                if tier_cfg is not None and tier_cfg.model:
+                    model_name = tier_cfg.model
+                else:
+                    rm = (getattr(self.cfg, "role_models", {}) or {}).get(
+                        "test_writer" if role == "test-writer" else role
+                    )
+                    model_name = rm.model if rm is not None else ""
+                default_effort = (
+                    self.cfg.effort_for_role(role)[0]
+                    if hasattr(self.cfg, "effort_for_role")
+                    else ""
+                )
+                self.board.upsert_member(
+                    mname,
+                    kind=kind,
+                    role=role,
+                    card=self.card.id,
+                    tier=tier_name,
+                    model=model_name,
+                    effort=default_effort,
+                    state="active",
+                    added_by="system",
+                )
+        self._board_members_ready = True
+
+    def _post_board(
+        self,
+        *,
+        author: str,
+        to: list[str] | str,
+        kind: str,
+        body: str,
+        attempt: int = 0,
+        ref: int | None = None,
+        evidence: list[str] | None = None,
+        trusted: bool | None = None,
+    ) -> dict | None:
+        if self.board is None:
+            return None
+        return self.board.post(
+            author=author,
+            to=to,
+            kind=kind,
+            body=body,
+            card=self.card.id,
+            attempt=attempt,
+            ref=ref,
+            evidence=evidence,
+            trusted=trusted,
+        )
+
+    def _consume_member_hints(self, member_name: str) -> list[str]:
+        if self.board is None:
+            return []
+        unread = self.board.read(
+            as_name=member_name, limit=None, for_model=True, advance_cursor=True
+        )
+        return [
+            str(post.get("body", "")).strip()
+            for post in unread
+            if post.get("kind") == "note" and str(post.get("body", "")).strip()
+        ]
+
+    def _refund_member_attempt(self, board_role: str) -> None:
+        if self.board is None:
+            return
+        member_name = worker_member_name(self.card.id, board_role)
+        current = self.board.get_member(member_name)
+        if current is None:
+            return
+        refunded = max(0, int(current.get("attempts", 0) or 0) - 1)
+        self.board.update_member(member_name, attempts=refunded)
+        if member_name in self._member_stats:
+            self._member_stats[member_name]["attempts"] = refunded
+
+    def _apply_handback_set_no_coordinator(
+        self,
+        member_name: str,
+        *,
+        tier: str | None,
+        effort: str | None,
+    ) -> None:
+        """Apply a `set` resolution when `coordinator` is not yet registered on board."""
+        tiers = getattr(self.cfg, "tiers", {}) or {}
+        current = self.board.get_member(member_name) or {}
+        new_tier = str(tier) if tier is not None else str(current.get("tier", "") or "")
+        new_model = str(current.get("model", "") or "")
+        tier_cfg = tiers.get(new_tier)
+        if tier is not None:
+            if tier_cfg is None:
+                raise Refused("unknown-tier", f"unknown tier {tier!r}")
+            new_model = tier_cfg.model
+        new_effort = (
+            str(effort) if effort is not None else str(current.get("effort", "") or "")
+        )
+        if effort is not None:
+            if tier_cfg is None and hasattr(self.cfg, "tier_for_model"):
+                tier_cfg = self.cfg.tier_for_model(new_model)
+            if tier_cfg is not None and tier_cfg.efforts and new_effort not in tier_cfg.efforts:
+                raise Refused(
+                    "invalid-effort",
+                    f"effort {new_effort!r} is not allowed for tier {tier_cfg.name!r}",
+                )
+        self.board.update_member(
+            member_name, tier=new_tier, model=new_model, effort=new_effort
+        )
+        self.team_sets.append(
+            {
+                "member": member_name,
+                "tier": new_tier,
+                "effort": new_effort,
+                "detail": f"set {member_name}: tier={new_tier} effort={new_effort}",
+            }
+        )
+
+    def _member_effort_key(self, board_role: str) -> str:
+        member_name = worker_member_name(self.card.id, board_role)
+        if self.board is not None:
+            member = self.board.get_member(member_name)
+            if member is not None:
+                return f"{member.get('tier', '')}:{member.get('effort', '')}"
+        ov = self._role_overrides.get(board_role)
+        if ov is not None:
+            return f"{ov[0] or ''}:{ov[1] or ''}"
+        if hasattr(self.cfg, "effort_for_role"):
+            eff, _ = self.cfg.effort_for_role(board_role)
+            return f":{eff}"
+        return ""
+
+    def _apply_coordinator_resolution(
+        self,
+        resolution,
+        *,
+        board_role: str,
+        member_name: str,
+        member_before: dict | None,
+        unread_notes_before: int,
+        reason: str,
+        context_label: str,
+    ) -> tuple[str | None, str]:
+        """Interpret coordinator hint/set/retry/block action or board mutation."""
+        action = ""
+        res_dict: dict = {}
+        if isinstance(resolution, str):
+            action = resolution.strip().lower()
+        elif isinstance(resolution, dict):
+            res_dict = dict(resolution)
+            action = str(res_dict.get("action", "") or "").strip().lower()
+
+        if action == "hint":
+            hint_body = str(res_dict.get("body", "") or "").strip()
+            if self.board is not None and hint_body:
+                existing_notes = [
+                    str(post.get("body", "")).strip()
+                    for post in self.board.read(
+                        as_name=member_name,
+                        limit=None,
+                        for_model=False,
+                        advance_cursor=False,
+                    )
+                    if post.get("kind") == "note"
+                ]
+                if hint_body not in existing_notes:
+                    self.board.post(
+                        author="coordinator",
+                        to=[member_name],
+                        kind="note",
+                        card=self.card.id,
+                        body=hint_body,
+                        trusted=True,
+                    )
+            elif hint_body:
+                self._pending_hints.setdefault(board_role, []).append(hint_body)
+            return "hint", ""
+
+        if action == "set":
+            tier_new = res_dict.get("tier")
+            effort_new = res_dict.get("effort")
+            if self.board is not None:
+                current = self.board.get_member(member_name) or {}
+                changed_by_hook = (
+                    member_before is not None
+                    and (
+                        current.get("tier") != member_before.get("tier")
+                        or current.get("effort") != member_before.get("effort")
+                    )
+                )
+                if not changed_by_hook and (
+                    tier_new is not None or effort_new is not None
+                ):
+                    coord = self.board.get_member("coordinator")
+                    if coord is not None and coord.get("role") == "coordinator":
+                        swarm_set(
+                            self.board,
+                            self.cfg,
+                            caller="coordinator",
+                            member_name=member_name,
+                            tier=tier_new,
+                            effort=effort_new,
+                            reason=f"{context_label}: {reason[:120]}",
+                        )
+                    else:
+                        self._apply_handback_set_no_coordinator(
+                            member_name, tier=tier_new, effort=effort_new
+                        )
+            elif tier_new is not None or effort_new is not None:
+                tiers = getattr(self.cfg, "tiers", {}) or {}
+                tier_cfg = tiers.get(str(tier_new)) if tier_new else None
+                model_ov = tier_cfg.model if tier_cfg is not None else None
+                eff_ov = str(effort_new) if effort_new is not None else None
+                ep_ov = (
+                    tier_cfg.effort_param
+                    if tier_cfg is not None
+                    else (
+                        self.cfg.tier_for_model(model_ov or "").effort_param
+                        if hasattr(self.cfg, "tier_for_model") and eff_ov
+                        else ("reasoning_effort" if eff_ov else None)
+                    )
+                )
+                self._role_overrides[board_role] = (model_ov, eff_ov, ep_ov)
+            return "set", ""
+
+        if action == "retry":
+            return "retry", ""
+
+        if action == "block":
+            return "block", str(res_dict.get("reason", "") or reason)
+
+        if not action and self.board is not None:
+            current = self.board.get_member(member_name) or {}
+            unread_notes_after = sum(
+                1
+                for post in self.board.read(
+                    as_name=member_name,
+                    limit=None,
+                    for_model=False,
+                    advance_cursor=False,
+                )
+                if post.get("kind") == "note"
+            )
+            tier_or_effort_changed = (
+                member_before is not None
+                and (
+                    current.get("tier") != member_before.get("tier")
+                    or current.get("effort") != member_before.get("effort")
+                )
+            )
+            if unread_notes_after > unread_notes_before:
+                return "hint", ""
+            if tier_or_effort_changed:
+                return "set", ""
+
+        return None, str(res_dict.get("reason", "") or reason)
+
+    def _maybe_handle_struggling(
+        self,
+        *,
+        role: str,
+        attempt_no: int,
+        detail: str,
+        diff_text: str = "",
+    ) -> bool:
+        """Track failures at the worker's current effort and escalate via coordinator."""
+        board_role = (
+            "test-writer" if role == "test_writer" else normalize_role(role)
+        )
+        eff_key = self._member_effort_key(board_role)
+        prev_key, prev_count = self._effort_failures.get(board_role, ("", 0))
+        count = 1 if eff_key != prev_key else prev_count + 1
+        self._effort_failures[board_role] = (eff_key, count)
+
+        escalate_after = int(
+            getattr(self.swarm, "escalate_after", 2)
+            if self.swarm is not None
+            else 2
+        )
+        attempts_left = (
+            max(0, self.budget.test_writer_attempt_cap - self.budget.test_writer_attempts)
+            if role == "test_writer"
+            else self.budget.implementer_attempts_left()
+        )
+        if count < max(1, escalate_after) or attempts_left <= 0:
+            return False
+        if self.on_struggling is None:
+            return False
+
+        member_name = worker_member_name(self.card.id, board_role)
+        member_before = (
+            self.board.get_member(member_name) if self.board is not None else None
+        )
+        unread_notes_before = 0
+        post_rec = None
+        if self.board is not None:
+            unread_notes_before = sum(
+                1
+                for post in self.board.read(
+                    as_name=member_name,
+                    limit=None,
+                    for_model=False,
+                    advance_cursor=False,
+                )
+                if post.get("kind") == "note"
+            )
+            post_rec = self._post_board(
+                author="gates",
+                to=["coordinator"],
+                kind="note",
+                attempt=attempt_no,
+                body=(
+                    f"struggling {member_name} ({eff_key or 'default'}, "
+                    f"{count} failure(s)): {detail[:300]}"
+                ),
+                trusted=True,
+            )
+
+        tier_cur = str((member_before or {}).get("tier", "") or "")
+        effort_cur = str((member_before or {}).get("effort", "") or "")
+        cancel_fn = lambda: bool(
+            self.state.kill_requested(getattr(self.cfg, "kill_switch", None))
+        )
+        resolution = self.on_struggling(
+            {
+                "card_id": self.card.id,
+                "role": role,
+                "board_role": board_role,
+                "member": member_name,
+                "attempt": attempt_no,
+                "failed_at_effort": count,
+                "tier": tier_cur,
+                "effort": effort_cur,
+                "detail": detail,
+                "diff": diff_text,
+                "board": self.board,
+                "post": post_rec,
+                "budget": self.budget,
+                "heartbeat_fn": self._heartbeat,
+                "cancel_check": cancel_fn,
+                "micromanager": self.micromanager,
+            }
+        )
+        outcome, block_reason = self._apply_coordinator_resolution(
+            resolution,
+            board_role=board_role,
+            member_name=member_name,
+            member_before=member_before,
+            unread_notes_before=unread_notes_before,
+            reason=detail[:300],
+            context_label="struggling",
+        )
+        if outcome in ("hint", "set", "retry"):
+            self.diff_hashes.clear()
+            self.error_signatures.clear()
+            self.named_history.clear()
+            self._effort_failures[board_role] = (
+                self._member_effort_key(board_role),
+                0,
+            )
+            return True
+        if outcome == "block":
+            raise GateFailure(StopCode.HANDED_BACK, block_reason)
+        return False
+
+    def _handle_handback(
+        self,
+        *,
+        role: str,
+        call,
+        attempt_no: int,
+        call_seq: int,
+        reason: str,
+    ) -> str | None:
+        """Handle a worker hand-back answer (`<<<HANDBACK ... >>>`).
+
+        Returns None to refund & retry, a failure detail string when
+        `handbacks_per_card` is exceeded (counting it as a failed attempt), or
+        raises `GateFailure(HANDED_BACK)` when blocked.
+        """
+        board_role = (
+            "checker"
+            if role in ("checker_pass1", "checker_pass2")
+            else ("test-writer" if role == "test_writer" else role)
+        )
+        member_name = worker_member_name(self.card.id, board_role)
+        max_handbacks = int(
+            getattr(self.swarm, "handbacks_per_card", 2)
+            if self.swarm is not None
+            else 2
+        )
+        hb_index = len(self.handbacks) + 1
+        within_limit = hb_index <= max_handbacks
+        hb_entry: dict = {
+            "role": role,
+            "member": member_name,
+            "attempt": attempt_no,
+            "call_seq": call_seq,
+            "reason": reason,
+            "refunded": within_limit,
+            "outcome": "limit-exceeded" if not within_limit else "pending",
+        }
+        self.handbacks.append(hb_entry)
+        self.log(f"{self.card.id}: {role} handed back (#{hb_index}): {reason}")
+
+        member_before = (
+            self.board.get_member(member_name) if self.board is not None else None
+        )
+        unread_notes_before = 0
+        post_rec = None
+        if self.board is not None:
+            unread_notes_before = sum(
+                1
+                for post in self.board.read(
+                    as_name=member_name,
+                    limit=None,
+                    for_model=False,
+                    advance_cursor=False,
+                )
+                if post.get("kind") == "note"
+            )
+            post_rec = self._post_board(
+                author=member_name,
+                to=["coordinator"],
+                kind="handback",
+                attempt=call_seq,
+                body=(
+                    reason
+                    if within_limit
+                    else f"hand-back limit ({max_handbacks}) exceeded: {reason}"
+                ),
+            )
+
+        if not within_limit:
+            detail = f"hand-back limit ({max_handbacks}) exceeded: {reason}"
+            att_phase = "test-writer" if role == "test_writer" else (
+                "implement" if role == "implementer" else role
+            )
+            self._record_attempt(
+                att_phase,
+                "failed-gates",
+                StopCode.HANDED_BACK,
+                role=role,
+                attempt=attempt_no,
+                detail=detail,
+            )
+            self._record_contrast_attempt(
+                attempt=attempt_no,
+                phase=role,
+                role=role,
+                outcome="fail",
+                error_signature="handback-limit",
+                detail=detail,
+                stop_code=StopCode.HANDED_BACK,
+                call=call,
+            )
+            return detail
+
+        # Refund attempt before checking coordinator resolution so blocking leaves 0 attempts.
+        if role == "test_writer":
+            self.budget.test_writer_attempts = max(
+                0, self.budget.test_writer_attempts - 1
+            )
+        elif role == "implementer":
+            self.budget.implementer_attempts = max(
+                0, self.budget.implementer_attempts - 1
+            )
+        self._refund_member_attempt(board_role)
+
+        resolution = None
+        if self.on_handback is not None:
+            cancel_fn = lambda: bool(
+                self.state.kill_requested(getattr(self.cfg, "kill_switch", None))
+            )
+            resolution = self.on_handback(
+                {
+                    "card_id": self.card.id,
+                    "role": role,
+                    "board_role": board_role,
+                    "member": member_name,
+                    "attempt": attempt_no,
+                    "call_seq": call_seq,
+                    "handback_index": hb_index,
+                    "reason": reason,
+                    "board": self.board,
+                    "post": post_rec,
+                    "budget": self.budget,
+                    "heartbeat_fn": self._heartbeat,
+                    "cancel_check": cancel_fn,
+                    "micromanager": self.micromanager,
+                }
+            )
+
+        outcome, block_reason = self._apply_coordinator_resolution(
+            resolution,
+            board_role=board_role,
+            member_name=member_name,
+            member_before=member_before,
+            unread_notes_before=unread_notes_before,
+            reason=reason,
+            context_label="handback",
+        )
+        if outcome in ("hint", "set", "retry"):
+            hb_entry["outcome"] = outcome
+            return None
+
+        hb_entry["outcome"] = "blocked"
+        raise GateFailure(StopCode.HANDED_BACK, block_reason)
+
+    def _member_call_settings(self, role: str, member: dict) -> tuple[str, str | None, str, str]:
+        tiers = getattr(self.cfg, "tiers", {}) or {}
+        tier_name = str(member.get("tier", "") or getattr(self.swarm, "default_tier", "") or "")
+        tier_cfg = tiers.get(tier_name)
+        model_override = str(
+            member.get("model", "") or (tier_cfg.model if tier_cfg is not None else "") or ""
+        ) or None
+        effort = str(member.get("effort", "") or "")
+        if not effort:
+            effort_param = ""
+        elif tier_cfg is not None:
+            effort_param = tier_cfg.effort_param
+        elif hasattr(self.cfg, "tier_for_model"):
+            effort_param = self.cfg.tier_for_model(model_override or "").effort_param
+        else:
+            effort_param = "reasoning_effort"
+        return tier_name, model_override, effort, effort_param
+
+    def _call_board_role(
+        self,
+        role: str,
+        brief: Brief,
+        *,
+        attempt: int = 1,
+        response_format: str | None = None,
+        brief_path: Path | None = None,
+        brief_is_json: bool = False,
+        response_path: Path | None = None,
+    ):
+        if self.board is None:
+            board_role = (
+                "checker" if role in ("checker_pass1", "checker_pass2") else normalize_role(role)
+            )
+            pending = self._pending_hints.pop(board_role, [])
+            effective_brief = brief
+            if pending:
+                hint_block = "\n\nCoordinator hint (data):\n" + fence(
+                    "\n\n".join(pending), "coordinator hint"
+                )
+                effective_brief = Brief(brief.role, brief.body + hint_block)
+            if brief_path is not None and brief_is_json:
+                write_json(brief_path, {"brief": effective_brief.body})
+            ov_model, ov_eff, ov_ep = self._role_overrides.get(
+                board_role, (None, None, None)
+            )
+            call = self.roles.call(
+                role,
+                effective_brief,
+                attempt=attempt,
+                response_format=response_format,
+                model=ov_model,
+                effort=ov_eff,
+                effort_param=ov_ep,
+            )
+            if response_path is not None:
+                write_json(response_path, call.as_dict())
+            return call
+
+        self._ensure_board_members()
+        board_role = (
+            "checker" if role in ("checker_pass1", "checker_pass2") else normalize_role(role)
+        )
+        member_name = worker_member_name(self.card.id, board_role)
+        hints = self._consume_member_hints(member_name)
+        effective_brief = brief
+        if hints:
+            hint_block = "\n\nCoordinator hint (data):\n" + fence(
+                "\n\n".join(hints), "coordinator hint"
+            )
+            effective_brief = Brief(brief.role, brief.body + hint_block)
+
+        target_brief = brief_path or (
+            self.card_layout / "briefs" / f"{attempt}-{role.replace('_', '-')}.md"
+        )
+        if brief_is_json:
+            write_json(target_brief, {"brief": effective_brief.body})
+        else:
+            target_brief.parent.mkdir(parents=True, exist_ok=True)
+            target_brief.write_text(effective_brief.body, encoding="utf-8")
+
+        member = self.board.get_member(member_name) or {}
+        tier_name, model_override, effort_val, effort_param = self._member_call_settings(
+            role, member
+        )
+        self._post_board(
+            author="gates",
+            to=[member_name],
+            kind="brief",
+            attempt=attempt,
+            body=f"{board_role} brief (attempt {attempt})",
+            evidence=[str(target_brief)],
+            trusted=True,
+        )
+
+        call = self.roles.call(
+            role,
+            effective_brief,
+            attempt=attempt,
+            response_format=response_format,
+            model=model_override,
+            effort=effort_val,
+            effort_param=effort_param,
+        )
+
+        target_resp = response_path or (
+            self.card_layout / "responses" / f"{attempt}-{role.replace('_', '-')}.json"
+        )
+        write_json(target_resp, call.as_dict())
+
+        tok_in = int(getattr(call, "tokens_in", 0) or 0)
+        tok_out = int(getattr(call, "tokens_out", 0) or 0)
+        eff_key = effort_val or "none"
+        self.effort_tokens[eff_key] = self.effort_tokens.get(eff_key, 0) + tok_in + tok_out
+
+        current = self.board.get_member(member_name) or member
+        new_in = int(current.get("tokens_in", 0) or 0) + tok_in
+        new_out = int(current.get("tokens_out", 0) or 0) + tok_out
+        new_calls = int(current.get("calls", 0) or 0) + 1
+        new_attempts = int(current.get("attempts", 0) or 0) + (
+            0 if role == "checker_pass2" else 1
+        )
+        by_eff = dict(current.get("tokens_by_effort") or {})
+        by_eff[eff_key] = int(by_eff.get(eff_key, 0) or 0) + tok_in + tok_out
+        self.board.update_member(
+            member_name,
+            tokens_in=new_in,
+            tokens_out=new_out,
+            tokens=new_in + new_out,
+            calls=new_calls,
+            attempts=new_attempts,
+            tokens_by_effort=by_eff,
+        )
+        self._member_stats[member_name] = {
+            "member": member_name,
+            "role": board_role,
+            "tier": tier_name,
+            "effort": effort_val,
+            "model": model_override or "",
+            "attempts": new_attempts,
+            "calls": new_calls,
+            "tokens_in": new_in,
+            "tokens_out": new_out,
+            "tokens": new_in + new_out,
+        }
+
+        self._post_board(
+            author=member_name,
+            to=["gates"],
+            kind="result",
+            attempt=attempt,
+            body=f"{board_role} answered ({len(call.content)} chars, {tok_in} in / {tok_out} out)",
+            evidence=[str(target_resp)],
+        )
+        return call
+
+    def team_summary(self) -> list[dict]:
+        """Per-member team summary for the dossier and telemetry."""
+        if self.board is None:
+            return []
+        rows: list[dict] = []
+        for role in WORKER_ROLES:
+            mname = worker_member_name(self.card.id, role)
+            member = self.board.get_member(mname)
+            if member is None:
+                continue
+            tok_in = int(member.get("tokens_in", 0) or 0)
+            tok_out = int(member.get("tokens_out", 0) or 0)
+            rows.append({
+                "member": mname,
+                "role": role,
+                "tier": str(member.get("tier", "") or ""),
+                "effort": str(member.get("effort", "") or ""),
+                "model": str(member.get("model", "") or ""),
+                "attempts": int(member.get("attempts", 0) or 0),
+                "calls": int(member.get("calls", 0) or 0),
+                "tokens_in": tok_in,
+                "tokens_out": tok_out,
+                "tokens": tok_in + tok_out,
+            })
+        return rows
+
+    def board_sets_summary(self) -> list[dict]:
+        """Set actions targeting this card's team on the board."""
+        if self.board is None or not self.board.board_dir.exists():
+            return list(self.team_sets)
+        team_names = {worker_member_name(self.card.id, role) for role in WORKER_ROLES}
+        posts = self.board.read(as_name="*", since=0, limit=None, for_model=False)
+        sets: list[dict] = []
+        for post in posts:
+            if post.get("kind") != "action":
+                continue
+            body = str(post.get("body", "") or "")
+            if not body.startswith("set "):
+                continue
+            recipients = set(post.get("to") or ())
+            if post.get("card") == self.card.id or (recipients & team_names):
+                sets.append({
+                    "seq": post.get("seq"),
+                    "at": post.get("at", ""),
+                    "from": post.get("from", ""),
+                    "to": list(post.get("to") or ()),
+                    "detail": body,
+                })
+        return sets or list(self.team_sets)
 
     def _current_step(self) -> dict | None:
         """The planner step the implementer is on, or None when there is no plan.
@@ -768,6 +1602,15 @@ class CardRun:
         write_json(self.card_layout / "card.json",
                    {"card": self.card.as_dict(), "hash": self.card_hash_at_claim,
                     "read_at": utc_now()})
+        if self.board is not None:
+            self._ensure_board_members()
+            self._post_board(
+                author="gates",
+                to=[],
+                kind="note",
+                body=f"claimed {self.card.id} (hash {self.card_hash_at_claim[:12]})",
+                trusted=True,
+            )
 
         eligibility = check_eligibility(self.card, self.cfg,
                                         deps_done=self.deps_done,
@@ -808,81 +1651,87 @@ class CardRun:
     def _step_baseline(self) -> None:
         self.phase = "baseline"
         unit = self._effective_unit()
-        cached = None
-        if self.cfg.baseline_cache:
-            cached = self._read_baseline_cache(unit)
-        if cached is not None:
-            gate = GateResult("baseline", PASS, "cached: two runs agreed",
-                              {"cached": True})
-            self._record_gate(gate)
-            self.base_test_list = cached.get("list", {"tests": []})
-            return
+        lock_cm = (
+            baseline_lock_for(self._cache_file(unit))
+            if self.cfg.baseline_cache
+            else contextlib.nullcontext()
+        )
+        with lock_cm:
+            cached = None
+            if self.cfg.baseline_cache:
+                cached = self._read_baseline_cache(unit)
+            if cached is not None:
+                gate = GateResult("baseline", PASS, "cached: two runs agreed",
+                                  {"cached": True})
+                self._record_gate(gate)
+                self.base_test_list = cached.get("list", {"tests": []})
+                return
 
-        runs = []
-        for index in (1, 2):
-            result = self._run(runner_kind("test"),
-                               self.pack.commands("test", unit=unit)["argv"],
-                               counted="fixed")
-            out, err = self._output(result)
-            parsed = self.pack.parse_tests(out, err)
-            runs.append((result, parsed))
+            runs = []
+            for index in (1, 2):
+                result = self._run(runner_kind("test"),
+                                   self.pack.commands("test", unit=unit)["argv"],
+                                   counted="fixed")
+                out, err = self._output(result)
+                parsed = self.pack.parse_tests(out, err)
+                runs.append((result, parsed))
 
-        first, second = runs
-        sg_first = suite_green(first[1], self.cfg.known_failing,
-                               run_cls=first[0].cls, exit_code=first[0].exit_code)
-        sg_second = suite_green(second[1], self.cfg.known_failing,
-                                run_cls=second[0].cls, exit_code=second[0].exit_code)
+            first, second = runs
+            sg_first = suite_green(first[1], self.cfg.known_failing,
+                                   run_cls=first[0].cls, exit_code=first[0].exit_code)
+            sg_second = suite_green(second[1], self.cfg.known_failing,
+                                    run_cls=second[0].cls, exit_code=second[0].exit_code)
 
-        # A baseline that does not compile is not green, and not "no failures"
-        # either. Check compile errors before INFRA/missing_footers so compile
-        # failures stay a card/repo baseline error cleanly.
-        compile_broken = (first[1].get("compile_errors")
-                          or second[1].get("compile_errors"))
-        if compile_broken:
-            detail = ("the base does not build: "
-                      + str(compile_broken[:3]))
-            self._record_gate(GateResult("baseline", FAIL, detail,
-                                         {"compile_errors": compile_broken}))
-            raise GateFailure(StopCode.DIRTY_BASELINE, detail)
+            # A baseline that does not compile is not green, and not "no failures"
+            # either. Check compile errors before INFRA/missing_footers so compile
+            # failures stay a card/repo baseline error cleanly.
+            compile_broken = (first[1].get("compile_errors")
+                              or second[1].get("compile_errors"))
+            if compile_broken:
+                detail = ("the base does not build: "
+                          + str(compile_broken[:3]))
+                self._record_gate(GateResult("baseline", FAIL, detail,
+                                             {"compile_errors": compile_broken}))
+                raise GateFailure(StopCode.DIRTY_BASELINE, detail)
 
-        if (first[0].cls == INFRA or second[0].cls == INFRA
-                or sg_first.result == INFRA or sg_second.result == INFRA):
-            self._record_gate(GateResult("baseline", INFRA,
-                                         "a baseline run did not finish"))
-            raise Infra("baseline-infra",
-                        "a baseline run did not finish, so nothing can be judged")
+            if (first[0].cls == INFRA or second[0].cls == INFRA
+                    or sg_first.result == INFRA or sg_second.result == INFRA):
+                self._record_gate(GateResult("baseline", INFRA,
+                                             "a baseline run did not finish"))
+                raise Infra("baseline-infra",
+                            "a baseline run did not finish, so nothing can be judged")
 
-        red_first = _red(parsed=first[1], known=self.cfg.known_failing)
-        red_second = _red(parsed=second[1], known=self.cfg.known_failing)
-        disagree = [name for name in red_first if name not in red_second]
-        disagree += [name for name in red_second if name not in red_first]
+            red_first = _red(parsed=first[1], known=self.cfg.known_failing)
+            red_second = _red(parsed=second[1], known=self.cfg.known_failing)
+            disagree = [name for name in red_first if name not in red_second]
+            disagree += [name for name in red_second if name not in red_first]
 
-        if red_first or red_second or not sg_first.ok or not sg_second.ok:
-            if red_first or red_second:
-                detail = ("red on base: "
-                          + ", ".join(sorted(set(red_first + red_second))[:10]))
-                if disagree:
-                    detail += f"; the two runs disagreed on {len(disagree)} test(s)"
-            else:
-                detail = sg_first.detail or sg_second.detail or "baseline failed"
-            self._record_gate(GateResult("baseline", FAIL, detail,
-                                         {"red": red_first + red_second,
-                                          "disagreed": disagree,
-                                          "first": sg_first.evidence,
-                                          "second": sg_second.evidence}))
-            raise GateFailure(StopCode.DIRTY_BASELINE, detail)
+            if red_first or red_second or not sg_first.ok or not sg_second.ok:
+                if red_first or red_second:
+                    detail = ("red on base: "
+                              + ", ".join(sorted(set(red_first + red_second))[:10]))
+                    if disagree:
+                        detail += f"; the two runs disagreed on {len(disagree)} test(s)"
+                else:
+                    detail = sg_first.detail or sg_second.detail or "baseline failed"
+                self._record_gate(GateResult("baseline", FAIL, detail,
+                                             {"red": red_first + red_second,
+                                              "disagreed": disagree,
+                                              "first": sg_first.evidence,
+                                              "second": sg_second.evidence}))
+                raise GateFailure(StopCode.DIRTY_BASELINE, detail)
 
-        list_result = self._run(runner_kind("list"),
-                                self.pack.commands("list", unit=unit)["argv"],
-                                counted="fixed")
-        out, err = self._output(list_result)
-        self.base_test_list = self.pack.parse_list(out)
-        self._record_gate(GateResult(
-            "baseline", PASS,
-            f"two runs green and agreed; {len(self.base_test_list['tests'])} "
-            f"existing test(s)",
-            {"cached": False, "existing_tests": len(self.base_test_list["tests"])}))
-        self._write_baseline_cache(unit, self.base_test_list)
+            list_result = self._run(runner_kind("list"),
+                                    self.pack.commands("list", unit=unit)["argv"],
+                                    counted="fixed")
+            out, err = self._output(list_result)
+            self.base_test_list = self.pack.parse_list(out)
+            self._record_gate(GateResult(
+                "baseline", PASS,
+                f"two runs green and agreed; {len(self.base_test_list['tests'])} "
+                f"existing test(s)",
+                {"cached": False, "existing_tests": len(self.base_test_list["tests"])}))
+            self._write_baseline_cache(unit, self.base_test_list)
 
     def _cache_file(self, unit: str) -> Path:
         return self.state.cache_path(
@@ -1006,13 +1855,40 @@ class CardRun:
         brief = build_planner_brief(
             self.card, self.book, harness_guidance=planner_harness
         )
-        try:
-            call = self.roles.call("planner", brief, response_format="json")
-        except (Infra, Invalid):
-            self.planner_used = False
-            self.log(f"{self.card.id}: planner unavailable, running unsplit")
-            return
-        self.budget.note_tokens(call.tokens_in, call.tokens_out, call.spend)
+        max_hb = int(
+            getattr(self.swarm, "handbacks_per_card", 2)
+            if self.swarm is not None
+            else 2
+        )
+        call = None
+        for call_seq in range(1, max_hb + 2):
+            try:
+                call = self._call_board_role(
+                    "planner",
+                    brief,
+                    attempt=call_seq,
+                    response_format="json",
+                    response_path=self.card_layout / "responses" / (
+                        "planner.json" if call_seq == 1 else f"planner-{call_seq}.json"
+                    ),
+                )
+            except (Infra, Invalid):
+                self.planner_used = False
+                self.log(f"{self.card.id}: planner unavailable, running unsplit")
+                return
+            self.budget.note_tokens(call.tokens_in, call.tokens_out, call.spend)
+            hb_reason = None if call.cut_off else parse_handback(call.content)
+            if hb_reason is None:
+                break
+            limit_err = self._handle_handback(
+                role="planner",
+                call=call,
+                attempt_no=1,
+                call_seq=call_seq,
+                reason=hb_reason,
+            )
+            if limit_err is not None:
+                raise GateFailure(StopCode.HANDED_BACK, limit_err)
         try:
             plan = parse_plan(call.content, card=self.card)
         except Invalid as exc:
@@ -1065,9 +1941,11 @@ class CardRun:
         free_sends = self.cfg.test_writer_attempts
         free_retries = self.cfg.test_writer_attempts
         attempt = 0
+        call_seq = 0
         while free_sends > 0:
             free_sends -= 1
             attempt += 1
+            call_seq += 1
             self.attempt = attempt
             # Every test-writer attempt starts cleanly from the scaffold commit,
             # so a failed or refused attempt cannot leave an edit behind.
@@ -1086,10 +1964,31 @@ class CardRun:
                 attempt=attempt, previous_failure=last_failure,
                 guidance=tw_guidance, context_files=self.extra_context_files,
                 harness_guidance=tw_harness)
-            call = self.roles.call("test_writer", brief, attempt=attempt)
+            call = self._call_board_role(
+                "test_writer",
+                brief,
+                attempt=call_seq,
+                response_path=self.card_layout / "responses" / f"A{call_seq}-test-writer.json",
+            )
             self.budget.note_tokens(call.tokens_in, call.tokens_out, call.spend)
-            write_json(self.card_layout / "responses" / f"A{attempt}-test-writer.json",
-                       call.as_dict())
+
+            hb_reason = None if call.cut_off else parse_handback(call.content)
+            if hb_reason is not None:
+                limit_err = self._handle_handback(
+                    role="test_writer",
+                    call=call,
+                    attempt_no=attempt,
+                    call_seq=call_seq,
+                    reason=hb_reason,
+                )
+                if limit_err is None:
+                    attempt -= 1
+                    free_sends += 1
+                    continue
+                last_failure = limit_err
+                if free_sends <= 0:
+                    raise GateFailure(StopCode.TESTS_UNPROVABLE, last_failure)
+                continue
 
             try:
                 edits = parse_answer_edits(call)
@@ -1187,6 +2086,11 @@ class CardRun:
                 if free_sends <= 0:
                     raise
                 last_failure = exc.detail
+                self._maybe_handle_struggling(
+                    role="test_writer",
+                    attempt_no=attempt,
+                    detail=last_failure,
+                )
                 if self.micromanager.enabled:
                     self._refresh_micromanager_harness_context(
                         "test_writer",
@@ -1438,6 +2342,7 @@ class CardRun:
         step_advances = 0
         max_step_advances = len(self.plan.steps) if self.plan else 0
         attempt_seq = int(self.budget.implementer_attempts)
+        call_seq = attempt_seq
 
         while free_calls > 0:
             uncommitted = self._diff_against_head_before_edits()
@@ -1447,6 +2352,7 @@ class CardRun:
             self.budget.take_implementer_attempt()
             attempt_seq += 1
             attempt_no = attempt_seq
+            call_seq += 1
             self._heartbeat()
             self._begin_attempt(attempt_no)
 
@@ -1474,13 +2380,31 @@ class CardRun:
                 step_context="\n".join(self.step_summaries),
                 context_files=self.extra_context_files,
                 harness_guidance=impl_harness)
-            write_json(self.card_layout / "briefs" / f"{attempt_no}-implementer.md",
-                       {"brief": brief.body})
-
-            call = self.roles.call("implementer", brief, attempt=attempt_no)
+            call = self._call_board_role(
+                "implementer",
+                brief,
+                attempt=call_seq,
+                brief_path=self.card_layout / "briefs" / f"{call_seq}-implementer.md",
+                brief_is_json=True,
+                response_path=self.card_layout / "responses" / f"{call_seq}-implementer.json",
+            )
             self.budget.note_tokens(call.tokens_in, call.tokens_out, call.spend)
-            write_json(self.card_layout / "responses" / f"{attempt_no}-implementer.json",
-                       call.as_dict())
+
+            hb_reason = None if call.cut_off else parse_handback(call.content)
+            if hb_reason is not None:
+                limit_err = self._handle_handback(
+                    role="implementer",
+                    call=call,
+                    attempt_no=attempt_no,
+                    call_seq=call_seq,
+                    reason=hb_reason,
+                )
+                if limit_err is None:
+                    attempt_seq -= 1
+                    free_calls += 1
+                    continue
+                last_failure = limit_err
+                continue
 
             try:
                 edits = parse_answer_edits(call)
@@ -1906,6 +2830,13 @@ class CardRun:
 
     def _check_progress_with_coach(self, diff: dict, detail: str,
                                    attempt_no: int) -> None:
+        if self._maybe_handle_struggling(
+            role="implementer",
+            attempt_no=attempt_no,
+            detail=detail,
+            diff_text=diff.get("diff", ""),
+        ):
+            return
         try:
             self._check_progress()
         except GateFailure as exc:
@@ -2476,10 +3407,13 @@ class CardRun:
             [path for path in changed if self._is_test_path(path)],
             ref=self.base_commit or "HEAD")
         brief1 = build_checker_pass1_brief(self.card, test_diff)
-        call1 = self.roles.call("checker_pass1", brief1, attempt=1)
+        call1 = self._call_board_role(
+            "checker_pass1",
+            brief1,
+            attempt=1,
+            response_path=self.card_layout / "responses" / "checker-pass1.json",
+        )
         self.budget.note_tokens(call1.tokens_in, call1.tokens_out, call1.spend)
-        write_json(self.card_layout / "responses" / "checker-pass1.json",
-                   call1.as_dict())
         restatement = parse_restatement(call1.content, self.card)
         self.checker_restatement = restatement
         gate1 = self._record_gate(GateResult(
@@ -2495,10 +3429,13 @@ class CardRun:
                 modified[path] = full.read_text()[:8000]
         brief2 = build_checker_pass2_brief(
             self.card, full_diff, [g.as_dict() for g in self.gates], modified)
-        call2 = self.roles.call("checker_pass2", brief2, attempt=2)
+        call2 = self._call_board_role(
+            "checker_pass2",
+            brief2,
+            attempt=2,
+            response_path=self.card_layout / "responses" / "checker-pass2.json",
+        )
         self.budget.note_tokens(call2.tokens_in, call2.tokens_out, call2.spend)
-        write_json(self.card_layout / "responses" / "checker-pass2.json",
-                   call2.as_dict())
 
         counters = parse_counter_tests(call2.content)
         self.counter_summary = {
@@ -2511,6 +3448,25 @@ class CardRun:
         self._last_failing_counters = []
         if counters.tests:
             self._run_counter_tests(counters.tests)
+
+        if self.board is not None and self._last_failing_counters:
+            names = ", ".join(
+                str(c.get("name", "?")) for c in self._last_failing_counters
+            )
+            evidence = [
+                str(p)
+                for idx in range(1, len(counters.tests) + 1)
+                for p in [self.card_layout / "gates" / f"counter-test-{idx}.json"]
+                if p.exists()
+            ]
+            self._post_board(
+                author=worker_member_name(self.card.id, "checker"),
+                to=[worker_member_name(self.card.id, "implementer")],
+                kind="defect",
+                attempt=max(1, self.attempt),
+                body=f"counter-tests failed: {names}",
+                evidence=evidence,
+            )
 
         self._record_gate(GateResult(
             "checker-pass2", PASS,
@@ -2721,6 +3677,24 @@ class CardRun:
 
     # -- finishing ------------------------------------------------------------
 
+    def _project_name(self) -> str:
+        name = str(getattr(self.cfg, "name", "") or "").strip()
+        if name:
+            return name
+        repo = getattr(self.cfg, "repo", None)
+        return Path(repo).name if repo else self.worktree.name
+
+    def _scope_markers(self) -> set[str] | None:
+        """What ties a lesson to this project (`harness_scope.project_markers`).
+
+        None when they can't be worked out; every lesson is then kept `project`.
+        """
+        try:
+            tracked = self.git.tracked_files()
+        except Exception:  # noqa: BLE001
+            return None
+        return project_markers(self.worktree, self._project_name(), tracked)
+
     def _record_harness_outcome(self, final_state: str) -> None:
         if not self._harness_enabled() or self.harness_library is None:
             return
@@ -2783,6 +3757,7 @@ class CardRun:
                 failure=self.detail,
                 micromanager=self.micromanager,
                 reflect=self._should_reflect_harness(),
+                scope_markers=self._scope_markers(),
             )
             post_revision = int(res.get("revision", pre_revision) or 0)
             self.harness_revision = pre_revision
@@ -2794,6 +3769,15 @@ class CardRun:
                 "post_revision": post_revision,
                 "cues_applied": list(self.harness_cues_applied),
             }
+            if self.global_library is not None:
+                try:
+                    share = bool(getattr(getattr(self.cfg, "harness", None), "share", True))
+                    self.global_summary.update(self.harness_library.report_to_global(
+                        self.global_library, self._project_name(), share=share))
+                except Exception as exc:  # noqa: BLE001
+                    self.global_summary["error"] = f"{type(exc).__name__}: {exc}"
+            if self.global_summary:
+                self.harness_summary["global"] = dict(self.global_summary)
             metrics = res.get("metrics") or {}
             eff = float(metrics.get("harness_efficiency", 0.0) or 0.0)
             self._record_gate(GateResult(
@@ -2812,6 +3796,8 @@ class CardRun:
                     "efficiency_score": eff,
                 },
             ))
+        except GateFailure:
+            raise
         except Exception as exc:  # noqa: BLE001 — never abort _finish() on harness errors
             self.harness_revision = pre_revision
             self.harness_summary = {
@@ -2841,6 +3827,10 @@ class CardRun:
             self.ended_at = utc_now()
         try:
             self._record_harness_outcome(final_state)
+        except GateFailure as exc:
+            self.stop_code = exc.code
+            self.detail = exc.detail
+            final_state = "blocked"
         except Exception as exc:  # noqa: BLE001 — guarantee finish completes cleanly
             self.log(f"{self.card.id}: harness outcome error ignored in _finish: {exc}")
         mm_budget = getattr(self.micromanager, "budget", None)
@@ -2854,6 +3844,30 @@ class CardRun:
                 "reviewer_brief": self.reviewer_brief,
             }
         self._write_dossier(final_state)
+        if self.board is not None:
+            self._ensure_board_members()
+            ev = [self.dossier_path] if self.dossier_path else []
+            if final_state == "in-review":
+                self._post_board(
+                    author="gates",
+                    to=["coordinator"],
+                    kind="done",
+                    attempt=max(1, self.attempt),
+                    body=f"{self.card.id} reached in-review ({len(self.gates)} gates)",
+                    evidence=ev,
+                    trusted=True,
+                )
+            else:
+                code_str = self.stop_code.value if self.stop_code else "blocked"
+                self._post_board(
+                    author="gates",
+                    to=["coordinator"],
+                    kind="blocked",
+                    attempt=max(1, self.attempt),
+                    body=f"{self.card.id} {final_state} ({code_str}): {(self.detail or '')[:500]}",
+                    evidence=ev,
+                    trusted=True,
+                )
 
         record = self._card_record(final_state)
         write_json(self.card_layout / "card-record.json", record)
@@ -2962,7 +3976,11 @@ class CardRun:
             "harness_revision": int(self.harness_revision or 0),
             "harness_cues_applied": list(self.harness_cues_applied),
             "harness_lessons_added": list(self.harness_lessons_added),
+            "team": self.team_summary(),
+            "handbacks": list(self.handbacks),
         }
+        if self.board is not None:
+            record["by_effort"] = dict(self.effort_tokens)
         return complete_record(record, CARD_FIELDS)
 
 

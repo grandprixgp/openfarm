@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import math
 import os
 import re
 import tomllib
@@ -23,7 +24,15 @@ CONFIG_PATH = Path(".openfarm") / "config.toml"
 KNOWN_TABLES = {
     "project", "adapters", "model", "policy", "eligibility", "brief",
     "runner", "budget", "gates", "cards", "micromanager", "state", "harness",
+    "swarm", "tiers",
 }
+
+DEFAULT_EFFORTS = ("off", "low", "medium", "high", "xhigh", "max")
+_TIER_KEYS = {"model", "efforts", "effort_param"}
+_FORBIDDEN_TIER_KEYS = ("endpoint", "allowed_endpoints", "key_file", "headers")
+_RESERVED_EFFORT_PARAMS = frozenset({
+    "model", "messages", "max_tokens", "temperature", "seed", "response_format",
+})
 
 _TABLE_KEYS = {
     "project": {"name", "lane", "base_branch", "state_dir"},
@@ -62,9 +71,15 @@ _TABLE_KEYS = {
     "harness": {"enabled", "dir", "capture_on", "max_cues_per_brief",
                 "max_active_adaptations", "min_confidence", "probe_window",
                 "auto_demote", "allow_micromanager_reflection",
-                "editable_surfaces"},
+                "editable_surfaces", "global_dir", "learn_from", "share"},
+    "swarm": {"enabled", "coordinator", "supervisor", "coordinator_effort",
+              "supervisor_effort", "default_tier", "escalate_after",
+              "handbacks_per_card", "max_members", "coordinator_calls_per_run",
+              "coordinator_tokens_per_run", "external_wait",
+              "on_external_timeout", "stall_after"},
+    "tiers": set(_TIER_KEYS),
 }
-_ROLE_MODEL_KEYS = {"model", "temperature", "vary_seed"}
+_ROLE_MODEL_KEYS = {"model", "temperature", "vary_seed", "effort"}
 _HEADER_NAME = re.compile(r"^[A-Za-z0-9!#$%&'*+.^_`|~-]+$")
 # openfarm sets these itself; a config may not replace the key or the body type.
 _RESERVED_HEADERS = {"authorization", "content-type", "content-length", "host"}
@@ -187,17 +202,74 @@ def _nonneg_float(value, what: str, default: float) -> float:
 class RoleModel:
     """One model role's settings."""
 
-    __slots__ = ("model", "temperature", "vary_seed")
+    __slots__ = ("model", "temperature", "vary_seed", "effort")
 
     def __init__(self, model: str = "", temperature: float = 0.2,
-                 vary_seed: bool = False) -> None:
+                 vary_seed: bool = False, effort: str = "") -> None:
         self.model = model
         self.temperature = temperature
         self.vary_seed = vary_seed
+        self.effort = effort
 
     def as_dict(self) -> dict:
         return {"model": self.model, "temperature": self.temperature,
-                "vary_seed": self.vary_seed}
+                "vary_seed": self.vary_seed, "effort": self.effort}
+
+
+@dataclasses.dataclass
+class TierConfig:
+    """One named model tier and its allowed effort settings."""
+
+    name: str
+    model: str
+    efforts: tuple[str, ...] = DEFAULT_EFFORTS
+    effort_param: str = "reasoning_effort"
+
+    def as_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "model": self.model,
+            "efforts": list(self.efforts),
+            "effort_param": self.effort_param,
+        }
+
+
+@dataclasses.dataclass
+class SwarmConfig:
+    """Settings for the v0.8 board, seats, coordinator and parallel cards."""
+
+    enabled: bool = False
+    coordinator: str = "code"
+    supervisor: str = "config"
+    coordinator_effort: str = "max"
+    supervisor_effort: str = "max"
+    default_tier: str = "default"
+    escalate_after: int = 2
+    handbacks_per_card: int = 2
+    max_members: int = 24
+    coordinator_calls_per_run: int = 60
+    coordinator_tokens_per_run: int = 600_000
+    external_wait_s: float = 1800.0
+    on_external_timeout: str = "fallback"
+    stall_after_s: float = 300.0
+
+    def as_dict(self) -> dict:
+        return {
+            "enabled": self.enabled,
+            "coordinator": self.coordinator,
+            "supervisor": self.supervisor,
+            "coordinator_effort": self.coordinator_effort,
+            "supervisor_effort": self.supervisor_effort,
+            "default_tier": self.default_tier,
+            "escalate_after": self.escalate_after,
+            "handbacks_per_card": self.handbacks_per_card,
+            "max_members": self.max_members,
+            "coordinator_calls_per_run": self.coordinator_calls_per_run,
+            "coordinator_tokens_per_run": self.coordinator_tokens_per_run,
+            "external_wait_s": self.external_wait_s,
+            "on_external_timeout": self.on_external_timeout,
+            "stall_after_s": self.stall_after_s,
+        }
 
 
 class ExtraGate:
@@ -243,6 +315,7 @@ class MicromanagerConfig:
         }
 
 
+VALID_LEARN_FROM = ("both", "project", "global")
 VALID_HARNESS_CAPTURE_ON = ("retry_recovery", "fail", "counter_fail", "pass")
 VALID_HARNESS_SURFACES = (
     "test_writer_guidance",
@@ -273,6 +346,11 @@ class HarnessConfig:
         "context_hints",
         "micromanager_context",
     )
+    # v0.7 global learning. An empty global_dir means the default: the
+    # OPENFARM_GLOBAL_HARNESS environment variable, else ~/.openfarm/global/harness.
+    global_dir: str = ""
+    learn_from: str = "both"
+    share: bool = True
 
     def as_dict(self) -> dict:
         return {
@@ -286,6 +364,9 @@ class HarnessConfig:
             "auto_demote": self.auto_demote,
             "allow_micromanager_reflection": self.allow_micromanager_reflection,
             "editable_surfaces": list(self.editable_surfaces),
+            "global_dir": self.global_dir,
+            "learn_from": self.learn_from,
+            "share": self.share,
         }
 
 
@@ -531,6 +612,18 @@ class Config:
             and self.micromanager.mode != "off"
         )
         self.harness = self._parse_harness(self._table("harness"))
+        self.tiers = self._parse_tiers(
+            self._data.get("tiers"), self.role_models["implementer"].model
+        )
+        self.swarm = self._parse_swarm(self._table("swarm"))
+        for role_name, role_model in self.role_models.items():
+            if role_model.effort:
+                tier = self.tier_for_model(role_model.model)
+                if role_model.effort not in tier.efforts:
+                    raise ConfigError(
+                        f"[model] {role_name}.effort {role_model.effort!r} is not "
+                        f"in tier {tier.name!r} efforts {list(tier.efforts)!r}"
+                    )
 
     def _parse_harness(self, h: dict) -> HarnessConfig:
         enabled = _as_bool(h.get("enabled"), "[harness] enabled", True)
@@ -592,6 +685,18 @@ class Config:
         else:
             editable_surfaces = VALID_HARNESS_SURFACES
 
+        raw_global = h.get("global_dir", "")
+        if raw_global is None:
+            raw_global = ""
+        if not isinstance(raw_global, str) or "\x00" in raw_global:
+            raise ConfigError("[harness] global_dir: expected a path string")
+        global_dir = ""
+        if raw_global.strip():
+            global_dir = str(self._outside_repo(raw_global.strip(), "[harness] global_dir"))
+        learn_from = _as_choice(h.get("learn_from"), "[harness] learn_from", "both",
+                                VALID_LEARN_FROM)
+        share = _as_bool(h.get("share"), "[harness] share", True)
+
         return HarnessConfig(
             enabled=enabled,
             dir=resolved_dir,
@@ -603,6 +708,9 @@ class Config:
             auto_demote=auto_demote,
             allow_micromanager_reflection=allow_mm_refl,
             editable_surfaces=editable_surfaces,
+            global_dir=global_dir,
+            learn_from=learn_from,
+            share=share,
         )
 
     def _parse_micromanager(self, mm: dict) -> MicromanagerConfig:
@@ -713,13 +821,245 @@ class Config:
         model_name = str(raw_model) if raw_model is not None else default_model
         if not model_name and default_model:
             model_name = default_model
+        raw_effort = value.get("effort")
+        if raw_effort is None:
+            effort = ""
+        else:
+            if not isinstance(raw_effort, str):
+                raise ConfigError(f"[model] {role}.effort must be a string")
+            if any(ch.isspace() for ch in raw_effort) or "\x00" in raw_effort:
+                raise ConfigError(
+                    f"[model] {role}.effort {raw_effort!r} must not contain whitespace"
+                )
+            effort = raw_effort
         return RoleModel(
             model=model_name,
             temperature=_as_float(value.get("temperature"),
                                   f"[model] {role}.temperature", default_temp),
             vary_seed=_as_bool(value.get("vary_seed"),
                                f"[model] {role}.vary_seed", default_vary),
+            effort=effort,
         )
+
+    def _parse_tiers(self, raw_tiers, default_model: str) -> dict[str, TierConfig]:
+        if raw_tiers is None:
+            raw_tiers = {}
+        if not isinstance(raw_tiers, dict):
+            raise ConfigError("[tiers] must be a table")
+        if not raw_tiers:
+            return {
+                "default": TierConfig(
+                    name="default",
+                    model=default_model,
+                    efforts=DEFAULT_EFFORTS,
+                    effort_param="reasoning_effort",
+                )
+            }
+        tiers: dict[str, TierConfig] = {}
+        for tier_name, entry in raw_tiers.items():
+            if (not isinstance(tier_name, str) or not tier_name
+                    or any(ch.isspace() for ch in tier_name)):
+                raise ConfigError(f"[tiers] invalid tier name {tier_name!r}")
+            if not isinstance(entry, dict):
+                raise ConfigError(f"[tiers.{tier_name}] must be a table")
+            for forbidden in _FORBIDDEN_TIER_KEYS:
+                if forbidden in entry:
+                    raise ConfigError(
+                        f"[tiers.{tier_name}] cannot set {forbidden!r}: tiers share "
+                        f"[model]'s endpoint, key_file and headers"
+                    )
+            _check_keys(entry, _TIER_KEYS, f"[tiers.{tier_name}]")
+            raw_model = entry.get("model")
+            if not isinstance(raw_model, str) or not raw_model.strip():
+                raise ConfigError(
+                    f"[tiers.{tier_name}] model is required and must be a non-empty string"
+                )
+            model_name = raw_model.strip()
+
+            raw_ep = entry.get("effort_param")
+            if raw_ep is None and "effort_param" not in entry:
+                effort_param = "reasoning_effort"
+            else:
+                if not isinstance(raw_ep, str):
+                    raise ConfigError(f"[tiers.{tier_name}] effort_param must be a string")
+                effort_param = raw_ep
+                if effort_param != "":
+                    if any(ch.isspace() for ch in effort_param) or "\x00" in effort_param:
+                        raise ConfigError(
+                            f"[tiers.{tier_name}] effort_param must not contain whitespace"
+                        )
+                    if effort_param in _RESERVED_EFFORT_PARAMS:
+                        raise ConfigError(
+                            f"[tiers.{tier_name}] effort_param cannot use reserved key "
+                            f"{effort_param!r}"
+                        )
+
+            if "efforts" not in entry or entry["efforts"] is None:
+                efforts = DEFAULT_EFFORTS if effort_param else ()
+            else:
+                raw_efforts = _as_str_list(entry["efforts"], f"[tiers.{tier_name}] efforts")
+                for item in raw_efforts:
+                    if not item or any(ch.isspace() for ch in item) or "\x00" in item:
+                        raise ConfigError(
+                            f"[tiers.{tier_name}] efforts: invalid effort value {item!r}"
+                        )
+                efforts = tuple(dict.fromkeys(raw_efforts))
+
+            tiers[tier_name] = TierConfig(
+                name=tier_name,
+                model=model_name,
+                efforts=efforts,
+                effort_param=effort_param,
+            )
+        return tiers
+
+    def _parse_swarm(self, sw: dict) -> SwarmConfig:
+        enabled = _as_bool(sw.get("enabled"), "[swarm] enabled", False)
+        first_tier = next(iter(self.tiers))
+        raw_default = sw.get("default_tier")
+        if raw_default is None:
+            default_tier = first_tier
+        else:
+            if not isinstance(raw_default, str) or raw_default not in self.tiers:
+                raise ConfigError(
+                    f"[swarm] default_tier {raw_default!r} is not a configured tier"
+                )
+            default_tier = raw_default
+        default_tier_obj = self.tiers[default_tier]
+
+        raw_coord = sw.get("coordinator")
+        coordinator = "code" if raw_coord is None else raw_coord
+        if not isinstance(coordinator, str):
+            raise ConfigError("[swarm] coordinator must be a string")
+        coord_tier: TierConfig | None = None
+        if coordinator in ("code", "external"):
+            pass
+        elif coordinator.startswith("tier:"):
+            tname = coordinator[5:]
+            if not tname or tname not in self.tiers:
+                raise ConfigError(
+                    f"[swarm] coordinator references unknown tier {tname!r}"
+                )
+            coord_tier = self.tiers[tname]
+        else:
+            raise ConfigError(
+                f"[swarm] coordinator {coordinator!r} must be 'code', 'external', or 'tier:<name>'"
+            )
+
+        raw_sup = sw.get("supervisor")
+        supervisor = "config" if raw_sup is None else raw_sup
+        if not isinstance(supervisor, str):
+            raise ConfigError("[swarm] supervisor must be a string")
+        sup_tier: TierConfig | None = None
+        if supervisor in ("config", "external", "off"):
+            pass
+        elif supervisor.startswith("tier:"):
+            tname = supervisor[5:]
+            if not tname or tname not in self.tiers:
+                raise ConfigError(
+                    f"[swarm] supervisor references unknown tier {tname!r}"
+                )
+            sup_tier = self.tiers[tname]
+        else:
+            raise ConfigError(
+                f"[swarm] supervisor {supervisor!r} must be 'config', 'external', 'off', or 'tier:<name>'"
+            )
+
+        coordinator_effort = self._seat_effort(
+            sw, "coordinator_effort", coord_tier, default_tier_obj
+        )
+        supervisor_effort = self._seat_effort(
+            sw, "supervisor_effort", sup_tier, default_tier_obj
+        )
+
+        escalate_after = _as_int(sw.get("escalate_after"), "[swarm] escalate_after", 2)
+        if escalate_after < 1:
+            raise ConfigError("[swarm] escalate_after must be >= 1")
+        handbacks_per_card = _nonneg_int(
+            sw.get("handbacks_per_card"), "[swarm] handbacks_per_card", 2
+        )
+        max_members = _as_int(sw.get("max_members"), "[swarm] max_members", 24)
+        if max_members < 1:
+            raise ConfigError("[swarm] max_members must be >= 1")
+        coord_calls = _nonneg_int(
+            sw.get("coordinator_calls_per_run"), "[swarm] coordinator_calls_per_run", 60
+        )
+        coord_tokens = _nonneg_int(
+            sw.get("coordinator_tokens_per_run"),
+            "[swarm] coordinator_tokens_per_run",
+            600_000,
+        )
+
+        raw_wait = sw.get("external_wait")
+        if isinstance(raw_wait, bool):
+            raise ConfigError("[swarm] external_wait must be a duration")
+        external_wait_s = parse_duration(
+            "30m" if raw_wait is None else raw_wait, "[swarm] external_wait"
+        )
+        if not math.isfinite(external_wait_s) or external_wait_s <= 0:
+            raise ConfigError("[swarm] external_wait must be > 0")
+
+        on_external_timeout = _as_choice(
+            sw.get("on_external_timeout"),
+            "[swarm] on_external_timeout",
+            "fallback",
+            ("fallback", "block"),
+        )
+
+        raw_stall = sw.get("stall_after")
+        if isinstance(raw_stall, bool):
+            raise ConfigError("[swarm] stall_after must be a duration")
+        stall_after_s = parse_duration(
+            "5m" if raw_stall is None else raw_stall, "[swarm] stall_after"
+        )
+        if not math.isfinite(stall_after_s) or stall_after_s <= 0:
+            raise ConfigError("[swarm] stall_after must be > 0")
+
+        return SwarmConfig(
+            enabled=enabled,
+            coordinator=coordinator,
+            supervisor=supervisor,
+            coordinator_effort=coordinator_effort,
+            supervisor_effort=supervisor_effort,
+            default_tier=default_tier,
+            escalate_after=escalate_after,
+            handbacks_per_card=handbacks_per_card,
+            max_members=max_members,
+            coordinator_calls_per_run=coord_calls,
+            coordinator_tokens_per_run=coord_tokens,
+            external_wait_s=external_wait_s,
+            on_external_timeout=on_external_timeout,
+            stall_after_s=stall_after_s,
+        )
+
+    def _seat_effort(
+        self,
+        sw: dict,
+        key: str,
+        seat_tier: TierConfig | None,
+        default_tier: TierConfig,
+    ) -> str:
+        explicit = key in sw and sw[key] is not None
+        if explicit:
+            raw = sw[key]
+            if not isinstance(raw, str):
+                raise ConfigError(f"[swarm] {key} must be a string")
+            if any(ch.isspace() for ch in raw) or "\x00" in raw:
+                raise ConfigError(f"[swarm] {key} {raw!r} must not contain whitespace")
+            effort = raw
+        elif seat_tier is not None and not seat_tier.efforts and seat_tier.effort_param == "":
+            effort = ""
+        else:
+            effort = "max"
+
+        if seat_tier is not None or explicit:
+            target = seat_tier if seat_tier is not None else default_tier
+            if effort and effort not in target.efforts:
+                raise ConfigError(
+                    f"[swarm] {key} {effort!r} is not in tier {target.name!r} "
+                    f"efforts {list(target.efforts)!r}"
+                )
+        return effort
 
     def _outside_repo(self, value, what: str) -> Path:
         if not value:
@@ -735,6 +1075,34 @@ class Config:
         return resolved
 
     # -- derived values -------------------------------------------------------
+
+    def tier_for_model(self, model_name: str) -> TierConfig:
+        """Return the tier matching `model_name`, falling back to `default_tier`."""
+        default = self.tiers[self.swarm.default_tier]
+        if model_name:
+            if default.model == model_name:
+                return default
+            for tier in self.tiers.values():
+                if tier.model == model_name:
+                    return tier
+        return default
+
+    def effort_for_role(self, role: str) -> tuple[str, str]:
+        """Return `(effort, effort_param)` for a configured role, or `("", "")`."""
+        aliases = {
+            "checker_pass1": "checker",
+            "checker_pass2": "checker",
+            "test-writer": "test_writer",
+        }
+        role_model = self.role_models.get(aliases.get(role, role))
+        if role_model is None:
+            role_model = self.role_models.get("implementer")
+        if role_model is None or not role_model.effort:
+            return ("", "")
+        tier = self.tier_for_model(role_model.model)
+        if not tier.effort_param:
+            return ("", "")
+        return (role_model.effort, tier.effort_param)
 
     def known_failing_hash(self) -> str:
         """The cache key component that changes when `known_failing` changes."""

@@ -1,0 +1,92 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="360" viewBox="0 0 1280 360" role="img" aria-labelledby="swarm-t swarm-d">
+<title id="swarm-t">v0.8 swarm architecture: seats, shared run board, parallel cards, and stdlib TUI</title>
+<desc id="swarm-d">When [swarm] enabled is false, runs match v0.7 exactly. When enabled, coordinator seats (code, tier:&lt;name&gt;, external), supervisor seats (config, tier:&lt;name&gt;, external, off), and code StallMonitor communicate over the append-only file-locked board.jsonl while non-colliding cards execute in parallel worktrees bounded by globs_overlap and BuildLimiter and inspected live through the 7-view stdlib TUI and humanized CLI.</desc>
+<defs>
+  <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0" stop-color="#0b1220"/><stop offset="1" stop-color="#17233d"/>
+  </linearGradient>
+</defs>
+<rect x="0" y="0" width="1280" height="360" rx="18" fill="url(#bg)"/>
+<rect x="0.5" y="0.5" width="1279" height="359" rx="18" fill="none" stroke="#ffffff" stroke-opacity="0.08"/>
+
+<text x="40" y="46" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="21" font-weight="700" fill="#f1f5f9" text-anchor="start">v0.8 swarm: seats, shared run board, parallel cards, and stdlib TUI</text>
+
+<rect x="888" y="24" width="352" height="28" rx="14" fill="#fbbf24" fill-opacity="0.12" stroke="#fbbf24" stroke-opacity="0.6"/>
+<text x="1064" y="42" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="12" font-weight="600" fill="#fbbf24" text-anchor="middle">[swarm] enabled = false -&gt; exact v0.7 behaviour</text>
+
+<!-- Left column: Seats & Monitor -->
+<rect x="40" y="76" width="330" height="76" rx="12" fill="#a78bfa" fill-opacity="0.10" stroke="#a78bfa" stroke-opacity="0.75" stroke-width="1.5"/>
+<text x="60" y="102" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="16" font-weight="700" fill="#f1f5f9" text-anchor="start">Coordinator seat</text>
+<text x="60" y="122" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="12.5" font-weight="600" fill="#a78bfa" text-anchor="start">code | tier:&lt;name&gt; | external</text>
+<text x="60" y="140" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#9fb0c8" text-anchor="start">starts cards, sets tier:effort, posts hints</text>
+
+<rect x="40" y="164" width="330" height="76" rx="12" fill="#a78bfa" fill-opacity="0.10" stroke="#a78bfa" stroke-opacity="0.75" stroke-width="1.5"/>
+<text x="60" y="190" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="16" font-weight="700" fill="#f1f5f9" text-anchor="start">Supervisor seat</text>
+<text x="60" y="210" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="12" font-weight="600" fill="#a78bfa" text-anchor="start">config | tier:&lt;name&gt; | external | off</text>
+<text x="60" y="228" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#9fb0c8" text-anchor="start">answers typed board questions</text>
+
+<rect x="40" y="252" width="330" height="76" rx="12" fill="#fbbf24" fill-opacity="0.10" stroke="#fbbf24" stroke-opacity="0.75" stroke-width="1.5"/>
+<text x="60" y="278" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="16" font-weight="700" fill="#f1f5f9" text-anchor="start">StallMonitor (code)</text>
+<text x="60" y="298" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#fbbf24" text-anchor="start">posts one stall alert after stall_after</text>
+<text x="60" y="316" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#9fb0c8" text-anchor="start">no model calls; tracks external waits</text>
+
+<!-- Center hub: Append-Only Run Board -->
+<rect x="430" y="76" width="360" height="190" rx="16" fill="#fbbf24" fill-opacity="0.10" stroke="#fbbf24" stroke-opacity="0.85" stroke-width="2"/>
+<rect x="530" y="92" width="160" height="22" rx="11" fill="#fbbf24" fill-opacity="0.18"/>
+<text x="610" y="107" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="11" font-weight="700" fill="#fbbf24" text-anchor="middle" letter-spacing="0.8">RUN BOARD</text>
+<text x="610" y="138" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="20" font-weight="800" fill="#f1f5f9" text-anchor="middle">Append-only board.jsonl</text>
+<text x="610" y="162" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="12" font-weight="600" fill="#38bdf8" text-anchor="middle">runs/&lt;id&gt;/board/board.jsonl + members.json</text>
+<text x="610" y="186" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#9fb0c8" text-anchor="middle">flock #seq posts: brief · gate · question · answer</text>
+<text x="610" y="206" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#9fb0c8" text-anchor="middle">handback · stall · action · done (code-only)</text>
+<rect x="454" y="220" width="312" height="32" rx="9" fill="#0b1220" fill-opacity="0.58" stroke="#fbbf24" stroke-opacity="0.45"/>
+<text x="610" y="240" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="12" font-weight="600" fill="#fbbf24" text-anchor="middle">x-cmd-zdr: 1 + sanitized posts + expects</text>
+
+<!-- Center bottom: TUI & CLI -->
+<rect x="430" y="280" width="360" height="48" rx="12" fill="#38bdf8" fill-opacity="0.12" stroke="#38bdf8" stroke-opacity="0.8" stroke-width="1.5"/>
+<text x="610" y="302" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="13" font-weight="700" fill="#f1f5f9" text-anchor="middle">openfarm tui (7 views) · humanized CLI</text>
+<text x="610" y="319" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#38bdf8" text-anchor="middle">split panes · / search · PTY tested · --json parity</text>
+
+<!-- Right column: Parallel Non-Colliding Cards -->
+<rect x="850" y="76" width="390" height="76" rx="12" fill="#34d399" fill-opacity="0.10" stroke="#34d399" stroke-opacity="0.75" stroke-width="1.5"/>
+<text x="870" y="102" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="16" font-weight="700" fill="#f1f5f9" text-anchor="start">CARD-1 worktree</text>
+<text x="870" y="122" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="12" font-weight="600" fill="#34d399" text-anchor="start">touches: src/alpha.rs · dsf:medium -&gt; high</text>
+<text x="870" y="140" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#9fb0c8" text-anchor="start">isolated branch; real cargo / unittest gates</text>
+
+<rect x="850" y="164" width="390" height="76" rx="12" fill="#34d399" fill-opacity="0.10" stroke="#34d399" stroke-opacity="0.75" stroke-width="1.5"/>
+<text x="870" y="190" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="16" font-weight="700" fill="#f1f5f9" text-anchor="start">CARD-2 worktree</text>
+<text x="870" y="210" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="12" font-weight="600" fill="#34d399" text-anchor="start">touches: src/beta.rs · dsf:max</text>
+<text x="870" y="228" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#9fb0c8" text-anchor="start">concurrent run · &lt;&lt;&lt;HANDBACK on replan_if</text>
+
+<rect x="850" y="252" width="390" height="76" rx="12" fill="#fbbf24" fill-opacity="0.10" stroke="#fbbf24" stroke-opacity="0.75" stroke-width="1.5"/>
+<text x="870" y="278" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="16" font-weight="700" fill="#f1f5f9" text-anchor="start">Collision + build guards</text>
+<text x="870" y="298" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="11.5" font-weight="600" fill="#fbbf24" text-anchor="start">globs_overlap NFA + BuildLimiter(concurrent_builds)</text>
+<text x="870" y="316" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#9fb0c8" text-anchor="start">budgets &amp; gates remain immutable by any seat</text>
+
+<!-- Connector paths -->
+<path d="M430,146 C400,146 400,114 370,114" fill="none" stroke="#9fb0c8" stroke-width="2"/>
+<path d="M430,178 C400,178 400,202 370,202" fill="none" stroke="#9fb0c8" stroke-width="2"/>
+<path d="M430,210 C400,210 400,290 370,290" fill="none" stroke="#9fb0c8" stroke-width="2"/>
+
+<path d="M790,146 C820,146 820,114 850,114" fill="none" stroke="#9fb0c8" stroke-width="2"/>
+<path d="M790,178 C820,178 820,202 850,202" fill="none" stroke="#9fb0c8" stroke-width="2"/>
+<path d="M790,210 C820,210 820,290 850,290" fill="none" stroke="#9fb0c8" stroke-width="2"/>
+
+<line x1="610" y1="266" x2="610" y2="280" stroke="#38bdf8" stroke-width="2"/>
+
+<!-- Endpoint dots -->
+<circle cx="430" cy="146" r="4" fill="#fbbf24"/>
+<circle cx="430" cy="178" r="4" fill="#fbbf24"/>
+<circle cx="430" cy="210" r="4" fill="#fbbf24"/>
+<circle cx="370" cy="114" r="4" fill="#a78bfa"/>
+<circle cx="370" cy="202" r="4" fill="#a78bfa"/>
+<circle cx="370" cy="290" r="4" fill="#fbbf24"/>
+
+<circle cx="790" cy="146" r="4" fill="#fbbf24"/>
+<circle cx="790" cy="178" r="4" fill="#fbbf24"/>
+<circle cx="790" cy="210" r="4" fill="#fbbf24"/>
+<circle cx="850" cy="114" r="4" fill="#34d399"/>
+<circle cx="850" cy="202" r="4" fill="#34d399"/>
+<circle cx="850" cy="290" r="4" fill="#fbbf24"/>
+<circle cx="610" cy="266" r="4" fill="#fbbf24"/>
+<circle cx="610" cy="280" r="4" fill="#38bdf8"/>
+</svg>

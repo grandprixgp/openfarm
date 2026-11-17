@@ -1,15 +1,16 @@
 ---
 name: openfarm
 description: >-
-  Operate an initialized Openfarm v0.6.0 project across card waves: manage
+  Operate an initialized Openfarm v0.8.0 project across card waves: manage
   Frontier Claude ACP OAuth setup (openfarm acp), clarify new feature waves
   with openfarm-grill-me, prepare queues with openfarm supervise, execute
-  lesser-model + ACP runs via openfarm run without bloating frontier context,
-  inspect dossiers, record verdicts, merge local branches, and curate
-  <state_dir>/harness/ recursive memory.
+  lesser-model + ACP runs (and v0.8 swarm boards/tiers) via openfarm run
+  without bloating frontier context, inspect dossiers or openfarm tui, record
+  verdicts, merge local branches, and curate <state_dir>/harness/ recursive
+  memory.
 ---
 
-# Openfarm Wave Operations Skill (`v0.6.0`)
+# Openfarm Wave Operations Skill (`v0.8.0`)
 
 Use this skill after `/openfarm-initialize` (or `openfarm adopt` on an existing repository) has set up `.openfarm/config.toml`, committed the baseline on the base branch, and verified `cards/` via `openfarm check`.
 
@@ -47,6 +48,9 @@ See [prompts/wave_operator.md](./prompts/wave_operator.md) for the full operator
    openfarm supervise --triage-blocked --json
    openfarm harness status --json
    openfarm harness index
+   openfarm harness status --global --json
    ```
+   Lessons proven on 3 or more cards that name nothing of this project go to the global library (`~/.openfarm/global/harness`) unless `[harness] share = false`; other projects try them like their own. `[harness] learn_from` (`both`, `project` or `global`) or `openfarm run --learn-from` picks which lessons apply. Retire a bad global lesson with `openfarm harness demote <gid> --global`.
 6. **Measure, When Asked**: `openfarm bench run --dry-run` checks the bench for free; `openfarm bench run --arm farm=<file> --arm solo=<file>` compares the farm with Claude working alone on 12 tasks with hidden tests (examples in `bench/arms/`). A live bench spends real model money, so run it only when the owner asks.
-7. **Compact Context Between Waves**: Keep only `main` commit state, remaining `cards/`, and `openfarm harness status` summary before starting the next wave.
+7. **Inspect Live Swarm Runs & TUI (v0.8)**: When `[swarm] enabled = true`, monitor the shared run board (`openfarm board read --as "*"`), drive external coordinator/supervisor seats (`openfarm swarm status|tiers|join|start|set|hint|block|remove`, `openfarm board answer`), or inspect runs and seven live views with `openfarm tui [--run ID] [--view overview|cards|dossier|board|swarm|harness|ops] [--once]`.
+8. **Compact Context Between Waves**: Keep only `main` commit state, remaining `cards/`, and `openfarm harness status` summary before starting the next wave.

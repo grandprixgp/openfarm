@@ -158,6 +158,14 @@ STUB_FORMAT = """To add a stub for a new symbol, at the end of an existing file:
 <the stub, which must fail when called>
 """
 
+HANDBACK_INSTRUCTIONS = """When to hand a card back:
+After one failed fix of the same problem, or when something the card assumes is
+false, hand back instead of trying a third way (in place of edits or JSON):
+
+<<<HANDBACK
+<reason explaining what failed twice or which assumption is false>
+>>>"""
+
 
 class Brief:
     """One built brief, ready to send."""
@@ -176,6 +184,7 @@ def _card_section(card: Card) -> str:
         + (f" in {t.file}" if t.file else "")
         + (f"\n    Asserts (data):\n{fence(t.asserts, 'asserts')}" if t.asserts else "")
         for t in card.tests) or "  (none)"
+    replan_signs = list(getattr(card, "replan_if", ()) or ())
     return (
         f"Card: {card.id}\n"
         f"Title (data):\n{fence(card.title, 'title')}\n"
@@ -185,6 +194,9 @@ def _card_section(card: Card) -> str:
         + (f"Reference: {card.reference}\n" if card.reference else "")
         + (f"Tests that may be edited: {', '.join(card.test_edits)}\n"
            if card.test_edits else "")
+        + (f"\nSigns that mean hand back (replan_if, data):\n"
+           + fence("\n".join(f"- {s}" for s in replan_signs), "replan_if") + "\n"
+           if replan_signs else "")
         + "\nDone text (data):\n" + fence(card.done_text, "done text")
     )
 
@@ -195,6 +207,29 @@ def _safe_existing_target(book: BriefBook, path: str) -> Path | None:
     except PermissionError:
         return None
     return target if target.exists() and target.is_file() else None
+
+
+def _expand_touch_paths(book: BriefBook, patterns: list[str]) -> list[str]:
+    """Expand glob patterns in `touches` to safe existing files, keeping literals."""
+    expanded: list[str] = []
+    seen: set[str] = set()
+    root = book.worktree.resolve()
+    for raw in patterns:
+        norm = normalise(raw)
+        if not norm or escapes(norm) or norm.startswith("/"):
+            continue
+        if "*" in norm or "?" in norm:
+            for candidate in sorted(root.glob(norm)):
+                if not candidate.is_file():
+                    continue
+                rel = normalise(candidate.relative_to(root).as_posix())
+                if rel not in seen and not book.is_hidden(rel):
+                    seen.add(rel)
+                    expanded.append(rel)
+        elif norm not in seen:
+            seen.add(norm)
+            expanded.append(norm)
+    return expanded
 
 
 def _merged_context_files(card: Card, extra: list[str] | None) -> list[str]:
@@ -208,7 +243,7 @@ def _merged_context_files(card: Card, extra: list[str] | None) -> list[str]:
 def planner_brief(card: Card, book: BriefBook, harness_guidance: str = "") -> Brief:
     parts = [ROLE_HEADERS["planner"], "", _card_section(card), "",
              "Files in your touches, by signature:"]
-    for path in card.touches:
+    for path in _expand_touch_paths(book, card.touches):
         if book.is_hidden(path):
             continue
         # A new file (a test-backfill card's test file, say) has no signatures yet.
@@ -222,6 +257,7 @@ def planner_brief(card: Card, book: BriefBook, harness_guidance: str = "") -> Br
     if harness_guidance and harness_guidance.strip():
         parts.append("\nHarness adaptations (data):\n"
                      + fence(harness_guidance, "harness adaptations"))
+    parts.append("\n" + HANDBACK_INSTRUCTIONS)
     return Brief("planner", "\n".join(parts))
 
 
@@ -274,8 +310,11 @@ def test_writer_brief(card: Card, book: BriefBook, pack,
                 parts.append(f"\n### {normalise(path)} (does not exist yet)")
     else:
         parts.append("\nProduction files in touches, by signature only:")
-        for path in prod_touches:
+        for path in _expand_touch_paths(book, prod_touches):
             if book.is_hidden(path):
+                continue
+            if _safe_existing_target(book, path) is None:
+                parts.append(f"\n### {normalise(path)} (does not exist yet)")
                 continue
             parts.append(f"\n### {path}\n{book.signatures(path, pack)}")
 
@@ -320,6 +359,7 @@ def test_writer_brief(card: Card, book: BriefBook, pack,
         parts.append("\n" + STUB_FORMAT)
 
     parts.append("\n" + EDIT_FORMAT)
+    parts.append("\n" + HANDBACK_INSTRUCTIONS)
     return Brief("test_writer", "\n".join(parts))
 
 
@@ -340,7 +380,7 @@ def implementer_brief(card: Card, book: BriefBook, frozen_tests: dict[str, str],
 
     if attempt == 1:
         parts.append("Full text of files in your touches:")
-        for path in card.touches:
+        for path in _expand_touch_paths(book, card.touches):
             if book.is_hidden(path):
                 continue
             target = _safe_existing_target(book, path)
@@ -363,7 +403,7 @@ def implementer_brief(card: Card, book: BriefBook, frozen_tests: dict[str, str],
             parts.append("\nA counter-test also failed on this diff:\n"
                          + fence(counter_tests, "counter-test"))
         current_sections: list[str] = []
-        for path in card.touches:
+        for path in _expand_touch_paths(book, card.touches):
             if book.is_hidden(path):
                 continue
             target = _safe_existing_target(book, path)
@@ -413,12 +453,14 @@ def implementer_brief(card: Card, book: BriefBook, frozen_tests: dict[str, str],
                      f"Tests this step turns green: {', '.join(step.get('tests', []))}")
 
     parts.append("\n" + EDIT_FORMAT)
+    parts.append("\n" + HANDBACK_INSTRUCTIONS)
     return Brief("implementer", "\n".join(parts))
 
 
 def checker_pass1_brief(card: Card, test_diff: str) -> Brief:
     parts = [ROLE_HEADERS["checker_pass1"], "", _card_section(card), "",
-             "The test diff, and nothing else:\n" + fence(test_diff, "test diff")]
+             "The test diff, and nothing else:\n" + fence(test_diff, "test diff"),
+             "", HANDBACK_INSTRUCTIONS]
     return Brief("checker_pass1", "\n".join(parts))
 
 
@@ -432,6 +474,7 @@ def checker_pass2_brief(card: Card, full_diff: str, gate_results: list[dict],
     parts.append("\nModified files:")
     for path, text in modified_files.items():
         parts.append(f"\n### {path}\n{text}")
+    parts.append("\n" + HANDBACK_INSTRUCTIONS)
     return Brief("checker_pass2", "\n".join(parts))
 
 

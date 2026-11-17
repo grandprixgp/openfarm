@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -21,6 +22,9 @@ from ..errors import Infra, Invalid, Refused
 
 _RETRYABLE_HTTP_CODES = frozenset({429, 502, 503, 504})
 _MAX_RETRY_DELAY_S = 30.0
+_RESERVED_EFFORT_PARAMS = frozenset({
+    "model", "messages", "max_tokens", "temperature", "seed", "response_format",
+})
 
 
 class Completion:
@@ -176,7 +180,9 @@ class OpenAICompatibleBackend:
     def complete(self, role: str, model: str, temperature: float,
                  messages: list[dict], seed: int | None = None,
                  max_tokens: int = 4096,
-                 response_format: str | None = None) -> Completion:
+                 response_format: str | None = None,
+                 effort: str = "",
+                 effort_param: str = "") -> Completion:
         url = f"{self.endpoint}/chat/completions"
         if not _within(url, self.allowed_endpoints):
             raise Refused("endpoint-not-allowed",
@@ -188,6 +194,12 @@ class OpenAICompatibleBackend:
             payload["seed"] = seed
         if response_format == "json":
             payload["response_format"] = {"type": "json_object"}
+        if effort and effort_param:
+            if (effort_param in _RESERVED_EFFORT_PARAMS
+                    or any(ch.isspace() for ch in effort_param)):
+                raise Invalid("bad-effort-param",
+                              f"effort_param {effort_param!r} is invalid")
+            payload[effort_param] = effort
 
         request = urllib.request.Request(
             url, data=json.dumps(payload).encode("utf-8"),
@@ -261,6 +273,7 @@ class ScriptedBackend:
         self.script = dict(script or {})
         self.default = default
         self.calls: list[dict] = []
+        self._lock = threading.Lock()
 
     def hello(self) -> dict:
         return {"name": self.name, "versions": [1], "ops": ["hello", "complete"]}
@@ -269,15 +282,29 @@ class ScriptedBackend:
                  messages: list[dict], seed: int | None = None,
                  max_tokens: int = 4096,
                  response_format: str | None = None,
-                 card_id: str = "", attempt: int = 1) -> Completion:
+                 card_id: str = "", attempt: int = 1,
+                 effort: str = "", effort_param: str = "") -> Completion:
         call = {"role": role, "card_id": card_id, "attempt": attempt,
                 "messages": messages, "seed": seed, "model": model,
-                "temperature": temperature}
-        self.calls.append(call)
+                "temperature": temperature, "effort": effort,
+                "effort_param": effort_param}
+        with self._lock:
+            self.calls.append(call)
+
+        keys: list[str] = []
+        if card_id:
+            if effort:
+                keys.append(f"{card_id}/{role}/{attempt}/{effort}")
+                keys.append(f"{card_id}/{role}/{effort}")
+            keys.append(f"{card_id}/{role}/{attempt}")
+            keys.append(f"{card_id}/{role}")
+        if effort:
+            keys.append(f"{role}/{attempt}/{effort}")
+            keys.append(f"{role}/{effort}")
+        keys.extend((f"{role}/{attempt}", role, "*"))
 
         entry = None
-        for key in (f"{card_id}/{role}/{attempt}", f"{card_id}/{role}",
-                    role, "*"):
+        for key in keys:
             if key in self.script:
                 entry = self.script[key]
                 break
