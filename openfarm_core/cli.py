@@ -841,12 +841,29 @@ class _SharedAcpSupervisor:
     prompt at a time, so the cards' calls take turns on one lock. A process that
     dies (a timed-out turn kills it) is replaced once for everyone, and every
     card opens a fresh session on the new one.
+
+    A standalone ACP server held in a boundary (`codex-acp`, `agy acp`, ...)
+    can see only the one folder it was started in, so a session at another
+    card's worktree would be outside it. Then each card gets its own server,
+    started in its own worktree, and nothing is shared but the budget.
+    openfarm's own bridges confine each prompt's child at the session's folder,
+    and Claude under `auto` is not confined, so both keep the one process.
     """
 
     def __init__(self, proto: ClaudeAcpMicromanager) -> None:
         self.proto = proto
         self.lock = threading.RLock()
         self.adapter = None
+        self.per_card = self._confined_server()
+
+    def _adapter_for(self, cwd: Path) -> ClaudeAcpAdapter:
+        p = self.proto
+        return ClaudeAcpAdapter(
+            command=p.command, cwd=cwd, provider=p.provider,
+            isolate_home=p.isolate_home, auth_file=p.auth_file, auth_mode=p.auth_mode,
+            never_touch=p.never_touch, forbidden_files=p.forbidden_files,
+            allowed_root=cwd, confine=p.confine,
+        )
 
     @staticmethod
     def hold_of(command, provider: str, tool_policy: str, settings):
@@ -866,6 +883,15 @@ class _SharedAcpSupervisor:
             normalize_acp_provider(provider), settings, transport=transport,
             tool_policy=tool_policy if transport == "bridge" else "none")
 
+    def _confined_server(self) -> bool:
+        """Whether the supervisor is a standalone ACP server inside a boundary."""
+        p = self.proto
+        try:
+            transport, hold = self.hold_of(p.command, p.provider, "none", p.confine)
+        except AdapterError:
+            return False
+        return transport == "server" and hold.boundary
+
     def live_adapter(self):
         """The one live adapter, started or replaced as needed (call under `lock`)."""
         proc = getattr(self.adapter, "_proc", None) if self.adapter is not None else None
@@ -874,25 +900,23 @@ class _SharedAcpSupervisor:
                 self.adapter.close()
             self.adapter = None
         if self.adapter is None:
-            p = self.proto
-            self.adapter = ClaudeAcpAdapter(
-                command=p.command, cwd=p.cwd, provider=p.provider,
-                isolate_home=p.isolate_home, auth_file=p.auth_file, auth_mode=p.auth_mode,
-                never_touch=p.never_touch, forbidden_files=p.forbidden_files,
-                allowed_root=p.cwd,
-            )
+            self.adapter = self._adapter_for(self.proto.cwd)
         return self.adapter
 
-    def for_card(self, worktree: Path, card_dir: Path) -> "_CardAcpSupervisor":
+    def for_card(self, worktree: Path, card_dir: Path) -> ClaudeAcpMicromanager:
         p = self.proto
-        return _CardAcpSupervisor(
-            self, command=p.command, cwd=worktree, provider=p.provider, model=p.model,
+        kwargs = dict(
+            command=p.command, cwd=worktree, provider=p.provider, model=p.model,
             effort=p.effort, tool_policy=p.tool_policy, timeout_s=p.timeout_s,
             isolate_home=p.isolate_home, auth_file=p.auth_file, auth_mode=p.auth_mode,
             never_touch=p.never_touch, forbidden_files=p.forbidden_files,
             cost_per_1k_in=p.cost_per_1k_in, cost_per_1k_out=p.cost_per_1k_out,
-            state_dir=p.state_dir, card_dir=card_dir,
+            state_dir=p.state_dir, card_dir=card_dir, confine=p.confine,
         )
+        if self.per_card:
+            # Its own confined server, rooted at its worktree; closed with the card.
+            return ClaudeAcpMicromanager(**kwargs)
+        return _CardAcpSupervisor(self, **kwargs)
 
     def close(self) -> None:
         with self.lock:
