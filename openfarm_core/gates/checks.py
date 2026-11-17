@@ -407,30 +407,50 @@ def mutation_gate(parsed: dict, min_kill_rate: float, mode: str,
                   category: str,
                   required_for: list[str] | tuple[str, ...] = ("test-backfill",)
                   ) -> GateResult:
-    """Mutation: blocking when mode is required or category is in `required_for`."""
+    """Mutation: blocking when mode is required or category is in `required_for`.
+
+    The kill rate divides by the mutants that could be judged. A pack that counts
+    timed-out and unviable mutants (cargo-mutants does) says so with `judged`,
+    caught plus missed: a mutant that did not build, or whose tests never finished,
+    proves nothing either way. Without `judged` every mutant counts, as before.
+    """
     killed = int(parsed.get("killed", 0))
     survived = int(parsed.get("survived", 0))
     total = int(parsed.get("total", killed + survived))
+    timeout = int(parsed.get("timeout", 0) or 0)
+    unviable = int(parsed.get("unviable", 0) or 0)
+    judged = int(parsed["judged"]) if "judged" in parsed else total
     capped = bool(parsed.get("capped", False))
-    rate = (killed / total) if total else 0.0
+    rate = (killed / judged) if judged else 0.0
 
     evidence = {"killed": killed, "survived": survived, "total": total,
                 "capped": capped, "kill_rate": rate}
+    if "judged" in parsed:
+        evidence.update({"judged": judged, "timeout": timeout, "unviable": unviable})
     blocking = mode == "required" or (
         category in tuple(required_for) and mode != "off")
+    unjudged = []
+    if timeout:
+        unjudged.append(f"{timeout} timed out")
+    if unviable:
+        unjudged.append(f"{unviable} unviable")
+    tail = f"; not judged: {', '.join(unjudged)}" if unjudged else ""
 
     if mode == "off":
         return GateResult("mutation", PASS, "mutation is off in this config",
                           evidence)
     if capped:
-        detail = f"mutation hit its cap after {killed}/{total} mutants"
+        detail = f"mutation hit its cap after {killed}/{judged} mutants"
+        return GateResult("mutation", FAIL if blocking else PASS, detail, evidence)
+    if not judged:
+        detail = f"no mutant could be judged ({total} found{tail})"
         return GateResult("mutation", FAIL if blocking else PASS, detail, evidence)
     if rate < min_kill_rate:
         detail = (f"kill rate {rate:.0%} below the required {min_kill_rate:.0%} "
-                  f"({killed}/{total})")
+                  f"({killed}/{judged}{tail})")
         return GateResult("mutation", FAIL if blocking else PASS, detail, evidence)
     return GateResult("mutation", PASS,
-                      f"kill rate {rate:.0%} ({killed}/{total})", evidence)
+                      f"kill rate {rate:.0%} ({killed}/{judged}{tail})", evidence)
 
 
 def extra_gate_result(name: str, passed: bool, on_fail: str,

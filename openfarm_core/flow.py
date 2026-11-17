@@ -3431,6 +3431,10 @@ class CardRun:
                 "mutation", PASS, "no production lines changed"))
             return
 
+        if hasattr(self.pack, "mutation_output"):
+            # The tool's own output folder goes with the card's evidence, never into
+            # the worktree, where it would be an untracked folder on the branch.
+            self.pack.mutation_output = self.card_layout / "gates" / "mutation"
         try:
             argv = self.pack.commands(
                 "mutation", files=production, tests=self.card.test_names)["argv"]
@@ -3460,19 +3464,29 @@ class CardRun:
             return
 
         try:
-            parsed = self.pack.parse_mutation(out)
+            # A pack that knows its tool's exit codes reads them first: a failing
+            # baseline or a usage error is the tool not having run, not a result.
+            reader = getattr(self.pack, "read_mutation", None)
+            if reader is not None:
+                parsed = reader(out, err, result.exit_code)
+            else:
+                parsed = self.pack.parse_mutation(out)
         except Invalid as exc:
             # A tool that is not installed, or prints nothing, is not a finding
             # about the code. In report mode that is recorded and the card carries
             # on; when mutation is this card's only proof, it blocks.
+            not_run = exc.code == "mutation-not-run"
             self._record_gate(GateResult(
                 "mutation", FAIL if breaking else PASS,
-                f"the mutation tool's output could not be read: {exc.message}"))
+                (f"the mutation tool did not run: {exc.message}" if not_run else
+                 f"the mutation tool's output could not be read: {exc.message}"),
+                {"exit_code": result.exit_code}))
             if breaking:
                 raise GateFailure(
                     StopCode.MUTATION_CAP,
-                    "mutation is this card's only proof and its output could not "
-                    "be read") from exc
+                    "mutation is this card's only proof and "
+                    + ("the tool did not run" if not_run else
+                       "its output could not be read")) from exc
             return
         # One mutation run is many builds: `cargo mutants` compiles every mutant, so
         # the cap counts the mutants it set out to test, not the one command. The cap
@@ -3483,6 +3497,9 @@ class CardRun:
             "survived": parsed.get("survived", 0),
             "total": parsed.get("total", 0),
             "capped": parsed.get("capped", False) or self.budget.mutation_capped()}
+        for key in ("timeout", "unviable", "judged"):
+            if key in parsed:
+                self.mutation_summary[key] = parsed.get(key, 0)
         gate = self._record_gate(mutation_gate(
             parsed, self.cfg.mutation_min_kill_rate, mode, self.card.category,
             required_for=self.cfg.mutation_required_for))
