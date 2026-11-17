@@ -76,9 +76,10 @@ class RealPayloadFormattingTests(unittest.TestCase):
     toys: list = []
 
     @classmethod
-    def _both(cls, label: str, human_repo: Path, json_repo: Path, *argv: str) -> _Captured:
+    def _both(cls, label: str, human_repo: Path, json_repo: Path, *argv: str,
+              json_argv: tuple[str, ...] | None = None) -> _Captured:
         h_code, out, err, seen = run_human(human_repo, *argv)
-        j_code, payload, _ = run_json(json_repo, *argv)
+        j_code, payload, _ = run_json(json_repo, *(json_argv if json_argv is not None else argv))
         cap = _Captured(label, h_code, j_code, out, err, seen, payload)
         cls.captured[label] = cap
         return cap
@@ -125,11 +126,14 @@ class RealPayloadFormattingTests(unittest.TestCase):
             cls._both(f"swarm-bare-{label}", h, j, "swarm")
             cls._both(f"swarm-tiers-{label}", h, j, "swarm", "tiers")
             if label == "on":
-                cls._both("swarm-status", h, j, "swarm", "status", "--run", rid_h)
-                cls.captured["swarm-status"].json_payload = run_json(
-                    j, "swarm", "status", "--run", rid_j)[1]
-                cls._both("board-read", h, j, "board", "read", "--run", rid_h, "--as", "*")
-                cls._both("board-status", h, j, "board", "read", "--run", rid_h, "--status")
+                # Each twin has its own run id: they match only if both runs
+                # started in the same second.
+                for name, tail in (("swarm-status", ("swarm", "status")),
+                                   ("board-read", ("board", "read")),
+                                   ("board-status", ("board", "read"))):
+                    extra = {"board-read": ("--as", "*"), "board-status": ("--status",)}.get(name, ())
+                    cls._both(name, h, j, *tail, "--run", rid_h, *extra,
+                              json_argv=(*tail, "--run", rid_j, *extra))
             cls._both(f"pause-{label}", h, j, "pause", "--reason", "x")
             cls._both(f"run-paused-{label}", h, j, "run", "--cards", "1")
             cls._both(f"resume-{label}", h, j, "resume")
