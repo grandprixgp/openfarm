@@ -384,19 +384,31 @@ def _baseline_check(ctx: Context, source: FileCardSource, card: Card) -> dict:
                  for name in card.test_names}
         passing = [name for name, status in named.items() if status == "ok"]
         mixed = [name for name, status in named.items() if status == "mixed"]
+        # Skipped or expected to fail on base (`ignored`): the fail-before gate
+        # refuses those too, since a test that did not run proves nothing. Only
+        # a test that is not there yet (`not-run`) is left to the test writer.
+        ignored = [name for name, status in named.items()
+                   if status not in ("ok", "mixed", "FAILED", "not-run")]
         out = {
-            "ok": not passing and not mixed,
+            "ok": not passing and not mixed and not ignored,
             "class": result.cls,
             "named": named,
             "failed_on_base": [name for name, status in named.items()
                                if status == "FAILED"],
             "passing_on_base": passing,
         }
+        problems = []
         if mixed:
             out["mixed_on_base"] = mixed
-            out["error"] = ("these named tests were reported both failing and not "
+            problems.append("these named tests were reported both failing and not "
                             "failing on base, so they prove nothing: "
                             + ", ".join(mixed))
+        if ignored:
+            out["ignored_on_base"] = ignored
+            problems.append("these named tests were skipped or expected to fail on "
+                            "base, so they prove nothing: " + ", ".join(ignored))
+        if problems:
+            out["error"] = "; ".join(problems)
         return out
     finally:
         if lock_held and cache_lock is not None:

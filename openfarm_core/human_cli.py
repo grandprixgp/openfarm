@@ -558,6 +558,12 @@ def _format_check(payload: dict, style: Style) -> str:
                     note = style.red(f"{ICON_FAIL} already passes on base")
                 elif st_val == "FAILED":
                     note = style.green(f"{ICON_OK} fails on base (expected)")
+                elif st_val == "mixed":
+                    note = style.red(f"{ICON_FAIL} fails in some rows only, proves nothing")
+                elif st_val == "ignored":
+                    note = style.red(f"{ICON_FAIL} skipped or expected to fail, proves nothing")
+                elif st_val == "not-run":
+                    note = style.yellow(f"{ICON_DOT} not on base yet (the test writer adds it)")
                 else:
                     note = style.yellow(f"{ICON_DOT} {st_val}")
                 rows.append([test_name, st_val, note])
