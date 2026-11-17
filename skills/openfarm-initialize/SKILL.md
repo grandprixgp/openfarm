@@ -38,13 +38,15 @@ ls -la ~/.config/openfarm/ 2>/dev/null || true
 - **Frontier Model (Claude / Antigravity / Codex ACP via OAuth, or Driver Mode):** Look at `oauth_ready` and `resolved_transport` in `openfarm acp status --json` (or `--provider claude|antigravity|codex|all`):
   - If `oauth_ready: true`, Frontier ACP supervision (`init --acp-provider claude|antigravity|codex`) and Driver mode (`openfarm drive --agent ...`) are ready with zero extra API keys.
   - If `oauth_ready: false`, guide the owner once to sign in via `openfarm acp login --provider <provider>` (or `claude auth login --claudeai` / `agy acp --login` / `codex login`), or pass `--profile solo` if intentionally disabling Frontier ACP supervision.
+  - Claude is the default and the recommended provider. Codex and Antigravity children run inside a bubblewrap (`bwrap`) boundary; check the "Confinement" part of `openfarm acp status` says `bwrap` works before choosing Antigravity.
+  - **Antigravity:** openfarm starts `agy` with no person typing. Ask the owner to check that their Antigravity plan's terms allow that before using it on OAuth; an API key (`auth = "api-key"` with `auth_file`) is the other route. Do not choose Antigravity OAuth by default. It is untested live since the first v0.8.1 build.
 - **Worker Models (ZDR OpenAI-compatible API key):** Ask **at most once** if a ZDR endpoint URL / Worker API key file is not yet configured (or proceed immediately with placeholder settings if the user wants an offline dry-run or scripted run).
 
 ### Existing repository instead of an empty directory
 
 When the directory already holds a git repository with code, `openfarm init` refuses it. Take this path instead:
 
-1. Make sure the work tree is clean, then run `openfarm adopt --dir . --json` (auto-detects Rust, Python, or TypeScript, or pass `--lang rust|python|typescript`). It writes `.openfarm/config.toml`, `.openfarm/PROJECT_SPEC.md` and `cards/.gitkeep`, commits nothing, and runs the suite once. If `known_failing_proposed` is not empty, show the owner those tests and copy them into `[policy] known_failing` only if they agree.
+1. Make sure the work tree is clean, then run `openfarm adopt --dir . --json` (auto-detects the language, or pass `--lang rust|python|typescript`; a `Cargo.toml` or Python manifest decides, so pass `--lang typescript` to adopt the TypeScript side of a repo that also has one; TypeScript tests must run with `node --test`, other test runners are refused). It writes `.openfarm/config.toml`, `.openfarm/PROJECT_SPEC.md` and `cards/.gitkeep`, commits nothing, and runs the suite once. If `known_failing_proposed` is not empty, show the owner those tests and copy them into `[policy] known_failing` only if they agree.
 2. Grill as in step 0, reading the existing code for facts instead of asking.
 3. Instead of step 3's new skeleton: propose `never_touch` from the code (the modules that hold the project's invariants), and pick one existing, well-tested module as the reference slice that `pattern` and `small-feature` cards name in `reference`. Write no new skeleton. Put both, and the module ownership map, in `.openfarm/PROJECT_SPEC.md`, and confirm `never_touch` with the owner.
 4. Fill in `[model]` (endpoint, key file, models and any zero-retention header) as in step 1, then continue at step 4 (cards) and step 5 (commit and check) on the repository's own base branch rather than `main`.
@@ -61,11 +63,16 @@ openfarm init <project_name> \
   --json
 ```
 
-By default `openfarm init` configures `[adapters] micromanager = "claude-acp"` (or `antigravity-acp` / `codex-acp` via `--acp-provider`), `[micromanager] mode = "active"`, `auth = "oauth"`, `binary = "auto"`, while configuring Workers under `[model]`. Add `--endpoint <URL> --model <MODEL_NAME>` if known, or pass `--profile advisory|solo` / adjust later via `openfarm acp configure --provider ...`. Confirm the JSON response reports `"config_valid": true`.
+By default `openfarm init` configures `[adapters] micromanager = "claude-acp"` (or `antigravity-acp` / `codex-acp` via `--acp-provider`), `[micromanager] mode = "active"`, `auth = "oauth"`, `binary = "auto"`, `tool_policy = "none"`, while configuring Workers under `[model]`. Add `--endpoint <URL> --model <MODEL_NAME>` if known, or pass `--profile advisory|solo` / adjust later via `openfarm acp configure --provider ...`. Confirm the JSON response reports `"config_valid": true`.
 
-Verify zero-token ACP handshake works in the initialized repo when supervision is enabled:
+With `--acp-provider codex`, switch to openfarm's own Codex bridge right after init (with `binary = "auto"` a standalone `codex-acp` on `PATH` would be used, and it completed no turn on a ChatGPT login in testing):
 ```bash
-openfarm acp probe --json
+openfarm acp configure --provider codex --binary codex-exec --tool-policy none --json
+```
+
+Verify zero-token ACP handshake works in the initialized repo when supervision is enabled (name the provider; probing Antigravity starts `agy`):
+```bash
+openfarm acp probe --provider <claude|codex|antigravity> --json
 ```
 
 Remind the user (if `"key_file_present": false`) to place their Worker ZDR API key outside the repository at the printed `key_file` path with `chmod 600`.
