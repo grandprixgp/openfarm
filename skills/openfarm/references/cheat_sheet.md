@@ -8,21 +8,21 @@ Exit codes: `0` ok/eligible | `1` refused/ineligible | `2` usage/config | `3` in
 | --- | --- |
 | `init` | `openfarm init <NAME> [--dir PATH] [--idea TEXT] [--profile auto\|solo\|advisory\|active] [--acp-provider claude\|antigravity\|codex] [--mutation auto\|off\|report\|required] [--endpoint URL] [--model NAME] [--commit]` |
 | `adopt` | `openfarm adopt [--dir DIR] [--lang rust\|python\|typescript] [--state-dir PATH] [--key-file PATH] [--no-suite]` |
-| `bench` | `openfarm bench list [--dir bench]` / `openfarm bench run [--task ID]... [--arm farm=FILE] [--arm solo=FILE] [--repeats N] [--out DIR] [--dry-run]` |
+| `bench` | `openfarm bench list [--tasks DIR]` / `openfarm bench run [--tasks DIR] [--task ID]... [--arm NAME=FILE]... [--repeats N] [--out DIR] [--dry-run]` (`--dir` is an alias of `--tasks`; default repeats 3, 1 with `--dry-run`) |
 | `install-skill` | `openfarm install-skill [--target all\|claude\|antigravity\|codex\|agents\|workspace] [--dest PATH] [--install-bin PATH] [--dry-run]` |
-| `acp` | `openfarm acp [status\|login\|configure\|probe] [--provider claude\|antigravity\|codex\|all] [--mode active\|advisory\|off] [--auth oauth\|api-key\|auto] [--binary auto\|claude\|claude-agent-acp\|agy\|agy-print\|antigravity-acp\|codex\|codex-acp] [--model M] [--effort low\|medium\|high\|xhigh\|max] [--tool-policy none\|read-only] [--claudeai\|--console] [--setup-token]` |
+| `acp` | `openfarm acp [status\|login\|configure\|probe] [--provider claude\|antigravity\|codex\|all] [--mode active\|advisory\|off] [--auth oauth\|api-key\|auto] [--binary auto\|claude\|claude-agent-acp\|agy\|agy-print\|antigravity-acp\|codex\|codex-acp\|codex-exec] [--model M] [--effort low\|medium\|high\|xhigh\|max] [--tool-policy none\|read-only] [--auth-file PATH] [--clear-auth-file] [--claudeai\|--console] [--sso] [--email E] [--setup-token]`; `status` never starts `agy`; `probe --provider all` skips Antigravity and exits `3` unless every probed provider is ok |
 | `tui` | `openfarm tui [--run ID] [--refresh SEC] [--once] [--view overview\|cards\|dossier\|board\|swarm\|harness\|ops]` |
-| `check` | `openfarm check <CARD> [--baseline]` |
+| `check` | `openfarm check <CARD> [--baseline]` (also shows the tooling the card's gates will use) |
 | `supervise` | `openfarm supervise (--triage-blocked \| --prepare-queue) [--card ID] [--apply] [--mm-script PATH]` |
 | `run` | `openfarm run [--cards N] [--spend AMT] [--for DUR \| --until UTC] [--card ID] [--dry-run] [--script PATH] [--mm-script PATH] [--run-id ID] [--learn-from both\|project\|global]` |
 | `status` | `openfarm status [--card ID]` |
 | `pause` / `resume` | `openfarm pause [--reason TEXT]` / `openfarm resume [--clear-breaker] [--clear-kill]` |
 | `stop` / `release` | `openfarm stop [--reason TEXT]` / `openfarm release <CARD> --reason TEXT` |
 | `dossier` | `openfarm dossier <CARD> [--run RUN] [--attempt N] [--format md\|json]` |
-| `verdict` / `escape` | `openfarm verdict <CARD> (clean\|minor-fix\|bounced\|scrapped) --review-tokens N [--minutes M] [--note TEXT]` / `openfarm escape <CARD> --note TEXT` |
+| `verdict` / `escape` | `openfarm verdict <CARD> (clean\|minor-fix\|bounced\|scrapped) --review-tokens N [--minutes M] [--note TEXT]` / `openfarm escape <CARD> --note TEXT`; your `verdict` (`by: reviewer`) overwrites a driver's (`by: driver/<agent>`) |
 | `done` | `openfarm done <CARD> [--note TEXT]` |
 | `harness` | `openfarm harness [status\|index\|show\|promote\|demote\|reset] [TARGET] [--reason TEXT] [--yes]`; `status`, `promote <gid>` and `demote <gid>` take `--global` for the global library |
-| `board` | `openfarm board (read \| post \| answer \| wait) [--run ID] [--as MEMBER] ...` |
+| `board` | `openfarm board (read \| post \| answer \| wait) [--run ID] [--as MEMBER] ...` (`post`, `answer` and `wait` need `--as`) |
 | `swarm` | `openfarm swarm (status \| tiers \| join \| start \| set \| hint \| block \| remove) [--run ID] ...` |
 | `drive` | `openfarm drive [--agent claude\|antigravity\|agy\|codex] [--seat both\|coordinator\|supervisor] [--run ID] [--cards N] [--card ID]... [--spend AMT] [--driver-name NAME] [--driver-bin PATH] [--model M] [--effort E] [--max-turns N] [--turn-timeout SECONDS] [--wave] [--record-verdict] [--script PATH]` |
 
@@ -39,3 +39,17 @@ Exit codes: `0` ok/eligible | `1` refused/ineligible | `2` usage/config | `3` in
 
 - Non-harness-polluting (isolated): `ineligible`, `dirty-baseline`, `card-changed`, `stale-conflict`, `infra`, `lease-expired`, `handed-back`, `seat-silent`, `killed`, `released`, `paused`.
 - Learning / retry-feedback codes: `tests-unprovable`, `attempts`, `no-progress`, `build-cap`, `mutation-cap`, `budget`, `cannot-split`, `checker-reject`, `supervisor-reject`, `extra-gate`, `refused` (only when model ran).
+
+## Frontier Providers (`[micromanager]`)
+
+- **Claude:** recommended with `tool_policy = "none"`. Under `confine = "auto"` openfarm puts no OS boundary around it; `confine = "bwrap"` does.
+- **Codex:** use `binary = "codex-exec"` with `tool_policy = "none"` (tools off by flags, plus a `bwrap` boundary when it works). `read-only` is refused where Codex's own sandbox cannot start inside the boundary (Ubuntu).
+- **Antigravity:** always inside the `bwrap` boundary, refused without it. The owner must check their Antigravity plan's terms allow openfarm to start `agy` unattended before using OAuth; an API key (`auth = "api-key"`, `auth_file`) is the other route. Untested live since the first build.
+- `confine = "off"`: no boundary; the child can read whatever the owner's user can.
+- Codex and Antigravity report no cost: without `cost_per_1k_in` / `cost_per_1k_out` their spend reads zero and the caps cannot fire.
+
+## Language Packs
+
+- **Python:** `unittest` unless pytest is configured; `ruff` only where the project configures it, else a syntax check and no format check.
+- **TypeScript:** `node --test` only (npm, jest, vitest, mocha refused); `tsc` with a `tsconfig.json`, else syntax only; `prettier` only where configured; no mutation (`mutation = "required"` is a config error); `--lang typescript` on a repo that also has a Cargo or Python manifest.
+- **Rust:** mutation by `cargo mutants`, kill rate = caught ÷ (caught + missed).
