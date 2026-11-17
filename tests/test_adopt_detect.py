@@ -52,19 +52,17 @@ class AdoptDetectTests(unittest.TestCase):
 
         self.assertEqual(caught.exception.code, "ambiguous-language")
 
+        # A package.json or tsconfig.json beside a Rust or Python manifest is
+        # what v0.8 adopted as that language; it still is.
         ts_rust = self.new_root()
         (ts_rust / "Cargo.toml").write_text("")
         (ts_rust / "package.json").write_text("{}\n")
-        with self.assertRaises(Refused) as caught2:
-            detect_language(ts_rust)
-        self.assertEqual(caught2.exception.code, "ambiguous-language")
+        self.assertEqual(detect_language(ts_rust), "rust")
 
         ts_py = self.new_root()
         (ts_py / "pyproject.toml").write_text("")
         (ts_py / "tsconfig.json").write_text("{}\n")
-        with self.assertRaises(Refused) as caught3:
-            detect_language(ts_py)
-        self.assertEqual(caught3.exception.code, "ambiguous-language")
+        self.assertEqual(detect_language(ts_py), "python")
 
     def test_no_manifest_is_unsupported(self) -> None:
         empty_root = self.new_root()

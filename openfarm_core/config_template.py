@@ -56,6 +56,7 @@ def render_config(*, name: str, language: str, base_branch: str, state_dir: Path
         runner = [f"cargo_flags = {toml_list(cargo_flags or [])}"]
     elif language == "typescript":
         forbidden_files = ["**/package.json", "**/package-lock.json",
+                           "**/yarn.lock", "**/pnpm-lock.yaml", "**/.npmrc",
                            "**/tsconfig.json", "**/node_modules/**",
                            ".openfarm/**", ".claude/**"]
         flagged_patterns = []

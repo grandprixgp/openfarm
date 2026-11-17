@@ -18,38 +18,43 @@ from .git import Git
 def detect_language(root: Path) -> str:
     """Return `"rust"`, `"python"`, or `"typescript"` from top-level manifests.
 
-    Raises `openfarm_core.errors.Refused` with code "ambiguous-language" when
-    multiple kinds of manifest are present, or "unsupported-language" when none
-    is. Only the top level of `root` is looked at; nothing is written.
+    A Cargo or Python manifest decides it, as in v0.8: a `package.json` or
+    `tsconfig.json` beside one (web assets, docs tooling) does not make the repo
+    ambiguous, and adopt says it saw them (`typescript_manifests`). TypeScript is
+    chosen only when it is the one kind of manifest; `--lang typescript` adopts a
+    repo that is really both. Raises `openfarm_core.errors.Refused` with code
+    "ambiguous-language" when both a Rust and a Python manifest are present, or
+    "unsupported-language" when none is. Only the top level of `root` is looked
+    at; nothing is written.
     """
     root = Path(root)
     has_cargo = (root / "Cargo.toml").is_file()
     has_python = ((root / "pyproject.toml").is_file()
                   or (root / "setup.py").is_file())
-    has_ts = ((root / "package.json").is_file()
-              or (root / "tsconfig.json").is_file())
 
-    detected: list[str] = []
-    if has_cargo:
-        detected.append("rust")
-    if has_python:
-        detected.append("python")
-    if has_ts:
-        detected.append("typescript")
-
-    if len(detected) > 1:
+    if has_cargo and has_python:
         raise Refused(
             "ambiguous-language",
-            f"multiple language manifests are present ({', '.join(detected)}); "
-            f"pass --lang {' or --lang '.join(detected)}",
+            "both a Rust and a Python manifest are present; pass --lang rust or "
+            "--lang python",
         )
-    if len(detected) == 1:
-        return detected[0]
+    if has_cargo:
+        return "rust"
+    if has_python:
+        return "python"
+    if typescript_manifests(root):
+        return "typescript"
     raise Refused(
         "unsupported-language",
         "no supported language manifest found: expected Cargo.toml, pyproject.toml, "
         "setup.py, package.json, or tsconfig.json",
     )
+
+
+def typescript_manifests(root: Path) -> list[str]:
+    """The top-level TypeScript/Node manifests present in `root`."""
+    return [name for name in ("package.json", "tsconfig.json")
+            if (Path(root) / name).is_file()]
 
 
 def baseline_known_failing(root: Path, language: str, *, target_dir: Path,
@@ -206,6 +211,11 @@ def adopt_project(
     adopt_notes: list[str] = []
     if resolved_language == "typescript":
         typescript_tools, adopt_notes = typescript_adopt_checks(root)
+    elif language is None and typescript_manifests(root):
+        adopt_notes.append(
+            f"{' and '.join(typescript_manifests(root))} found too; adopted as "
+            f"{resolved_language} from its manifest, as before. To work on the "
+            "TypeScript side instead, adopt with --lang typescript")
 
     baseline = None
     if run_suite:
