@@ -451,6 +451,23 @@ def suite_green(parsed: dict, known_failing: list[str],
             "test footer reported failures not matched cleanly",
             {"footers": footers, "unexpected": unexpected, "known-red": known_red})
 
+    if run_cls == FAIL and not failed_results:
+        # The run failed and nothing it printed says which test did: cargo that
+        # stopped before building (`--locked` with a stale lockfile, a manifest
+        # that does not parse), pytest that exits 1 after "N passed" over a
+        # coverage floor. Whatever it was, it is not a green suite. The one
+        # failed exit that is a finished run is the empty one (`NO TESTS RAN`,
+        # exit 5): a footer that counted no test at all.
+        counted = sum(int(f.get("passed", 0)) + int(f.get("failed", 0))
+                      + int(f.get("ignored", 0)) for f in footers)
+        if not footers or counted:
+            return GateResult(
+                "suite", FAIL,
+                f"the test run failed (exit code {exit_code}) and nothing it printed "
+                f"names a failing test, so it cannot be read as green",
+                {"run_class": run_cls, "exit_code": exit_code, "footers": footers,
+                 "unexpected": unexpected, "known-red": known_red})
+
     detail = "suite green"
     if known_red:
         detail += f"; {len(known_red)} known red left out"
