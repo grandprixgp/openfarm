@@ -926,9 +926,9 @@ class StallMonitor:
     """Periodic stall detector (`role = "monitor"`, `kind = "code"`).
 
     Triggers when the run has not ended, no card thread is actively executing,
-    every non-removed non-infra member is waiting or idle on external input,
-    unfinished work remains, and nothing non-`stall` has been posted within
-    `[swarm] stall_after`. Emits at most one `kind = "stall"` post per board
+    no worker of an unfinished card is active (seats only act when asked and
+    never count), unfinished work remains, and nothing non-`stall` has been
+    posted within `[swarm] stall_after`. Emits at most one `kind = "stall"` post per board
     activity sequence until non-`stall` activity advances the board.
     """
 
@@ -960,7 +960,10 @@ class StallMonitor:
         self._last_non_stall_seq: int = 0
         self._last_activity_at: float | None = None
         self._stalled_for_seq: int = -1
-        self._all_posts: list[dict] = []
+        # Bounded state: unanswered questions by seq and what the board says
+        # about each card, not every post of the run.
+        self._open_questions: dict[int, dict] = {}
+        self._progress = CardProgress()
         self._seed_initial_activity()
 
     def _seed_initial_activity(self) -> None:
@@ -991,15 +994,36 @@ class StallMonitor:
             self._sync_posts_unlocked(cur_now)
             self._last_activity_at = cur_now
 
+    def _track_post_unlocked(self, post: dict, members: dict[str, dict] | None) -> None:
+        seq = int(post.get("seq", 0) or 0)
+        kind = post.get("kind")
+        if kind == "question":
+            self._open_questions[seq] = post
+        elif kind == "answer" and post.get("ref"):
+            self._open_questions.pop(int(post.get("ref", 0) or 0), None)
+        if post.get("card") and kind in ("done", "blocked", "action"):
+            if members is None:
+                members = {
+                    str(m.get("name", "")): m
+                    for m in self.board.list_members(include_removed=True)
+                }
+            self._progress.feed([post], members)
+
     def _sync_posts_unlocked(self, cur_now: float) -> None:
         new_posts = self.board.read(
             as_name="*", since=self._scan_seq, limit=None, for_model=False
         )
+        members: dict[str, dict] | None = None
+        if any(p.get("card") and p.get("kind") in ("done", "blocked", "action") for p in new_posts):
+            members = {
+                str(m.get("name", "")): m
+                for m in self.board.list_members(include_removed=True)
+            }
         for post in new_posts:
             seq = int(post.get("seq", 0) or 0)
             if seq > self._scan_seq:
                 self._scan_seq = seq
-            self._all_posts.append(post)
+            self._track_post_unlocked(post, members)
             if post.get("kind") != "stall":
                 if seq > self._last_non_stall_seq:
                     self._last_non_stall_seq = seq
@@ -1008,40 +1032,48 @@ class StallMonitor:
         if self._last_activity_at is None:
             self._last_activity_at = cur_now
 
+    def _finished_cards_unlocked(self, roster: list[dict]) -> set[str]:
+        self._progress.note_members(roster)
+        return self._progress.finished
+
     def _every_member_waiting_or_idle_unlocked(self) -> bool:
-        for member in self.board.list_members(include_removed=False):
+        """True when no member is doing work of its own.
+
+        A seat (coordinator, supervisor) only acts when asked, whatever fills
+        it (code, a tier, a config supervisor, an outside member), so it never
+        counts as working: whether a card thread is really busy is answered by
+        `active_work_fn`. A worker of a finished card is done working.
+        """
+        roster = self.board.list_members(include_removed=False)
+        finished = self._finished_cards_unlocked(roster)
+        for member in roster:
             name = str(member.get("name", "") or "")
             role = normalize_role(str(member.get("role", "") or ""))
             if name in _INFRA_ROLES or role in _INFRA_ROLES:
+                continue
+            if role in SEAT_ROLES:
                 continue
             if member.get("state") == "waiting":
                 continue
             if member.get("kind") == "external":
                 continue
+            cid = str(member.get("card", "") or "")
+            if cid and cid in finished:
+                continue
             return False
         return True
 
     def _oldest_unanswered_question_unlocked(self) -> dict | None:
-        answered = {
-            int(post.get("ref", 0) or 0)
-            for post in self._all_posts
-            if post.get("kind") == "answer" and post.get("ref")
-        }
-        for post in self._all_posts:
-            seq = int(post.get("seq", 0) or 0)
-            if post.get("kind") == "question" and seq not in answered:
-                return post
-        return None
+        if not self._open_questions:
+            return None
+        return self._open_questions[min(self._open_questions)]
 
     def _has_unfinished_work_unlocked(self) -> bool:
         if self._unfinished_fn is not None:
             return bool(self._unfinished_fn())
-        finished_cards = {
-            str(post.get("card", "") or "")
-            for post in self._all_posts
-            if post.get("kind") in ("done", "blocked") and post.get("card")
-        }
-        for member in self.board.list_members(include_removed=False):
+        roster = self.board.list_members(include_removed=False)
+        finished_cards = self._finished_cards_unlocked(roster)
+        for member in roster:
             cid = str(member.get("card", "") or "")
             if cid and cid not in finished_cards:
                 return True
@@ -1105,7 +1137,6 @@ class StallMonitor:
                 trusted=True,
             )
             self._scan_seq = max(self._scan_seq, int(post.get("seq", 0) or 0))
-            self._all_posts.append(post)
             self._stalled_for_seq = stalled_seq
             return post
 
