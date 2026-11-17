@@ -1905,6 +1905,8 @@ def cmd_swarm(ctx: Context, args) -> int:
         _emit_ctx(ctx, {"run_id": rid, "member": member}, "swarm_join")
         return EXIT_OK
 
+    # A name typed after --as proves nothing: from the command line only a
+    # member that joined the coordinator seat may steer (outside=True).
     if action == "start":
         card_id = _check_id(args.card, "card id")
         team = parse_team_spec(args.team)
@@ -1913,6 +1915,7 @@ def cmd_swarm(ctx: Context, args) -> int:
             board,
             ctx.cfg,
             caller=args.as_name,
+            outside=True,
             card_id=card_id,
             team=team,
             source=source,
@@ -1925,6 +1928,7 @@ def cmd_swarm(ctx: Context, args) -> int:
             board,
             ctx.cfg,
             caller=args.as_name,
+            outside=True,
             member_name=args.member,
             tier=args.tier,
             effort=args.effort,
@@ -1938,6 +1942,7 @@ def cmd_swarm(ctx: Context, args) -> int:
             board,
             ctx.cfg,
             caller=args.as_name,
+            outside=True,
             member_name=args.member,
             body=args.body,
         )
@@ -1951,6 +1956,7 @@ def cmd_swarm(ctx: Context, args) -> int:
             board,
             ctx.cfg,
             caller=args.as_name,
+            outside=True,
             card_id=card_id,
             reason=args.reason,
             source=source,
@@ -1964,6 +1970,7 @@ def cmd_swarm(ctx: Context, args) -> int:
             board,
             ctx.cfg,
             caller=args.as_name,
+            outside=True,
             member_name=args.member,
             source=source,
         )

@@ -820,6 +820,16 @@ global_dir = "{self.global_harness}"
         )
         self.assertEqual(block_res["exit_code"], 0, block_res["output"])
 
+        # CARD-3 was running, so its block is a stop request: its members stay
+        # until the card's own final post (code, as `gates`) lands.
+        from openfarm_core.board import Board, board_dir_for
+        Board(
+            board_dir_for(StateDir(self.state_root), self.run_id), state_dir=self.state_root
+        ).post(
+            "gates", ["coordinator"], "blocked", "CARD-3 blocked (refused): needs review",
+            card="CARD-3", trusted=True,
+        )
+
         rm_res = dispatch_cli_command(
             self.repo,
             None,
