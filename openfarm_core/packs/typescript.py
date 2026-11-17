@@ -377,31 +377,74 @@ _IMPORTED_FROM_RE = re.compile(
     r"imported from (?P<path>\S+\.(?:ts|mts|cts|tsx|js|mjs|cjs|jsx))"
 )
 
-#: Comment suppressions (scanned on comment text only).
+#: Comment suppressions (scanned on comment text only). Python's `# type: ignore`
+#: is `@ts-ignore`/`@ts-expect-error`/`@ts-nocheck`, its `# noqa` is
+#: `eslint-disable`, and its `# pragma: no cover` is a c8/istanbul/v8 ignore.
 BANNED_IN_COMMENTS = (
     (r"@ts-ignore\b", "suppression-ts-ignore"),
+    (r"@ts-expect-error\b", "suppression-ts-expect-error"),
     (r"@ts-nocheck\b", "suppression-ts-nocheck"),
     (r"eslint-disable\b", "suppression-eslint"),
+    (r"\b(?:c8|istanbul|v8|node:coverage)\s+(?:ignore|disable)\b", "suppression-coverage"),
 )
+
+#: Bare names; the `node:` spellings are caught anywhere by the rule before.
+_NETWORK_MODULES = r"(?:http|https|http2|net|dgram|tls|dns)"
 
 #: Banned anywhere in added code (comments stripped).
 #: Tuple format: (regex, label, mask_strings)
 BANNED_ANYWHERE = (
     (r"\bdebugger\b", "debug-call", True),
+    (r"""["'](?:node:)?inspector(?:/promises)?["']""", "debug-call", False),
+    # `test.skip(`, `t.skip(`, `describe.skip(`; the option forms are below.
     (r"\.skip\s*\(", "test-skipped", True),
     (r"\.only\s*\(", "test-only", True),
-    (r"\b(?:test|it)\.todo\s*\(", "test-todo", True),
+    (r"\.todo\s*\(", "test-todo", True),
     (r"\bchild_process\b", "process-call", False),
+    (r"\bprocess\s*\.\s*(?:binding|_linkedBinding|dlopen)\s*\(", "process-call", True),
     (r"\bfetch\s*\(", "network-call", True),
-    (r"\beval\s*\(", "dynamic-exec", True),
-    (r"\bnew\s+Function\s*\(", "dynamic-exec", True),
+    (r"""["']node:(?:http|https|http2|net|dgram|tls|dns)(?:/\w+)?["']""", "network-call",
+     False),
+    (r"""(?:\bfrom\s*|\bimport\s*\(\s*|\brequire\s*\(\s*|\bimport\s+)["']"""
+     + _NETWORK_MODULES + r"""(?:/\w+)?["']""", "network-call", False),
+    (r"""["']undici["']""", "network-call", False),
+    (r"\b(?:XMLHttpRequest|WebSocket|EventSource)\b|\bsendBeacon\s*\(", "network-call",
+     True),
+    # Any reference to eval, so `(0, eval)(...)` and `globalThis.eval` count too.
+    (r"\beval\b", "dynamic-exec", True),
+    (r"\bFunction\s*\(", "dynamic-exec", True),
+    (r"""["'](?:node:)?vm["']""", "dynamic-exec", False),
+    # A module chosen at run time can be anything, child_process included.
+    (r"""\b(?:import|require)\s*\(\s*(?!["'][^"'`]*["']\s*[,)])""", "dynamic-exec", False),
+    # `globalThis["fetch"]` and the like reach anything by a computed name.
+    (r"\b(?:globalThis|global)\s*(?:\?\.\s*)?\[", "dynamic-exec", True),
+    # An empty catch, as a statement or a promise handler.
+    (r"\bcatch\s*(?:\([^)]*\))?\s*\{\s*\}", "swallowed-exception", True),
+    (r"\.catch\s*\(\s*(?:\(\s*\w*\s*\)|\w+)?\s*=>\s*(?:\{\s*\}|undefined\b|null\b|void\s+0\b)",
+     "swallowed-exception", True),
 )
 
-#: Banned only in production code (strings retained to catch stub messages).
+#: `node:test` options that skip, park or single out a test: `{ skip: true }`,
+#: `{ todo: "later" }`, `{ only: true }`, `{ expectFailure: true }`. On the line of
+#: a test/it/describe/suite call any value but `false` counts; on a line of its
+#: own (a multi-line options object) in a test file, `true` or a string does.
+_TEST_CALL_RE = re.compile(r"\b(?:test|it|describe|suite)(?:\.\w+)?\s*\(")
+_TEST_OPTION_RE = re.compile(r"(?<![\w$.])(skip|todo|only|expectFailure)\s*:")
+_TEST_OPTION_LABELS = {"skip": "test-skipped", "todo": "test-todo", "only": "test-only",
+                       "expectFailure": "test-skipped"}
+
+#: A leftover stub in production: any error thrown with a not-implemented message.
+#: Python bans `raise NotImplementedError`; the TypeScript spelling has no type of
+#: its own, so the message is what marks it.
+_STUB_MESSAGE = (r"""["'`]\s*(?:not\s+(?:yet\s+)?implemented|unimplemented|todo|"""
+                 r"""stub)\b""")
 BANNED_PRODUCTION = (
-    (r"""\bthrow\s+new\s+Error\s*\(\s*["'`](?:not\s+implemented|todo)\b""",
-     "leftover-stub"),
+    (r"\bthrow\s*\(?\s*(?:new\s+)?[\w$.]*\s*\(\s*" + _STUB_MESSAGE, "leftover-stub"),
 )
+_STUB_RE = re.compile(BANNED_PRODUCTION[0][0], re.IGNORECASE)
+#: A line whose throw goes on to the next line.
+_OPEN_THROW_RE = re.compile(r"\bthrow\b(?:\s+new)?(?:\s+[\w$.]+)?\s*\(?\s*$")
+_OPEN_CATCH_RE = re.compile(r"\bcatch\s*(?:\([^)]*\))?\s*\{\s*$")
 
 _TEST_KIND = "test"
 _PRODUCTION_KIND = "production"
@@ -917,6 +960,10 @@ class TypeScriptPack(Pack):
         production = production_paths or set()
         block_state: dict[str, bool] = {}
         last_line: dict[str, int] = {}
+        #: The previous added line's code per path, when it left a throw or a
+        #: catch open for the next line to finish.
+        open_throw: dict[str, str] = {}
+        open_catch: set[str] = set()
 
         for entry in added_lines:
             path = str(entry.get("path", ""))
@@ -924,13 +971,16 @@ class TypeScriptPack(Pack):
             text = str(entry.get("text", ""))
             if last_line.get(path) != line_no - 1:
                 block_state[path] = False
+                open_throw.pop(path, None)
+                open_catch.discard(path)
             in_block = block_state.get(path, False)
             code, comment, next_block = _split_ts_code_and_comments(text, in_block)
             block_state[path] = next_block
             last_line[path] = line_no
 
-            is_production = (path in production or self.classify_paths(
-                [path]).get(path) == _PRODUCTION_KIND)
+            kind = (_PRODUCTION_KIND if path in production
+                    else self.classify_paths([path]).get(path))
+            is_production = kind == _PRODUCTION_KIND
 
             def hit(label: str) -> None:
                 banned.append({"pattern": label, "file": path,
@@ -941,16 +991,39 @@ class TypeScriptPack(Pack):
                     if re.search(pattern, comment):
                         hit(label)
 
-            if code.strip():
-                code_no_str = _mask_ts_strings(code)
-                for pattern, label, mask_str in BANNED_ANYWHERE:
-                    target = code_no_str if mask_str else code
-                    for _match in re.finditer(pattern, target):
-                        hit(label)
-                if is_production:
-                    for pattern, label in BANNED_PRODUCTION:
-                        for _match in re.finditer(pattern, code, flags=re.IGNORECASE):
-                            hit(label)
+            if not code.strip():
+                continue
+            code_no_str = _mask_ts_strings(code)
+            for pattern, label, mask_str in BANNED_ANYWHERE:
+                target = code_no_str if mask_str else code
+                for _match in re.finditer(pattern, target):
+                    hit(label)
+            on_test_call = bool(_TEST_CALL_RE.search(code_no_str))
+            for match in _TEST_OPTION_RE.finditer(code_no_str):
+                value = code[match.end():].lstrip()
+                if on_test_call:
+                    if not re.match(r"false\b", value):
+                        hit(_TEST_OPTION_LABELS[match.group(1)])
+                elif kind == _TEST_KIND and re.match(r"""true\b|["'`]""", value):
+                    hit(_TEST_OPTION_LABELS[match.group(1)])
+            if path in open_catch and code_no_str.lstrip().startswith("}"):
+                hit("swallowed-exception")
+            open_catch.discard(path)
+            if _OPEN_CATCH_RE.search(code_no_str):
+                open_catch.add(path)
+            if is_production:
+                own = list(_STUB_RE.finditer(code))
+                for _match in own:
+                    hit("leftover-stub")
+                started = open_throw.pop(path, None)
+                if started is not None and not own:
+                    joined = started + " " + code.strip()
+                    if _STUB_RE.search(joined):
+                        hit("leftover-stub")
+                    elif len(joined) < 400 and not code.rstrip().endswith((";", "}")):
+                        open_throw[path] = joined
+                if not own and _OPEN_THROW_RE.search(code_no_str):
+                    open_throw[path] = code.strip()
 
             for pattern in (flagged_patterns or []):
                 try:
