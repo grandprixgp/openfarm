@@ -415,6 +415,24 @@ class PythonPack(Pack):
             return _parse_pytest(text)
         return _parse_unittest(text)
 
+    def row_file(self, row: dict) -> str | None:
+        """The test file of a row, from its binary.
+
+        pytest rows carry the node id's file (`tests/test_x.py::TestA`), unittest
+        rows the module and class (`tests.test_x.TestA`, so the module is all but
+        the last part).
+        """
+        binary = str(row.get("binary", "") or "")
+        if not binary:
+            return None
+        head = binary.split("::", 1)[0]
+        if head.endswith(".py"):
+            return head
+        if "::" in binary or "/" in head:
+            return None
+        module = head.rpartition(".")[0]
+        return module.replace(".", "/") + ".py" if module else None
+
     def parse_mutation(self, stdout: str) -> dict:
         raise Invalid("no-python-mutation",
                       "the Python pack has no mutation tool in v0.6")
