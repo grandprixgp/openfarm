@@ -11,6 +11,9 @@ Follow this protocol whenever running Openfarm waves on a project:
    - `dirty-baseline`: inspect failing test on `main`, fix or add exact test name to `known_failing` outside the farm, clear cache if needed, re-run `--dry-run`.
    - `infra`: fix disk/endpoint/ACP issue (if OAuth expired, run `openfarm acp login --provider claude|antigravity|codex`), run `openfarm resume`, `openfarm release <ID> --reason "infra retry"`, and re-run.
    - `acp-auth-required`: Frontier OAuth credentials are missing or expired — run `openfarm acp login --provider <provider>` (or `claude auth login --claudeai` / `agy acp --login` / `codex login`), verify with `openfarm acp probe --provider <provider> --json`, then `openfarm release <ID> --reason "oauth refreshed"`.
+   - `acp-confine-unavailable` or a refusal saying bubblewrap is not usable: a Codex or Antigravity child needs the `bwrap` boundary. Tell the owner to install bubblewrap, or switch Codex to `binary = "codex-exec"` with `tool_policy = "none"`. Do not set `confine = "off"` yourself: it lets the child read whatever the owner's user can.
+   - A refusal that Codex `read-only` cannot start its own sandbox inside the boundary: use `tool_policy = "none"`, or the Claude provider for a seat that reads files.
+   - `acp-provider-mismatch`: `[micromanager] binary` names another provider's program; make it match `[adapters] micromanager` or use `binary = "auto"`.
    - Circuit breaker tripped (`3` consecutive blocks with same stop code): inspect `breaker.json`, run `openfarm supervise --triage-blocked`, fix card scope, then `openfarm resume --clear-breaker`.
 5. **Curate `<state_dir>/harness/` carefully**:
    - Let `HarnessLibrary` auto-promote, probe for `probe_window`, and auto-demote regressions automatically.
