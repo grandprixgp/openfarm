@@ -1593,6 +1593,10 @@ class _TSScanner:
         out = list(line)
         i = 0
         last_sig = ""
+        #: The word that ends at `last_sig`, and whether it follows a `.` (a
+        #: property such as `x.return` is not the keyword).
+        last_word = ""
+        word_is_property = False
         while i < n:
             if self.in_block_comment:
                 if line.startswith("*/", i):
@@ -1663,7 +1667,9 @@ class _TSScanner:
                 self.template_quote = True
                 i += 1
                 continue
-            if ch == "/" and _regex_can_start(last_sig):
+            if ch == "/" and (_regex_can_start(last_sig) or (
+                    last_word in _REGEX_AFTER_WORDS and not word_is_property
+                    and (last_sig.isalnum() or last_sig in "_$"))):
                 j = i + 1
                 in_cls = False
                 closed = False
@@ -1690,9 +1696,25 @@ class _TSScanner:
                     continue
 
             if not ch.isspace():
+                if ch.isalnum() or ch in "_$":
+                    if i > 0 and (line[i - 1].isalnum() or line[i - 1] in "_$") \
+                            and last_word:
+                        last_word += ch
+                    else:
+                        word_is_property = last_sig == "."
+                        last_word = ch
+                else:
+                    last_word = ""
                 last_sig = ch
             i += 1
         return "".join(out)
+
+
+#: Keywords after which a `/` starts a regex literal, not a division.
+_REGEX_AFTER_WORDS = frozenset({
+    "return", "typeof", "case", "do", "else", "in", "of", "new", "delete", "void",
+    "throw", "yield", "await", "instanceof",
+})
 
 
 def _regex_can_start(prev: str) -> bool:
@@ -2008,17 +2030,34 @@ def _extract_ts_signatures(text: str) -> list[str]:
                 max(cur, start_idx + 1))
 
     index = 0
+    decorators: list[str] = []
     while index < total:
         if blocked[index]:
             index += 1
             continue
         line = lines[index]
+        if masks[index].lstrip().startswith("@"):
+            # Decorators belong to the class below them: keep them with it.
+            cur, depth, found = index, 0, []
+            while cur < total and len(found) < 10:
+                found.append(lines[cur].rstrip())
+                depth += sum(masks[cur].count(c) for c in "({[") \
+                    - sum(masks[cur].count(c) for c in ")}]")
+                cur += 1
+                if depth <= 0 and not (cur < total and masks[cur].lstrip().startswith("@")):
+                    break
+            following = _DECL_HEADER_RE.match(lines[cur]) if cur < total else None
+            decorators = found if following and following.group(1) == "class" else []
+            index = max(cur, index + 1)
+            continue
         match = _DECL_HEADER_RE.match(line)
         if not match:
+            decorators = []
             index += 1
             continue
 
         kw = match.group(1)
+        pending, decorators = decorators, []
         if kw == "function":
             block, next_idx = collect_callable(index)
             out.append("\n".join(block))
@@ -2062,7 +2101,7 @@ def _extract_ts_signatures(text: str) -> list[str]:
             continue
 
         if kw == "class":
-            block = []
+            block = list(pending)
             depth = 0
             seen_open = False
             cur = index
