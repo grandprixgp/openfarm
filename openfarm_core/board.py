@@ -86,6 +86,8 @@ _ROLE_ALIASES: dict[str, str] = {
 _MENTION_RE = re.compile(r"(?<![A-Za-z0-9_.-])@([A-Za-z0-9_-]+)")
 _MEMBER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
+_USAGE_KEYS: tuple[str, ...] = ("calls", "tokens", "tokens_by_effort")
+
 _REGISTRY_LOCK = threading.Lock()
 _PROCESS_LOCKS: dict[Path, tuple[threading.RLock, threading.Condition]] = {}
 _LOCK_DEPTHS: dict[Path, int] = {}
@@ -128,13 +130,28 @@ def normalize_role(role: str) -> str:
     return dashed
 
 
+def _strip_controls(text: str) -> str:
+    return _CONTROL_RE.sub("", text)
+
+
 def clean_post_body(body: str, *, max_len: int = MAX_POST_BODY_LEN) -> str:
-    """Clean untrusted post text using ``harness_memory.sanitize_lesson_text``."""
+    """Clean untrusted post text using ``harness_memory.sanitize_lesson_text``.
+
+    Also drops C0/C1 control characters other than tab and newline (BEL, CR,
+    backspace, ...), which the lesson cleaner leaves in. When dropping them
+    changes the text, it is cleaned again, so a control character cannot hide
+    a directive from the first pass.
+    """
     text = str(body or "")
-    if 0 < max_len < 3:
-        cleaned = sanitize_lesson_text(text, max_len=0)
-        return cleaned[:max_len]
-    return sanitize_lesson_text(text, max_len=max_len)
+    cleaned = sanitize_lesson_text(text, max_len=0)
+    stripped = _strip_controls(cleaned)
+    if stripped != cleaned:
+        stripped = _strip_controls(sanitize_lesson_text(stripped, max_len=0))
+    if max_len > 0 and len(stripped) > max_len:
+        if max_len < 3:
+            return stripped[:max_len]
+        return stripped[: max_len - 3].rstrip() + "..."
+    return stripped
 
 
 def board_dir_for(state_dir: StateDir | Path | str, run_id: str) -> Path:
@@ -602,6 +619,16 @@ class Board:
                 "tokens_out": int(existing.get("tokens_out", 0) or 0),
                 "attempts": int(existing.get("attempts", 0) or 0),
             }
+            # Usage counters survive a re-register (a re-join, a fresh start
+            # of the same member), so the token report never loses calls.
+            if existing:
+                for key in _USAGE_KEYS:
+                    if key in existing:
+                        record[key] = (
+                            dict(existing[key] or {})
+                            if key == "tokens_by_effort"
+                            else int(existing[key] or 0)
+                        )
             members[clean_name] = record
             self._save_members_unlocked(members)
             return dict(record)
@@ -694,18 +721,23 @@ class Board:
             return out
 
     def _load_posts_unlocked(self) -> list[dict]:
+        """Every readable post, in file order.
+
+        A torn or unparseable line (a crash mid-write, a stray byte) is skipped
+        on its own; the posts after it are still read.
+        """
         if not self.posts_path.is_file():
             return []
         posts: list[dict] = []
-        for line in self.posts_path.read_text(encoding="utf-8").splitlines():
-            stripped = line.strip()
+        for raw_line in self.posts_path.read_bytes().split(b"\n"):
+            stripped = raw_line.strip()
             if not stripped:
                 continue
             try:
-                item = json.loads(stripped)
-            except json.JSONDecodeError:
+                item = json.loads(stripped.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
                 continue
-            if isinstance(item, dict):
+            if isinstance(item, dict) and isinstance(item.get("seq"), int):
                 posts.append(item)
         return posts
 
@@ -720,9 +752,23 @@ class Board:
         try:
             record = json.loads(last_line.decode("utf-8"))
         except (UnicodeDecodeError, ValueError):
-            posts = self._load_posts_unlocked()
-            return int(posts[-1]["seq"]) if posts else 0
-        return int(record.get("seq", 0) or 0) if isinstance(record, dict) else 0
+            record = None
+        if isinstance(record, dict) and isinstance(record.get("seq"), int):
+            return int(record["seq"])
+        posts = self._load_posts_unlocked()
+        return max((int(p["seq"]) for p in posts), default=0)
+
+    def _append_record_unlocked(self, record: dict) -> None:
+        """Append one post line, never gluing it onto a torn last line."""
+        line = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
+        if self.posts_path.is_file() and self.posts_path.stat().st_size > 0:
+            with self.posts_path.open("rb") as check:
+                check.seek(-1, os.SEEK_END)
+                if check.read(1) != b"\n":
+                    line = b"\n" + line
+        with self.posts_path.open("ab") as handle:
+            handle.write(line)
+            handle.flush()
 
     def _validate_evidence_paths(self, evidence: list[str] | None) -> list[str]:
         if not evidence:
@@ -867,9 +913,7 @@ class Board:
             "expects": dict(expects) if isinstance(expects, dict) else expects,
         }
 
-        with self.posts_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-            handle.flush()
+        self._append_record_unlocked(record)
 
         if advance_author_cursor and author_member is not None:
             current_cursor = int(author_member.get("last_read_seq", 0) or 0)
@@ -1020,6 +1064,7 @@ class Board:
         limit: int | None,
         for_model: bool | None,
         viewer_kind: str,
+        newest: bool = False,
     ) -> list[dict]:
         posts = self._load_posts_unlocked()
         matched: list[dict] = []
@@ -1030,7 +1075,10 @@ class Board:
                 continue
             matched.append(post)
         if limit is not None:
-            matched = matched[:limit]
+            if newest:
+                matched = matched[-limit:] if limit > 0 else []
+            else:
+                matched = matched[:limit]
         return self._clean_posts_for_viewer(
             matched,
             members,
@@ -1089,6 +1137,10 @@ class Board:
                 )
             else:
                 effective_since = 0 if since is None else int(since)
+            # No cursor and no --since: someone looking at the board wants the
+            # latest posts. Paging forward from a cursor or --since still gives
+            # the oldest unread first.
+            newest = viewer_member is None and since is None
 
             result = self._matching_posts_unlocked(
                 members,
@@ -1097,6 +1149,7 @@ class Board:
                 limit=limit,
                 for_model=for_model,
                 viewer_kind=viewer_kind,
+                newest=newest,
             )
             if viewer_member is not None and advance_cursor and result:
                 new_cursor = max(
