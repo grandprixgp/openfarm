@@ -1478,14 +1478,46 @@ def _format_drive(payload: dict, style: Style) -> str:
     ok = bool(payload.get("ok", True))
     badge = style.green(f"{ICON_OK} ok") if ok else style.red(f"{ICON_FAIL} failed")
     lines = [style.heading(f"Driver Run {run_id}") + f"  [{agent} / {seat}]  {badge}"]
-    lines.extend(_render_kv_section("Driver", [
+    tokens_txt = (
+        f"{_fmt_int(payload.get('driver_tokens_in', 0))} in / "
+        f"{_fmt_int(payload.get('driver_tokens_out', 0))} out"
+    )
+    if payload.get("driver_tokens_estimated"):
+        tokens_txt += " (estimated)"
+    pairs: list[tuple[str, object]] = [
         ("agent", agent),
         ("seat", seat),
         ("driver_turns", payload.get("driver_turns", 0)),
-        ("driver_tokens", f"{_fmt_int(payload.get('driver_tokens_in', 0))} in / {_fmt_int(payload.get('driver_tokens_out', 0))} out"),
+        ("driver_tokens", tokens_txt),
+    ]
+    if "driver_spend" in payload:
+        pairs.append(("driver_spend", _fmt_usd(
+            payload.get("driver_spend", 0.0),
+            measured=bool(payload.get("driver_spend_measured", False)),
+        )))
+    for part, vals in (payload.get("driver_by_part") or {}).items():
+        part_txt = (
+            f"{_fmt_int(vals.get('tokens_in', 0))} in / {_fmt_int(vals.get('tokens_out', 0))} out, "
+            f"{vals.get('turns', 0)} turn(s)"
+        )
+        if vals.get("estimated"):
+            part_txt += " (estimated)"
+        pairs.append((f"  {part}", part_txt))
+    pairs.extend([
         ("actions_taken", len(payload.get("actions_taken") or ())),
         ("answers_sent", len(payload.get("answers_sent") or ())),
-    ], style=style))
+    ])
+    if payload.get("timeouts"):
+        pairs.append((
+            "timed_out",
+            f"{len(payload['timeouts'])} (on_external_timeout = "
+            f"{payload.get('on_external_timeout', 'fallback')})",
+        ))
+    if payload.get("driver_errors"):
+        pairs.append(("failed_turns", len(payload["driver_errors"])))
+    if payload.get("spend_stopped"):
+        pairs.append(("stopped", payload["spend_stopped"]))
+    lines.extend(_render_kv_section("Driver", pairs, style=style))
 
     outcomes = payload.get("outcomes") or []
     lines.append(style.bold(f"Outcomes ({len(outcomes)})"))
@@ -1503,13 +1535,22 @@ def _format_drive(payload: dict, style: Style) -> str:
     reviews = payload.get("reviews") or []
     if reviews:
         lines.append(style.bold(f"Wave Reviews ({len(reviews)})"))
+        def _rev_note(r: dict) -> str:
+            if r.get("not_reviewed_reason"):
+                return f"not reviewed: {r['not_reviewed_reason']}"
+            if r.get("not_recorded_reason"):
+                return f"{r.get('note') or ''} (not recorded: {r['not_recorded_reason']})".strip()
+            return r.get("note") or "-"
+
         rev_rows = [
             [
                 _outcome_card(r),
-                format_state(r.get("verdict") or "-", style=style),
-                _fmt_int(r.get("review_tokens", 0)),
-                "yes" if r.get("recorded") else "no",
-                _truncate(r.get("note") or "-", 56),
+                format_state(r.get("verdict") or "not reviewed", style=style),
+                _fmt_int(r.get("review_tokens", 0)) + ("~" if r.get("review_tokens_estimated") else ""),
+                "yes" if r.get("recorded") else (
+                    "kept existing" if r.get("kept_existing") else "no"
+                ),
+                _truncate(_rev_note(r), 72),
             ]
             for r in reviews
         ]
@@ -1519,6 +1560,28 @@ def _format_drive(payload: dict, style: Style) -> str:
             style=style,
             right_align={2},
         ))
+
+    for title, items, fmt in (
+        ("Timed Out (no usable driver answer)", payload.get("timeouts") or [],
+         lambda t: f"{t.get('card') or '-'} {t.get('op') or t.get('event') or ''} "
+                   f"#{t.get('seq')}: {t.get('policy')}; {t.get('reason')}"),
+        ("Failed Driver Turns", payload.get("driver_errors") or [],
+         lambda e: f"turn {e.get('turn')}: {e.get('code')}: {e.get('message')}"),
+    ):
+        if items:
+            lines.append(style.bold(f"{title} ({len(items)})"))
+            for item in items[:10]:
+                lines.append(f"  {style.yellow(ICON_DOT)} {_truncate(fmt(item), 110)}")
+            if len(items) > 10:
+                lines.append(f"  {style.dim(f'... {len(items) - 10} more (see --json)')}")
+
+    notes = payload.get("notes") or []
+    if notes:
+        lines.append(style.bold("Notes"))
+        for note in notes:
+            lines.append(f"  {style.yellow(ICON_DOT)} {note}")
+    for problem in payload.get("cleanup_problems") or []:
+        lines.append(f"  {style.red(ICON_FAIL)} clean-up: {problem}")
 
     next_tips: list[str] = []
     in_review = [

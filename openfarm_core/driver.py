@@ -515,6 +515,7 @@ class DriverAgent:
         entry = self._next_scripted_entry(turn_key)
         tok_in = 0
         tok_out = 0
+        cost = 0.0
         if isinstance(entry, dict):
             if entry.get("fail"):
                 kind = str(entry.get("fail"))
@@ -526,6 +527,7 @@ class DriverAgent:
                 raise Infra(kind, msg)
             tok_in = int(entry.get("tokens_in", 0) or 0)
             tok_out = int(entry.get("tokens_out", 0) or 0)
+            cost = float(entry.get("cost_usd", 0.0) or 0.0)
             if "content" in entry:
                 raw_text = str(entry["content"])
             elif "text" in entry:
@@ -547,6 +549,7 @@ class DriverAgent:
             text=text,
             tokens_in=tok_in,
             tokens_out=tok_out,
+            cost_usd=cost,
             estimated_usage=estimated,
             raw_argv=["scripted"],
         )
@@ -1216,6 +1219,7 @@ def _apply_coordinator_fallback(
     reason: str,
     timeouts: list[dict],
     given_up_seqs: set[int],
+    allow_starts: bool = True,
 ) -> None:
     """What happens to coordinator work the driver did not do, by `on_external_timeout`.
 
@@ -1268,7 +1272,7 @@ def _apply_coordinator_fallback(
             timeouts=timeouts,
         )
 
-    if policy == "block":
+    if policy == "block" or not allow_starts:
         return
     running = set(state_snap["running_cards"])
     slots_left = max(0, max(1, int(cfg.concurrent_cards or 1)) - len(running))
@@ -1506,6 +1510,7 @@ def _review_wave(
     record_verdict: bool,
     counters: dict,
     max_turns: int,
+    spend_stop=None,
 ) -> list[dict]:
     """Review each `in-review` card's dossier and diff without reading `never_touch`.
 
@@ -1613,12 +1618,15 @@ def _review_wave(
             except (Infra, Refused) as exc:
                 reason = f"the reviewer's turn failed ({exc.code}): {exc.message}"
                 return None
-            _count_turn(counters, resp)
+            _count_turn(counters, resp, shares={"review": 1.0})
             tokens += resp.tokens_in + resp.tokens_out
             estimated = estimated or resp.estimated_usage
             return resp
 
-        if counters["turns"] >= max_turns:
+        spend_reason = spend_stop() if spend_stop is not None else ""
+        if spend_reason:
+            reason = f"no review: {spend_reason}"
+        elif counters["turns"] >= max_turns:
             reason = f"no driver turn was left for the review (--max-turns {max_turns})"
         else:
             resp = _turn(review_prompt, f"driver/wave/{cid}")
@@ -1718,6 +1726,22 @@ def _review_wave(
     return reviews
 
 
+def _wave_spend_stop(
+    counters: dict, state: StateDir, run_id: str, cap: float, stopped: list[str]
+) -> str:
+    if stopped:
+        return stopped[0]
+    if cap <= 0:
+        return ""
+    used = float(counters.get("cost_usd", 0.0) or 0.0) + _run_spend_so_far(state, run_id)
+    if used >= cap:
+        stopped.append(
+            f"night spend {used:.4f} (driver {counters['cost_usd']:.4f}) reached its cap of {cap:.4f}"
+        )
+        return stopped[0]
+    return ""
+
+
 def _parse_wave_verdict(raw_text: str) -> tuple[str, str, str]:
     """`(verdict, note, error)` from a reviewer's answer. A token count in it is ignored."""
     try:
@@ -1733,10 +1757,155 @@ def _parse_wave_verdict(raw_text: str) -> tuple[str, str, str]:
     return verdict, note, ""
 
 
-def _count_turn(counters: dict, resp: DriverResponse) -> None:
-    """Add one answered driver turn's usage to the drive's totals."""
+def _new_counters() -> dict:
+    return {
+        "turns": 0,
+        "tokens_in": 0,
+        "tokens_out": 0,
+        "cost_usd": 0.0,
+        "answered_turns": 0,
+        "estimated_turns": 0,
+        "uncosted_turns": 0,
+        "by_part": {},
+    }
+
+
+def _count_turn(counters: dict, resp: DriverResponse, *, shares: dict[str, float] | None = None) -> None:
+    """Add one answered driver turn's usage and cost to the drive's totals.
+
+    `shares` splits the turn between the parts it worked for (`coordinator`,
+    `supervisor`, `review`), adding up to 1. Token counts the CLI did not report
+    were guessed (`estimated_usage`) and are counted as such.
+    """
     counters["tokens_in"] += resp.tokens_in
     counters["tokens_out"] += resp.tokens_out
+    cost = float(resp.cost_usd or 0.0)
+    counters["cost_usd"] += cost
+    counters["answered_turns"] += 1
+    if resp.estimated_usage:
+        counters["estimated_turns"] += 1
+    if cost <= 0:
+        counters["uncosted_turns"] += 1
+    for part, (t_in, t_out, part_cost) in _split_usage(resp, shares or {"coordinator": 1.0}).items():
+        bucket = counters["by_part"].setdefault(
+            part, {"turns": 0, "tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0, "estimated": False}
+        )
+        bucket["turns"] += 1
+        bucket["tokens_in"] += t_in
+        bucket["tokens_out"] += t_out
+        bucket["cost_usd"] += part_cost
+        bucket["estimated"] = bucket["estimated"] or resp.estimated_usage
+
+
+def _split_usage(resp: DriverResponse, shares: dict[str, float]) -> dict[str, tuple[int, int, float]]:
+    """A turn's tokens and cost split by `shares`; whole tokens, nothing lost."""
+    parts = [p for p, w in shares.items() if w > 0] or ["coordinator"]
+    out: dict[str, tuple[int, int, float]] = {}
+    left_in, left_out, left_cost = resp.tokens_in, resp.tokens_out, float(resp.cost_usd or 0.0)
+    for idx, part in enumerate(parts):
+        if idx == len(parts) - 1:
+            out[part] = (left_in, left_out, left_cost)
+            break
+        w = shares[part]
+        t_in = int(resp.tokens_in * w)
+        t_out = int(resp.tokens_out * w)
+        c = float(resp.cost_usd or 0.0) * w
+        out[part] = (t_in, t_out, c)
+        left_in -= t_in
+        left_out -= t_out
+        left_cost -= c
+    return out
+
+
+def _turn_shares(seat: str, *, sup_work: bool, coord_work: bool) -> dict[str, float]:
+    """Which seat a driver turn worked for. A turn that did both is split evenly."""
+    if seat == "supervisor":
+        return {"supervisor": 1.0}
+    if seat == "coordinator":
+        return {"coordinator": 1.0}
+    if sup_work and coord_work:
+        return {"supervisor": 0.5, "coordinator": 0.5}
+    if sup_work:
+        return {"supervisor": 1.0}
+    return {"coordinator": 1.0}
+
+
+def _effective_spend_cap(cfg: Config, spend: float | None) -> float:
+    """The night's cap as `openfarm run` works it out: `--spend` lowers, never raises."""
+    cap = float(getattr(cfg, "spend_per_night", 0.0) or 0.0)
+    if spend is not None and spend > 0:
+        cap = min(spend, cap) if cap > 0 else float(spend)
+    return cap
+
+
+def _run_spend_so_far(state: StateDir, run_id: str) -> float:
+    """What the run's finished cards recorded: workers' and supervisor's spend."""
+    total = 0.0
+    with contextlib.suppress(OSError):
+        for rec_path in state.cards.glob(f"*/{run_id}/card-record.json"):
+            rec = read_json(rec_path) or {}
+            if isinstance(rec, dict):
+                total += float(rec.get("spend", 0.0) or 0.0)
+                total += float(rec.get("micromanager_spend", 0.0) or 0.0)
+    return total
+
+
+def _driver_spend_report(counters: dict, provider: str) -> dict:
+    """The driver's own usage and spend for the payload and `run.json`."""
+    notes: list[str] = []
+    answered = int(counters.get("answered_turns", 0) or 0)
+    uncosted = int(counters.get("uncosted_turns", 0) or 0)
+    estimated = int(counters.get("estimated_turns", 0) or 0)
+    if uncosted:
+        notes.append(
+            f"the driver's CLI ({provider}) reported no cost for {uncosted} of {answered} "
+            "turn(s) and the driver has no rates to price them, so those turns count as "
+            "zero against --spend and spend_per_night: the caps cannot fire for the driver"
+        )
+    if estimated:
+        notes.append(
+            f"the driver's CLI ({provider}) reported no token usage for {estimated} of "
+            f"{answered} turn(s); their tokens are estimated from the text length"
+        )
+    by_part = {
+        part: {**vals, "cost_usd": round(float(vals.get("cost_usd", 0.0)), 6)}
+        for part, vals in sorted((counters.get("by_part") or {}).items())
+    }
+    return {
+        "agent": provider,
+        "turns": int(counters.get("turns", 0) or 0),
+        "answered_turns": answered,
+        "tokens_in": int(counters.get("tokens_in", 0) or 0),
+        "tokens_out": int(counters.get("tokens_out", 0) or 0),
+        "tokens_estimated": bool(estimated),
+        "estimated_turns": estimated,
+        "spend": round(float(counters.get("cost_usd", 0.0) or 0.0), 6),
+        "spend_measured": answered > 0 and uncosted == 0,
+        "by_part": by_part,
+        "notes": notes,
+    }
+
+
+def _add_driver_to_run_record(state: StateDir, run_id: str, report: dict) -> bool:
+    """Put the driver's usage into the run's `run.json` once the run has written it.
+
+    The driver's spend joins the run's `spend` (what the caps count); its tokens
+    stay apart under `driver`, with the estimated flag, like an outside seat's.
+    """
+    run_file = state.runs / run_id / "run.json"
+    record = read_json(run_file)
+    if not isinstance(record, dict):
+        return False
+    record["driver"] = dict(report)
+    record["driver_spend"] = report["spend"]
+    record["spend"] = round(float(record.get("spend", 0.0) or 0.0) + float(report["spend"]), 6)
+    notes = [str(n) for n in (record.get("notes") or [])]
+    for note in report.get("notes") or []:
+        if note not in notes:
+            notes.append(note)
+    record["notes"] = notes
+    write_json(run_file, record)
+    return True
 
 
 def _collect_outcomes(state: StateDir, run_id: str, managed_payload: dict | None) -> list[dict]:
@@ -1901,7 +2070,7 @@ def drive_run(
         if selected_cards:
             target_ids = list(selected_cards[:cards] if cards is not None else selected_cards)
 
-        counters = {"turns": 0, "tokens_in": 0, "tokens_out": 0}
+        counters = _new_counters()
         actions_taken: list[dict] = []
         answers_sent: list[dict] = []
         answered_seqs: set[int] = set()
@@ -1909,6 +2078,8 @@ def drive_run(
         resolved_event_seqs: set[int] = set()
         timeouts: list[dict] = []
         driver_errors: list[dict] = []
+        spend_stopped: list[str] = []
+        spend_cap = _effective_spend_cap(active_cfg, spend)
         timeout_policy = str(
             getattr(active_cfg.swarm, "on_external_timeout", "fallback") or "fallback"
         )
@@ -1953,17 +2124,28 @@ def drive_run(
                             "message": " ".join(str(exc.message).split())[:500],
                         })
                         return None
-                    _count_turn(counters, turn_resp)
+                    shares = _turn_shares(clean_seat, sup_work=sup_work, coord_work=coord_work)
+                    _count_turn(counters, turn_resp, shares=shares)
                     _record_driver_member_usage(
                         board,
-                        clean_seat,
-                        coord_name,
-                        sup_name,
-                        turn_resp.tokens_in,
-                        turn_resp.tokens_out,
-                        "",
+                        {"coordinator": coord_name, "supervisor": sup_name},
+                        turn_resp,
+                        shares,
+                        effort or "",
                     )
                     return turn_resp
+
+                def _spend_stop() -> str:
+                    """Why the driver may take no more turns for spend, or ''."""
+                    if spend_cap <= 0:
+                        return ""
+                    used = counters["cost_usd"] + _run_spend_so_far(state, resolved_rid)
+                    if used >= spend_cap:
+                        return (
+                            f"night spend {used:.4f} (driver {counters['cost_usd']:.4f}) "
+                            f"reached its cap of {spend_cap:.4f}"
+                        )
+                    return ""
 
                 def _give_up(
                     reason: str,
@@ -1990,6 +2172,7 @@ def drive_run(
                             reason=reason,
                             timeouts=timeouts,
                             given_up_seqs=given_up_seqs,
+                            allow_starts=not spend_stopped,
                         )
                     left = [
                         q for q in questions
@@ -2068,9 +2251,13 @@ def drive_run(
                         board.wait_after(scan_seq, 0.2)
                         continue
 
-                    if counters["turns"] >= max_turns:
+                    spend_reason = _spend_stop()
+                    if spend_reason and not spend_stopped:
+                        spend_stopped.append(spend_reason)
+                    if counters["turns"] >= max_turns or spend_stopped:
                         _give_up(
-                            f"no driver turn left (--max-turns {max_turns})",
+                            spend_stopped[0] if spend_stopped
+                            else f"no driver turn left (--max-turns {max_turns})",
                             snap=snap,
                             free_slots=free_slots,
                             questions=open_qs,
@@ -2293,9 +2480,16 @@ def drive_run(
                     record_verdict=record_verdict,
                     counters=counters,
                     max_turns=max_turns,
+                    spend_stop=lambda: _wave_spend_stop(
+                        counters, state, resolved_rid, spend_cap, spend_stopped
+                    ),
                 )
         has_infra = any(o.get("stop_code") == "infra" for o in outcomes) or (
             bool(run_rc) and run_rc[0] != 0
+        )
+        report = _driver_spend_report(counters, provider)
+        run_record_updated = (
+            _add_driver_to_run_record(state, resolved_rid, report) if managed else False
         )
         return {
             "ok": not has_infra,
@@ -2306,6 +2500,14 @@ def drive_run(
             "driver_turns": counters["turns"],
             "driver_tokens_in": counters["tokens_in"],
             "driver_tokens_out": counters["tokens_out"],
+            "driver_tokens_estimated": report["tokens_estimated"],
+            "driver_spend": report["spend"],
+            "driver_spend_measured": report["spend_measured"],
+            "driver_by_part": report["by_part"],
+            "spend_cap": spend_cap,
+            "spend_stopped": spend_stopped[0] if spend_stopped else "",
+            "run_record_updated": run_record_updated,
+            "notes": report["notes"],
             "actions_taken": actions_taken,
             "answers_sent": answers_sent,
             "timeouts": timeouts,
@@ -2430,23 +2632,23 @@ def _pick_turn_key(
 
 def _record_driver_member_usage(
     board: Board,
-    seat: str,
-    coord_name: str,
-    sup_name: str,
-    tokens_in: int,
-    tokens_out: int,
+    names: dict[str, str],
+    resp: DriverResponse,
+    shares: dict[str, float],
     effort: str,
 ) -> None:
+    """Book a turn's tokens on the seat member(s) it worked for."""
     if board.is_ended():
         return
-    target = coord_name if seat in ("both", "coordinator") else sup_name
-    if board.get_member(target) is None:
-        return
-    with contextlib.suppress(Refused):
-        board.add_member_usage(
-            target,
-            tokens_in=tokens_in,
-            tokens_out=tokens_out,
-            calls=1,
-            effort=effort,
-        )
+    for part, (t_in, t_out, _cost) in _split_usage(resp, shares).items():
+        target = names.get(part, "")
+        if not target or board.get_member(target) is None:
+            continue
+        with contextlib.suppress(Refused):
+            board.add_member_usage(
+                target,
+                tokens_in=t_in,
+                tokens_out=t_out,
+                calls=1,
+                effort=effort,
+            )
