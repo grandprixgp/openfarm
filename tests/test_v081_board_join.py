@@ -101,6 +101,29 @@ class LateExternalJoinTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "name-taken")
         self.assertEqual(self.board.get_member("CARD-9-implementer")["role"], "implementer")
 
+    def test_join_never_moves_or_revives_another_member(self) -> None:
+        swarm_join(self.board, self.cfg, name="sup", seat="supervisor", owner_kind="human")
+        with self.assertRaises(Refused) as other_seat:
+            swarm_join(self.board, self.cfg, name="sup", seat="coordinator", owner_kind="human")
+        self.assertEqual(other_seat.exception.code, "name-taken")
+        self.assertEqual(self.board.get_member("sup")["role"], "supervisor")
+        self.board.update_member("sup", state="removed")
+        with self.assertRaises(Refused) as removed:
+            swarm_join(self.board, self.cfg, name="sup", seat="supervisor", owner_kind="human")
+        self.assertEqual(removed.exception.code, "name-taken")
+        self.assertEqual(self.board.get_member("sup")["state"], "removed")
+        # a worker's tier record is left alone
+        self.board.upsert_member(
+            "CARD-7-checker", kind="scripted", role="checker", card="CARD-7",
+            tier="dsf", model="deepseek/deepseek-v4.1-flash", effort="high",
+        )
+        with self.assertRaises(Refused):
+            swarm_join(self.board, self.cfg, name="CARD-7-checker",
+                       seat="supervisor", owner_kind="agent")
+        worker = self.board.get_member("CARD-7-checker")
+        self.assertEqual((worker["role"], worker["tier"], worker["effort"]),
+                         ("checker", "dsf", "high"))
+
 
 if __name__ == "__main__":
     unittest.main()

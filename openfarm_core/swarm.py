@@ -318,11 +318,20 @@ def swarm_join(
 
     board.ensure()
     same_name = board.get_member(clean_name)
-    if same_name is not None and same_name.get("kind") != "external":
+    # A join may only re-confirm the same outside member in the same seat. Any
+    # other owner of the name (a worker, a code member, a member in the other
+    # seat, a removed member) keeps its record: the join would otherwise hand
+    # that name a seat and overwrite its tier and role.
+    if same_name is not None and (
+        same_name.get("kind") != "external"
+        or normalize_role(str(same_name.get("role", ""))) != clean_seat
+        or same_name.get("state") == "removed"
+    ):
         raise Refused(
             "name-taken",
             f"{clean_name!r} is already a {same_name.get('kind')!r} member "
-            f"({same_name.get('role')!r}); join under another name",
+            f"({same_name.get('role')!r}, {same_name.get('state')!r}); "
+            "join under another name",
         )
     active_members = board.list_members(include_removed=False)
     for existing in active_members:
