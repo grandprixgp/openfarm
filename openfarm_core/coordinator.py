@@ -1282,7 +1282,7 @@ class SwarmRunner:
                             self.coordinator._code_fallback.on_plan(rt, post_event=False)
                         ext_idle_since = time.monotonic()
                         continue
-                    head_now = self.board.head_seq()
+                    head_now = self.coordinator._scan_seq
                     with rt.coordinator_waiting():
                         self.board.wait_after(
                             head_now, min(self.coordinator.poll_interval_s, remaining_ext)

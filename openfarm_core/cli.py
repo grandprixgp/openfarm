@@ -77,6 +77,7 @@ from .swarm import (
     swarm_status,
     swarm_tiers,
 )
+from .tui import VIEWS as TUI_VIEWS, run_tui
 
 EXIT_OK = 0
 EXIT_REFUSED = 1
@@ -1961,6 +1962,19 @@ def build_parser() -> argparse.ArgumentParser:
     acp.add_argument("--setup-token", action="store_true",
                      help="run `claude setup-token` for long-lived CLAUDE_CODE_OAUTH_TOKEN")
 
+    tui_p = sub.add_parser(
+        "tui",
+        help="open interactive terminal UI or render one snapshot",
+    )
+    tui_p.add_argument("--run", dest="run_id", default=None,
+                       help="pin TUI to a specific run id")
+    tui_p.add_argument("--refresh", type=float, default=1.0,
+                       help="refresh interval in seconds (default: 1.0)")
+    tui_p.add_argument("--once", action="store_true",
+                       help="render a single view snapshot and exit")
+    tui_p.add_argument("--view", choices=TUI_VIEWS, default="overview",
+                       help="initial TUI view (default: overview)")
+
     return parser
 
 
@@ -2168,12 +2182,29 @@ def cmd_acp(args) -> int:
     return EXIT_OK
 
 
+def cmd_tui(args) -> int:
+    if args.refresh is not None and args.refresh <= 0:
+        raise UsageError("--refresh must be positive")
+    repo = Path(args.repo) if getattr(args, "repo", None) else Path.cwd()
+    config_path = Path(args.config) if getattr(args, "config", None) else None
+    return run_tui(
+        repo=repo,
+        config_path=config_path,
+        run_id=args.run_id,
+        refresh_s=float(args.refresh or 1.0),
+        once=bool(args.once),
+        view=args.view,
+        json_output=bool(getattr(args, "json", False)),
+    )
+
+
 PRE_CONFIG_COMMANDS = {
     "adopt": cmd_adopt,
     "bench": cmd_bench,
     "init": cmd_init,
     "install-skill": cmd_install_skill,
     "acp": cmd_acp,
+    "tui": cmd_tui,
 }
 
 
