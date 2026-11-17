@@ -875,7 +875,14 @@ def swarm_remove(
     source=None,
     outside: bool = False,
 ) -> dict:
-    """Remove a member whose card is finished."""
+    """Remove a member whose card is finished.
+
+    Finished is the board's say alone (`_finished_cards_from_board`: the card's
+    own final post, or blocked before it started), so a caller can never have
+    the members of a card whose thread is still running removed. A
+    `finished_cards` argument is accepted for older callers and not used.
+    """
+    del finished_cards
     _require_coordinator(board, caller, outside=outside)
     member = board.get_member(member_name)
     if member is None:
@@ -898,8 +905,7 @@ def swarm_remove(
 
     card_id = str(member.get("card", "") or "")
     if card_id:
-        finished = set(finished_cards or ()) | _finished_cards_from_board(board)
-        if card_id not in finished:
+        if card_id not in _finished_cards_from_board(board):
             cards_map = _load_cards_map(source, cards_by_id)
             card = cards_map.get(card_id)
             if card is None and source is not None and hasattr(source, "read"):

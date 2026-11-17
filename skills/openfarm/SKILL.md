@@ -30,9 +30,9 @@ See [prompts/wave_operator.md](./prompts/wave_operator.md) for the full operator
    # ACP / configured-seat mode:
    openfarm run --cards 3 --spend 10.00 --json
    # Or automated external Driver mode (claude, antigravity/agy, or codex):
-   openfarm drive --agent claude --seat both --cards 3 --spend 10.00 --wave --record-verdict --json
+   openfarm drive --agent claude --seat both --cards 3 --spend 10.00 --wave --json
    ```
-   Openfarm handles worktree isolation, Phase A fail-before tests, scaffold contracts, Phase B checkpoints, retries, ACP coaching / Driver board coordination, `revert-check`, checker counter-tests, and `HarnessLibrary` capture (`<state_dir>/harness/`) **without feeding build logs into your context window**. (`openfarm drive --wave --record-verdict` inspects `in-review` dossiers and diffs without reading `never_touch` files and records verdicts without merging or pushing.)
+   Openfarm handles worktree isolation, Phase A fail-before tests, scaffold contracts, Phase B checkpoints, retries, ACP coaching / Driver board coordination, `revert-check`, checker counter-tests, and `HarnessLibrary` capture (`<state_dir>/harness/`) **without feeding build logs into your context window**. (`openfarm drive --wave` adds the driver's own first look at each `in-review` card, without reading `never_touch` files and without merging or pushing. With `--record-verdict` it writes that look to `verdict.json` marked `by: driver/<agent>`, only where no verdict exists yet, never `clean` on a cut diff, and records nothing when the driver gave no usable answer. It is a cheap model's opinion, not a review: your own or the frontier lane's verdict in step 4 still decides the merge.)
 3. **Review Compact Dossiers & Actual Git Diff**:
    ```bash
    git branch --list 'openfarm/*'

@@ -5,8 +5,8 @@ Follow this protocol whenever running Openfarm waves on a project:
 1. **Never paste raw `cargo` build logs or intermediate failed attempt diffs into frontier conversation.** Rely on `openfarm run --cards N --json` (ACP mode) or `openfarm drive --agent claude|antigravity|codex --seat both --cards N --json` (Driver mode) to return compact per-card summaries (`final_state`, `stop_code`, `branch`, `harness_revision`).
 2. **Respect the local-only boundary**:
    - Openfarm never pushes branches.
-   - Review `openfarm dossier <CARD-ID>` (note: test diff precedes production diff) and `git diff main..<branch>` (or use `openfarm drive --wave --record-verdict`, which reviews without reading `never_touch` and never merges/pushes) before merging onto `main` with `git merge --no-ff`.
-3. **Always record `openfarm verdict`** (`clean`, `minor-fix`, `bounced`, `scrapped` with `--review-tokens <n>`, or `--wave --record-verdict` in Driver mode) so payback and review metrics remain accurate.
+   - Review `openfarm dossier <CARD-ID>` (note: test diff precedes production diff) and `git diff main..<branch>` (`openfarm drive --wave` can add the driver's own first look, but it does not replace this review) before merging onto `main` with `git merge --no-ff`.
+3. **Always record `openfarm verdict`** (`clean`, `minor-fix`, `bounced`, `scrapped` with `--review-tokens <n>`) yourself; a `verdict.json` marked `by: driver/<agent>` from `--wave --record-verdict` is the driver's opinion, not yours: check it and record your own, so payback and review metrics remain accurate.
 4. **Recover cleanly from blocks**:
    - `dirty-baseline`: inspect failing test on `main`, fix or add exact test name to `known_failing` outside the farm, clear cache if needed, re-run `--dry-run`.
    - `infra`: fix disk/endpoint/ACP issue (if OAuth expired, run `openfarm acp login --provider claude|antigravity|codex`), run `openfarm resume`, `openfarm release <ID> --reason "infra retry"`, and re-run.

@@ -406,6 +406,12 @@ def cmd_run(ctx: Context, args) -> int:
         _emit_ctx(ctx, {"refused": True,
                         "reason": f"another run holds the lock: {holder.get('run_id')}"}, "run")
         return EXIT_REFUSED
+    stale = getattr(ctx.state, "last_lock_takeover", None)
+    if stale:
+        print(f"note: took over run.lock from run {stale.get('run_id')!r} "
+              f"(pid {stale.get('pid')} on {stale.get('host')}, started "
+              f"{stale.get('started_at')}), which is no longer running",
+              file=sys.stderr)
 
     try:
         return _do_run(ctx, args, run_id)
@@ -2420,6 +2426,9 @@ def build_parser() -> argparse.ArgumentParser:
                          default=None, help="reasoning effort for the driver agent")
     drive_p.add_argument("--max-turns", type=int, default=40,
                          help="maximum driver turns (default: 40)")
+    drive_p.add_argument("--turn-timeout", type=float, default=180.0, metavar="SECONDS",
+                         help="seconds one driver turn may take before it is ended "
+                              "(default: 180)")
     drive_p.add_argument("--wave", action="store_true",
                          help="inspect in-review dossiers and diffs after the run")
     drive_p.add_argument("--record-verdict", action="store_true",
@@ -2701,6 +2710,7 @@ def cmd_drive(ctx: Context, args) -> int:
         wave=bool(args.wave),
         record_verdict=bool(args.record_verdict),
         script=Path(args.script) if getattr(args, "script", None) else None,
+        turn_timeout=getattr(args, "turn_timeout", 180.0),
     )
     _emit_ctx(ctx, payload, "drive")
     if payload.get("refused"):
