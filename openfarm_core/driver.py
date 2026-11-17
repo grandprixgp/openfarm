@@ -2904,7 +2904,8 @@ def _end_drive(
             if member is None or member.get("state") == "removed":
                 continue
             seat = str(member.get("role") or "")
-            board.update_member(name, state="removed")
+            # `left_seat`: it left by itself, so the same driver may join again.
+            board.update_member(name, state="removed", left_seat=True)
             board.post(
                 author="system",
                 to=["all"],
