@@ -16,9 +16,11 @@ import subprocess
 import tomllib
 from pathlib import Path
 
+from . import confine as confine_lib
 from .adapters.acp import (
     ACP_PROVIDERS,
     ClaudeAcpAdapter,
+    _bridge_provider,
     acp_adapter_for_provider,
     infer_acp_provider,
     is_acp_adapter,
@@ -352,6 +354,7 @@ def inspect_acp_status(
             codex_acp_bin=codex_acp_bin,
         )
 
+    confinement = _confinement_report(cfg, providers)
     primary = providers[primary_provider]
     claude_info = providers.get("claude") or {}
 
@@ -369,7 +372,10 @@ def inspect_acp_status(
         "credentials_mode": primary["credentials_mode"],
         "cli_auth": primary["cli_auth"],
         "providers": providers,
+        "confinement": confinement,
     }
+    if confinement.get("notes"):
+        payload["hint"] = " ".join(str(n) for n in confinement["notes"])
     if "antigravity" in providers:
         payload["agy_cli"] = providers["antigravity"].get("agy_cli")
         payload["antigravity_acp"] = providers["antigravity"].get("antigravity_acp")
@@ -410,6 +416,57 @@ def inspect_acp_status(
             }
 
     return payload
+
+
+def _repo_confine(cfg: Config | None) -> confine_lib.ConfineSettings:
+    if cfg is None:
+        return confine_lib.ConfineSettings()
+    return confine_lib.settings_from_config(cfg)
+
+
+def _provider_transport(cfg: Config | None, provider: str, info: dict) -> str:
+    """`bridge` when openfarm's own bridge would run this provider, else `server`."""
+    cmd: list[str] | None = None
+    if cfg is not None and is_acp_adapter(cfg.micromanager_adapter) \
+            and normalize_acp_provider(cfg.micromanager_adapter) == provider:
+        raw_bin = str(cfg.micromanager.binary or "auto")
+        if raw_bin != "auto":
+            try:
+                cmd = resolve_acp_command([raw_bin, *cfg.micromanager.args], provider=provider)
+            except (Invalid, ValueError):
+                cmd = None
+    if cmd is None:
+        cmd = [str(c) for c in (info.get("resolved_command") or [])]
+    return "bridge" if _bridge_provider(cmd) else "server"
+
+
+def _confinement_report(cfg: Config | None, providers: dict[str, dict]) -> dict:
+    """How each provider's child would be held, per tool policy, under the repo's setting."""
+    settings = _repo_confine(cfg)
+    needs_bwrap = settings.mode != "off" and (
+        settings.mode == "bwrap" or any(p != "claude" for p in providers))
+    usable, detail = confine_lib.bwrap_status() if needs_bwrap else (False, "not checked")
+    notes: list[str] = []
+    for name, info in providers.items():
+        transport = _provider_transport(cfg, name, info)
+        held: dict[str, object] = {"mode": settings.mode, "transport": transport}
+        for policy in ("none", "read-only"):
+            hold = confine_lib.decide(name, transport=transport, tool_policy=policy,
+                                      mode=settings.mode, bwrap_usable=usable,
+                                      bwrap_reason=detail)
+            held[policy] = hold.describe()
+            if hold.refused:
+                held[f"{policy}_refused"] = hold.refused
+            if hold.note and hold.note not in notes:
+                notes.append(hold.note)
+        info["confinement"] = held
+    return {
+        "setting": confine_lib.CONFINE_SETTING,
+        "mode": settings.mode,
+        "bwrap": {"usable": usable, "detail": detail},
+        "read_roots": list(settings.read_roots),
+        "notes": notes,
+    }
 
 
 def run_acp_login(
@@ -753,6 +810,7 @@ def _probe_single_provider(
     effective_iso: bool,
     effective_auth_file: Path | str | None,
     timeout_s: float,
+    confine: confine_lib.ConfineSettings | None = None,
 ) -> dict[str, object]:
     adapter = ClaudeAcpAdapter(
         command=cmd,
@@ -761,22 +819,32 @@ def _probe_single_provider(
         isolate_home=effective_iso,
         auth_file=effective_auth_file,
         auth_mode=effective_auth,
+        confine=confine,
     )
     try:
         init_res = adapter.initialize(timeout_s=float(timeout_s))
         resolved_argv = list(adapter.argv)
         agent_caps = dict(adapter.agent_capabilities)
         auth_methods = list(adapter.auth_methods)
+        held = adapter.confinement_summary()
+        notes = list(adapter.notes)
     finally:
         adapter.close()
-    return {
+    out: dict[str, object] = {
         "ok": True,
         "provider": provider,
         "protocol_version": init_res.get("protocolVersion"),
         "resolved_argv": resolved_argv,
         "agent_capabilities": agent_caps,
         "auth_methods": auth_methods,
+        "confinement": held,
     }
+    off_note = held["none"].get("note") if isinstance(held.get("none"), dict) else ""
+    if off_note and off_note not in notes:
+        notes.append(off_note)
+    if notes:
+        out["notes"] = notes
+    return out
 
 
 def probe_acp(
@@ -804,8 +872,10 @@ def probe_acp(
         except Invalid as exc:
             raise UsageError(exc.message) from exc
 
+    confine_settings = confine_lib.ConfineSettings()
     if (repo_path / CONFIG_PATH).is_file():
         cfg = load_config(repo_path)
+        confine_settings = _repo_confine(cfg)
         repo_provider = _repo_acp_provider(cfg)
         effective_auth = cfg.micromanager.auth
         effective_iso = cfg.micromanager.isolate_home
@@ -843,6 +913,7 @@ def probe_acp(
                     effective_iso=effective_iso,
                     effective_auth_file=effective_auth_file,
                     timeout_s=timeout_s,
+                    confine=confine_settings,
                 )
             except (AdapterError, OSError) as exc:
                 results[item] = {
@@ -876,6 +947,7 @@ def probe_acp(
         effective_iso=effective_iso,
         effective_auth_file=effective_auth_file,
         timeout_s=timeout_s,
+        confine=confine_settings,
     )
     status = inspect_acp_status(repo_path, provider=prov)
     return {

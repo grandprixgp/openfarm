@@ -19,6 +19,12 @@ import threading
 import uuid
 from pathlib import Path
 
+if __package__ in (None, ""):
+    # Run as a script by the ACP adapter: make the package importable.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from openfarm_core import confine as confine_lib
+
 PROTOCOL_VERSION = 1
 _AUTH_HINT_RE = re.compile(
     r"not logged in|please run /login|authentication_failed|oauth|"
@@ -146,8 +152,15 @@ class NativeClaudeAcpServer:
             if isinstance(sys_meta, dict)
             else ""
         )
+        of_meta = meta.get("openfarm") if isinstance(meta.get("openfarm"), dict) else {}
+        confine_meta = of_meta.get("confine")
+        # Claude's own rules hold it; a boundary is added only when the adapter
+        # says so (`[micromanager] confine = "bwrap"`).
+        hold = confine_lib.bridge_plan("claude", tool_policy, confine_meta)
         sid = f"native-{uuid.uuid4().hex[:12]}"
         self._sessions[sid] = {
+            "hold": hold,
+            "confine_meta": confine_meta if isinstance(confine_meta, dict) else {},
             "cwd": cwd,
             "model": str(cc_opts.get("model") or ""),
             "effort": str(cc_opts.get("effort") or ""),
@@ -211,6 +224,17 @@ class NativeClaudeAcpServer:
             self._cancelled_sessions.discard(sid)
 
         argv = self._build_claude_argv(session)
+        hold = session.get("hold")
+        if hold is not None:
+            try:
+                argv = confine_lib.bridge_child_argv(
+                    argv, hold, session.get("confine_meta"), session_dir=session["cwd"])
+            except confine_lib.ConfineError as exc:
+                self._send_error(
+                    req_id, -32001, exc.message,
+                    data={"kind": "refused", "code": "acp-confine-unavailable"},
+                )
+                return
         try:
             proc = subprocess.Popen(
                 argv,

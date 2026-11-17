@@ -63,6 +63,13 @@ from openfarm_core.tui import collect_snapshot, render_snapshot
 
 STAND_IN = ROOT / "tests" / "acp_stand_in.py"
 
+from openfarm_core import confine as confine_lib
+from openfarm_core.confine import codex_tool_flags
+
+# Codex and Antigravity children need the bubblewrap boundary under `auto`; on a
+# host where bwrap cannot run, these tests run them unconfined instead.
+TEST_CONFINE = "auto" if confine_lib.bwrap_status()[0] else "off"
+
 
 def _base_config(state_dir: Path) -> dict:
     return {
@@ -386,7 +393,7 @@ class MultiProviderEnvAndSyncTests(unittest.TestCase):
         acp = ClaudeAcpAdapter(
             [sys.executable, str(STAND_IN), "--mode", "normal"],
             cwd=self.tmp,
-            provider="antigravity",
+            provider="antigravity", confine=TEST_CONFINE,
             isolate_home=True,
             auth_mode="oauth",
             env={"HOME": str(fake_home)},
@@ -445,7 +452,7 @@ class MultiProviderEnvAndSyncTests(unittest.TestCase):
         acp = ClaudeAcpAdapter(
             [sys.executable, str(STAND_IN), "--mode", "normal"],
             cwd=self.tmp,
-            provider="codex",
+            provider="codex", confine=TEST_CONFINE,
             isolate_home=True,
             auth_mode="oauth",
             env={"HOME": str(fake_home)},
@@ -467,7 +474,7 @@ class MultiProviderEnvAndSyncTests(unittest.TestCase):
         acp_bad = ClaudeAcpAdapter(
             [sys.executable, str(STAND_IN), "--mode", "normal"],
             cwd=self.tmp,
-            provider="codex",
+            provider="codex", confine=TEST_CONFINE,
             isolate_home=True,
             auth_mode="oauth",
             env={"HOME": str(fake_home)},
@@ -498,7 +505,7 @@ class NativeBridgesAndHandshakeTests(unittest.TestCase):
         with ClaudeAcpAdapter(
             [sys.executable, str(CODEX_NATIVE_ACP), "--codex-bin", str(mock_codex)],
             cwd=self.tmp,
-            provider="codex",
+            provider="codex", confine=TEST_CONFINE,
             isolate_home=True,
             auth_mode="oauth",
             env={"HOME": str(fake_home), "OPENAI_API_KEY": "sk-strip"},
@@ -525,6 +532,7 @@ class NativeBridgesAndHandshakeTests(unittest.TestCase):
                     "--ignore-rules",
                     "-s",
                     "read-only",
+                    *codex_tool_flags("read-only"),
                     "-C",
                     str(self.tmp),
                     "-m",
@@ -547,7 +555,7 @@ class NativeBridgesAndHandshakeTests(unittest.TestCase):
         with ClaudeAcpAdapter(
             [sys.executable, str(CODEX_NATIVE_ACP), "--codex-bin", str(bad_codex)],
             cwd=self.tmp,
-            provider="codex",
+            provider="codex", confine=TEST_CONFINE,
             auth_mode="oauth",
         ) as acp:
             sid = acp.new_session(cwd=self.tmp)
@@ -567,7 +575,7 @@ class NativeBridgesAndHandshakeTests(unittest.TestCase):
         with ClaudeAcpAdapter(
             [sys.executable, str(CODEX_NATIVE_ACP), "--codex-bin", str(sleep_codex)],
             cwd=self.tmp,
-            provider="codex",
+            provider="codex", confine=TEST_CONFINE,
             auth_mode="oauth",
         ) as acp:
             sid = acp.new_session(cwd=self.tmp)
@@ -587,7 +595,7 @@ class NativeBridgesAndHandshakeTests(unittest.TestCase):
         with ClaudeAcpAdapter(
             [sys.executable, str(AGY_NATIVE_ACP), "--agy-bin", str(mock_agy)],
             cwd=self.tmp,
-            provider="antigravity",
+            provider="antigravity", confine=TEST_CONFINE,
             isolate_home=True,
             auth_mode="oauth",
             env={"HOME": str(fake_home), "GEMINI_API_KEY": "strip-me", "GOOGLE_API_KEY": "strip-too"},
@@ -630,7 +638,7 @@ class NativeBridgesAndHandshakeTests(unittest.TestCase):
         with ClaudeAcpAdapter(
             [str(mock_agy), "acp"],
             cwd=self.tmp,
-            provider="antigravity",
+            provider="antigravity", confine=TEST_CONFINE,
             isolate_home=True,
             auth_mode="oauth",
             env={"HOME": str(fake_home)},
@@ -651,7 +659,7 @@ class NativeBridgesAndHandshakeTests(unittest.TestCase):
         bin_32601 = self.tmp / "bin-32601"
         bin_32601.mkdir()
         agy_32601 = _write_mock_agy(bin_32601, mode="ignore-32601")
-        with ClaudeAcpAdapter([str(agy_32601), "acp"], cwd=self.tmp, provider="antigravity") as acp:
+        with ClaudeAcpAdapter([str(agy_32601), "acp"], cwd=self.tmp, provider="antigravity", confine=TEST_CONFINE) as acp:
             sid = acp.new_session(cwd=self.tmp, model="m1", effort="low")
             res = acp.prompt(sid, "ok")
             self.assertEqual(json.loads(res.text)["cfg_calls"], [])
@@ -659,7 +667,7 @@ class NativeBridgesAndHandshakeTests(unittest.TestCase):
         bin_auth = self.tmp / "bin-auth"
         bin_auth.mkdir()
         agy_auth = _write_mock_agy(bin_auth, mode="auth-required")
-        with ClaudeAcpAdapter([str(agy_auth), "acp"], cwd=self.tmp, provider="antigravity") as acp:
+        with ClaudeAcpAdapter([str(agy_auth), "acp"], cwd=self.tmp, provider="antigravity", confine=TEST_CONFINE) as acp:
             with self.assertRaises(Refused) as caught:
                 acp.new_session(cwd=self.tmp)
             self.assertEqual(caught.exception.code, "acp-auth-required")
@@ -714,6 +722,7 @@ class ConfigWiringCoordinatorAndCliTests(unittest.TestCase):
             "mode": "active",
             "binary": str(mock_agy),
             "effort": "high",
+            "confine": TEST_CONFINE,
         }
         cfg = Config(data, self.repo)
         backend = open_backend(cfg)
@@ -744,6 +753,7 @@ class ConfigWiringCoordinatorAndCliTests(unittest.TestCase):
             "mode": "active",
             "binary": str(coord_codex),
             "effort": "medium",
+            "confine": TEST_CONFINE,
         }
         coord_data["swarm"] = {
             "enabled": True,

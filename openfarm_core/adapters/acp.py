@@ -40,6 +40,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
+from .. import confine as confine_lib
 from ..errors import AdapterError, Infra, Invalid, Refused
 from ..globs import escapes, matches_any, normalise
 
@@ -101,6 +102,16 @@ def _cleanup_all_isolated_homes() -> None:
 
 atexit.register(_cleanup_all_isolated_homes)
 
+_WARNED: set[str] = set()
+
+
+def _warn_once(text: str) -> None:
+    with _ISOLATED_HOMES_LOCK:
+        if text in _WARNED:
+            return
+        _WARNED.add(text)
+    print(f"openfarm: {text}", file=sys.stderr)
+
 # Control sequence strippers. Order matters: complete sequences first, then
 # lone unclosed prefixes so subsequent printable text is never truncated.
 _OSC_COMPLETE_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
@@ -134,6 +145,45 @@ _DEFAULT_FORBIDDEN_FILES: tuple[str, ...] = (
 CLAUDE_NATIVE_ACP = Path(__file__).resolve().with_name("claude_native_acp.py")
 AGY_NATIVE_ACP = Path(__file__).resolve().with_name("agy_native_acp.py")
 CODEX_NATIVE_ACP = Path(__file__).resolve().with_name("codex_native_acp.py")
+_BRIDGE_SCRIPTS = {
+    CLAUDE_NATIVE_ACP: "claude",
+    AGY_NATIVE_ACP: "antigravity",
+    CODEX_NATIVE_ACP: "codex",
+}
+class AcpCommand(list):
+    """An ACP command argv that carries its confinement settings along.
+
+    The settings reach the adapter through code that only passes `command` on
+    (the micromanager and the run's shared supervisor), so they ride with it.
+    """
+
+    confine: confine_lib.ConfineSettings = confine_lib.ConfineSettings()
+
+
+def acp_command(command: str | list[str], confine) -> AcpCommand:
+    """`command` as an argv list carrying `confine` (settings, a mode string or None)."""
+    if isinstance(command, str):
+        try:
+            argv = shlex.split(command)
+        except ValueError as exc:
+            raise Invalid("acp-bad-command", f"cannot parse ACP command {command!r}: {exc}") from exc
+    else:
+        argv = [str(part) for part in command]
+    out = AcpCommand(argv)
+    out.confine = confine_lib.as_settings(confine)
+    return out
+
+
+def _bridge_provider(argv: list[str]) -> str:
+    """The provider of openfarm's own bridge when `argv` runs one, else ``""``."""
+    if len(argv) < 2:
+        return ""
+    try:
+        return _BRIDGE_SCRIPTS.get(Path(argv[1]).resolve(), "")
+    except (OSError, ValueError):
+        return ""
+
+
 
 
 def normalize_acp_provider(value: str) -> str:
@@ -669,6 +719,7 @@ class ClaudeAcpAdapter:
         allowed_root: Path | str | None = None,
         max_line_bytes: int = DEFAULT_MAX_LINE_BYTES,
         stderr_tail_lines: int = 100,
+        confine=None,
     ) -> None:
         if auth_mode not in ("oauth", "api-key", "auto"):
             raise Invalid(
@@ -678,6 +729,16 @@ class ClaudeAcpAdapter:
         self.provider = infer_acp_provider(command, provider)
         self.name = f"{self.provider}-acp"
         self.argv = resolve_acp_command(command, provider=self.provider)
+        if confine is None:
+            confine = getattr(command, "confine", None)
+        try:
+            self.confine = confine_lib.as_settings(confine)
+        except confine_lib.ConfineError as exc:
+            raise Invalid(exc.code, exc.message) from exc
+        self.transport = "bridge" if _bridge_provider(self.argv) else "server"
+        self.process_hold: confine_lib.Hold | None = None
+        self._boundary_root: Path | None = None
+        self.notes: list[str] = []
 
         self.cwd = Path(cwd or Path.cwd())
         self.allowed_root = Path(allowed_root or self.cwd).resolve()
@@ -754,6 +815,9 @@ class ClaudeAcpAdapter:
         self._stderr_tail.clear()
         self._orig_home = (self.extra_env or {}).get("HOME") or os.environ.get("HOME", "")
         self._initial_creds_bytes = None
+        hold = self._decide_hold("none")
+        if self.transport == "server" and hold.refused:
+            raise Refused("acp-confine-unavailable", hold.refused)
         env, isolated_home = _sanitised_env(
             extra_env=self.extra_env,
             isolate_home=self.isolate_home,
@@ -771,9 +835,28 @@ class ClaudeAcpAdapter:
                     self._initial_creds_bytes = iso_creds.read_bytes()
                 except OSError:
                     self._initial_creds_bytes = None
+        argv = list(self.argv)
+        if self.transport == "server":
+            self.process_hold = hold
+            self._note_hold(hold)
+            if hold.boundary:
+                try:
+                    argv = confine_lib.boundary_argv(
+                        argv,
+                        session_dir=self.cwd,
+                        home_dir=isolated_home,
+                        hide_globs=self._hide_globs(),
+                        hide_paths=self.confine.hide_paths,
+                        read_roots=self.confine.read_roots,
+                        env=env,
+                    )
+                except confine_lib.ConfineError as exc:
+                    self._cleanup_isolated_home()
+                    raise Refused("acp-confine-unavailable", exc.message) from exc
+                self._boundary_root = self.cwd.resolve()
         try:
             proc = subprocess.Popen(
-                self.argv,
+                argv,
                 cwd=str(self.cwd),
                 env=env,
                 stdin=subprocess.PIPE,
@@ -786,7 +869,7 @@ class ClaudeAcpAdapter:
             self._cleanup_isolated_home()
             raise Infra(
                 "acp-spawn-failed",
-                f"{self.argv[0]} could not start: {exc}",
+                f"{argv[0]} could not start: {exc}",
             ) from exc
 
         self._proc = proc
@@ -985,6 +1068,80 @@ class ClaudeAcpAdapter:
     def _isolated_cred_path(self, home_dir: Path) -> Path:
         return home_dir.joinpath(*self._cred_relpath())
 
+    # -- confinement ----------------------------------------------------------
+
+    def _hide_globs(self) -> list[str]:
+        out: list[str] = []
+        for pat in (*_DEFAULT_FORBIDDEN_FILES, *self.forbidden_files, *self.never_touch):
+            norm = normalise(str(pat or ""))
+            if norm and norm not in out:
+                out.append(norm)
+        return out
+
+    def _decide_hold(self, tool_policy: str) -> confine_lib.Hold:
+        mode = self.confine.mode
+        needs_check = not (mode == "off" or (mode == "auto" and self.provider == "claude"))
+        usable, reason = confine_lib.bwrap_status() if needs_check else (False, "")
+        return confine_lib.decide(
+            self.provider,
+            transport=self.transport,
+            tool_policy=tool_policy,
+            mode=mode,
+            bwrap_usable=usable,
+            bwrap_reason=reason,
+        )
+
+    def _note_hold(self, hold: confine_lib.Hold) -> None:
+        if hold.note and hold.note not in self.notes:
+            self.notes.append(hold.note)
+            _warn_once(hold.note)
+
+    def confinement_summary(self) -> dict:
+        """How this adapter's children are (or would be) held, per tool policy."""
+        out: dict[str, object] = {"mode": self.confine.mode, "transport": self.transport}
+        for policy in ("none", "read-only"):
+            out[policy] = self._decide_hold(policy).as_dict()
+        return out
+
+    def _bridge_meta(self, tool_policy: str, hold: confine_lib.Hold) -> dict:
+        return {
+            "toolPolicy": tool_policy,
+            "confine": {
+                "mode": self.confine.mode,
+                "flags": hold.flags,
+                "boundary": hold.boundary,
+                "bwrap": confine_lib.find_bwrap() if hold.boundary else "",
+                "hideGlobs": self._hide_globs(),
+                "hidePaths": list(self.confine.hide_paths),
+                "readRoots": list(self.confine.read_roots),
+            },
+        }
+
+    def _check_session_inside_boundary(self, session_cwd: Path) -> None:
+        root = self._boundary_root
+        if root is None:
+            return
+        try:
+            resolved = session_cwd.resolve()
+        except (OSError, ValueError) as exc:
+            raise Refused("acp-confine-session-outside", f"bad session folder {session_cwd}: {exc}") from exc
+        if resolved != root and root not in resolved.parents:
+            raise Refused(
+                "acp-confine-session-outside",
+                f"this {self.provider} ACP server was confined to {root} when it started; "
+                f"a session at {resolved} would be outside its boundary. Use openfarm's own "
+                "bridge ([micromanager] binary = \"codex-exec\" for Codex, \"agy-print\" for "
+                "Antigravity), or set [micromanager] confine = \"off\".",
+            )
+        parts = resolved.relative_to(root).parts
+        globs = self._hide_globs()
+        if any(matches_any("/".join(parts[: i + 1]), globs) for i in range(len(parts))):
+            raise Refused(
+                "acp-confine-session-outside",
+                f"session folder {resolved} is hidden inside this server's boundary "
+                "(never_touch / forbidden_files)",
+            )
+
     def _persist_refreshed_oauth_credentials(self) -> None:
         """Persist refreshed OAuth credentials back to host HOME safely."""
         if (
@@ -1091,6 +1248,7 @@ class ClaudeAcpAdapter:
             self._session_ids.clear()
             self._session_cost_usd = 0.0
             self._initial_creds_bytes = None
+            self._boundary_root = None
             self._cleanup_isolated_home()
 
     # -- ACP RPC methods ------------------------------------------------------
@@ -1347,8 +1505,15 @@ class ClaudeAcpAdapter:
                 "acp-bad-tool-policy",
                 f"tool_policy must be 'none' or 'read-only', got {tool_policy!r}",
             )
+        session_path = Path(cwd) if cwd is not None else self.cwd
+        hold = self._decide_hold(tool_policy)
+        if hold.refused:
+            raise Refused("acp-confine-unavailable", hold.refused)
         if not self._initialized:
             self.initialize(timeout_s=timeout_s)
+        self._check_session_inside_boundary(session_path)
+        if self.transport == "bridge":
+            self._note_hold(hold)
         if (
             not self._authenticated
             and self.auth_methods
@@ -1388,8 +1553,11 @@ class ClaudeAcpAdapter:
             if effort:
                 codex_opts["effort"] = str(effort)
             meta["codex"] = {"options": codex_opts}
+        if self.transport == "bridge":
+            # openfarm's own bridges apply the policy and the boundary per prompt.
+            meta["openfarm"] = self._bridge_meta(tool_policy, hold)
 
-        session_cwd = str(Path(cwd) if cwd is not None else self.cwd)
+        session_cwd = str(session_path)
         req_id = self._next_id()
         deadline = time.monotonic() + float(timeout_s)
         self._send_json(
@@ -1440,10 +1608,15 @@ class ClaudeAcpAdapter:
                 "acp-bad-tool-policy",
                 f"tool_policy must be 'none' or 'read-only', got {tool_policy!r}",
             )
+        hold = self._decide_hold(tool_policy)
+        if hold.refused:
+            raise Refused("acp-confine-unavailable", hold.refused)
         if not self._initialized:
             self.initialize(timeout_s=timeout_s)
 
-        session_cwd = str(Path(cwd) if cwd is not None else self.cwd)
+        session_path = Path(cwd) if cwd is not None else self.cwd
+        self._check_session_inside_boundary(session_path)
+        session_cwd = str(session_path)
         req_id = self._next_id()
         deadline = time.monotonic() + float(timeout_s)
         self._replaying_history = True

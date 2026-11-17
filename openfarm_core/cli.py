@@ -2646,8 +2646,38 @@ def cmd_acp(args) -> int:
         )
     else:
         raise UsageError(f"unknown acp action: {action}")
-    _emit_standalone(payload, bool(getattr(args, "json", False)), kind=f"acp_{action}")
+    want_json = bool(getattr(args, "json", False))
+    _emit_standalone(payload, want_json, kind=f"acp_{action}")
+    if not want_json and action in ("status", "probe"):
+        for line in _acp_confinement_lines(payload):
+            print(line)
     return EXIT_OK
+
+
+def _acp_confinement_lines(payload: dict) -> list[str]:
+    """Plain lines saying how each provider's child is held: flags, boundary or nothing."""
+    block = payload.get("confinement")
+    providers = payload.get("providers")
+    if not isinstance(block, dict) or not isinstance(providers, dict):
+        return []
+    bw = block.get("bwrap") if isinstance(block.get("bwrap"), dict) else {}
+    head = (f"Confinement ({block.get('setting', '[micromanager] confine')} = "
+            f"\"{block.get('mode', 'auto')}\"; bwrap: {bw.get('detail', 'unknown')})")
+    lines = ["", head]
+    for name, info in providers.items():
+        held = info.get("confinement") if isinstance(info, dict) else None
+        if not isinstance(held, dict):
+            continue
+        line = (f"  {name}: tool policy none -> {held.get('none', '?')}, "
+                f"read-only -> {held.get('read-only', '?')} ({held.get('transport', '?')})")
+        lines.append(line)
+        for policy in ("none", "read-only"):
+            why = held.get(f"{policy}_refused")
+            if why:
+                lines.append(f"    {policy}: {why}")
+    for note in block.get("notes") or ():
+        lines.append(f"  note: {note}")
+    return lines
 
 
 def cmd_tui(args) -> int:

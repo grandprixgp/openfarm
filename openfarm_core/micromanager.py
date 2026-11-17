@@ -2465,6 +2465,21 @@ def open_micromanager(
             binary = str(_cfg_get(mm_cfg, "binary", "auto") or "auto")
             raw_args = _cfg_get(mm_cfg, "args", None) or []
             command = [binary, *[str(a) for a in raw_args]] if raw_args else binary
+        from . import confine as confine_lib
+        from .adapters.acp import acp_command
+
+        # The confinement settings ride on the command to every adapter it opens,
+        # including the run's shared supervisor process.
+        key_file = _cfg_get(cfg, "key_file", None)
+        try:
+            confine_settings = confine_lib.ConfineSettings(
+                mode=str(_cfg_get(mm_cfg, "confine", "auto") or "auto"),
+                read_roots=tuple(str(r) for r in (_cfg_get(mm_cfg, "confine_read_roots", ()) or ())),
+                hide_paths=(str(key_file),) if key_file else (),
+            )
+        except confine_lib.ConfineError as exc:
+            raise Invalid(exc.code, exc.message) from exc
+        command = acp_command(command, confine_settings)
         model = str(
             _cfg_get(mm_cfg, "model", _cfg_get(cfg, "micromanager_model", "")) or ""
         )

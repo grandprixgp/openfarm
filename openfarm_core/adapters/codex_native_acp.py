@@ -19,6 +19,12 @@ import threading
 import uuid
 from pathlib import Path
 
+if __package__ in (None, ""):
+    # Run as a script by the ACP adapter: make the package importable.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from openfarm_core import confine as confine_lib
+
 PROTOCOL_VERSION = 1
 _AUTH_HINT_RE = re.compile(
     r"not logged in|please run.*login|codex login|authentication_failed|"
@@ -235,12 +241,27 @@ class NativeCodexAcpServer:
             if isinstance(sys_meta, dict)
             else ""
         )
+        of_meta = meta.get("openfarm") if isinstance(meta.get("openfarm"), dict) else {}
+        tool_policy = str(of_meta.get("toolPolicy") or opts.get("toolPolicy") or "none")
+        if tool_policy not in ("none", "read-only"):
+            self._send_error(req_id, -32602, f"Unknown tool policy: {tool_policy!r}")
+            return
+        confine_meta = of_meta.get("confine")
+        hold = confine_lib.bridge_plan("codex", tool_policy, confine_meta)
+        if hold.refused:
+            self._send_error(
+                req_id, -32001, hold.refused,
+                data={"kind": "refused", "code": "acp-confine-unavailable"},
+            )
+            return
         sid = f"codex-native-{uuid.uuid4().hex[:12]}"
         self._sessions[sid] = {
             "cwd": cwd,
             "model": str(opts.get("model") or ""),
             "effort": str(opts.get("effort") or ""),
-            "tool_policy": str(opts.get("toolPolicy") or "read-only"),
+            "tool_policy": tool_policy,
+            "hold": hold,
+            "confine_meta": confine_meta if isinstance(confine_meta, dict) else {},
             "system_prompt": system_prompt,
             "used_tokens": 0,
             "cum_cost": 0.0,
@@ -248,6 +269,10 @@ class NativeCodexAcpServer:
         self._send_result(req_id, {"sessionId": sid})
 
     def _build_codex_argv(self, session: dict) -> list[str]:
+        """The `codex exec` argv; the boundary, when held so, wraps it in `_child_argv`."""
+        tool_policy = str(session.get("tool_policy") or "none")
+        hold = session.get("hold")
+        flags = bool(getattr(hold, "flags", True))
         argv = [
             self.codex_bin,
             "exec",
@@ -258,15 +283,24 @@ class NativeCodexAcpServer:
             "--ignore-rules",
             "-s",
             "read-only",
-            "-C",
-            session["cwd"],
         ]
+        if flags:
+            argv.extend(confine_lib.codex_tool_flags(tool_policy))
+        argv.extend(["-C", session["cwd"]])
         if session["model"]:
             argv.extend(["-m", session["model"]])
         if session["effort"]:
             argv.extend(["-c", f'model_reasoning_effort={json.dumps(session["effort"])}'])
         argv.append("-")
         return argv
+
+    def _child_argv(self, session: dict) -> list[str]:
+        argv = self._build_codex_argv(session)
+        hold = session.get("hold")
+        if hold is None:
+            return argv
+        return confine_lib.bridge_child_argv(
+            argv, hold, session.get("confine_meta"), session_dir=session["cwd"])
 
     def _run_prompt(self, req_id: object, params: dict) -> None:
         sid = str(params.get("sessionId") or "")
@@ -285,7 +319,14 @@ class NativeCodexAcpServer:
         with self._proc_lock:
             self._cancelled_sessions.discard(sid)
 
-        argv = self._build_codex_argv(session)
+        try:
+            argv = self._child_argv(session)
+        except confine_lib.ConfineError as exc:
+            self._send_error(
+                req_id, -32001, exc.message,
+                data={"kind": "refused", "code": "acp-confine-unavailable"},
+            )
+            return
         try:
             proc = subprocess.Popen(
                 argv,

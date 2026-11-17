@@ -18,6 +18,12 @@ import threading
 import uuid
 from pathlib import Path
 
+if __package__ in (None, ""):
+    # Run as a script by the ACP adapter: make the package importable.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from openfarm_core import confine as confine_lib
+
 PROTOCOL_VERSION = 1
 _AUTH_HINT_RE = re.compile(
     r"not logged in|please run /login|authentication_failed|"
@@ -214,6 +220,20 @@ class NativeAgyAcpServer:
         elif isinstance(sys_meta, dict) and sys_meta.get("append"):
             system_prompt = str(sys_meta.get("append") or "")
 
+        of_meta = meta.get("openfarm") if isinstance(meta.get("openfarm"), dict) else {}
+        tool_policy = str(of_meta.get("toolPolicy") or "none")
+        if tool_policy not in ("none", "read-only"):
+            self._send_error(req_id, -32602, f"Unknown tool policy: {tool_policy!r}")
+            return
+        confine_meta = of_meta.get("confine")
+        hold = confine_lib.bridge_plan("antigravity", tool_policy, confine_meta)
+        if hold.refused:
+            self._send_error(
+                req_id, -32001, hold.refused,
+                data={"kind": "refused", "code": "acp-confine-unavailable"},
+            )
+            return
+
         sid = f"agy-native-{uuid.uuid4().hex[:12]}"
         model = str(opts.get("model") or "")
         effort = str(opts.get("effort") or "")
@@ -221,6 +241,9 @@ class NativeAgyAcpServer:
             "cwd": cwd,
             "model": model,
             "effort": effort,
+            "tool_policy": tool_policy,
+            "hold": hold,
+            "confine_meta": confine_meta if isinstance(confine_meta, dict) else {},
             "system_prompt": system_prompt,
             "used_tokens": 0,
             "cum_cost": 0.0,
@@ -273,6 +296,13 @@ class NativeAgyAcpServer:
         argv.extend(["-p", full_prompt])
         return argv
 
+    def _child_argv(self, session: dict, argv: list[str]) -> list[str]:
+        hold = session.get("hold")
+        if hold is None:
+            return argv
+        return confine_lib.bridge_child_argv(
+            argv, hold, session.get("confine_meta"), session_dir=session["cwd"])
+
     def _run_prompt(self, req_id: object, params: dict) -> None:
         sid = str(params.get("sessionId") or "")
         session = self._sessions.get(sid)
@@ -291,6 +321,14 @@ class NativeAgyAcpServer:
             self._cancelled_sessions.discard(sid)
 
         argv = self._build_agy_argv(session, full_prompt)
+        try:
+            argv = self._child_argv(session, argv)
+        except confine_lib.ConfineError as exc:
+            self._send_error(
+                req_id, -32001, exc.message,
+                data={"kind": "refused", "code": "acp-confine-unavailable"},
+            )
+            return
         try:
             proc = subprocess.Popen(
                 argv,
