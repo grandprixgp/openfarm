@@ -515,11 +515,27 @@ def _unfence(text: str) -> str:
     return "\n".join(lines).rstrip() + "\n" if lines else ""
 
 
+#: After a test's name in a header: where it lives or what it does, not its name.
+_PATH_TAIL_RE = re.compile(r"\s+(?:(?:in|at)\s+\S*[/.]\S*|\([^()]*[/.][^()]*\))\s*$")
+_NAME_TAIL_RE = re.compile(
+    r"\s+(?:(?:in|at)\s+\S*[/.]\S*|\(.*\)|[-–—:]\s.*|[-–—])\s*$")
+
+
 def _test_name(raw: str) -> str:
+    """The test's name from a header or a JSON entry.
+
+    `name in tests/x.py`, `name (tests/x.py)` and `name - what it checks` give
+    `name`. A name with spaces is kept whole: a `node:test` title is a sentence
+    ("a value below the range becomes the bottom"), and the runner reports it so.
+    """
     name = raw.strip().strip("`'\"*").strip()
-    # `name in tests/x.py` or `name (tests/x.py)`: the name is the first word.
-    name = re.split(r"\s+(?:in|at|\()\s*|\s+", name, maxsplit=1)[0]
-    return name.strip("`'\"*:()")
+    first, _, rest = name.partition(" ")
+    if rest and re.fullmatch(r"[A-Za-z_][\w:.]*", first.strip("`'\"*")) \
+            and _NAME_TAIL_RE.match(" " + rest.strip()):
+        name = first
+    else:
+        name = _PATH_TAIL_RE.sub("", name)
+    return name.strip().strip("`'\"*:").strip()
 
 
 def _add_test(tests: list[dict], dropped: list[dict], name: str, content: str,

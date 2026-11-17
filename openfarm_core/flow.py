@@ -3908,6 +3908,11 @@ class CardRun:
                 if got and (got.endswith(("::" + name, "." + name))
                             or name.endswith(("::" + got, "." + got))):
                     return entry.get("status", "")
+            # `test_x checks the start`: a header with words after a one-word
+            # name, from a language whose test names have no spaces.
+            first = name.split(" ", 1)[0]
+            if first != name:
+                return status_of(parsed, first)
             return "not-run"
 
         for index, counter in enumerate(tests, start=1):
