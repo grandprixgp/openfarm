@@ -2140,16 +2140,18 @@ def build_parser() -> argparse.ArgumentParser:
         "bench",
         help="run the efficacy bench",
         formatter_class=raw_fmt,
-        epilog="Examples:\n  openfarm bench\n  openfarm bench list --dir bench\n  openfarm bench run --dry-run --task py-bounded-full",
+        epilog="Examples:\n  openfarm bench\n  openfarm bench list --tasks bench\n  openfarm bench run --dry-run --task py-bounded-full",
     )
     bench_sub = bench.add_subparsers(dest="bench_command")
     bench_list = bench_sub.add_parser("list", help="list bench tasks")
-    bench_list.add_argument("--dir", default="bench",
-                            help="directory of bench tasks")
+    bench_list.add_argument("--tasks", "--dir", dest="dir", default="bench",
+                            help="folder of bench tasks, one folder per task with a task.toml "
+                            "(default: ./bench; the openfarm checkout ships one)")
     bench_run = bench_sub.add_parser(
         "run", help="run bench tasks in each arm and write a local report")
-    bench_run.add_argument("--dir", default="bench",
-                           help="directory of bench tasks")
+    bench_run.add_argument("--tasks", "--dir", dest="dir", default="bench",
+                           help="folder of bench tasks, one folder per task with a task.toml "
+                           "(default: ./bench; the openfarm checkout ships one)")
     bench_run.add_argument("--task", action="append", default=[],
                            help="task id to run (repeatable; default: all)")
     bench_run.add_argument("--arm", action="append", default=[],
@@ -2322,6 +2324,31 @@ def _emit_bench_error(message: str, want_json: bool) -> int:
     return EXIT_TROUBLE
 
 
+BENCH_NEEDS = (
+    "bench needs a folder of bench tasks: one folder per task, each with a task.toml, "
+    "the card, a repo/ to start from and hidden tests (the openfarm checkout ships "
+    "one in bench/). Point it at one with --tasks PATH, for example "
+    "'openfarm bench list --tasks ~/openfarm/bench' or "
+    "'openfarm bench run --dry-run --tasks ~/openfarm/bench'."
+)
+
+
+def _emit_no_tasks_folder(tasks_dir: Path, want_json: bool, *, bare: bool = False) -> int:
+    """No tasks folder: a usage problem, said plainly, with what bench needs."""
+    if bare:
+        message = f"no bench tasks folder here ({tasks_dir}). {BENCH_NEEDS}"
+    elif tasks_dir.exists():
+        message = f"{tasks_dir} is not a folder. {BENCH_NEEDS}"
+    else:
+        message = f"no bench tasks folder at {tasks_dir}. {BENCH_NEEDS}"
+    if want_json:
+        print(json.dumps({"error": message, "kind": "usage error"}, indent=2,
+                         ensure_ascii=False))
+    else:
+        print(f"openfarm: bench: {message}", file=sys.stderr)
+    return EXIT_USAGE
+
+
 def cmd_bench(args) -> int:
     action = getattr(args, "bench_command", None)
     want_json = bool(getattr(args, "json", False))
@@ -2334,17 +2361,17 @@ def cmd_bench(args) -> int:
             repo_arg = getattr(args, "repo", ".") or "."
             repo_bench = Path(repo_arg) / "bench"
             args.dir = str(repo_bench) if repo_arg != "." and repo_bench.is_dir() else "bench"
+        if not Path(args.dir).is_dir():
+            return _emit_no_tasks_folder(Path(args.dir), want_json, bare=True)
         return cmd_bench_list(args)
-    raise UsageError("bench requires a subcommand")
+    raise UsageError("bench requires a subcommand: list or run (" + BENCH_NEEDS + ")")
 
 
 def cmd_bench_list(args) -> int:
     want_json = bool(getattr(args, "json", False))
     tasks_dir = Path(args.dir)
-    if not tasks_dir.exists():
-        return _emit_bench_error(f"{tasks_dir}: no such directory", want_json)
     if not tasks_dir.is_dir():
-        return _emit_bench_error(f"{tasks_dir}: not a directory", want_json)
+        return _emit_no_tasks_folder(tasks_dir, want_json)
 
     tasks: list[dict[str, str]] = []
     for child in sorted(tasks_dir.iterdir(), key=lambda path: path.name):
@@ -2373,7 +2400,7 @@ def cmd_bench_run(args) -> int:
     want_json = bool(getattr(args, "json", False))
     tasks_dir = Path(args.dir)
     if not tasks_dir.is_dir():
-        return _emit_bench_error(f"{tasks_dir}: no such directory", want_json)
+        return _emit_no_tasks_folder(tasks_dir, want_json)
     try:
         tasks = [load_task(child) for child in sorted(tasks_dir.iterdir())
                  if child.is_dir() and (child / "task.toml").is_file()]
