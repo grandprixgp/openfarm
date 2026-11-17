@@ -86,14 +86,19 @@ class AcpHumanTests(unittest.TestCase):
 
     def test_probe_shows_the_same_table_from_the_probes_own_hold(self) -> None:
         status = self.status("codex")
+        self.assertEqual(status["providers"]["codex"]["confinement"]["none"],
+                         "flags + boundary")
+        # What the probe itself used wins over what status works out.
         held = {"mode": "auto", "transport": "codex-exec",
-                "none": {"held_by": "flags + boundary", "refused": ""},
-                "read-only": {"held_by": "flags + boundary", "refused": ""}}
+                "none": {"held_by": "boundary", "refused": ""},
+                "read-only": {"held_by": "boundary", "refused": ""}}
         payload = {**status, "ok": True, "provider": "codex", "protocol_version": 1,
                    "auth_methods": [], "confinement": held, "action": "probe"}
         text = self.human("acp_probe", payload)
         row = self.row(text, "codex")
-        self.assertIn("flags + boundary", row)
+        self.assertNotIn("flags", row)
+        self.assertIn("boundary", row)
+        self.assertIn("codex-exec", row)
         self.assertIn("$HOME (found)", row)
         self.assertIn('[micromanager] confine = "auto"', text)
         # The probe for all providers carries each one's hold in its results.

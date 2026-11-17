@@ -1393,10 +1393,11 @@ def _format_acp_children(payload: dict, style: Style) -> list[str]:
         held = info.get("confinement") if isinstance(info.get("confinement"), dict) else {}
         probed = (results.get(name) or {}).get("confinement") if isinstance(
             results.get(name), dict) else None
-        if not held and isinstance(top.get("none"), (dict, str)) and len(providers) == 1:
-            held = top
         if isinstance(probed, dict) and probed.get("none") is not None:
             held = probed
+        elif isinstance(top.get("none"), dict) and len(providers) == 1:
+            # A single probe's payload carries the hold the probe itself used.
+            held = top
         cells = [name, _acp_login_place(info)]
         for policy in ("none", "read-only"):
             word = _acp_held(held.get(policy)) if held else "?"
