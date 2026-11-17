@@ -130,12 +130,12 @@ if mode == "no-usage":
     emit_result(json.dumps({{"ok": True}}))
     raise SystemExit(0)
 
+# The driver's child may have no writable folder (the boundary), so the
+# "then recover" fakes keep no count: they answer badly until asked to correct.
+is_correction = "Previous JSON turn had issue" in prompt_raw
+
 if mode == "bad-then-recover":
-    marker = Path(os.getcwd()) / ".mock-turn-count"
-    count = int(marker.read_text(encoding="utf-8")) if marker.is_file() else 0
-    count += 1
-    marker.write_text(str(count), encoding="utf-8")
-    if count == 1:
+    if not is_correction:
         emit_result("NOT VALID JSON AT ALL")
         raise SystemExit(0)
 
@@ -144,11 +144,7 @@ if mode == "always-bad":
     raise SystemExit(0)
 
 if mode == "refuse-then-recover":
-    marker = Path(os.getcwd()) / ".mock-refuse-count"
-    count = int(marker.read_text(encoding="utf-8")) if marker.is_file() else 0
-    count += 1
-    marker.write_text(str(count), encoding="utf-8")
-    if count == 1:
+    if not is_correction:
         emit_result(json.dumps({{"actions": [{{"action": "start", "card": "NO-SUCH-CARD"}}], "answers": []}}))
         raise SystemExit(0)
 
@@ -407,8 +403,6 @@ class DriverAgentUnitTests(unittest.TestCase):
             "--ignore-rules",
             "-s",
             "read-only",
-            "-C",
-            str(self.work_dir.resolve()),
             "-m",
             "gpt-5-codex",
             "-c",
@@ -416,6 +410,9 @@ class DriverAgentUnitTests(unittest.TestCase):
             "-",
         ):
             self.assertIn(req_flag, x_info["args"])
+        # The child works in an empty private folder of the driver's, not in `cwd`.
+        self.assertEqual(x_info["args"][x_info["args"].index("-C") + 1], x_info["cwd"])
+        self.assertNotEqual(Path(x_info["cwd"]), self.work_dir.resolve())
         self.assertIn("SYS_CX", x_info["stdin"])
         self.assertTrue(x_info["codex_home"].startswith(x_info["home"]))
         self.assertEqual(x_info["openai_key"], "")
@@ -631,6 +628,8 @@ class DriverModeEndToEndTests(unittest.TestCase):
         self.assertEqual(rc_ref, EXIT_OK, err_ref)
         p_ref = json.loads(out_ref)
         self.assertEqual(p_ref["outcomes"][0]["final_state"], "in-review")
+        # Every turn ran: the fake works without a writable folder.
+        self.assertEqual(p_ref["driver_errors"], [])
 
         # 3. Always malformed JSON -> 1 correction turn, then the run's own timeout rule
         # (`on_external_timeout = "fallback"` by default) for what the driver could not

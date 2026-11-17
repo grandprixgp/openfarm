@@ -22,13 +22,17 @@ import tempfile
 import threading
 from pathlib import Path
 
+from . import confine as confine_lib
+from . import logins
 from .adapters.acp import (
     _AUTH_ERROR_RE,
+    _DEFAULT_FORBIDDEN_FILES,
     _unregister_isolated_home,
     _sanitised_env,
     normalize_acp_provider,
     strip_control_sequences,
 )
+from .adapters.agy_native_acp import MAX_ARG_BYTES as AGY_MAX_ARG_BYTES
 from .adapters.files import FileCardSource
 from .board import (
     Board,
@@ -45,7 +49,7 @@ from .config import Config
 from .coordinator import _clean_json_payload
 from .errors import AdapterError, Infra, Invalid, Refused, UsageError
 from .git import Git
-from .globs import matches_any
+from .globs import matches_any, normalise
 from .micromanager import SEAT_TIMEOUT_PREFIX
 from .state import StateDir, _safe_id, read_json, utc_now, write_json
 from .swarm import (
@@ -388,8 +392,58 @@ def _end_process_group(proc, *, grace_s: float = 2.0) -> None:
         proc.communicate(timeout=max(grace_s, 2.0))
 
 
+def driver_hold(provider: str, settings=None) -> confine_lib.Hold:
+    """How the driver's CLI child is held, by `[micromanager] confine`.
+
+    The driver starts one CLI child per turn, as openfarm's own bridges do, and
+    its turns need no tools: tool policy `none`, transport `bridge`. So Codex
+    gets the strict flag set (and the boundary when bwrap works), Antigravity
+    needs the boundary, Claude is left to its own rules under `auto` and
+    confined under `bwrap`, and `off` confines nothing.
+    """
+    held = confine_lib.as_settings(settings)
+    mode = held.mode
+    needs_check = not (mode == "off" or (mode == "auto" and provider == "claude"))
+    usable, reason = confine_lib.bwrap_status() if needs_check else (False, "")
+    hold = confine_lib.decide(
+        provider,
+        transport="bridge",
+        tool_policy="none",
+        mode=mode,
+        bwrap_usable=usable,
+        bwrap_reason=reason,
+    )
+    if not hold.note:
+        note = confine_lib.hold_note(hold, reason)
+        if note:
+            hold = dataclasses.replace(hold, note=note)
+    return hold
+
+
+def agy_prompt_too_large(full_prompt: str) -> str:
+    """Why an Antigravity prompt cannot go into one argv word, or '' when it fits.
+
+    The same limit and wording as the Antigravity bridge (`agy_native_acp`).
+    """
+    size = len(full_prompt.encode("utf-8"))
+    if size + 1 <= AGY_MAX_ARG_BYTES:
+        return ""
+    return (
+        f"the prompt is {size} bytes, but agy takes it as one command-line "
+        f"argument (-p) and Linux caps one argument at {AGY_MAX_ARG_BYTES} bytes "
+        f"(MAX_ARG_STRLEN, including its NUL); shorten the prompt below "
+        f"{AGY_MAX_ARG_BYTES - 1} bytes"
+    )
+
+
 class DriverAgent:
-    """Headless read-only driver wrapper for `claude`, `agy`, or `codex`."""
+    """Headless read-only driver wrapper for `claude`, `agy`, or `codex`.
+
+    Each turn's child is held by the same rules as openfarm's bridges
+    (`driver_hold`): the boundary's session folder is an empty private folder
+    of the driver's own, since a turn's prompt carries all it needs. Claude
+    under `auto` keeps the folder it was given (`cwd`), as before.
+    """
 
     def __init__(
         self,
@@ -404,6 +458,7 @@ class DriverAgent:
         timeout_s: float = DEFAULT_TURN_TIMEOUT_S,
         env: dict[str, str] | None = None,
         script: object = None,
+        confine=None,
     ) -> None:
         self.provider = normalize_acp_provider(agent)
         self.cwd = Path(cwd or Path.cwd()).resolve()
@@ -414,6 +469,14 @@ class DriverAgent:
         self.forbidden_files = list(forbidden_files or ())
         self.timeout_s = float(timeout_s or DEFAULT_TURN_TIMEOUT_S)
         self.extra_env = dict(env) if env is not None else None
+        try:
+            self.confine = confine_lib.as_settings(confine)
+        except confine_lib.ConfineError as exc:
+            raise Invalid(exc.code, exc.message) from exc
+        self.notes: list[str] = []
+        self.last_sync: logins.SyncResult | None = None
+        self._hold: confine_lib.Hold | None = None
+        self._own_dir: Path | None = None
         self._script = script
         self._turn_counter = 0
         self._script_list_idx = 0
@@ -425,7 +488,43 @@ class DriverAgent:
         self.close()
 
     def close(self) -> None:
-        return
+        if self._own_dir is not None:
+            shutil.rmtree(self._own_dir, ignore_errors=True)
+            self._own_dir = None
+
+    def _note(self, text: str) -> None:
+        if text and text not in self.notes:
+            self.notes.append(text)
+
+    @property
+    def hold(self) -> confine_lib.Hold:
+        """How this driver's children are held (decided once per driver)."""
+        if self._hold is None:
+            self._hold = driver_hold(self.provider, self.confine)
+            self._note(self._hold.note)
+        return self._hold
+
+    @property
+    def child_dir(self) -> Path:
+        """The child's working folder, and the boundary's session folder.
+
+        An empty private folder made on first use, removed on close. Only Claude
+        outside a boundary keeps `cwd`, its folder before confinement existed.
+        """
+        if self.provider == "claude" and not self.hold.boundary:
+            return self.cwd
+        if self._own_dir is None:
+            self._own_dir = Path(tempfile.mkdtemp(prefix="openfarm-drive-empty-")).resolve()
+            self._own_dir.chmod(0o700)
+        return self._own_dir
+
+    def _hide_globs(self) -> list[str]:
+        out: list[str] = []
+        for pat in (*_DEFAULT_FORBIDDEN_FILES, *self.forbidden_files, *self.never_touch):
+            norm = normalise(str(pat or ""))
+            if norm and norm not in out:
+                out.append(norm)
+        return out
 
     def resolve_bin(self) -> str:
         """Resolve CLI binary path for the configured driver provider."""
@@ -435,7 +534,10 @@ class DriverAgent:
         return shutil.which(default_name) or default_name
 
     def build_argv(self, *, system_prompt: str = "", prompt: str = "") -> list[str]:
-        """Build read-only / no-write headless CLI invocation argv."""
+        """Build read-only / no-write headless CLI invocation argv.
+
+        The boundary, when the child is held so, wraps this in `child_argv`.
+        """
         bin_path = self.resolve_bin()
         if self.provider == "claude":
             # Never pass `--bare`: `--bare` disables Claude OAuth credentials.
@@ -492,15 +594,46 @@ class DriverAgent:
             "--ignore-rules",
             "-s",
             "read-only",
-            "-C",
-            str(self.cwd),
         ]
+        if self.hold.flags:
+            argv.extend(confine_lib.codex_tool_flags("none"))
+        argv.extend(["-C", str(self.child_dir)])
         if self.model:
             argv.extend(["-m", self.model])
         if self.effort:
             argv.extend(["-c", f"model_reasoning_effort={json.dumps(self.effort)}"])
         argv.append("-")
         return argv
+
+    def child_argv(
+        self,
+        argv: list[str],
+        *,
+        home_dir: Path | None,
+        env: dict[str, str] | None = None,
+    ) -> list[str]:
+        """`argv`, inside the boundary when the child is held so.
+
+        A child that may not start (`hold.refused`), or whose boundary cannot be
+        built, is refused (`acp-confine-unavailable`) before anything runs.
+        """
+        hold = self.hold
+        if hold.refused:
+            raise Refused("acp-confine-unavailable", hold.refused)
+        if not hold.boundary:
+            return list(argv)
+        try:
+            return confine_lib.boundary_argv(
+                argv,
+                session_dir=self.child_dir,
+                home_dir=home_dir,
+                hide_globs=self._hide_globs(),
+                hide_paths=self.confine.hide_paths,
+                read_roots=self.confine.read_roots,
+                env=env,
+            )
+        except confine_lib.ConfineError as exc:
+            raise Refused("acp-confine-unavailable", exc.message) from exc
 
     def _next_scripted_entry(self, turn_key: str) -> object:
         script = self._script
@@ -593,6 +726,8 @@ class DriverAgent:
         if self._script is not None:
             return self._complete_scripted(prompt, turn_key=turn_key)
 
+        if self.hold.refused:
+            raise Refused("acp-confine-unavailable", self.hold.refused)
         argv = self.build_argv(system_prompt=system_prompt, prompt=prompt)
         if self.provider == "claude":
             stdin_text = prompt
@@ -622,12 +757,13 @@ class DriverAgent:
                     initial_bytes = iso_creds.read_bytes()
 
         try:
+            spawn_argv = self.child_argv(argv, home_dir=isolated_home, env=env)
             try:
                 # Its own session, so the whole group (the CLI and anything it
                 # started) can be ended before the isolated HOME is deleted.
                 proc = _POPEN(
-                    argv,
-                    cwd=str(self.cwd),
+                    spawn_argv,
+                    cwd=str(self.child_dir),
                     env=env,
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
@@ -2018,6 +2154,33 @@ def drive_run(
     selected_cards = [_safe_id(cid, "card id") for cid in (card_ids or ()) if str(cid).strip()]
     worker_script_path, driver_script = _load_script_bundle(script)
 
+    # The driver's CLI children are held by the bridges' rules. A child that may
+    # not start is refused here, before a run starts or a seat is joined.
+    try:
+        confine_settings = confine_lib.settings_from_config(cfg)
+    except confine_lib.ConfineError as exc:
+        raise Invalid(exc.code, exc.message) from exc
+    if driver_script is None:
+        hold = driver_hold(provider, confine_settings)
+        if hold.refused:
+            return {
+                "ok": False,
+                "refused": True,
+                "reason": hold.refused,
+                "code": "acp-confine-unavailable",
+                "agent": provider,
+                "seat": clean_seat,
+                "run_id": str(run_id or ""),
+                "confine": hold.as_dict(),
+                "driver_turns": 0,
+                "driver_tokens_in": 0,
+                "driver_tokens_out": 0,
+                "actions_taken": [],
+                "answers_sent": [],
+                "outcomes": [],
+                "reviews": [],
+            }
+
     managed = run_id is None
     if managed:
         base_rid = f"run-{utc_now().replace('-', '').replace(':', '')}"
@@ -2142,7 +2305,9 @@ def drive_run(
             forbidden_files=active_cfg.forbidden_files,
             timeout_s=turn_timeout,
             script=driver_script,
+            confine=confine_settings,
         ) as drv:
+            driver_confine = drv.hold.as_dict() if driver_script is None else {}
             if not board.is_ended():
                 if clean_seat in ("both", "coordinator"):
                     swarm_join(
@@ -2537,6 +2702,11 @@ def drive_run(
             bool(run_rc) and run_rc[0] != 0
         )
         report = _driver_spend_report(counters, provider)
+        # How the CLI child was held (`off`, flags alone) and refused credential
+        # copies go with the spend notes, into the payload and `run.json`.
+        for note in drv.notes:
+            if note not in report["notes"]:
+                report["notes"].append(note)
         run_record_updated = (
             _add_driver_to_run_record(state, resolved_rid, report) if managed else False
         )
@@ -2562,6 +2732,7 @@ def drive_run(
             "timeouts": timeouts,
             "driver_errors": driver_errors,
             "on_external_timeout": timeout_policy,
+            "confine": driver_confine,
             "outcomes": outcomes,
             "reviews": reviews,
         }

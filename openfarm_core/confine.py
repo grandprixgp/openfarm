@@ -206,6 +206,32 @@ def off_note(provider: str) -> str:
     )
 
 
+def flags_only_note(provider: str, bwrap_reason: str = "") -> str:
+    """The note for a child held by its tool flags alone (no boundary could be built)."""
+    why = f" ({bwrap_reason})" if bwrap_reason else ""
+    return (
+        f"the {provider} child is held by its tool flags alone: bubblewrap is not usable "
+        f"here{why}, so there is no OS boundary and a tool the flags miss could read "
+        "whatever your user can read"
+    )
+
+
+def hold_note(hold: "Hold", bwrap_reason: str = "") -> str:
+    """What a run's notes say about a child that is not confined, or '' when it is.
+
+    `off` gives `off_note`; a child held by flags alone (Codex when bwrap is
+    unusable) gives `flags_only_note`. Claude under `auto` follows its own rules
+    and a refused child never starts, so neither gives a note.
+    """
+    if hold.refused:
+        return ""
+    if hold.mode == "off":
+        return hold.note or off_note(hold.provider)
+    if hold.flags and not hold.boundary:
+        return flags_only_note(hold.provider, bwrap_reason)
+    return ""
+
+
 def decide(
     provider: str,
     *,
