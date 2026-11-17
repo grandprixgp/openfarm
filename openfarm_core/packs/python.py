@@ -718,7 +718,10 @@ def _parse_pytest(text: str) -> dict:
                 compile_errors.append({"pkg": path, "target": path, "binary": path})
             continue
         footer = _PT_FOOTER_RE.match(line.strip())
-        if footer and _PT_COUNT_RE.search(footer.group("summary")):
+        # `no tests ran` (exit 5) is a finished run with nothing in it, as
+        # unittest's `NO TESTS RAN` is; a run that died prints no footer at all.
+        if footer and (_PT_COUNT_RE.search(footer.group("summary"))
+                       or footer.group("summary").strip() == "no tests ran"):
             counts: dict[str, int] = {}
             for count in _PT_COUNT_RE.finditer(footer.group("summary")):
                 kind = count.group("kind")
