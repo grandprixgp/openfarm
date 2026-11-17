@@ -831,13 +831,9 @@ class ModelCoordinator:
                         })
                         if not sup_info.get("reason"):
                             sup_info["reason"] = body or str(sup_info.get("detail", "") or "")
-                        sup_res = rt.ask_supervisor_fn(sup_info)
-                        if isinstance(sup_res, dict) and sup_res.get("action") in (
-                            "hint",
-                            "set",
-                            "block",
-                        ):
-                            resolution = sup_res
+                        # Asked by `_decide` once the lock is released: the seat may
+                        # take up to `external_wait` to answer.
+                        resolution = {"action": "ask", "_info": sup_info}
                     else:
                         swarm_ask(
                             rt.board,
@@ -913,80 +909,127 @@ class ModelCoordinator:
         fallback_fn: Callable[[], dict | None],
         target_card: str = "",
         target_member: str = "",
+        defer_fallback: bool = False,
     ) -> dict | None:
+        """Decide one event: serialised under `self._lock`, waits outside it.
+
+        The lock covers the coordinator's own counters, the model call and the
+        execution of that answer's actions, so two events' decisions never
+        interleave their actions. A wait on the supervisor's seat (the `ask`
+        action, or the code policy's hand-back triage when `defer_fallback`) can
+        last up to `external_wait`, so it runs after the lock is released and
+        other cards' events are not queued behind it.
+        """
         with self._lock:
-            self.ensure_member(rt.board)
+            kind, value = self._decide_locked(
+                rt,
+                event,
+                event_details=event_details,
+                fallback_fn=None if defer_fallback else fallback_fn,
+                target_card=target_card,
+                target_member=target_member,
+            )
+        if kind == "fallback":
+            return fallback_fn()
+        if isinstance(value, dict) and value.get("action") == "ask" and "_info" in value:
+            if rt.ask_supervisor_fn is None:
+                return None
+            sup_res = rt.ask_supervisor_fn(value["_info"])
+            if isinstance(sup_res, dict) and sup_res.get("action") in ("hint", "set", "block"):
+                return sup_res
+            return None
+        return value
+
+    def _decide_locked(
+        self,
+        rt: CoordinatorRuntime,
+        event: str,
+        *,
+        event_details: dict,
+        fallback_fn: Callable[[], dict | None] | None,
+        target_card: str = "",
+        target_member: str = "",
+    ) -> tuple[str, dict | None]:
+        """Returns ("resolution", value) or ("fallback", None) when the caller must
+        run the code policy after releasing the lock."""
+
+        def _fallback() -> tuple[str, dict | None]:
+            if fallback_fn is None:
+                return ("fallback", None)
+            return ("resolution", fallback_fn())
+
+        self.ensure_member(rt.board)
+        if self._cap_exceeded():
+            return _fallback()
+
+        while True:
             if self._cap_exceeded():
-                return fallback_fn()
+                return _fallback()
 
-            while True:
-                if self._cap_exceeded():
-                    return fallback_fn()
+            prompt_text = self._build_state_prompt(rt, event, event_details)
+            effort_param = self.tier.effort_param if self.effort else ""
+            max_tokens = int(getattr(self.cfg, "model_max_tokens", 4096) or 4096)
+            attempt_num = self.calls + 1
+            messages = [
+                {"role": "system", "content": _COORDINATOR_SYSTEM_PROMPT},
+                {"role": "user", "content": prompt_text},
+            ]
+            try:
+                comp = _call_tier_complete(
+                    self.backend,
+                    role="coordinator",
+                    model=self.tier.model,
+                    temperature=0.2,
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    response_format="json",
+                    card_id=target_card,
+                    attempt=attempt_num,
+                    effort=self.effort,
+                    effort_param=effort_param,
+                )
+                tok_in = int(getattr(comp, "tokens_in", 0) or 0)
+                tok_out = int(getattr(comp, "tokens_out", 0) or 0)
+                self.calls += 1
+                self.tokens += tok_in + tok_out
+                rt.board.add_member_usage(
+                    "coordinator",
+                    tokens_in=tok_in,
+                    tokens_out=tok_out,
+                    calls=1,
+                    effort=self.effort,
+                )
+                raw_text = str(getattr(comp, "content", "") or "")
+                actions = self._parse_actions(raw_text)
+                had_error, resolution = self._execute_actions(
+                    rt,
+                    actions,
+                    target_card=target_card,
+                    target_member=target_member,
+                    event_name=event,
+                    event_info=event_details,
+                )
+            except (Invalid, ValueError, TypeError, Infra) as exc:
+                if isinstance(exc, Infra) and exc.code not in ("empty-output", "bad-json"):
+                    had_error = True
+                else:
+                    had_error = True
+                msg = getattr(exc, "message", str(exc))
+                code = getattr(exc, "code", "bad-coordinator-answer")
+                self._post_refusal(rt.board, code, msg, card=target_card)
+                resolution = None
 
-                prompt_text = self._build_state_prompt(rt, event, event_details)
-                effort_param = self.tier.effort_param if self.effort else ""
-                max_tokens = int(getattr(self.cfg, "model_max_tokens", 4096) or 4096)
-                attempt_num = self.calls + 1
-                messages = [
-                    {"role": "system", "content": _COORDINATOR_SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt_text},
-                ]
-                try:
-                    comp = _call_tier_complete(
-                        self.backend,
-                        role="coordinator",
-                        model=self.tier.model,
-                        temperature=0.2,
-                        messages=messages,
-                        max_tokens=max_tokens,
-                        response_format="json",
-                        card_id=target_card,
-                        attempt=attempt_num,
-                        effort=self.effort,
-                        effort_param=effort_param,
-                    )
-                    tok_in = int(getattr(comp, "tokens_in", 0) or 0)
-                    tok_out = int(getattr(comp, "tokens_out", 0) or 0)
-                    self.calls += 1
-                    self.tokens += tok_in + tok_out
-                    rt.board.add_member_usage(
-                        "coordinator",
-                        tokens_in=tok_in,
-                        tokens_out=tok_out,
-                        calls=1,
-                        effort=self.effort,
-                    )
-                    raw_text = str(getattr(comp, "content", "") or "")
-                    actions = self._parse_actions(raw_text)
-                    had_error, resolution = self._execute_actions(
-                        rt,
-                        actions,
-                        target_card=target_card,
-                        target_member=target_member,
-                        event_name=event,
-                        event_info=event_details,
-                    )
-                except (Invalid, ValueError, TypeError, Infra) as exc:
-                    if isinstance(exc, Infra) and exc.code not in ("empty-output", "bad-json"):
-                        had_error = True
-                    else:
-                        had_error = True
-                    msg = getattr(exc, "message", str(exc))
-                    code = getattr(exc, "code", "bad-coordinator-answer")
-                    self._post_refusal(rt.board, code, msg, card=target_card)
-                    resolution = None
+            if not had_error:
+                self.consecutive_bad = 0
+                self._cap_exceeded()
+                return ("resolution", resolution)
 
-                if not had_error:
-                    self.consecutive_bad = 0
-                    self._cap_exceeded()
-                    return resolution
-
-                self.consecutive_bad += 1
-                if self.consecutive_bad >= 2:
-                    self.consecutive_bad = 0
-                    return fallback_fn()
-                if self._cap_exceeded():
-                    return fallback_fn()
+            self.consecutive_bad += 1
+            if self.consecutive_bad >= 2:
+                self.consecutive_bad = 0
+                return _fallback()
+            if self._cap_exceeded():
+                return _fallback()
 
     def on_plan(self, rt: CoordinatorRuntime, *, post_event: bool = False) -> None:
         if post_event:
@@ -1019,6 +1062,7 @@ class ModelCoordinator:
             fallback_fn=lambda: self._code.on_handback(rt, info),
             target_card=str(info.get("card_id", "") or ""),
             target_member=str(info.get("member", "") or ""),
+            defer_fallback=True,
         )
         if res is None:
             return {"action": "block", "reason": str(info.get("reason", "") or "handed back")}
