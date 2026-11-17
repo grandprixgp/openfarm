@@ -40,6 +40,7 @@ from .adopt import adopt_project
 from .bench import load_task
 from .board import Board, VALID_POST_KINDS, board_dir_for
 from .adapters.acp import (
+    ClaudeAcpAdapter,
     acp_adapter_for_provider,
     is_acp_adapter,
     normalize_acp_provider,
@@ -72,7 +73,7 @@ from .harness_global import GlobalLibrary, global_dir_for
 from .harness_memory import HarnessLibrary
 from .harness_scope import project_markers
 from .human_cli import Style, error_hint, format_human
-from .micromanager import MicromanagerBudget, open_micromanager
+from .micromanager import ClaudeAcpMicromanager, MicromanagerBudget, open_micromanager
 from .packs.base import pack_for
 from .state import (StateDir, _safe_id, baseline_lock_for, read_json, utc_now,
                     utc_after, write_json)
@@ -487,6 +488,7 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
         swarm_cfg is not None and swarm_cfg.enabled and not args.dry_run
     )
     shared_mm_backend = None
+    mm_seat: _SharedAcpSupervisor | None = None
     coord_backend = None
     swarm_sup = swarm_cfg.supervisor if swarm_cfg is not None else "config"
     uses_acp_sup = is_acp_adapter(swarm_sup) or (
@@ -504,6 +506,10 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
             cfg, ctx.state.root, ctx.repo, worktree=ctx.repo, budget=night_mm_budget
         )
         shared_mm_backend = getattr(shared_mm, "backend", None)
+        if isinstance(shared_mm_backend, ClaudeAcpMicromanager):
+            # Share the process, not the conversation: see _SharedAcpSupervisor.
+            mm_seat = _SharedAcpSupervisor(shared_mm_backend)
+            shared_mm_backend = None
     coord_spec = str(getattr(swarm_cfg, "coordinator", "code") or "")
     if swarm_parallel and coord_spec.startswith("tier:"):
         coord_backend = open_backend(cfg, script_path)
@@ -600,6 +606,7 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
                     mm_backend=shared_mm_backend,
                     on_handback=on_handback,
                     on_struggling=on_struggling,
+                    mm_seat=mm_seat,
                 )
 
             def _record_swarm_outcome(cid: str, outcome: dict) -> bool:
@@ -646,6 +653,11 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
         if shared_mm_backend is not None and hasattr(shared_mm_backend, "close"):
             try:
                 shared_mm_backend.close()
+            except Exception as exc:
+                print(f"micromanager close error ignored: {exc}", file=sys.stderr)
+        if mm_seat is not None:
+            try:
+                mm_seat.close()
             except Exception as exc:
                 print(f"micromanager close error ignored: {exc}", file=sys.stderr)
         if board is not None:
@@ -744,6 +756,83 @@ def _load_test_conventions(cfg, worktree: Path) -> str:
     return ""
 
 
+class _SharedAcpSupervisor:
+    """The run's one ACP supervisor process, with one session per card.
+
+    Parallel cards share the ACP process (the spec's "one Claude ACP process
+    when the supervisor is `acp`"), but not a conversation: v0.8 sent every
+    card's supervisor prompts into one session rooted at the repository, so a
+    card's supervisor saw the other cards' prompts and answers. Each card now
+    gets its own session, rooted at its own worktree, and its own artifact
+    numbering; the night's supervisor budget stays shared. The adapter takes one
+    prompt at a time, so the cards' calls take turns on one lock. A process that
+    dies (a timed-out turn kills it) is replaced once for everyone, and every
+    card opens a fresh session on the new one.
+    """
+
+    def __init__(self, proto: ClaudeAcpMicromanager) -> None:
+        self.proto = proto
+        self.lock = threading.RLock()
+        self.adapter = None
+
+    def live_adapter(self):
+        """The one live adapter, started or replaced as needed (call under `lock`)."""
+        proc = getattr(self.adapter, "_proc", None) if self.adapter is not None else None
+        if self.adapter is not None and proc is not None and proc.poll() is not None:
+            with contextlib.suppress(Exception):
+                self.adapter.close()
+            self.adapter = None
+        if self.adapter is None:
+            p = self.proto
+            self.adapter = ClaudeAcpAdapter(
+                command=p.command, cwd=p.cwd, provider=p.provider,
+                isolate_home=p.isolate_home, auth_file=p.auth_file, auth_mode=p.auth_mode,
+                never_touch=p.never_touch, forbidden_files=p.forbidden_files,
+                allowed_root=p.cwd,
+            )
+        return self.adapter
+
+    def for_card(self, worktree: Path, card_dir: Path) -> "_CardAcpSupervisor":
+        p = self.proto
+        return _CardAcpSupervisor(
+            self, command=p.command, cwd=worktree, provider=p.provider, model=p.model,
+            effort=p.effort, tool_policy=p.tool_policy, timeout_s=p.timeout_s,
+            isolate_home=p.isolate_home, auth_file=p.auth_file, auth_mode=p.auth_mode,
+            never_touch=p.never_touch, forbidden_files=p.forbidden_files,
+            cost_per_1k_in=p.cost_per_1k_in, cost_per_1k_out=p.cost_per_1k_out,
+            state_dir=p.state_dir, card_dir=card_dir,
+        )
+
+    def close(self) -> None:
+        with self.lock:
+            if self.adapter is not None:
+                self.adapter.close()
+                self.adapter = None
+
+
+class _CardAcpSupervisor(ClaudeAcpMicromanager):
+    """One card's supervisor: its own session on the run's shared ACP process."""
+
+    def __init__(self, seat: _SharedAcpSupervisor, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._seat = seat
+        # One prompt at a time on the one process, whichever card asks.
+        self._lock = seat.lock
+
+    def _ensure_session(self):
+        adapter = self._seat.live_adapter()
+        if self._adapter is not adapter:
+            self._adapter = adapter
+            self._session_id = None
+        return super()._ensure_session()
+
+    def close(self) -> None:
+        # The card is done with its session; the run closes the shared process.
+        with self._lock:
+            self._session_id = None
+            self._adapter = None
+
+
 def _run_card(ctx: Context, source: FileCardSource, card_id: str, run_id: str,
               telemetry, run_dir: Path, script: Path | None,
               backend=None, mm_script: Path | None = None,
@@ -754,7 +843,8 @@ def _run_card(ctx: Context, source: FileCardSource, card_id: str, run_id: str,
               build_limiter: BuildLimiter | None = None,
               mm_backend=None,
               on_handback=None,
-              on_struggling=None) -> dict:
+              on_struggling=None,
+              mm_seat: _SharedAcpSupervisor | None = None) -> dict:
     """Claim one card and drive it. `backend` overrides the configured one."""
     cfg = ctx.cfg
     holder = f"openfarm:{run_id}"
@@ -788,7 +878,12 @@ def _run_card(ctx: Context, source: FileCardSource, card_id: str, run_id: str,
     book.pack = pack
     conventions = _load_test_conventions(cfg, worktree)
 
-    owns_mm = micromanager is None and mm_backend is None
+    if mm_seat is not None and micromanager is None and mm_backend is None:
+        # Its own session on the run's shared supervisor process, at its worktree.
+        mm_backend = mm_seat.for_card(worktree, card_dir)
+        owns_mm = True  # closing it ends the card's session, not the process
+    else:
+        owns_mm = micromanager is None and mm_backend is None
     mm = (micromanager if micromanager is not None else open_micromanager(
         cfg, card_dir, ctx.repo, script=mm_script,
         worktree=worktree, card_dir=card_dir, budget=mm_budget,
