@@ -28,6 +28,7 @@ from .swarm import (
     WORKER_ROLES,
     StallMonitor,
     cards_collide,
+    collision_reason,
     swarm_ask,
     swarm_block,
     swarm_hint,
@@ -1058,11 +1059,15 @@ class ExternalCoordinator:
                     author = str(item.get("from", "") or "")
                     to_list = item.get("to") or []
                     body = str(item.get("body", "") or "")
+                    # Only the coordinator's seat steers: a post from anyone else is
+                    # data, whatever its kind or addressee.
+                    if rt.board.seat_of(author) != "coordinator":
+                        continue
                     if kind == "note" and member_name in to_list:
                         return {"action": "hint"}
                     if kind == "action" and member_name in to_list and body.startswith("set "):
                         return {"action": "set"}
-                    if kind == "blocked" and item.get("card") == card_id and author != "gates":
+                    if kind == "blocked" and item.get("card") == card_id:
                         return {"action": "block", "reason": body or str(info.get("reason", ""))}
 
                 if callable(heartbeat_fn):
@@ -1095,7 +1100,15 @@ class ExternalCoordinator:
             _post_event(rt.board, "plan", f"event: plan; ready: {ready}")
 
     def scan_external_actions(self, rt: CoordinatorRuntime) -> bool:
-        """Scan new board posts for `swarm start` / `swarm block`. Return True if acted."""
+        """Act on new checked `swarm start` / `swarm block` posts. Return True if acted.
+
+        Only posts by the current holder of the coordinator seat count; anything
+        else on the board is data. A `start` must have gone through `swarm_start`
+        (its worker members exist, added by that holder), and is re-checked against
+        what is really in flight before the card is launched; a failed check is
+        refused with a board post. A `blocked` post stops a card that never started;
+        on a running card it is a stop request the card's own thread acts on.
+        """
         acted = False
         posts = rt.board.read(
             as_name="*", since=self._scan_seq, limit=None, for_model=False
@@ -1107,14 +1120,80 @@ class ExternalCoordinator:
             cid = str(item.get("card", "") or "")
             body = str(item.get("body", "") or "")
             if kind == "action" and body.startswith("start ") and cid:
-                if cid in rt.pending and cid not in rt.launched and cid not in rt.finished:
+                if rt.board.seat_of(author) != "coordinator":
+                    continue
+                with rt.lock:
+                    if cid in rt.launched or cid in rt.finished:
+                        continue
+                    if not self._started_through_swarm_start(rt, cid, author):
+                        self._refuse_start(
+                            rt, author, cid, "not-checked",
+                            f"start {cid} did not go through `swarm start`",
+                        )
+                        continue
+                    why = self._launch_refusal(rt, cid)
+                    if why:
+                        code, message = why
+                        self._refuse_start(rt, author, cid, code, message)
+                        continue
                     rt.launch_card(cid)
-                    acted = True
-            elif kind == "blocked" and cid and author != "gates":
-                if cid in rt.pending and cid not in rt.launched and cid not in rt.finished:
-                    rt.mark_blocked(cid, StopCode.REFUSED.value, body or "blocked by coordinator")
+                acted = True
+            elif kind == "blocked" and cid:
+                if rt.board.seat_of(author) != "coordinator":
+                    continue
+                if rt.mark_blocked(cid, StopCode.REFUSED.value, body or "blocked by coordinator"):
                     acted = True
         return acted
+
+    @staticmethod
+    def _started_through_swarm_start(rt: CoordinatorRuntime, cid: str, author: str) -> bool:
+        for role in WORKER_ROLES:
+            member = rt.board.get_member(f"{cid}-{role}")
+            if (
+                member is None
+                or member.get("state") == "removed"
+                or str(member.get("card", "") or "") != cid
+                or str(member.get("added_by", "") or "") != author
+            ):
+                return False
+        return True
+
+    @staticmethod
+    def _launch_refusal(rt: CoordinatorRuntime, cid: str) -> tuple[str, str] | None:
+        """Why `cid` cannot launch now against what is really in flight, or None."""
+        if rt.can_launch(cid):
+            return None
+        if cid not in rt.pending:
+            return ("not-pending", f"card {cid!r} is not waiting to start in this run")
+        if rt.free_slots() <= 0:
+            return ("slot-limit", f"{len(rt.in_flight)} cards running, no free card slot")
+        cand = rt.card_map.get(cid)
+        if cand is None or cand.state != "ready":
+            return ("not-ready", f"card {cid!r} is not ready")
+        for active_id in sorted(rt.in_flight.values()):
+            active = rt.card_map.get(active_id)
+            if active is not None:
+                reason = collision_reason(cand, active)
+                if reason:
+                    return (
+                        "card-collision",
+                        f"card {cid!r} collides with running card {active_id!r}: {reason}",
+                    )
+        return ("cannot-launch", f"card {cid!r} cannot start now")
+
+    @staticmethod
+    def _refuse_start(rt: CoordinatorRuntime, author: str, cid: str, code: str, message: str) -> None:
+        to = [author] if author and rt.board.get_member(author) is not None else []
+        rt.board.post(
+            author="gates",
+            to=to,
+            kind="action",
+            card=cid,
+            body=f"refused ({code}): {message}",
+            trusted=True,
+        )
+        # The refused start's workers must not make the board count the card as running.
+        retire_card_members(rt.board, cid, reason="start refused")
 
     def on_finished(self, _rt: CoordinatorRuntime, _card_id: str, _outcome: dict) -> None:
         return
