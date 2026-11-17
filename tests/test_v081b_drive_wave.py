@@ -19,7 +19,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from openfarm_core.config import load_config
-from openfarm_core.driver import WAVE_DIFF_LIMIT, DriverAgent, drive_run
+from openfarm_core.driver import DriverAgent, drive_run
 from openfarm_core.state import StateDir
 from tests.test_python_e2e import GOOD_IMPLEMENTATION, GOOD_TEST, build_python_toy
 
@@ -166,6 +166,7 @@ class WaveReviewVerdictTests(_WaveFixture):
         self.assertGreater(data["review_tokens"], 0)
 
 
+WAVE_DIFF_LIMIT = 24000  # the cut the driver applies (driver.WAVE_DIFF_LIMIT)
 _PADDING = "PADDING = '''\n" + ("padding line for a long diff\n" * 1200) + "'''\n"
 
 
