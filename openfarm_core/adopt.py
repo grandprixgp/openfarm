@@ -267,7 +267,9 @@ def typescript_adopt_checks(root: Path) -> tuple[dict, list[str]]:
     that `check` and every card use the same. Raises `Refused`
     "unsupported-test-runner" when the test script is not a `node --test` one.
     """
-    from .packs.typescript import resolve_tooling
+    import shutil
+
+    from .packs.typescript import adopt_findings, resolve_tooling
 
     tooling = resolve_tooling(root, {})
     if tooling["test_script"]:
@@ -275,6 +277,12 @@ def typescript_adopt_checks(root: Path) -> tuple[dict, list[str]]:
     notes = [f"tests run with {tooling['runner']}; typecheck: {tooling['typecheck']}; "
              f"format: {tooling['format']}"]
     notes += tooling["notes"]
+    node = shutil.which("node")
+    if node:
+        notes += adopt_findings(root, node)
+    else:
+        notes.append("node was not found, so adopt could not check what node --test "
+                     "can run")
     return tooling, notes
 
 

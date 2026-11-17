@@ -287,12 +287,20 @@ def _check_typescript(card: Card, cfg, root: Path | None,
 
     tooling = resolve_tooling(root, settings_from_config(cfg))
     result.info["typescript"] = {key: tooling[key] for key in
-                                 ("runner", "typecheck", "tsc", "format", "prettier",
-                                  "notes")}
+                                 ("runner", "typecheck", "syntax_only", "tsc", "format",
+                                  "prettier", "notes")}
     if tooling["test_script"]:
         result.fail("typescript-test-runner", tooling["test_script"])
     for problem in tooling["problems"]:
         result.fail("typescript-tools", problem)
+    if tooling["syntax_only"]:
+        jsx = [path for path in [*card.touches, *(t.file for t in card.tests if t.file)]
+               if normalise(path).endswith((".tsx", ".jsx"))]
+        if jsx:
+            result.fail("typescript-jsx-unchecked",
+                        f"{jsx[0]} is a .tsx/.jsx file and there is no tsc to check it: "
+                        "node cannot parse JSX, so a card there could reach review "
+                        "with code that does not parse. Set up tsc and a tsconfig.json")
 
 
 def _check_done_text(card: Card, result: EligibilityResult) -> None:

@@ -28,11 +28,13 @@ from .base import Pack
 PURPOSES = ("build", "test", "list", "lint", "ws-lint", "format", "fmt-check",
             "typecheck", "mutation", "extra")
 
-#: Directories discovery and syntax checks never walk into.
-_SKIP_DIRS = (
-    ".git", ".hg", "node_modules", "dist", "build", "target",
-    ".next", ".nuxt", ".turbo", "coverage", ".openfarm", ".cache",
-)
+#: Directories discovery and syntax checks never walk into, at any depth.
+_SKIP_DIRS = (".git", ".hg", "node_modules", ".openfarm")
+#: Build output, skipped only at a unit root (the walk's root, or a folder with
+#: a package.json or tsconfig.json): `src/build/` is source, `dist/` is not.
+_BUILD_DIRS = ("dist", "build", "target", ".next", ".nuxt", ".turbo", "coverage",
+               ".cache")
+_UNIT_MANIFESTS = ("package.json", "tsconfig.json")
 
 _TS_EXTS = (".ts", ".mts", ".cts", ".tsx")
 _JS_EXTS = (".js", ".mjs", ".cjs", ".jsx")
@@ -80,6 +82,8 @@ def _js(template: str) -> str:
     """A JS source with the pack's shared constants filled in."""
     return (template
             .replace("__SKIP_DIRS__", json.dumps(list(_SKIP_DIRS)))
+            .replace("__BUILD_DIRS__", json.dumps(list(_BUILD_DIRS)))
+            .replace("__UNIT_MANIFESTS__", json.dumps(list(_UNIT_MANIFESTS)))
             .replace("__TEST_FILE_RE__", json.dumps(_TEST_FILE_PATTERN))
             .replace("__REPORT_MARK__", json.dumps(_REPORT_MARK)))
 
@@ -92,15 +96,21 @@ function isTestFile(rel) {
   const name = rel.split("/").pop();
   return testFileRe.test(name);
 }
-function walk(dir, onFile) {
+const buildDirs = new Set(__BUILD_DIRS__);
+const unitManifests = __UNIT_MANIFESTS__;
+function walk(dir, onFile, atRoot = true) {
   let entries;
   try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
   catch { return; }
-  entries.sort((a, b) => a.name.localeCompare(b.name));
+  entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  const unitRoot = atRoot || unitManifests.some((m) => entries.some(
+    (e) => e.name === m && e.isFile()));
   for (const entry of entries) {
     const full = path.join(dir, entry.name);
     if (entry.isDirectory()) {
-      if (!skip.has(entry.name)) walk(full, onFile);
+      if (skip.has(entry.name)) continue;
+      if (unitRoot && buildDirs.has(entry.name)) continue;
+      walk(full, onFile, false);
       continue;
     }
     if (entry.isFile()) onFile(full);
@@ -623,6 +633,13 @@ def resolve_tooling(worktree: Path, settings: dict | None = None) -> dict:
         elif not has_tsconfig:
             check_notes.append(_NOTE_NO_TSCONFIG)
 
+    jsx = jsx_files(root) if typecheck == "syntax" else []
+    if jsx:
+        check_notes.append(
+            f"{len(jsx)} .tsx/.jsx file(s) are not checked (first: {jsx[0]}): node "
+            "cannot parse JSX, so only tsc can check them; cards that touch them are "
+            "refused until tsc and a tsconfig.json are set up")
+
     want_format = str(chosen.get("typescript_format") or "auto")
     if want_format == "prettier":
         fmt = "prettier"
@@ -648,11 +665,99 @@ def resolve_tooling(worktree: Path, settings: dict | None = None) -> dict:
         "link_node_modules": bool(chosen.get("link_node_modules", True)),
         "base": str(base),
         "test_script": test_script_problem(root),
+        "syntax_only": typecheck == "syntax",
+        "jsx_files": len(jsx),
         "typecheck_notes": check_notes,
         "format_notes": format_notes,
         "notes": check_notes + format_notes,
         "problems": problems,
     }
+
+
+_JSX_EXTS = (".tsx", ".jsx")
+
+
+def jsx_files(root: Path, limit: int = 1000) -> list[str]:
+    """`.tsx`/`.jsx` files under `root`, by the shared walk, repository-relative."""
+    root = Path(root)
+    found: list[str] = []
+    if not root.is_dir():
+        return found
+    for cur, _dirs, files in _walk_sorted(root):
+        for name in files:
+            if name.endswith(_JSX_EXTS):
+                found.append((cur / name).relative_to(root).as_posix())
+                if len(found) >= limit:
+                    return found
+    return found
+
+
+#: What node's type stripping refuses, and what the owner can do about it.
+_STRIP_ADVICE = (
+    ("enum", "enums", "replace each enum with a union of literals or an `as const` "
+     "object"),
+    ("namespace", "namespaces", "turn each namespace into a module of its own, or "
+     "`declare` it when it only holds types"),
+    ("parameter propert", "constructor parameter properties", "declare the field in "
+     "the class and assign it in the constructor"),
+)
+_RELATIVE_IMPORT_RE = re.compile(
+    r"""(?:\bfrom\s*|\bimport\s*\(\s*|\bimport\s+|\brequire\s*\(\s*)(["'])(\.{1,2}/[^"'\n]*)\1""")
+
+
+def adopt_findings(root: Path, node: str = "node", timeout_s: float = 300.0) -> list[str]:
+    """What node --test cannot run in this repo, and what to do about each.
+
+    Node strips types only: enums, namespaces and parameter properties are
+    refused, and an import of a relative path without its extension is not
+    found at run time. Each finding is one line naming the first file.
+    """
+    import subprocess
+
+    root = Path(root)
+    notes: list[str] = []
+    try:
+        done = subprocess.run([node, "--no-warnings", "--input-type=module", "-e",
+                               _CHECK_SCRIPT, "."], cwd=root, capture_output=True,
+                              text=True, timeout=timeout_s, check=False)
+        errors = done.stderr.splitlines()
+    except (OSError, subprocess.TimeoutExpired):
+        errors = []
+    for needle, what, advice in _STRIP_ADVICE:
+        hits = [line.split(": SyntaxError", 1)[0] for line in errors
+                if needle in line.lower() and ": SyntaxError" in line]
+        if hits:
+            first = Path(hits[0])
+            try:
+                first = first.resolve().relative_to(root.resolve())
+            except (OSError, ValueError):
+                pass
+            notes.append(f"node cannot run TypeScript {what} ({len(hits)} file(s), first: "
+                         f"{first.as_posix()}): {advice}")
+    bare: list[tuple[str, str]] = []
+    for cur, _dirs, files in _walk_sorted(root):
+        for name in files:
+            if not name.endswith(_CODE_EXTS) or name.endswith(".d.ts"):
+                continue
+            path = cur / name
+            try:
+                text = path.read_text(errors="replace")
+            except OSError:
+                continue
+            for match in _RELATIVE_IMPORT_RE.finditer(text):
+                spec = match.group(2)
+                last = spec.rsplit("/", 1)[-1]
+                if "." not in last.lstrip(".") and not spec.endswith("/"):
+                    bare.append((path.relative_to(root).as_posix(), spec))
+    if bare:
+        files = sorted({file for file, _ in bare})
+        file, spec = bare[0]
+        notes.append(
+            f"{len(files)} file(s) import a relative path without its extension (first: "
+            f"{file} imports {spec!r}): node finds only full names, so write "
+            f"'{spec}.ts' and set allowImportingTsExtensions (or "
+            "rewriteRelativeImportExtensions) in tsconfig.json")
+    return notes
 
 
 def link_node_modules(worktree: Path, base: Path) -> str:
@@ -1083,11 +1188,17 @@ class TypeScriptPack(Pack):
 # -- helpers ------------------------------------------------------------------
 
 
-def _walk_sorted(root: Path, skip: set[str]):
-    import os
+def _walk_sorted(root: Path, skip: set[str] | None = None):
+    """The same walk as the scripts' `walk`: `_SKIP_DIRS` anywhere, `_BUILD_DIRS`
+    only at a unit root."""
+    skip = set(_SKIP_DIRS) if skip is None else set(skip)
+    root = Path(root)
     for cur, dirs, files in os.walk(root):
-        dirs[:] = sorted(d for d in dirs if d not in skip)
-        yield Path(cur), dirs, sorted(files)
+        here = Path(cur)
+        unit_root = here == root or any(name in files for name in _UNIT_MANIFESTS)
+        dirs[:] = sorted(d for d in dirs if d not in skip
+                         and not (unit_root and d in _BUILD_DIRS))
+        yield here, dirs, sorted(files)
 
 
 def _test_name_regex(tests: list[str] | None) -> str:
