@@ -166,6 +166,10 @@ false, hand back instead of trying a third way (in place of edits or JSON):
 <reason explaining what failed twice or which assumption is false>
 >>>"""
 
+# Hand-back text goes into a brief only when the swarm is on (`handback=True`). With
+# the swarm off a run is v0.7's, so its briefs are v0.7's: no hand-back invitation
+# and no `replan_if` signs.
+
 
 class Brief:
     """One built brief, ready to send."""
@@ -178,13 +182,13 @@ class Brief:
         return self.body
 
 
-def _card_section(card: Card) -> str:
+def _card_section(card: Card, handback: bool = False) -> str:
     tests = "\n".join(
         f"  - {t.name}"
         + (f" in {t.file}" if t.file else "")
         + (f"\n    Asserts (data):\n{fence(t.asserts, 'asserts')}" if t.asserts else "")
         for t in card.tests) or "  (none)"
-    replan_signs = list(getattr(card, "replan_if", ()) or ())
+    replan_signs = list(getattr(card, "replan_if", ()) or ()) if handback else []
     return (
         f"Card: {card.id}\n"
         f"Title (data):\n{fence(card.title, 'title')}\n"
@@ -240,8 +244,9 @@ def _merged_context_files(card: Card, extra: list[str] | None) -> list[str]:
     return list(dict.fromkeys(normalise(p) for p in merged if p))
 
 
-def planner_brief(card: Card, book: BriefBook, harness_guidance: str = "") -> Brief:
-    parts = [ROLE_HEADERS["planner"], "", _card_section(card), "",
+def planner_brief(card: Card, book: BriefBook, harness_guidance: str = "",
+                  handback: bool = False) -> Brief:
+    parts = [ROLE_HEADERS["planner"], "", _card_section(card, handback), "",
              "Files in your touches, by signature:"]
     for path in _expand_touch_paths(book, card.touches):
         if book.is_hidden(path):
@@ -257,7 +262,8 @@ def planner_brief(card: Card, book: BriefBook, harness_guidance: str = "") -> Br
     if harness_guidance and harness_guidance.strip():
         parts.append("\nHarness adaptations (data):\n"
                      + fence(harness_guidance, "harness adaptations"))
-    parts.append("\n" + HANDBACK_INSTRUCTIONS)
+    if handback:
+        parts.append("\n" + HANDBACK_INSTRUCTIONS)
     return Brief("planner", "\n".join(parts))
 
 
@@ -266,8 +272,9 @@ def test_writer_brief(card: Card, book: BriefBook, pack,
                       previous_failure: str = "",
                       guidance: str = "",
                       context_files: list[str] | None = None,
-                      harness_guidance: str = "") -> Brief:
-    parts = [ROLE_HEADERS["test_writer"], "", _card_section(card), ""]
+                      harness_guidance: str = "",
+                      handback: bool = False) -> Brief:
+    parts = [ROLE_HEADERS["test_writer"], "", _card_section(card, handback), ""]
 
     classified = pack.classify_paths(card.touches) if hasattr(pack, "classify_paths") else {}
     touch_test_paths = [
@@ -381,7 +388,8 @@ def test_writer_brief(card: Card, book: BriefBook, pack,
         parts.append("\n" + STUB_FORMAT)
 
     parts.append("\n" + EDIT_FORMAT)
-    parts.append("\n" + HANDBACK_INSTRUCTIONS)
+    if handback:
+        parts.append("\n" + HANDBACK_INSTRUCTIONS)
     return Brief("test_writer", "\n".join(parts))
 
 
@@ -397,8 +405,9 @@ def implementer_brief(card: Card, book: BriefBook, frozen_tests: dict[str, str],
                       guidance: str = "",
                       step_context: str = "",
                       context_files: list[str] | None = None,
-                      harness_guidance: str = "") -> Brief:
-    parts = [ROLE_HEADERS["implementer"], "", _card_section(card), ""]
+                      harness_guidance: str = "",
+                      handback: bool = False) -> Brief:
+    parts = [ROLE_HEADERS["implementer"], "", _card_section(card, handback), ""]
 
     if attempt == 1:
         parts.append("Full text of files in your touches:")
@@ -475,20 +484,22 @@ def implementer_brief(card: Card, book: BriefBook, frozen_tests: dict[str, str],
                      f"Tests this step turns green: {', '.join(step.get('tests', []))}")
 
     parts.append("\n" + EDIT_FORMAT)
-    parts.append("\n" + HANDBACK_INSTRUCTIONS)
+    if handback:
+        parts.append("\n" + HANDBACK_INSTRUCTIONS)
     return Brief("implementer", "\n".join(parts))
 
 
-def checker_pass1_brief(card: Card, test_diff: str) -> Brief:
-    parts = [ROLE_HEADERS["checker_pass1"], "", _card_section(card), "",
-             "The test diff, and nothing else:\n" + fence(test_diff, "test diff"),
-             "", HANDBACK_INSTRUCTIONS]
+def checker_pass1_brief(card: Card, test_diff: str, handback: bool = False) -> Brief:
+    parts = [ROLE_HEADERS["checker_pass1"], "", _card_section(card, handback), "",
+             "The test diff, and nothing else:\n" + fence(test_diff, "test diff")]
+    if handback:
+        parts.extend(["", HANDBACK_INSTRUCTIONS])
     return Brief("checker_pass1", "\n".join(parts))
 
 
 def checker_pass2_brief(card: Card, full_diff: str, gate_results: list[dict],
-                        modified_files: dict[str, str]) -> Brief:
-    parts = [ROLE_HEADERS["checker_pass2"], "", _card_section(card), "",
+                        modified_files: dict[str, str], handback: bool = False) -> Brief:
+    parts = [ROLE_HEADERS["checker_pass2"], "", _card_section(card, handback), "",
              "The full diff:\n" + fence(full_diff, "diff")]
     parts.append("\nGate results:")
     for gate in gate_results:
@@ -496,7 +507,8 @@ def checker_pass2_brief(card: Card, full_diff: str, gate_results: list[dict],
     parts.append("\nModified files:")
     for path, text in modified_files.items():
         parts.append(f"\n### {path}\n{text}")
-    parts.append("\n" + HANDBACK_INSTRUCTIONS)
+    if handback:
+        parts.append("\n" + HANDBACK_INSTRUCTIONS)
     return Brief("checker_pass2", "\n".join(parts))
 
 

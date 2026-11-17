@@ -12,7 +12,8 @@ import shutil
 from pathlib import Path
 
 from .board import normalize_role
-from .briefs import Brief, BriefBook, fence
+from .briefs import (Brief, BriefBook, checker_pass1_brief, checker_pass2_brief,
+                     fence, implementer_brief, planner_brief, test_writer_brief)
 from .budget import Budget, BudgetExceeded, NightBudget
 from .cards import Card
 from .edits import (apply_edits, diff_text, line_counts, parse_edits,
@@ -34,11 +35,8 @@ from .harness_scope import project_markers
 from .harness_memory import (GuidanceSelection, HarnessLibrary, _classify_failure,
                              _is_unsafe_path)
 from .micromanager import open_micromanager
-from .roles import (Plan, Roles, parse_answer_edits, build_checker_pass1_brief,
-                    build_checker_pass2_brief, build_implementer_brief,
-                    build_planner_brief, build_test_writer_brief,
-                    parse_counter_tests, parse_handback, parse_plan,
-                    parse_restatement, wants_planner)
+from .roles import (Plan, Roles, parse_answer_edits, parse_counter_tests,
+                    parse_handback, parse_plan, parse_restatement, wants_planner)
 from .state import append_jsonl, baseline_lock_for, utc_now, utc_after, write_json
 from .swarm import WORKER_ROLES, swarm_set, worker_kind_for_config, worker_member_name
 
@@ -119,6 +117,9 @@ class CardRun:
 
         self.board = board
         self.swarm = swarm if swarm is not None else getattr(cfg, "swarm", None)
+        #: With the swarm off a run is v0.7's: briefs carry no hand-back text and no
+        #: answer is read as a hand-back. A run gets a board only with the swarm on.
+        self.swarm_on = board is not None or bool(getattr(self.swarm, "enabled", False))
         self.on_handback = on_handback
         self.on_struggling = on_struggling
         self.team_sets: list[dict] = []
@@ -1155,6 +1156,17 @@ class CardRun:
         hb_entry["outcome"] = "blocked"
         raise GateFailure(StopCode.HANDED_BACK, block_reason)
 
+    def _handback_reason(self, call) -> str | None:
+        """The hand-back reason in a worker's answer, or None.
+
+        Only with the swarm on. With it off no brief invites a hand-back, so the
+        answer goes down v0.7's path like any other answer without usable edits.
+        A cut-off answer is never a hand-back.
+        """
+        if not self.swarm_on or call.cut_off:
+            return None
+        return parse_handback(call.content)
+
     def _member_call_settings(self, role: str, member: dict) -> tuple[str, str | None, str, str]:
         tiers = getattr(self.cfg, "tiers", {}) or {}
         tier_name = str(member.get("tier", "") or getattr(self.swarm, "default_tier", "") or "")
@@ -1852,8 +1864,9 @@ class CardRun:
             self.depth = 1
             return
         planner_harness = self._select_harness_guidance("planner")
-        brief = build_planner_brief(
-            self.card, self.book, harness_guidance=planner_harness
+        brief = planner_brief(
+            self.card, self.book, harness_guidance=planner_harness,
+            handback=self.swarm_on,
         )
         max_hb = int(
             getattr(self.swarm, "handbacks_per_card", 2)
@@ -1877,7 +1890,7 @@ class CardRun:
                 self.log(f"{self.card.id}: planner unavailable, running unsplit")
                 return
             self.budget.note_tokens(call.tokens_in, call.tokens_out, call.spend)
-            hb_reason = None if call.cut_off else parse_handback(call.content)
+            hb_reason = self._handback_reason(call)
             if hb_reason is None:
                 break
             limit_err = self._handle_handback(
@@ -1959,11 +1972,11 @@ class CardRun:
             tw_harness = self._select_harness_guidance(
                 "test_writer", failure_class=tw_fc
             )
-            brief = build_test_writer_brief(
+            brief = test_writer_brief(
                 self.card, self.book, self.pack, self.conventions,
                 attempt=attempt, previous_failure=last_failure,
                 guidance=tw_guidance, context_files=self.extra_context_files,
-                harness_guidance=tw_harness)
+                harness_guidance=tw_harness, handback=self.swarm_on)
             call = self._call_board_role(
                 "test_writer",
                 brief,
@@ -1972,7 +1985,7 @@ class CardRun:
             )
             self.budget.note_tokens(call.tokens_in, call.tokens_out, call.spend)
 
-            hb_reason = None if call.cut_off else parse_handback(call.content)
+            hb_reason = self._handback_reason(call)
             if hb_reason is not None:
                 limit_err = self._handle_handback(
                     role="test_writer",
@@ -2370,7 +2383,7 @@ class CardRun:
             impl_harness = self._select_harness_guidance(
                 "implementer", failure_class=impl_fc
             )
-            brief = build_implementer_brief(
+            brief = implementer_brief(
                 self.card, self.book, self._frozen_texts(),
                 attempt=max(2, attempt_no) if showing_diff else 1,
                 diff=last_failed_diff,
@@ -2379,7 +2392,8 @@ class CardRun:
                 guidance=guidance,
                 step_context="\n".join(self.step_summaries),
                 context_files=self.extra_context_files,
-                harness_guidance=impl_harness)
+                harness_guidance=impl_harness,
+                handback=self.swarm_on)
             call = self._call_board_role(
                 "implementer",
                 brief,
@@ -2390,7 +2404,7 @@ class CardRun:
             )
             self.budget.note_tokens(call.tokens_in, call.tokens_out, call.spend)
 
-            hb_reason = None if call.cut_off else parse_handback(call.content)
+            hb_reason = self._handback_reason(call)
             if hb_reason is not None:
                 limit_err = self._handle_handback(
                     role="implementer",
@@ -3406,7 +3420,7 @@ class CardRun:
             self.worktree,
             [path for path in changed if self._is_test_path(path)],
             ref=self.base_commit or "HEAD")
-        brief1 = build_checker_pass1_brief(self.card, test_diff)
+        brief1 = checker_pass1_brief(self.card, test_diff, handback=self.swarm_on)
         call1 = self._call_board_role(
             "checker_pass1",
             brief1,
@@ -3427,8 +3441,9 @@ class CardRun:
             full = self.worktree / path
             if full.exists():
                 modified[path] = full.read_text()[:8000]
-        brief2 = build_checker_pass2_brief(
-            self.card, full_diff, [g.as_dict() for g in self.gates], modified)
+        brief2 = checker_pass2_brief(
+            self.card, full_diff, [g.as_dict() for g in self.gates], modified,
+            handback=self.swarm_on)
         call2 = self._call_board_role(
             "checker_pass2",
             brief2,

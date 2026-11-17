@@ -107,12 +107,14 @@ class HandbackParsingAndBriefTests(unittest.TestCase):
         book = BriefBook(self.tmp, never_touch=[], forbidden=[])
         pack = pack_for("python")
 
+        # With the swarm on (handback=True) every brief invites a hand-back.
         briefs = [
-            planner_brief(card, book),
-            test_writer_brief(card, book, pack),
-            implementer_brief(card, book, {"tests/test_full.py": "pass"}),
-            checker_pass1_brief(card, "+def test_x(): pass"),
-            checker_pass2_brief(card, "+return", [{"name": "t", "result": "pass"}], {}),
+            planner_brief(card, book, handback=True),
+            test_writer_brief(card, book, pack, handback=True),
+            implementer_brief(card, book, {"tests/test_full.py": "pass"}, handback=True),
+            checker_pass1_brief(card, "+def test_x(): pass", handback=True),
+            checker_pass2_brief(card, "+return", [{"name": "t", "result": "pass"}], {},
+                                handback=True),
         ]
         for brief in briefs:
             self.assertIn("replan_if", brief.body)
