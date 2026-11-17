@@ -25,6 +25,7 @@ from .config import TierConfig
 from .errors import AdapterError, GateFailure, Infra, Invalid, Refused, StopCode
 from .micromanager import _call_tier_complete
 from .swarm import (
+    WORKER_ROLES,
     StallMonitor,
     cards_collide,
     swarm_ask,
@@ -60,8 +61,46 @@ _COORDINATOR_SYSTEM_PROMPT = (
     "- {\"action\": \"block\", \"card\": \"CARD-1\", \"reason\": \"...\"}\n"
     "- {\"action\": \"remove\", \"member\": \"CARD-1-implementer\"}\n"
     "- {\"action\": \"wait\", \"reason\": \"...\"}\n"
+    "Code removes a finished card's workers from the roster by itself, so you never "
+    "need `remove` for them. The roster holds at most `max_members` active members; "
+    "each `start` adds four.\n"
     "Return valid JSON only."
 )
+
+
+def retire_card_members(board: Board, card_id: str, *, reason: str = "card finished") -> list[str]:
+    """Remove a finished card's worker members from the roster, as code.
+
+    Called by the run loop as soon as a card's outcome is recorded, whatever kind of
+    coordinator holds the seat, so finished cards never fill `max_members`. Seat and
+    code members are left alone. Idempotent: members already removed are skipped.
+    """
+    clean = str(card_id or "").strip()
+    if not clean or not board.board_dir.exists():
+        return []
+    removed: list[str] = []
+    for member in board.list_members(include_removed=False):
+        if str(member.get("card", "") or "") != clean:
+            continue
+        if member.get("kind") in ("code", "external"):
+            continue
+        if normalize_role(str(member.get("role", "") or "")) not in WORKER_ROLES:
+            continue
+        try:
+            board.update_member(str(member["name"]), state="removed")
+        except Refused:
+            continue
+        removed.append(str(member["name"]))
+    if removed:
+        board.post(
+            author="gates",
+            to=[],
+            kind="roster",
+            card=clean,
+            body=f"removed {', '.join(removed)} ({reason})",
+            trusted=True,
+        )
+    return removed
 
 
 class CoordinatorRuntime:
@@ -354,20 +393,8 @@ class CodeCoordinator:
 
     def on_finished(self, rt: CoordinatorRuntime, card_id: str, _outcome: dict) -> None:
         self.ensure_member(rt.board)
-        for member in rt.board.list_members(include_removed=False):
-            if member.get("card") == card_id and member.get("kind") != "code":
-                try:
-                    swarm_remove(
-                        rt.board,
-                        rt.cfg,
-                        caller="coordinator",
-                        member_name=member["name"],
-                        finished_cards={card_id},
-                        cards_by_id=rt.card_map,
-                        source=rt.source,
-                    )
-                except Refused:
-                    continue
+        # The run loop has already retired the card's workers; this covers direct callers.
+        retire_card_members(rt.board, card_id)
         self.on_plan(rt)
 
     def on_stall(self, rt: CoordinatorRuntime, _info: dict) -> None:
@@ -574,6 +601,7 @@ class ModelCoordinator:
             "ready_cards": rt.ready_cards_snapshot(),
             "tiers": tiers_info,
             "roster": roster,
+            "max_members": int(getattr(self.cfg.swarm, "max_members", 24) or 24),
             "free_slots": rt.free_slots(),
             "unread_posts": sanitized_posts,
         }
@@ -727,6 +755,14 @@ class ModelCoordinator:
                         rt.mark_blocked(cid, StopCode.REFUSED.value, reason)
                 elif name == "remove":
                     mname = str(act.get("member") or act.get("member_name") or "").strip()
+                    existing = rt.board.get_member(mname) if mname else None
+                    if (
+                        existing is not None
+                        and existing.get("state") == "removed"
+                        and str(existing.get("card", "") or "") in rt.finished
+                    ):
+                        # Code already retired this finished card's worker: nothing to do.
+                        continue
                     swarm_remove(
                         rt.board,
                         rt.cfg,
@@ -1227,6 +1263,7 @@ class SwarmRunner:
                 rt.finished[cid] = rec
             self.night.note_card()
             self.record_outcome_fn(cid, rec)
+            retire_card_members(self.board, cid, reason="card blocked")
 
         rt = CoordinatorRuntime(
             board=self.board,
@@ -1347,6 +1384,9 @@ class SwarmRunner:
                             if self.record_outcome_fn(cid, outcome):
                                 with rt.lock:
                                     rt.stop_launching = True
+                            # Code retires the finished card's workers at once, whatever
+                            # coordinator is seated, so the roster never fills with them.
+                            retire_card_members(self.board, cid)
                             if not rt.stop_launching:
                                 with rt.coord_busy():
                                     self.coordinator.on_finished(rt, cid, outcome)
