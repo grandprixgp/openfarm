@@ -2212,6 +2212,8 @@ class ClaudeAcpAdapter:
                             tokens_out = update_tokens_out
                         else:
                             tokens_out = 0
+                        if resp_in_raw is not None:
+                            tokens_in = _with_cached_input(resp_usage, tokens_in, tokens_out)
                     except Invalid:
                         self._terminate_process_group()
                         raise
@@ -2257,6 +2259,30 @@ class ClaudeAcpAdapter:
                     tokens_out=update_tokens_out or 0,
                     vendor_cost_usd=partial_cost,
                 )
+
+
+def _with_cached_input(usage: dict, tokens_in: int, tokens_out: int) -> int:
+    """Input tokens with the cached ones counted.
+
+    ACP's usage block reports cached input apart (`cachedReadTokens`,
+    `cachedWriteTokens`). The real Claude ACP server leaves them out of
+    `inputTokens`: a turn that read 16,303 prompt tokens reported 2 (seen live),
+    which would make a supervisor's share of a run look like nothing. A server
+    whose `inputTokens` already holds them is told apart by its own total.
+    """
+    cached = 0
+    for key in ("cachedReadTokens", "cachedWriteTokens"):
+        raw = usage.get(key)
+        if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+            continue
+        cached += raw
+    if not cached:
+        return tokens_in
+    total = usage.get("totalTokens")
+    if isinstance(total, int) and not isinstance(total, bool) and total >= 0 \
+            and tokens_in + tokens_out >= total:
+        return tokens_in
+    return tokens_in + cached
 
 
 def _first_present(mapping: dict, keys: tuple[str, ...]):

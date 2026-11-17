@@ -72,5 +72,56 @@ class StandaloneCodexServerOptionsTests(unittest.TestCase):
         self.assertEqual(self._calls(), [])
 
 
+class CachedInputTokensTests(unittest.TestCase):
+    """A server that reports cached input apart still has it counted as input."""
+
+    def test_cached_tokens_are_added_unless_the_total_says_they_are_already_in(self) -> None:
+        from openfarm_core.adapters.acp import _with_cached_input
+        live = {"inputTokens": 2, "outputTokens": 4, "cachedReadTokens": 7095,
+                "cachedWriteTokens": 9208, "totalTokens": 16309}
+        self.assertEqual(_with_cached_input(live, 2, 4), 16305)
+        already = {"inputTokens": 16305, "outputTokens": 4, "cachedReadTokens": 7095,
+                   "totalTokens": 16309}
+        self.assertEqual(_with_cached_input(already, 16305, 4), 16305)
+        self.assertEqual(_with_cached_input({"inputTokens": 10, "cachedReadTokens": 5}, 10, 1), 15)
+        self.assertEqual(_with_cached_input({"inputTokens": 10}, 10, 1), 10)
+        self.assertEqual(_with_cached_input({"cachedReadTokens": "9", "cachedWriteTokens": -3}, 10, 1), 10)
+
+    def test_a_prompt_through_the_adapter_counts_them(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="of-v081-lead-use-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        server = tmp / "claude-agent-acp"
+        server.write_text(r"""#!/usr/bin/env python3
+import json, sys
+def out(obj):
+    print(json.dumps(obj), flush=True)
+for raw in sys.stdin:
+    raw = raw.strip()
+    if not raw:
+        continue
+    msg = json.loads(raw)
+    mid, method = msg.get("id"), msg.get("method")
+    if method == "initialize":
+        out({"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": 1, "agentCapabilities": {}}})
+    elif method == "session/new":
+        out({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": "s1"}})
+    elif method == "session/prompt":
+        out({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "s1", "update": {
+            "sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "pong"}}}})
+        out({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "end_turn", "usage": {
+            "inputTokens": 2, "outputTokens": 4, "cachedReadTokens": 7095,
+            "cachedWriteTokens": 9208, "totalTokens": 16309}}})
+    elif mid is not None:
+        out({"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": "Method not found"}})
+""")
+        server.chmod(0o755)
+        work = tmp / "work"
+        work.mkdir()
+        with ClaudeAcpAdapter([str(server)], cwd=work, provider="claude", auth_mode="api-key",
+                              isolate_home=False) as acp:
+            res = acp.prompt(acp.new_session(cwd=work), "go", timeout_s=30)
+        self.assertEqual((res.text, res.tokens_in, res.tokens_out), ("pong", 16305, 4))
+
+
 if __name__ == "__main__":
     unittest.main()
