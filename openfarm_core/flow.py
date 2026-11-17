@@ -131,6 +131,8 @@ class CardRun:
         self._role_overrides: dict[str, tuple[str | None, str | None, str | None]] = {}
         self._effort_failures: dict[str, tuple[str, int]] = {}
         self._board_members_ready = False
+        #: The coordinator's reason when it stopped this card while it ran.
+        self.coordinator_stop = ""
 
         self._owns_micromanager = micromanager is None
         cancel_fn = lambda: bool(
@@ -968,6 +970,7 @@ class CardRun:
 
         tier_cur = str((member_before or {}).get("tier", "") or "")
         effort_cur = str((member_before or {}).get("effort", "") or "")
+        self._check_stop_requested()
         cancel_fn = lambda: bool(
             self.state.kill_requested(getattr(self.cfg, "kill_switch", None))
         )
@@ -1122,6 +1125,11 @@ class CardRun:
 
         resolution = None
         if self.on_handback is not None:
+            try:
+                self._check_stop_requested()
+            except GateFailure:
+                hb_entry["outcome"] = "stopped"
+                raise
             cancel_fn = lambda: bool(
                 self.state.kill_requested(getattr(self.cfg, "kill_switch", None))
             )
@@ -1285,6 +1293,7 @@ class CardRun:
                 write_json(response_path, call.as_dict())
             return call
 
+        self._check_stop_requested()
         self._ensure_board_members()
         board_role = (
             "checker" if role in ("checker_pass1", "checker_pass2") else normalize_role(role)
@@ -1472,6 +1481,22 @@ class CardRun:
             raise GateFailure(
                 StopCode.KILLED,
                 "the kill switch was set while this card was in progress")
+        self._check_stop_requested()
+
+    def _check_stop_requested(self) -> None:
+        """A coordinator's stop request ends the card before its next call or build.
+
+        `swarm block` (or a tier coordinator's `block`) on a running card only posts
+        to the board, so the card asks before each model call and wherever the kill
+        switch is checked. A stopped card ends blocked with `refused` through the
+        normal finish path. With the swarm off there is no board and nothing to ask.
+        """
+        if self.board is None:
+            return
+        reason = self.board.stop_requested(self.card.id)
+        if reason:
+            self.coordinator_stop = reason
+            raise GateFailure(StopCode.REFUSED, f"stopped by coordinator: {reason}")
 
     def _run(self, kind: str, argv: list[str], counted: str = "model",
              unit: str = "", timeout_s: float | None = None):
@@ -1865,6 +1890,7 @@ class CardRun:
                 if t.get("name")
             ]
             self._refresh_micromanager_harness_context("planner")
+            self._check_stop_requested()
             try:
                 decision = self.micromanager.shape_and_plan(
                     self.card, sigs, ctx_contents, known_tests=known_tests, cfg=self.cfg
@@ -2147,6 +2173,7 @@ class CardRun:
                         "test_writer",
                         failure_class=_classify_failure(failure=last_failure),
                     )
+                    self._check_stop_requested()
                     try:
                         advice = self.micromanager.coach(
                             self.card, "test-writer", attempt,
@@ -2211,6 +2238,7 @@ class CardRun:
                     sigs[norm] = self.book.signatures(norm, self.pack)
                 except (OSError, Refused):
                     pass
+        self._check_stop_requested()
         try:
             scaffold_edits = self.micromanager.scaffold_contract(
                 self.card, base_files, sigs,
@@ -2903,6 +2931,7 @@ class CardRun:
                         failure=detail,
                     ),
                 )
+                self._check_stop_requested()
                 try:
                     advice = self.micromanager.coach(
                         self.card, "implementer", attempt_no,
@@ -3183,6 +3212,7 @@ class CardRun:
 
         if self.micromanager.enabled:
             self._refresh_micromanager_harness_context("micromanager")
+            self._check_stop_requested()
             try:
                 report = self.micromanager.triage_and_review("pre_review", {
                     "card_id": self.card.id,
@@ -3531,6 +3561,7 @@ class CardRun:
                 self._refresh_micromanager_harness_context(
                     "checker", failure_class="counter-test"
                 )
+                self._check_stop_requested()
                 try:
                     verdict = self.micromanager.adjudicate_checker(
                         self.card, full_diff, restatement,
@@ -3762,6 +3793,9 @@ class CardRun:
             isolated = (
                 self.stop_code in _HARNESS_ISOLATED_STOP_CODES
                 or (self.stop_code == StopCode.REFUSED and model_calls == 0)
+                # The coordinator's decision, not the card's failure; and no
+                # reflection call is made for a stopped card.
+                or (self.stop_code == StopCode.REFUSED and bool(self.coordinator_stop))
                 or final_state == "released"
             )
             if isolated:
