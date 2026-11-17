@@ -264,6 +264,28 @@ class ProbeAndChildTests(_Tmp):
         self.assertTrue(self._gone(pid), "the bridge's child group outlived the bridge")
 
 
+class AgyPromptLimitTests(_Tmp):
+    """A3: a prompt too large for one argv word is refused before agy starts."""
+
+    def test_huge_prompt_is_refused_before_spawn(self) -> None:
+        calls = self.tmp / "agy-calls.log"
+        agy = _script(self.bin / "agy", (
+            "#!/usr/bin/env python3\nimport json, sys\n"
+            f"open({str(calls)!r}, 'a').write('called\\n')\n"
+            "print(json.dumps({'response': 'ok', 'usage': {'input_tokens': 1, 'output_tokens': 1}}))\n"))
+        with ClaudeAcpAdapter([sys.executable, str(AGY_NATIVE_ACP), "--agy-bin", str(agy)],
+                              cwd=self.tmp, provider="antigravity", confine="off") as acp:
+            sid = acp.new_session(cwd=self.tmp, tool_policy="none")
+            with self.assertRaises(AdapterError) as caught:
+                acp.prompt(sid, "x" * 200_000, timeout_s=30)
+            self.assertIn("131072", caught.exception.message)
+            self.assertFalse(calls.exists())
+            # An ordinary prompt still goes through the -p argument.
+            res = acp.prompt(sid, "small", timeout_s=30)
+            self.assertIn("ok", res.text)
+        self.assertEqual(calls.read_text(), "called\n")
+
+
 class StatusModeTests(_Tmp):
     def test_off_mode_says_so_in_status(self) -> None:
         repo = self.tmp / "repo"

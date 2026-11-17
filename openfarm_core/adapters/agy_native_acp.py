@@ -25,6 +25,8 @@ if __package__ in (None, ""):
 from openfarm_core import confine as confine_lib
 
 PROTOCOL_VERSION = 1
+# Linux's MAX_ARG_STRLEN: one argv word, NUL included, is at most 32 pages.
+MAX_ARG_BYTES = 32 * 4096
 _AUTH_HINT_RE = re.compile(
     r"not logged in|please run /login|authentication_failed|"
     r"authentication required|not authenticated|invalid.*token|"
@@ -311,6 +313,21 @@ class NativeAgyAcpServer:
         with self._proc_lock:
             self._cancelled_sessions.discard(sid)
 
+        size = len(full_prompt.encode("utf-8"))
+        if size + 1 > MAX_ARG_BYTES:
+            # agy takes the prompt as one argv word (-p); Linux refuses a word over
+            # MAX_ARG_STRLEN with "[Errno 7] Argument list too long".
+            self._send_error(
+                req_id,
+                -32602,
+                f"the prompt is {size} bytes, but agy takes it as one command-line "
+                f"argument (-p) and Linux caps one argument at {MAX_ARG_BYTES} bytes "
+                f"(MAX_ARG_STRLEN, including its NUL); shorten the prompt below "
+                f"{MAX_ARG_BYTES - 1} bytes",
+                data={"kind": "refused", "code": "agy-prompt-too-large",
+                      "bytes": size, "limit": MAX_ARG_BYTES - 1},
+            )
+            return
         argv = self._build_agy_argv(session, full_prompt)
         try:
             argv = self._child_argv(session, argv)
