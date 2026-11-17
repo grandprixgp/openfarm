@@ -7,11 +7,9 @@ uses ``openfarm_core.git.Git``) and never reads or exposes ``key_file`` or
 
 from __future__ import annotations
 
-import argparse
 import contextlib
 import curses
 import dataclasses
-import importlib
 import io
 import json
 import os
@@ -31,12 +29,12 @@ from .bench import load_task, render_report
 from .cards import Card, extract_fenced_fields
 from .config import CONFIG_PATH, Config, ConfigError, load_config
 from .dossier import render_markdown
-from .errors import AdapterError, ConfigError as _CfgErr, Infra, Invalid, Refused, UsageError
+from .errors import Infra, Invalid, UsageError
 from .git import Git
-from .globs import matches, normalise
 from .harness_global import GlobalLibrary, global_dir_for
-from .harness_memory import HarnessLibrary, sanitize_lesson_text
-from .state import StateDir, _safe_id, append_jsonl, read_json, utc_now, write_json
+from .harness_memory import HarnessLibrary
+from .state import StateDir, _safe_id, read_json
+from .swarm import cards_collide
 
 VIEWS = ("overview", "cards", "dossier", "board", "swarm", "harness", "ops")
 VIEW_LABELS = {
@@ -49,35 +47,6 @@ VIEW_LABELS = {
     "ops": "Ops",
 }
 
-VALID_MEMBER_KINDS = ("api", "acp", "code", "external", "scripted")
-VALID_ROLES = (
-    "coordinator",
-    "supervisor",
-    "planner",
-    "test-writer",
-    "implementer",
-    "checker",
-    "gates",
-    "monitor",
-)
-VALID_POST_KINDS = (
-    "brief",
-    "result",
-    "gate",
-    "defect",
-    "question",
-    "answer",
-    "handback",
-    "action",
-    "done",
-    "blocked",
-    "stall",
-    "roster",
-    "note",
-)
-EFFORT_STEPS = ("off", "low", "medium", "high", "xhigh", "max")
-
-
 @dataclasses.dataclass
 class TuiContext:
     """Resolved repository, config, and state handles (supports pre-config dirs)."""
@@ -88,13 +57,6 @@ class TuiContext:
     config_error: str
     cfg: Config | None
     state: StateDir | None
-
-
-def _optional_module(name: str):
-    try:
-        return importlib.import_module(name)
-    except ImportError:
-        return None
 
 
 def _load_tui_context(repo: Path | str, config_path: Path | str | None = None) -> TuiContext:
@@ -131,15 +93,6 @@ def _load_tui_context(repo: Path | str, config_path: Path | str | None = None) -
     )
 
 
-def _normalize_role(role: str) -> str:
-    text = str(role or "").strip().lower()
-    if text == "test_writer":
-        return "test-writer"
-    if text == "micromanager":
-        return "supervisor"
-    return text
-
-
 def _is_secret_file(ctx: TuiContext, candidate: Path) -> bool:
     if ctx.cfg is None:
         return False
@@ -156,119 +109,6 @@ def _is_secret_file(ctx: TuiContext, candidate: Path) -> bool:
                 return True
         except OSError:
             continue
-    return False
-
-
-def _globs_overlap(pat1: str, pat2: str) -> bool:
-    """Return True if two repo-relative globs could match a common path."""
-    globs_mod = _optional_module("openfarm_core.globs")
-    mod_fn = getattr(globs_mod, "globs_overlap", None) if globs_mod else None
-    if callable(mod_fn):
-        return bool(mod_fn(pat1, pat2))
-
-    p1 = normalise(pat1)
-    p2 = normalise(pat2)
-    if not p1 or not p2:
-        return False
-    if p1 == p2:
-        return True
-    if not any(ch in p1 for ch in "*?"):
-        return matches(p1, p2)
-    if not any(ch in p2 for ch in "*?"):
-        return matches(p2, p1)
-    return _nfa_globs_overlap(p1, p2)
-
-
-def _compile_glob_tokens(pattern: str) -> list[str]:
-    tokens: list[str] = []
-    idx = 0
-    length = len(pattern)
-    while idx < length:
-        if pattern.startswith("**/", idx):
-            tokens.append("**/")
-            idx += 3
-        elif pattern.startswith("/**", idx) and idx + 3 == length:
-            tokens.append("/**")
-            idx += 3
-        elif pattern.startswith("**", idx):
-            tokens.append("**")
-            idx += 2
-        else:
-            tokens.append(pattern[idx])
-            idx += 1
-    return tokens
-
-
-def _nfa_globs_overlap(pat1: str, pat2: str) -> bool:
-    """Exact BFS over the product of two glob token streams."""
-    t1 = _compile_glob_tokens(pat1)
-    t2 = _compile_glob_tokens(pat2)
-    n1, n2 = len(t1), len(t2)
-
-    def _expand(tokens: list[str], pos: int) -> list[int]:
-        out = [pos]
-        seen = {pos}
-        stack = [pos]
-        while stack:
-            cur = stack.pop()
-            if cur >= len(tokens):
-                continue
-            tok = tokens[cur]
-            if tok in ("**/", "/**", "**", "*"):
-                nxt = cur + 1
-                if nxt not in seen:
-                    seen.add(nxt)
-                    out.append(nxt)
-                    stack.append(nxt)
-        return out
-
-    def _step(tok: str, ch: str) -> bool:
-        if tok == "**/":
-            return True
-        if tok == "/**":
-            return True
-        if tok == "**":
-            return True
-        if tok == "*":
-            return ch != "/"
-        if tok == "?":
-            return ch != "/"
-        return tok == ch
-
-    def _alphabet(i: int, j: int) -> list[str]:
-        chars = {"a", "/"}
-        for tok in (t1[i] if i < n1 else "", t2[j] if j < n2 else ""):
-            if len(tok) == 1 and tok not in "*?":
-                chars.add(tok)
-        return sorted(chars)
-
-    queue: list[tuple[int, int]] = []
-    visited: set[tuple[int, int]] = set()
-    for s1 in _expand(t1, 0):
-        for s2 in _expand(t2, 0):
-            pair = (s1, s2)
-            if pair not in visited:
-                visited.add(pair)
-                queue.append(pair)
-
-    while queue:
-        i, j = queue.pop(0)
-        if i == n1 and j == n2:
-            return True
-        if i == n1 or j == n2:
-            continue
-        tok1, tok2 = t1[i], t2[j]
-        for ch in _alphabet(i, j):
-            if not (_step(tok1, ch) and _step(tok2, ch)):
-                continue
-            next_i = i if tok1 in ("**/", "/**", "**", "*") else i + 1
-            next_j = j if tok2 in ("**/", "/**", "**", "*") else j + 1
-            for ni in _expand(t1, next_i):
-                for nj in _expand(t2, next_j):
-                    pair = (ni, nj)
-                    if pair not in visited:
-                        visited.add(pair)
-                        queue.append(pair)
     return False
 
 
@@ -722,18 +562,6 @@ def _read_cards_readonly(ctx: TuiContext) -> tuple[list[Card], str]:
     return cards, source_mode
 
 
-def _cards_collide(a: Card, b: Card) -> bool:
-    if a.id == b.id:
-        return False
-    if b.id in a.deps or a.id in b.deps:
-        return True
-    for pat1 in a.touches:
-        for pat2 in b.touches:
-            if _globs_overlap(pat1, pat2):
-                return True
-    return False
-
-
 def _collect_cards(ctx: TuiContext) -> dict:
     if not ctx.configured or ctx.cfg is None or ctx.state is None:
         return {"configured": False, "source_mode": "unconfigured", "cards": []}
@@ -755,7 +583,7 @@ def _collect_cards(ctx: TuiContext) -> dict:
         collides = [
             other.id
             for other in active_candidates
-            if other.id != card.id and _cards_collide(card, other)
+            if other.id != card.id and cards_collide(card, other)
         ]
         branches: list[str] = []
         unmerged = 0
@@ -2164,7 +1992,7 @@ def render_snapshot(
     return "\n".join(lines)
 
 
-# -- Evidence reader & checked fallback board/swarm actions ------------------
+# -- Evidence reader -----------------------------------------------------------
 
 
 def read_evidence_file(
@@ -2198,542 +2026,6 @@ def read_evidence_file(
     if not candidate.is_file():
         return {"ok": False, "refused": True, "reason": f"evidence file not found: {path}"}
     return {"ok": True, "path": str(candidate), "text": candidate.read_text(encoding="utf-8", errors="replace")}
-
-
-def _fallback_validate_expects(expects: dict | None, data: object) -> dict:
-    if not isinstance(data, dict):
-        raise Refused("invalid-answer", "answer payload must be a JSON object")
-    if not expects or not isinstance(expects, dict):
-        return data
-    required = expects.get("required") or ()
-    for key in required:
-        if key not in data:
-            raise Refused("invalid-answer", f"missing required field {key!r}")
-    allowed_verdicts = expects.get("verdicts") or expects.get("allowed_verdicts")
-    if allowed_verdicts and data.get("verdict") not in allowed_verdicts:
-        raise Refused(
-            "invalid-answer",
-            f"verdict {data.get('verdict')!r} not in {list(allowed_verdicts)}",
-        )
-    props = expects.get("properties") or expects.get("fields") or {}
-    if isinstance(props, dict):
-        for key, spec in props.items():
-            if key not in data:
-                continue
-            val = data[key]
-            if isinstance(spec, dict):
-                enum = spec.get("enum") or spec.get("choices")
-                if enum and val not in enum:
-                    raise Refused("invalid-answer", f"field {key!r}: {val!r} not in {list(enum)}")
-                expected_type = spec.get("type")
-                type_map = {
-                    "str": str,
-                    "string": str,
-                    "int": int,
-                    "integer": int,
-                    "float": (int, float),
-                    "number": (int, float),
-                    "bool": bool,
-                    "boolean": bool,
-                    "list": list,
-                    "array": list,
-                    "dict": dict,
-                    "object": dict,
-                }
-                if expected_type in type_map:
-                    py_type = type_map[expected_type]
-                    if expected_type in ("int", "integer", "float", "number") and isinstance(val, bool):
-                        raise Refused("invalid-answer", f"field {key!r} cannot be boolean")
-                    if not isinstance(val, py_type):
-                        raise Refused("invalid-answer", f"field {key!r} must be {expected_type}")
-    return data
-
-
-def _ensure_board_dir(state: StateDir, run_id: str) -> Path:
-    board_dir = state.run_dir(run_id) / "board"
-    board_dir.mkdir(parents=True, exist_ok=True)
-    (board_dir / "evidence").mkdir(parents=True, exist_ok=True)
-    if not (board_dir / "state.json").exists():
-        write_json(board_dir / "state.json", {"ended": False, "ended_at": "", "reason": ""})
-    if not (board_dir / "members.json").exists():
-        write_json(board_dir / "members.json", {})
-    return board_dir
-
-
-def _fallback_board_post(
-    ctx: TuiContext,
-    *,
-    run_id: str,
-    author: str,
-    to: list[str],
-    kind: str,
-    body: str,
-    card: str = "",
-    ref: int | None = None,
-) -> dict:
-    board_mod = _optional_module("openfarm_core.board")
-    board_dir = _ensure_board_dir(ctx.state, run_id)
-    if board_mod is not None and hasattr(board_mod, "Board"):
-        board = board_mod.Board(board_dir, state_dir=ctx.state.root)
-        board.ensure()
-        return board.post(author=author, to=to, kind=kind, body=body, card=card, ref=ref)
-
-    if kind not in VALID_POST_KINDS:
-        raise Refused("bad-post-kind", f"invalid post kind {kind!r}")
-    members = read_json(board_dir / "members.json", {}) or {}
-    author_rec = members.get(author) if isinstance(members, dict) else None
-    author_kind = str((author_rec or {}).get("kind", "external"))
-    if kind in ("done", "gate") and author_kind != "code":
-        raise Refused("reserved-kind", f"post kind {kind!r} is reserved for code members")
-
-    cleaned_body = body if author_kind == "code" else sanitize_lesson_text(body, max_len=8000)
-    existing = _read_board_posts_raw(board_dir)
-    next_seq = (int(existing[-1]["seq"]) + 1) if existing else 1
-    evidence: list[str] = []
-    if len(cleaned_body) > 8000:
-        ev_path = board_dir / "evidence" / f"post-{next_seq:04d}.txt"
-        ev_path.write_text(cleaned_body, encoding="utf-8")
-        evidence.append(str(ev_path))
-        cleaned_body = cleaned_body[:8000]
-    record = {
-        "seq": next_seq,
-        "at": utc_now(),
-        "from": author,
-        "to": list(dict.fromkeys([t for t in to if t])),
-        "kind": kind,
-        "card": card,
-        "attempt": 0,
-        "ref": ref,
-        "body": cleaned_body,
-        "evidence": evidence,
-    }
-    append_jsonl(board_dir / "board.jsonl", record)
-    return record
-
-
-def _fallback_board_answer(
-    ctx: TuiContext,
-    *,
-    run_id: str,
-    question_seq: int,
-    as_name: str,
-    data: object,
-    body: str = "",
-) -> dict:
-    board_mod = _optional_module("openfarm_core.board")
-    board_dir = _ensure_board_dir(ctx.state, run_id)
-    if board_mod is not None and hasattr(board_mod, "Board"):
-        board = board_mod.Board(board_dir, state_dir=ctx.state.root)
-        board.ensure()
-        return board.answer(question_seq, as_name=as_name, data=data, body=body)
-
-    posts = _read_board_posts_raw(board_dir)
-    question = next((p for p in posts if int(p.get("seq", 0)) == question_seq), None)
-    if question is None or question.get("kind") != "question":
-        raise Refused("bad-question", f"post #{question_seq} is not a question")
-    if any(p.get("kind") == "answer" and p.get("ref") == question_seq for p in posts):
-        raise Refused("already-answered", f"question #{question_seq} is already answered")
-
-    members = read_json(board_dir / "members.json", {}) or {}
-    member = members.get(as_name) if isinstance(members, dict) else None
-    member_role = _normalize_role((member or {}).get("role", ""))
-    to_norm = {_normalize_role(x) for x in (question.get("to") or [])}
-    if as_name not in (question.get("to") or []) and "all" not in to_norm and (not member_role or member_role not in to_norm):
-        raise Refused("not-addressee", f"{as_name!r} is not addressed on question #{question_seq}")
-
-    validated = _fallback_validate_expects(question.get("expects"), data)
-    ans_path = board_dir / "evidence" / f"answer-q{question_seq}.json"
-    write_json(ans_path, validated)
-    next_seq = (int(posts[-1]["seq"]) + 1) if posts else 1
-    record = {
-        "seq": next_seq,
-        "at": utc_now(),
-        "from": as_name,
-        "to": [str(question.get("from", "supervisor"))],
-        "kind": "answer",
-        "card": str(question.get("card", "")),
-        "attempt": int(question.get("attempt", 0) or 0),
-        "ref": question_seq,
-        "body": sanitize_lesson_text(body or json.dumps(validated, ensure_ascii=False), max_len=8000),
-        "evidence": [str(ans_path)],
-    }
-    append_jsonl(board_dir / "board.jsonl", record)
-    return record
-
-
-def _dispatch_fallback_board(ctx: TuiContext, tokens: list[str]) -> dict:
-    if not ctx.configured or ctx.state is None:
-        return _cmd_result(2, "", "repository is not configured")
-    parser = argparse.ArgumentParser(prog="openfarm board", add_help=False)
-    sub = parser.add_subparsers(dest="board_op")
-    p_read = sub.add_parser("read")
-    p_read.add_argument("--as", dest="as_name", default="*")
-    p_read.add_argument("--since", type=int, default=0)
-    p_read.add_argument("--limit", type=int, default=20)
-    p_read.add_argument("--seqs", default=None)
-    p_read.add_argument("--status", action="store_true")
-    p_read.add_argument("--run", default=None)
-
-    p_post = sub.add_parser("post")
-    p_post.add_argument("--as", dest="as_name", required=True)
-    p_post.add_argument("--to", required=True)
-    p_post.add_argument("--kind", default="note")
-    p_post.add_argument("--card", default="")
-    p_post.add_argument("--ref", type=int, default=None)
-    p_post.add_argument("--body", default=None)
-    p_post.add_argument("--file", default=None)
-    p_post.add_argument("--run", default=None)
-
-    p_ans = sub.add_parser("answer")
-    p_ans.add_argument("seq", type=int)
-    p_ans.add_argument("--as", dest="as_name", required=True)
-    p_ans.add_argument("--file", default=None)
-    p_ans.add_argument("--json-data", default=None)
-    p_ans.add_argument("--body", default="")
-    p_ans.add_argument("--run", default=None)
-
-    p_wait = sub.add_parser("wait")
-    p_wait.add_argument("--as", dest="as_name", required=True)
-    p_wait.add_argument("--since", type=int, default=0)
-    p_wait.add_argument("--timeout", default="0")
-    p_wait.add_argument("--run", default=None)
-
-    err_buf = io.StringIO()
-    try:
-        with contextlib.redirect_stderr(err_buf):
-            args = parser.parse_args(tokens)
-    except SystemExit:
-        return _cmd_result(2, "", err_buf.getvalue().strip() or "invalid board command")
-
-    run_id, _ = _resolve_run_id(ctx.state, getattr(args, "run", None))
-    if not run_id:
-        run_id = f"run-{utc_now().replace('-', '').replace(':', '')}"
-
-    try:
-        if args.board_op == "read":
-            board_data = _read_board_data(ctx, run_id)
-            if args.status:
-                payload = {
-                    "run_id": board_data["run_id"],
-                    "posts": board_data["total_posts"],
-                    "last_seq": board_data["last_seq"],
-                    "ended": board_data["ended"],
-                    "members": len(board_data["members"]),
-                    "unanswered_questions": len(board_data["unanswered_questions"]),
-                }
-            else:
-                posts = board_data["posts"]
-                if args.seqs:
-                    wanted = [int(s.strip()) for s in args.seqs.split(",") if s.strip()]
-                    by_seq = {p["seq"]: p for p in posts}
-                    posts = [by_seq[s] for s in wanted if s in by_seq]
-                else:
-                    posts = [p for p in posts if p["seq"] > args.since][: args.limit]
-                payload = {"run_id": board_data["run_id"], "posts": posts}
-            return _cmd_result(0, json.dumps(payload, indent=2, ensure_ascii=False), "", data=payload)
-
-        if args.board_op == "post":
-            if args.file:
-                res = read_evidence_file(ctx.repo, ctx.config_path, args.file, run_id=run_id)
-                if not res["ok"]:
-                    return _cmd_result(1, "", res["reason"], data={"refused": True, "reason": res["reason"]})
-                body = res["text"]
-            else:
-                body = args.body or ""
-            to_list = [x.strip() for x in args.to.split(",") if x.strip()]
-            rec = _fallback_board_post(
-                ctx,
-                run_id=run_id,
-                author=args.as_name,
-                to=to_list,
-                kind=args.kind,
-                body=body,
-                card=args.card,
-                ref=args.ref,
-            )
-            return _cmd_result(0, json.dumps(rec, indent=2, ensure_ascii=False), "", data=rec)
-
-        if args.board_op == "answer":
-            if args.file:
-                f = Path(args.file)
-                if _is_secret_file(ctx, f):
-                    return _cmd_result(1, "", "refused: cannot read secret key_file")
-                raw_json = f.read_text(encoding="utf-8")
-            elif args.json_data is not None:
-                raw_json = args.json_data
-            else:
-                return _cmd_result(2, "", "board answer requires --file or --json-data")
-            parsed = json.loads(raw_json)
-            rec = _fallback_board_answer(
-                ctx,
-                run_id=run_id,
-                question_seq=args.seq,
-                as_name=args.as_name,
-                data=parsed,
-                body=args.body,
-            )
-            return _cmd_result(0, json.dumps(rec, indent=2, ensure_ascii=False), "", data=rec)
-
-        if args.board_op == "wait":
-            board_data = _read_board_data(ctx, run_id)
-            posts = [p for p in board_data["posts"] if p["seq"] > args.since]
-            if posts:
-                payload = {"woke": True, "posts": posts, "last_seq": posts[-1]["seq"]}
-            elif board_data["ended"]:
-                payload = {"woke": False, "reason": "run-ended", "posts": []}
-            else:
-                payload = {"woke": False, "reason": "timeout", "posts": []}
-            return _cmd_result(0, json.dumps(payload, indent=2, ensure_ascii=False), "", data=payload)
-    except (Refused, Invalid, ValueError, OSError) as exc:
-        msg = getattr(exc, "message", str(exc))
-        return _cmd_result(1, json.dumps({"refused": True, "reason": msg}), msg, data={"refused": True, "reason": msg})
-
-    return _cmd_result(2, "", "unknown board subcommand")
-
-
-def _require_coordinator_seat(ctx: TuiContext, members: dict, caller: str) -> None:
-    if not caller:
-        raise Refused("not-coordinator", "caller (--as) is required and must hold the coordinator seat")
-    member = members.get(caller) if isinstance(members, dict) else None
-    if not isinstance(member, dict) or member.get("state") == "removed":
-        raise Refused("not-coordinator", f"{caller!r} is not an active member holding the coordinator seat")
-    if _normalize_role(member.get("role", "")) != "coordinator":
-        raise Refused("not-coordinator", f"{caller!r} has role {member.get('role')!r}, not coordinator")
-
-
-def _validate_tier_effort(cfg: Config, tier_name: str, effort: str) -> tuple[str, str]:
-    tiers = getattr(cfg, "tiers", None) or {}
-    if tiers:
-        if tier_name not in tiers:
-            raise Refused("bad-tier", f"unknown tier {tier_name!r}")
-        tier = tiers[tier_name]
-        allowed = tuple(getattr(tier, "efforts", ()) or ())
-        if effort and allowed and effort not in allowed:
-            raise Refused("bad-effort", f"effort {effort!r} is not allowed for tier {tier_name!r}")
-        return str(getattr(tier, "model", "")), effort
-    if tier_name and tier_name != "default":
-        raise Refused("bad-tier", f"unknown tier {tier_name!r}")
-    if effort and effort not in EFFORT_STEPS:
-        raise Refused("bad-effort", f"invalid effort {effort!r}")
-    impl = cfg.role_models.get("implementer") if cfg.role_models else None
-    return str(getattr(impl, "model", "") or ""), effort
-
-
-def _dispatch_fallback_swarm(ctx: TuiContext, tokens: list[str]) -> dict:
-    if not ctx.configured or ctx.cfg is None or ctx.state is None:
-        return _cmd_result(2, "", "repository is not configured")
-    parser = argparse.ArgumentParser(prog="openfarm swarm", add_help=False)
-    sub = parser.add_subparsers(dest="swarm_op")
-
-    p_st = sub.add_parser("status")
-    p_st.add_argument("--run", default=None)
-
-    sub.add_parser("tiers")
-
-    p_join = sub.add_parser("join")
-    p_join.add_argument("--name", required=True)
-    p_join.add_argument("--seat", required=True, choices=("coordinator", "supervisor"))
-    p_join.add_argument("--kind", default="agent", choices=("human", "agent"))
-    p_join.add_argument("--run", default=None)
-
-    p_start = sub.add_parser("start")
-    p_start.add_argument("card")
-    p_start.add_argument("--team", default="")
-    p_start.add_argument("--as", dest="as_name", default="")
-    p_start.add_argument("--run", default=None)
-
-    p_set = sub.add_parser("set")
-    p_set.add_argument("member")
-    p_set.add_argument("--tier", default="")
-    p_set.add_argument("--effort", default="")
-    p_set.add_argument("--as", dest="as_name", default="")
-    p_set.add_argument("--run", default=None)
-
-    p_hint = sub.add_parser("hint")
-    p_hint.add_argument("member")
-    p_hint.add_argument("--body", required=True)
-    p_hint.add_argument("--as", dest="as_name", default="")
-    p_hint.add_argument("--run", default=None)
-
-    p_block = sub.add_parser("block")
-    p_block.add_argument("card")
-    p_block.add_argument("--reason", required=True)
-    p_block.add_argument("--as", dest="as_name", default="")
-    p_block.add_argument("--run", default=None)
-
-    p_rm = sub.add_parser("remove")
-    p_rm.add_argument("member")
-    p_rm.add_argument("--as", dest="as_name", default="")
-    p_rm.add_argument("--run", default=None)
-
-    err_buf = io.StringIO()
-    try:
-        with contextlib.redirect_stderr(err_buf):
-            args = parser.parse_args(tokens)
-    except SystemExit:
-        return _cmd_result(2, "", err_buf.getvalue().strip() or "invalid swarm command")
-
-    if args.swarm_op == "tiers":
-        payload = {"tiers": _read_tiers_summary(ctx.cfg)}
-        return _cmd_result(0, json.dumps(payload, indent=2, ensure_ascii=False), "", data=payload)
-
-    run_id, _ = _resolve_run_id(ctx.state, getattr(args, "run", None))
-    if args.swarm_op == "status":
-        payload = _collect_swarm(ctx, run_id=run_id)
-        return _cmd_result(0, json.dumps(payload, indent=2, ensure_ascii=False), "", data=payload)
-
-    if not run_id:
-        run_id = f"run-{utc_now().replace('-', '').replace(':', '')}"
-    board_dir = _ensure_board_dir(ctx.state, run_id)
-    members = read_json(board_dir / "members.json", {}) or {}
-    swarm_cfg = _read_swarm_summary(ctx.cfg)
-
-    try:
-        if args.swarm_op == "join":
-            seat_val = swarm_cfg.get(args.seat, "")
-            if seat_val != "external":
-                raise Refused(
-                    "seat-not-external",
-                    f"[swarm] {args.seat} is {seat_val!r}, not 'external'",
-                )
-            members[args.name] = {
-                "name": args.name,
-                "kind": "external",
-                "role": args.seat,
-                "card": "",
-                "tier": "",
-                "effort": "",
-                "state": "active",
-                "added_by": "external",
-                "last_read_seq": 0,
-                "wait_since": "",
-                "tokens": {"in": 0, "out": 0},
-                "attempts": 0,
-                "owner_kind": args.kind,
-            }
-            write_json(board_dir / "members.json", members)
-            _fallback_board_post(
-                ctx,
-                run_id=run_id,
-                author=args.name,
-                to=["all"],
-                kind="roster",
-                body=f"{args.name} joined seat {args.seat} ({args.kind})",
-            )
-            payload = {"joined": True, "member": members[args.name], "run_id": run_id}
-            return _cmd_result(0, json.dumps(payload, indent=2, ensure_ascii=False), "", data=payload)
-
-        _require_coordinator_seat(ctx, members, getattr(args, "as_name", ""))
-
-        if args.swarm_op == "start":
-            cards, _ = _read_cards_readonly(ctx)
-            card = next((c for c in cards if c.id == args.card), None)
-            if card is None:
-                raise Refused("unknown-card", f"no card {args.card!r}")
-            if card.state != "ready":
-                raise Refused("not-ready", f"{card.id} is {card.state}, not ready")
-            running_cards = {
-                c.id: c for c in cards if c.state == "in_progress"
-            }
-            for running in running_cards.values():
-                if _cards_collide(card, running):
-                    raise Refused("card-collision", f"{card.id} collides with {running.id}")
-            team_spec: dict[str, dict[str, str]] = {}
-            if args.team:
-                for item in args.team.split(","):
-                    item = item.strip()
-                    if not item:
-                        continue
-                    role_part, sep, spec_part = item.partition("=")
-                    if not sep:
-                        raise Refused("bad-team", f"expected role=tier:effort, got {item!r}")
-                    tier_n, _, eff_n = spec_part.partition(":")
-                    model_n, eff_checked = _validate_tier_effort(
-                        ctx.cfg, tier_n.strip() or swarm_cfg["default_tier"], eff_n.strip()
-                    )
-                    team_spec[_normalize_role(role_part)] = {
-                        "tier": tier_n.strip() or swarm_cfg["default_tier"],
-                        "effort": eff_checked,
-                        "model": model_n,
-                    }
-            rec = _fallback_board_post(
-                ctx,
-                run_id=run_id,
-                author=args.as_name,
-                to=["all"],
-                kind="action",
-                card=card.id,
-                body=f"start {card.id} team={json.dumps(team_spec, sort_keys=True)}",
-            )
-            payload = {"action": "start", "card": card.id, "team": team_spec, "post": rec}
-            return _cmd_result(0, json.dumps(payload, indent=2, ensure_ascii=False), "", data=payload)
-
-        if args.swarm_op == "set":
-            target = members.get(args.member)
-            if not isinstance(target, dict) or target.get("state") == "removed":
-                raise Refused("unknown-member", f"member {args.member!r} not found")
-            new_tier = args.tier or str(target.get("tier") or swarm_cfg["default_tier"])
-            new_effort = args.effort or str(target.get("effort") or "")
-            model_n, eff_checked = _validate_tier_effort(ctx.cfg, new_tier, new_effort)
-            target["tier"] = new_tier
-            target["effort"] = eff_checked
-            if model_n:
-                target["model"] = model_n
-            write_json(board_dir / "members.json", members)
-            rec = _fallback_board_post(
-                ctx,
-                run_id=run_id,
-                author=args.as_name,
-                to=[args.member],
-                kind="action",
-                card=str(target.get("card", "")),
-                body=f"set {args.member} tier={new_tier} effort={eff_checked}",
-            )
-            payload = {"action": "set", "member": target, "post": rec}
-            return _cmd_result(0, json.dumps(payload, indent=2, ensure_ascii=False), "", data=payload)
-
-        if args.swarm_op == "hint":
-            target = members.get(args.member)
-            if not isinstance(target, dict) or target.get("state") == "removed":
-                raise Refused("unknown-member", f"member {args.member!r} not found")
-            rec = _fallback_board_post(
-                ctx,
-                run_id=run_id,
-                author=args.as_name,
-                to=[args.member],
-                kind="note",
-                card=str(target.get("card", "")),
-                body=args.body,
-            )
-            payload = {"action": "hint", "member": args.member, "post": rec}
-            return _cmd_result(0, json.dumps(payload, indent=2, ensure_ascii=False), "", data=payload)
-
-        if args.swarm_op == "block":
-            rec = _fallback_board_post(
-                ctx,
-                run_id=run_id,
-                author=args.as_name,
-                to=["all"],
-                kind="blocked",
-                card=args.card,
-                body=f"blocked {args.card}: {args.reason}",
-            )
-            payload = {"action": "block", "card": args.card, "reason": args.reason, "post": rec}
-            return _cmd_result(0, json.dumps(payload, indent=2, ensure_ascii=False), "", data=payload)
-
-        if args.swarm_op == "remove":
-            target = members.get(args.member)
-            if not isinstance(target, dict):
-                raise Refused("unknown-member", f"member {args.member!r} not found")
-            target["state"] = "removed"
-            write_json(board_dir / "members.json", members)
-            payload = {"action": "remove", "member": args.member, "state": "removed"}
-            return _cmd_result(0, json.dumps(payload, indent=2, ensure_ascii=False), "", data=payload)
-    except (Refused, Invalid, _CfgErr, ValueError) as exc:
-        msg = getattr(exc, "message", str(exc))
-        return _cmd_result(1, json.dumps({"refused": True, "reason": msg}), msg, data={"refused": True, "reason": msg})
-
-    return _cmd_result(2, "", "unknown swarm subcommand")
 
 
 def _cmd_result(exit_code: int, stdout: str, stderr: str, data: object = None) -> dict:
@@ -2780,12 +2072,6 @@ def dispatch_cli_command(
 
     from . import cli
 
-    known_cli = set(getattr(cli, "COMMANDS", {})) | set(getattr(cli, "PRE_CONFIG_COMMANDS", {}))
-    ctx = _load_tui_context(repo, config_path)
-    if cmd_name == "board" and "board" not in known_cli:
-        return _dispatch_fallback_board(ctx, argv_tokens[1:])
-    if cmd_name == "swarm" and "swarm" not in known_cli:
-        return _dispatch_fallback_swarm(ctx, argv_tokens[1:])
 
     resolved_repo = Path(repo).resolve()
     full_argv: list[str] = []
