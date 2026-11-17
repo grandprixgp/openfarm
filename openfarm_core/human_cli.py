@@ -631,6 +631,10 @@ def _format_run(payload: dict, style: Style) -> str:
         lines = [style.red(f"{ICON_FAIL} Run refused: {reason}")]
         if payload.get("code"):
             lines.append(format_kv([("code", payload["code"])], style=style))
+        if payload.get("child"):
+            # Which ACP child the confinement rules refused (worker, coordinator, supervisor).
+            child = f"{payload['child']} ({payload.get('provider') or '?'})"
+            lines.append(format_kv([("ACP child", child)], style=style))
         adapters = payload.get("adapters")
         if isinstance(adapters, dict) and adapters:
             lines.append(format_kv([(k, v) for k, v in adapters.items()], style=style))
