@@ -20,7 +20,8 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from openfarm_core.cli import EXIT_OK, main as cli_main
+from openfarm_core.cli import EXIT_OK
+from openfarm_core.cli import main as cli_main
 from openfarm_core.config import load_config
 from openfarm_core.driver import _DrivenNightBudget, drive_run
 from openfarm_core.state import StateDir, read_json

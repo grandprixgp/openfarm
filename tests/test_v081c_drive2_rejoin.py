@@ -26,7 +26,8 @@ if str(ROOT) not in sys.path:
 
 from openfarm_core import driver as driver_mod
 from openfarm_core.board import Board
-from openfarm_core.cli import EXIT_OK, main as cli_main
+from openfarm_core.cli import EXIT_OK
+from openfarm_core.cli import main as cli_main
 from openfarm_core.config import load_config
 from openfarm_core.driver import _end_drive, drive_run
 from openfarm_core.errors import Refused
@@ -124,7 +125,7 @@ class DriveTheSameRunTwiceTests(unittest.TestCase):
             "CARD-1/checker_pass2": "{}",
         }))
         self.driver = Path(self.toy.base) / "driver.json"
-        answer = lambda data: {"actions": [], "answers": [{"seq": "auto", "data": data}]}  # noqa: E731
+        answer = lambda data: {"actions": [], "answers": [{"seq": "auto", "data": data}]}
         self.driver.write_text(json.dumps({
             "driver/*": {"actions": [], "answers": []},
             "driver/question/shape_and_plan": answer({"verdict": "ready", "clarified_notes": "ok"}),
@@ -163,9 +164,9 @@ class DriveTheSameRunTwiceTests(unittest.TestCase):
         # The first drive stops at its first look at the board (a Ctrl-C, say).
         with mock.patch.object(driver_mod, "_parse_board_state",
                                side_effect=KeyboardInterrupt), \
-                contextlib.redirect_stderr(io.StringIO()):
-            with self.assertRaises(KeyboardInterrupt):
-                _drive()
+                contextlib.redirect_stderr(io.StringIO()), \
+                self.assertRaises(KeyboardInterrupt):
+            _drive()
         board = Board(posts.parent, state_dir=StateDir(self.toy.state_dir))
         self.assertEqual(board.get_member("d-sup")["state"], "removed")
         self.assertTrue(th.is_alive(), "the run belongs to its own process and goes on")

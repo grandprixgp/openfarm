@@ -216,7 +216,7 @@ def flags_only_note(provider: str, bwrap_reason: str = "") -> str:
     )
 
 
-def hold_note(hold: "Hold", bwrap_reason: str = "") -> str:
+def hold_note(hold: Hold, bwrap_reason: str = "") -> str:
     """What a run's notes say about a child that is not confined, or '' when it is.
 
     `off` gives `off_note`; a child held by flags alone (Codex when bwrap is

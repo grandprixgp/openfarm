@@ -15,7 +15,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from openfarm_core import confine as confine_lib
-from openfarm_core.cli import EXIT_OK, main as cli_main
+from openfarm_core.cli import EXIT_OK
+from openfarm_core.cli import main as cli_main
 from openfarm_core.state import read_json
 from tests.test_python_e2e import build_python_toy
 

@@ -127,9 +127,9 @@ class DriverLoginTests(unittest.TestCase):
         config_dir = self.tmp / "claude-elsewhere"
         config_dir.mkdir()
         (config_dir / ".credentials.json").write_text(json.dumps(_CLAUDE_OLD))
-        drv, seen = self._turn("claude", "refresh",
-                               {"HOME": str(self.host_home), "CLAUDE_CONFIG_DIR": str(config_dir)},
-                               new=json.dumps(_CLAUDE_NEW))
+        _drv, seen = self._turn("claude", "refresh",
+                                {"HOME": str(self.host_home), "CLAUDE_CONFIG_DIR": str(config_dir)},
+                                new=json.dumps(_CLAUDE_NEW))
         self.assertTrue(seen["had_login"])
         self.assertTrue(seen["claude_config_dir"].startswith(seen["home"]))
         self.assertEqual(json.loads((config_dir / ".credentials.json").read_text()), _CLAUDE_NEW)

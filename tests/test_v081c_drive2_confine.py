@@ -20,7 +20,8 @@ if str(ROOT) not in sys.path:
 
 from openfarm_core import confine as confine_lib
 from openfarm_core import driver as driver_mod
-from openfarm_core.cli import EXIT_OK, EXIT_REFUSED, main as cli_main
+from openfarm_core.cli import EXIT_OK, EXIT_REFUSED
+from openfarm_core.cli import main as cli_main
 from openfarm_core.driver import DriverAgent
 from openfarm_core.errors import Refused
 from openfarm_core.state import read_json
@@ -168,7 +169,7 @@ class DriverArgvTests(unittest.TestCase):
         self.assertEqual(drv.hold.describe(), "boundary")
 
     def test_antigravity_auto_without_bwrap_is_refused_before_spawn(self) -> None:
-        drv, call, err = self._drive_once("antigravity", "auto", usable=False)
+        _drv, call, err = self._drive_once("antigravity", "auto", usable=False)
         self.assertIsNone(call and call["argv"][:1], "nothing may start")
         self.assertIsInstance(err, Refused)
         self.assertEqual(err.code, "acp-confine-unavailable")
@@ -188,12 +189,12 @@ class DriverArgvTests(unittest.TestCase):
         self.assertEqual(drv.notes, [])
 
     def test_claude_bwrap_is_confined_or_refused(self) -> None:
-        drv, call, err = self._drive_once("claude", "bwrap", usable=True)
+        _drv, call, err = self._drive_once("claude", "bwrap", usable=True)
         self.assertIsNone(err)
         self.assertEqual(call["argv"][0], "/fake/bwrap")
         self.assertNotEqual(Path(call["cwd"]), self.repo.resolve())
         self.calls.clear()
-        drv2, call2, err2 = self._drive_once("claude", "bwrap", usable=False)
+        _drv2, call2, err2 = self._drive_once("claude", "bwrap", usable=False)
         self.assertIsNone(call2)
         self.assertEqual(err2.code, "acp-confine-unavailable")
         self.assertIn('confine = "bwrap" confines every provider', err2.message)
@@ -295,6 +296,7 @@ class DriveRunConfineTests(unittest.TestCase):
         h_rc, h_out, h_err = _run_cli("--repo", str(self.toy.root), "drive",
                                       "--agent", "codex", "--cards", "1",
                                       "--driver-bin", str(codex), "--script", str(self.worker))
+        self.assertEqual(h_rc, EXIT_OK, h_err)
         self.assertIn('confine = "off"', h_out + h_err)
 
 
