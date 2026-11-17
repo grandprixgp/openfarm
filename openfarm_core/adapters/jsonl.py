@@ -91,6 +91,7 @@ CARD_FIELDS = (
     "micromanager_tokens_out", "micromanager_spend",
     "false_rejects_dismissed",
     "harness_revision", "harness_cues_applied", "harness_lessons_added",
+    "team", "handbacks",
 )
 
 
@@ -129,7 +130,8 @@ def _default_for(field: str):
     if field == "planner_used":
         return False
     if field in ("findings_filed", "known_failing_excluded", "named_tests",
-                 "harness_cues_applied", "harness_lessons_added"):
+                 "harness_cues_applied", "harness_lessons_added",
+                 "team", "handbacks"):
         return []
     if field == "files_changed":
         return []

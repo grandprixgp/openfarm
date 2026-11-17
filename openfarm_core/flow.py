@@ -10,7 +10,8 @@ import hashlib
 import shutil
 from pathlib import Path
 
-from .briefs import BriefBook
+from .board import normalize_role
+from .briefs import Brief, BriefBook, fence
 from .budget import Budget, BudgetExceeded, NightBudget
 from .cards import Card
 from .edits import (apply_edits, diff_text, line_counts, parse_edits,
@@ -38,6 +39,7 @@ from .roles import (Plan, Roles, parse_answer_edits, build_checker_pass1_brief,
                     parse_counter_tests, parse_plan, parse_restatement,
                     wants_planner)
 from .state import append_jsonl, utc_now, utc_after, write_json
+from .swarm import WORKER_ROLES, worker_kind_for_config, worker_member_name
 
 _HARNESS_ISOLATED_STOP_CODES = frozenset({
     StopCode.INFRA,
@@ -86,7 +88,8 @@ class CardRun:
                  telemetry, budget: Budget | None = None,
                  deps_done: bool = True, conventions: str = "",
                  log=None, micromanager=None,
-                 harness_library: HarnessLibrary | None = None) -> None:
+                 harness_library: HarnessLibrary | None = None,
+                 board=None, swarm=None) -> None:
         self.card = card
         self.cfg = cfg
         self.state = state
@@ -197,6 +200,13 @@ class CardRun:
         self.unformatted: list[str] = []
         self.existing_tests_changed: list[str] = []
         self.ended_at = ""
+        self.board = board
+        self.swarm = swarm if swarm is not None else getattr(cfg, "swarm", None)
+        self.team_sets: list[dict] = []
+        self.handbacks: list[dict] = []
+        self.effort_tokens: dict[str, int] = {}
+        self._member_stats: dict[str, dict] = {}
+        self._board_members_ready = False
 
         harness_cfg = getattr(cfg, "harness", None)
         harness_enabled = bool(getattr(harness_cfg, "enabled", False))
@@ -540,7 +550,308 @@ class CardRun:
         write_json(path, gate.as_dict())
         self.log(f"{self.card.id}: {gate.name} {gate.result}"
                  + (f" — {gate.detail}" if gate.detail else ""))
+        if self.board is not None:
+            self._ensure_board_members()
+            to = [] if gate.result == PASS else self._gate_target(gate.name)
+            body = (
+                f"{gate.name}: {gate.result}"
+                + (f" — {gate.detail}" if gate.detail else "")
+            )
+            self._post_board(
+                author="gates",
+                to=to,
+                kind="gate",
+                attempt=attempt,
+                body=body,
+                evidence=[str(path)],
+                trusted=True,
+            )
         return gate
+
+    def _gate_target(self, gate_name: str) -> list[str]:
+        if (
+            gate_name in ("eligibility", "baseline", "harness-efficiency")
+            or gate_name.startswith("micromanager-")
+        ):
+            return []
+        if (
+            self.phase in ("test-writer", "prove-tests")
+            or gate_name in ("named-tests-exist", "fail-before", "revert-check")
+        ):
+            return [worker_member_name(self.card.id, "test-writer")]
+        return [worker_member_name(self.card.id, "implementer")]
+
+    def _ensure_board_members(self) -> None:
+        if self.board is None or self._board_members_ready:
+            return
+        self.board.ensure()
+        if self.board.get_member("gates") is None:
+            self.board.upsert_member(
+                "gates", kind="code", role="gates", added_by="system"
+            )
+        if (
+            self.board.get_member("coordinator") is None
+            and getattr(self.swarm, "coordinator", "code") == "code"
+        ):
+            self.board.upsert_member(
+                "coordinator", kind="code", role="coordinator", added_by="system"
+            )
+        tiers = getattr(self.cfg, "tiers", {}) or {}
+        default_tier_name = str(
+            getattr(self.swarm, "default_tier", "") or (next(iter(tiers), "default"))
+        )
+        kind = worker_kind_for_config(self.cfg)
+        for role in WORKER_ROLES:
+            mname = worker_member_name(self.card.id, role)
+            if self.board.get_member(mname) is None:
+                tier_cfg = tiers.get(default_tier_name) or next(iter(tiers.values()), None)
+                tier_name = tier_cfg.name if tier_cfg is not None else default_tier_name
+                if tier_cfg is not None and tier_cfg.model:
+                    model_name = tier_cfg.model
+                else:
+                    rm = (getattr(self.cfg, "role_models", {}) or {}).get(
+                        "test_writer" if role == "test-writer" else role
+                    )
+                    model_name = rm.model if rm is not None else ""
+                default_effort = (
+                    self.cfg.effort_for_role(role)[0]
+                    if hasattr(self.cfg, "effort_for_role")
+                    else ""
+                )
+                self.board.upsert_member(
+                    mname,
+                    kind=kind,
+                    role=role,
+                    card=self.card.id,
+                    tier=tier_name,
+                    model=model_name,
+                    effort=default_effort,
+                    state="active",
+                    added_by="system",
+                )
+        self._board_members_ready = True
+
+    def _post_board(
+        self,
+        *,
+        author: str,
+        to: list[str] | str,
+        kind: str,
+        body: str,
+        attempt: int = 0,
+        ref: int | None = None,
+        evidence: list[str] | None = None,
+        trusted: bool | None = None,
+    ) -> dict | None:
+        if self.board is None:
+            return None
+        return self.board.post(
+            author=author,
+            to=to,
+            kind=kind,
+            body=body,
+            card=self.card.id,
+            attempt=attempt,
+            ref=ref,
+            evidence=evidence,
+            trusted=trusted,
+        )
+
+    def _consume_member_hints(self, member_name: str) -> list[str]:
+        if self.board is None:
+            return []
+        unread = self.board.read(as_name=member_name, for_model=True, advance_cursor=True)
+        return [
+            str(post.get("body", "")).strip()
+            for post in unread
+            if post.get("kind") == "note" and str(post.get("body", "")).strip()
+        ]
+
+    def _member_call_settings(self, role: str, member: dict) -> tuple[str, str | None, str, str]:
+        tiers = getattr(self.cfg, "tiers", {}) or {}
+        tier_name = str(member.get("tier", "") or getattr(self.swarm, "default_tier", "") or "")
+        tier_cfg = tiers.get(tier_name)
+        model_override = str(
+            member.get("model", "") or (tier_cfg.model if tier_cfg is not None else "") or ""
+        ) or None
+        effort = str(member.get("effort", "") or "")
+        if not effort:
+            effort_param = ""
+        elif tier_cfg is not None:
+            effort_param = tier_cfg.effort_param
+        elif hasattr(self.cfg, "tier_for_model"):
+            effort_param = self.cfg.tier_for_model(model_override or "").effort_param
+        else:
+            effort_param = "reasoning_effort"
+        return tier_name, model_override, effort, effort_param
+
+    def _call_board_role(
+        self,
+        role: str,
+        brief: Brief,
+        *,
+        attempt: int = 1,
+        response_format: str | None = None,
+        brief_path: Path | None = None,
+        brief_is_json: bool = False,
+        response_path: Path | None = None,
+    ):
+        if self.board is None:
+            if brief_path is not None and brief_is_json:
+                write_json(brief_path, {"brief": brief.body})
+            call = self.roles.call(
+                role, brief, attempt=attempt, response_format=response_format
+            )
+            if response_path is not None:
+                write_json(response_path, call.as_dict())
+            return call
+
+        self._ensure_board_members()
+        board_role = (
+            "checker" if role in ("checker_pass1", "checker_pass2") else normalize_role(role)
+        )
+        member_name = worker_member_name(self.card.id, board_role)
+        hints = self._consume_member_hints(member_name)
+        effective_brief = brief
+        if hints:
+            hint_block = "\n\nCoordinator hint (data):\n" + fence(
+                "\n\n".join(hints), "coordinator hint"
+            )
+            effective_brief = Brief(brief.role, brief.body + hint_block)
+
+        target_brief = brief_path or (
+            self.card_layout / "briefs" / f"{attempt}-{role.replace('_', '-')}.md"
+        )
+        if brief_is_json:
+            write_json(target_brief, {"brief": effective_brief.body})
+        else:
+            target_brief.parent.mkdir(parents=True, exist_ok=True)
+            target_brief.write_text(effective_brief.body, encoding="utf-8")
+
+        member = self.board.get_member(member_name) or {}
+        tier_name, model_override, effort_val, effort_param = self._member_call_settings(
+            role, member
+        )
+        self._post_board(
+            author="gates",
+            to=[member_name],
+            kind="brief",
+            attempt=attempt,
+            body=f"{board_role} brief (attempt {attempt})",
+            evidence=[str(target_brief)],
+            trusted=True,
+        )
+
+        call = self.roles.call(
+            role,
+            effective_brief,
+            attempt=attempt,
+            response_format=response_format,
+            model=model_override,
+            effort=effort_val,
+            effort_param=effort_param,
+        )
+
+        target_resp = response_path or (
+            self.card_layout / "responses" / f"{attempt}-{role.replace('_', '-')}.json"
+        )
+        write_json(target_resp, call.as_dict())
+
+        tok_in = int(getattr(call, "tokens_in", 0) or 0)
+        tok_out = int(getattr(call, "tokens_out", 0) or 0)
+        eff_key = effort_val or "none"
+        self.effort_tokens[eff_key] = self.effort_tokens.get(eff_key, 0) + tok_in + tok_out
+
+        current = self.board.get_member(member_name) or member
+        new_in = int(current.get("tokens_in", 0) or 0) + tok_in
+        new_out = int(current.get("tokens_out", 0) or 0) + tok_out
+        new_calls = int(current.get("calls", 0) or 0) + 1
+        new_attempts = int(current.get("attempts", 0) or 0) + (
+            0 if role == "checker_pass2" else 1
+        )
+        by_eff = dict(current.get("tokens_by_effort") or {})
+        by_eff[eff_key] = int(by_eff.get(eff_key, 0) or 0) + tok_in + tok_out
+        self.board.update_member(
+            member_name,
+            tokens_in=new_in,
+            tokens_out=new_out,
+            tokens=new_in + new_out,
+            calls=new_calls,
+            attempts=new_attempts,
+            tokens_by_effort=by_eff,
+        )
+        self._member_stats[member_name] = {
+            "member": member_name,
+            "role": board_role,
+            "tier": tier_name,
+            "effort": effort_val,
+            "model": model_override or "",
+            "attempts": new_attempts,
+            "calls": new_calls,
+            "tokens_in": new_in,
+            "tokens_out": new_out,
+            "tokens": new_in + new_out,
+        }
+
+        self._post_board(
+            author=member_name,
+            to=["gates"],
+            kind="result",
+            attempt=attempt,
+            body=f"{board_role} answered ({len(call.content)} chars, {tok_in} in / {tok_out} out)",
+            evidence=[str(target_resp)],
+        )
+        return call
+
+    def team_summary(self) -> list[dict]:
+        """Per-member team summary for the dossier and telemetry."""
+        if self.board is None:
+            return []
+        rows: list[dict] = []
+        for role in WORKER_ROLES:
+            mname = worker_member_name(self.card.id, role)
+            member = self.board.get_member(mname)
+            if member is None:
+                continue
+            tok_in = int(member.get("tokens_in", 0) or 0)
+            tok_out = int(member.get("tokens_out", 0) or 0)
+            rows.append({
+                "member": mname,
+                "role": role,
+                "tier": str(member.get("tier", "") or ""),
+                "effort": str(member.get("effort", "") or ""),
+                "model": str(member.get("model", "") or ""),
+                "attempts": int(member.get("attempts", 0) or 0),
+                "calls": int(member.get("calls", 0) or 0),
+                "tokens_in": tok_in,
+                "tokens_out": tok_out,
+                "tokens": tok_in + tok_out,
+            })
+        return rows
+
+    def board_sets_summary(self) -> list[dict]:
+        """Set actions targeting this card's team on the board."""
+        if self.board is None or not self.board.board_dir.exists():
+            return list(self.team_sets)
+        team_names = {worker_member_name(self.card.id, role) for role in WORKER_ROLES}
+        posts = self.board.read(as_name="*", since=0, limit=None, for_model=False)
+        sets: list[dict] = []
+        for post in posts:
+            if post.get("kind") != "action":
+                continue
+            body = str(post.get("body", "") or "")
+            if not body.startswith("set "):
+                continue
+            recipients = set(post.get("to") or ())
+            if post.get("card") == self.card.id or (recipients & team_names):
+                sets.append({
+                    "seq": post.get("seq"),
+                    "at": post.get("at", ""),
+                    "from": post.get("from", ""),
+                    "to": list(post.get("to") or ()),
+                    "detail": body,
+                })
+        return sets or list(self.team_sets)
 
     def _current_step(self) -> dict | None:
         """The planner step the implementer is on, or None when there is no plan.
@@ -784,6 +1095,15 @@ class CardRun:
         write_json(self.card_layout / "card.json",
                    {"card": self.card.as_dict(), "hash": self.card_hash_at_claim,
                     "read_at": utc_now()})
+        if self.board is not None:
+            self._ensure_board_members()
+            self._post_board(
+                author="gates",
+                to=[],
+                kind="note",
+                body=f"claimed {self.card.id} (hash {self.card_hash_at_claim[:12]})",
+                trusted=True,
+            )
 
         eligibility = check_eligibility(self.card, self.cfg,
                                         deps_done=self.deps_done,
@@ -1023,7 +1343,13 @@ class CardRun:
             self.card, self.book, harness_guidance=planner_harness
         )
         try:
-            call = self.roles.call("planner", brief, response_format="json")
+            call = self._call_board_role(
+                "planner",
+                brief,
+                attempt=1,
+                response_format="json",
+                response_path=self.card_layout / "responses" / "planner.json",
+            )
         except (Infra, Invalid):
             self.planner_used = False
             self.log(f"{self.card.id}: planner unavailable, running unsplit")
@@ -1102,10 +1428,13 @@ class CardRun:
                 attempt=attempt, previous_failure=last_failure,
                 guidance=tw_guidance, context_files=self.extra_context_files,
                 harness_guidance=tw_harness)
-            call = self.roles.call("test_writer", brief, attempt=attempt)
+            call = self._call_board_role(
+                "test_writer",
+                brief,
+                attempt=attempt,
+                response_path=self.card_layout / "responses" / f"A{attempt}-test-writer.json",
+            )
             self.budget.note_tokens(call.tokens_in, call.tokens_out, call.spend)
-            write_json(self.card_layout / "responses" / f"A{attempt}-test-writer.json",
-                       call.as_dict())
 
             try:
                 edits = parse_answer_edits(call)
@@ -1490,13 +1819,15 @@ class CardRun:
                 step_context="\n".join(self.step_summaries),
                 context_files=self.extra_context_files,
                 harness_guidance=impl_harness)
-            write_json(self.card_layout / "briefs" / f"{attempt_no}-implementer.md",
-                       {"brief": brief.body})
-
-            call = self.roles.call("implementer", brief, attempt=attempt_no)
+            call = self._call_board_role(
+                "implementer",
+                brief,
+                attempt=attempt_no,
+                brief_path=self.card_layout / "briefs" / f"{attempt_no}-implementer.md",
+                brief_is_json=True,
+                response_path=self.card_layout / "responses" / f"{attempt_no}-implementer.json",
+            )
             self.budget.note_tokens(call.tokens_in, call.tokens_out, call.spend)
-            write_json(self.card_layout / "responses" / f"{attempt_no}-implementer.json",
-                       call.as_dict())
 
             try:
                 edits = parse_answer_edits(call)
@@ -2492,10 +2823,13 @@ class CardRun:
             [path for path in changed if self._is_test_path(path)],
             ref=self.base_commit or "HEAD")
         brief1 = build_checker_pass1_brief(self.card, test_diff)
-        call1 = self.roles.call("checker_pass1", brief1, attempt=1)
+        call1 = self._call_board_role(
+            "checker_pass1",
+            brief1,
+            attempt=1,
+            response_path=self.card_layout / "responses" / "checker-pass1.json",
+        )
         self.budget.note_tokens(call1.tokens_in, call1.tokens_out, call1.spend)
-        write_json(self.card_layout / "responses" / "checker-pass1.json",
-                   call1.as_dict())
         restatement = parse_restatement(call1.content, self.card)
         self.checker_restatement = restatement
         gate1 = self._record_gate(GateResult(
@@ -2511,10 +2845,13 @@ class CardRun:
                 modified[path] = full.read_text()[:8000]
         brief2 = build_checker_pass2_brief(
             self.card, full_diff, [g.as_dict() for g in self.gates], modified)
-        call2 = self.roles.call("checker_pass2", brief2, attempt=2)
+        call2 = self._call_board_role(
+            "checker_pass2",
+            brief2,
+            attempt=2,
+            response_path=self.card_layout / "responses" / "checker-pass2.json",
+        )
         self.budget.note_tokens(call2.tokens_in, call2.tokens_out, call2.spend)
-        write_json(self.card_layout / "responses" / "checker-pass2.json",
-                   call2.as_dict())
 
         counters = parse_counter_tests(call2.content)
         self.counter_summary = {
@@ -2527,6 +2864,25 @@ class CardRun:
         self._last_failing_counters = []
         if counters.tests:
             self._run_counter_tests(counters.tests)
+
+        if self.board is not None and self._last_failing_counters:
+            names = ", ".join(
+                str(c.get("name", "?")) for c in self._last_failing_counters
+            )
+            evidence = [
+                str(p)
+                for idx in range(1, len(counters.tests) + 1)
+                for p in [self.card_layout / "gates" / f"counter-test-{idx}.json"]
+                if p.exists()
+            ]
+            self._post_board(
+                author=worker_member_name(self.card.id, "checker"),
+                to=[worker_member_name(self.card.id, "implementer")],
+                kind="defect",
+                attempt=max(1, self.attempt),
+                body=f"counter-tests failed: {names}",
+                evidence=evidence,
+            )
 
         self._record_gate(GateResult(
             "checker-pass2", PASS,
@@ -2898,6 +3254,30 @@ class CardRun:
                 "reviewer_brief": self.reviewer_brief,
             }
         self._write_dossier(final_state)
+        if self.board is not None:
+            self._ensure_board_members()
+            ev = [self.dossier_path] if self.dossier_path else []
+            if final_state == "in-review":
+                self._post_board(
+                    author="gates",
+                    to=["coordinator"],
+                    kind="done",
+                    attempt=max(1, self.attempt),
+                    body=f"{self.card.id} reached in-review ({len(self.gates)} gates)",
+                    evidence=ev,
+                    trusted=True,
+                )
+            else:
+                code_str = self.stop_code.value if self.stop_code else "blocked"
+                self._post_board(
+                    author="gates",
+                    to=["coordinator"],
+                    kind="blocked",
+                    attempt=max(1, self.attempt),
+                    body=f"{self.card.id} {final_state} ({code_str}): {(self.detail or '')[:500]}",
+                    evidence=ev,
+                    trusted=True,
+                )
 
         record = self._card_record(final_state)
         write_json(self.card_layout / "card-record.json", record)
@@ -3006,7 +3386,11 @@ class CardRun:
             "harness_revision": int(self.harness_revision or 0),
             "harness_cues_applied": list(self.harness_cues_applied),
             "harness_lessons_added": list(self.harness_lessons_added),
+            "team": self.team_summary(),
+            "handbacks": list(self.handbacks),
         }
+        if self.board is not None:
+            record["by_effort"] = dict(self.effort_tokens)
         return complete_record(record, CARD_FIELDS)
 
 

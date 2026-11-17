@@ -117,6 +117,22 @@ def build_dossier(card_run, final_state: str,
             "production_diff": _production_diff(card_run),
         },
         "harness": _harness_summary(card_run, harness),
+        "team": list(
+            card_run.team_summary()
+            if hasattr(card_run, "team_summary")
+            else (getattr(card_run, "team", []) or [])
+        ),
+        "sets": list(
+            card_run.board_sets_summary()
+            if hasattr(card_run, "board_sets_summary")
+            else (getattr(card_run, "team_sets", []) or [])
+        ),
+        "handbacks": list(getattr(card_run, "handbacks", []) or []),
+        "board_path": (
+            str(card_run.board.board_dir)
+            if getattr(card_run, "board", None) is not None
+            else ""
+        ),
     }
 
 
@@ -402,6 +418,44 @@ def render_markdown(payload: dict) -> str:
             f"- Efficiency score: {float(harness.get('efficiency_score', 0.0) or 0.0):.4f}",
             "",
         ]
+    team = payload.get("team") or []
+    sets = payload.get("sets") or []
+    handbacks = payload.get("handbacks") or []
+    board_path = str(payload.get("board_path", "") or "")
+    if team or sets or handbacks or board_path:
+        lines += ["## Team and board", ""]
+        if board_path:
+            lines.append(f"- Board: `{board_path}`")
+        if team:
+            lines += [
+                "",
+                "| Member | Role | Tier | Effort | Attempts | Tokens |",
+                "| --- | --- | --- | --- | --- | --- |",
+            ]
+            for row in team:
+                lines.append(
+                    f"| {row.get('member', '')} | {row.get('role', '')} | "
+                    f"{row.get('tier', '')} | {row.get('effort', '') or 'default'} | "
+                    f"{row.get('attempts', 0)} | {row.get('tokens', 0)} |"
+                )
+        if sets:
+            lines += ["", "### Tier and effort changes", ""]
+            for entry in sets:
+                if isinstance(entry, dict):
+                    lines.append(f"- {entry.get('detail') or entry}")
+                else:
+                    lines.append(f"- {entry}")
+        if handbacks:
+            lines += ["", "### Hand-backs", ""]
+            for hb in handbacks:
+                if isinstance(hb, dict):
+                    lines.append(
+                        f"- {hb.get('role', 'worker')} (attempt {hb.get('attempt', 0)}): "
+                        f"{hb.get('reason', '')}"
+                    )
+                else:
+                    lines.append(f"- {hb}")
+        lines.append("")
     return "\n".join(lines)
 
 
