@@ -577,7 +577,12 @@ class DriverModeEndToEndTests(unittest.TestCase):
         self.assertEqual(len(vfiles), 1)
         vdata = json.loads(vfiles[0].read_text(encoding="utf-8"))
         self.assertEqual(vdata["verdict"], "clean")
-        self.assertEqual(vdata["review_tokens"], 111)
+        # The scripted answer claims 111; the record carries the turn's own
+        # (here guessed) tokens and says who decided.
+        self.assertNotEqual(vdata["review_tokens"], 111)
+        self.assertGreater(vdata["review_tokens"], 0)
+        self.assertTrue(vdata["review_tokens_estimated"])
+        self.assertEqual(vdata["by"], "driver/claude")
 
     def test_malformed_json_and_refusal_retry_and_safe_fallback(self) -> None:
         self._add_card_1()
@@ -702,7 +707,9 @@ class DriverModeEndToEndTests(unittest.TestCase):
         rev = payload["reviews"][0]
         self.assertEqual(rev["card"], "CARD-1")
         self.assertEqual(rev["verdict"], "clean")
-        self.assertEqual(rev["review_tokens"], 321)
+        # Measured from the mock CLI's own usage (60 + 5 + 3 in, 22 out), not the 321 it claims.
+        self.assertEqual(rev["review_tokens"], 90)
+        self.assertFalse(rev["review_tokens_estimated"])
         self.assertTrue(rev["recorded"])
         vpath = Path(rev["verdict_path"])
         self.assertTrue(vpath.is_file())
