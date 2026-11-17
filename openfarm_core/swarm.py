@@ -8,7 +8,7 @@ import time
 from typing import Callable, Iterable
 
 from .adapters.acp import is_acp_adapter
-from .board import Board, normalize_role
+from .board import CODE_AUTHOR_NAMES, Board, is_stop_request, normalize_role
 from .cards import Card
 from .errors import Refused
 from .globs import globs_overlap
@@ -157,6 +157,73 @@ def _load_cards_map(source=None, cards_by_id: dict[str, Card] | None = None) -> 
     return {}
 
 
+def _is_start_action(post: dict, members: dict[str, dict]) -> bool:
+    """A `start CARD` action posted by a holder of the coordinator seat."""
+    if post.get("kind") != "action" or not post.get("card"):
+        return False
+    if not str(post.get("body", "") or "").startswith("start "):
+        return False
+    member = members.get(str(post.get("from", "") or ""))
+    return member is not None and normalize_role(str(member.get("role", ""))) == "coordinator"
+
+
+class CardProgress:
+    """What the board says about each card: started, finished, asked to stop.
+
+    A card is finished only on its own final post (code, author `gates`, kind
+    `done` or `blocked`), or when the coordinator blocked it before it ever
+    started. A stop request on a running card leaves it running until its
+    thread ends and posts that final post.
+    """
+
+    def __init__(self) -> None:
+        self.started: set[str] = set()
+        self.final: set[str] = set()
+        self.stop_requested: set[str] = set()
+
+    def feed(self, posts: Iterable[dict], members: dict[str, dict]) -> None:
+        for post in posts:
+            cid = str(post.get("card", "") or "")
+            if not cid:
+                continue
+            author = str(post.get("from", "") or "")
+            kind = post.get("kind")
+            if author == "gates" and kind in ("done", "blocked"):
+                self.final.add(cid)
+            elif _is_start_action(post, members):
+                self.started.add(cid)
+            elif is_stop_request(post, members):
+                self.stop_requested.add(cid)
+
+    def note_members(self, members: Iterable[dict]) -> None:
+        # A card with team members on the roster was started, whatever path
+        # registered them.
+        for member in members:
+            cid = str(member.get("card", "") or "")
+            if cid:
+                self.started.add(cid)
+
+    @property
+    def finished(self) -> set[str]:
+        return self.final | (self.stop_requested - self.started)
+
+    @property
+    def stopping(self) -> set[str]:
+        """Running cards the coordinator asked to stop."""
+        return (self.stop_requested & self.started) - self.final
+
+
+def _card_progress(board: Board) -> CardProgress:
+    progress = CardProgress()
+    if not board.board_dir.exists():
+        return progress
+    roster = board.list_members(include_removed=True)
+    members = {str(m.get("name", "")): m for m in roster}
+    progress.note_members(roster)
+    progress.feed(board.read(as_name="*", since=0, limit=None, for_model=False), members)
+    return progress
+
+
 def _running_cards_from_board(board: Board) -> set[str]:
     finished = _finished_cards_from_board(board)
     return {
@@ -167,14 +234,7 @@ def _running_cards_from_board(board: Board) -> set[str]:
 
 
 def _finished_cards_from_board(board: Board) -> set[str]:
-    if not board.board_dir.exists():
-        return set()
-    posts = board.read(as_name="*", since=0, limit=None, for_model=False)
-    return {
-        str(p.get("card", ""))
-        for p in posts
-        if p.get("kind") in ("done", "blocked") and p.get("card")
-    }
+    return _card_progress(board).finished
 
 
 def swarm_tiers(cfg) -> dict:
@@ -188,13 +248,21 @@ def swarm_tiers(cfg) -> dict:
 def swarm_status(board: Board, cfg) -> dict:
     """Board summary, swarm settings, configured tiers, and non-removed roster."""
     members = board.list_members(include_removed=False)
-    running_cards = sorted(_running_cards_from_board(board))
+    progress = _card_progress(board)
+    running_cards = sorted(
+        {
+            str(m.get("card", ""))
+            for m in members
+            if m.get("card") and str(m.get("card", "")) not in progress.finished
+        }
+    )
     return {
         "board": board.status(),
         "swarm": cfg.swarm.as_dict(),
         "tiers": {name: tier.as_dict() for name, tier in cfg.tiers.items()},
         "members": members,
         "running_cards": running_cards,
+        "stopping_cards": sorted(set(running_cards) & progress.stopping),
     }
 
 
@@ -679,14 +747,52 @@ def swarm_block(
             f"card {card_id!r} is already in state {card.state!r}",
             card=card_id,
         )
+    progress = _card_progress(board)
+    if card_id in progress.finished:
+        raise _refuse(
+            board,
+            caller,
+            "already-finished",
+            f"card {card_id!r} has already finished on the board",
+            card=card_id,
+        )
+    if card_id in progress.stopping:
+        raise _refuse(
+            board,
+            caller,
+            "already-stopping",
+            f"card {card_id!r} was already asked to stop; it is still running until it ends",
+            card=card_id,
+        )
+    running = card_id in progress.started
+    if running:
+        # A stop request: the card's thread sees it before its next model call
+        # and ends with its own final post. Until then it still counts as
+        # running for collision and slot checks.
+        body = f"stop requested for {card_id} (it keeps running until it ends): {text}"
+        message = (
+            f"asked {card_id} to stop; it is still running until it ends "
+            "and stays in its slot until then"
+        )
+    else:
+        body = text
+        message = f"blocked {card_id} before it started"
     post = board.post(
         author=caller,
         to=["all"],
         kind="blocked",
         card=card_id,
-        body=text,
+        body=body,
     )
-    return {"action": "block", "card": card_id, "reason": text, "post": post}
+    return {
+        "action": "block",
+        "card": card_id,
+        "reason": text,
+        "running": running,
+        "stop_requested": running,
+        "message": message,
+        "post": post,
+    }
 
 
 def swarm_remove(

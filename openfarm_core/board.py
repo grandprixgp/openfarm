@@ -56,6 +56,29 @@ VALID_POST_KINDS: tuple[str, ...] = (
 MAX_POST_BODY_LEN = 8000
 _MODEL_KINDS = frozenset({"api", "acp", "scripted"})
 _RESERVED_POST_KINDS = frozenset({"done", "gate"})
+# Names only code writes under. A post from one of these is always code's own
+# (posted with `trusted=True`), so readers can rely on `from == "gates"`.
+CODE_AUTHOR_NAMES: frozenset[str] = frozenset({"gates", "monitor", "system"})
+# Kinds an outside member may write by hand with `openfarm board post`.
+OUTSIDE_POST_KINDS: tuple[str, ...] = ("note", "question", "defect", "result")
+# Where every other kind comes from, for the refusal message.
+_OUTSIDE_REFUSALS: dict[str, tuple[str, str]] = {
+    "action": ("use-swarm-command", "is written by the checked swarm commands (openfarm swarm start/set/hint)"),
+    "blocked": ("use-swarm-command", "is written by `openfarm swarm block`"),
+    "roster": ("use-swarm-command", "is written by `openfarm swarm join` and `openfarm swarm remove`"),
+    "answer": ("use-board-answer", "is written by `openfarm board answer`"),
+    "brief": ("reserved-kind", "is reserved for code"),
+    "gate": ("reserved-kind", "is reserved for code"),
+    "done": ("reserved-kind", "is reserved for code"),
+    "handback": ("reserved-kind", "is reserved for code"),
+    "stall": ("reserved-kind", "is reserved for code"),
+}
+# Body of a coordinator's stop request on a running card (see `swarm_block`).
+STOP_REQUEST_RE = re.compile(
+    r"^stop requested for \S+ \(it keeps running until it ends\):\s*"
+)
+# C0 and C1 control characters other than tab and newline.
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 _ROLE_ALIASES: dict[str, str] = {
     "test_writer": "test-writer",
     "micromanager": "supervisor",
@@ -353,6 +376,33 @@ def _post_addresses_member(post: dict, member: dict) -> bool:
         if role and normalize_role(target_str) == role:
             return True
     return False
+
+
+def is_stop_request(post: dict, members: dict[str, dict]) -> bool:
+    """True for a `blocked` post written by a holder of the coordinator seat.
+
+    Code's own posts (`gates`, `monitor`, `system`) are never requests: the
+    card's final `blocked` is written by `gates`.
+    """
+    if post.get("kind") != "blocked" or not str(post.get("card", "") or ""):
+        return False
+    author = str(post.get("from", "") or "")
+    if not author or author in CODE_AUTHOR_NAMES:
+        return False
+    member = members.get(author)
+    if member is None:
+        return False
+    return normalize_role(str(member.get("role", "") or "")) == "coordinator"
+
+
+def stop_request_reason(posts: list[dict], members: dict[str, dict], card_id: str) -> str:
+    """Reason of the latest coordinator stop request for `card_id`, or ''."""
+    for post in reversed(posts):
+        if str(post.get("card", "") or "") != card_id or not is_stop_request(post, members):
+            continue
+        body = STOP_REQUEST_RE.sub("", str(post.get("body", "") or "").strip(), count=1)
+        return body.strip() or "blocked by coordinator"
+    return ""
 
 
 class Board:
@@ -1255,17 +1305,7 @@ class Board:
         with self._locked():
             posts = self._load_posts_unlocked()
             members = self._load_members_unlocked()
-        for post in reversed(posts):
-            if post.get("kind") != "blocked" or str(post.get("card", "") or "") != clean:
-                continue
-            author = str(post.get("from", "") or "")
-            if author == "gates":
-                continue
-            member = members.get(author) or {}
-            if normalize_role(str(member.get("role", "") or "")) != "coordinator":
-                continue
-            return str(post.get("body", "") or "").strip() or "blocked by coordinator"
-        return ""
+        return stop_request_reason(posts, members, clean)
 
     def status(self) -> dict:
         if not self.board_dir.exists():
