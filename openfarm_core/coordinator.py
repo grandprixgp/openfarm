@@ -226,11 +226,19 @@ class CoordinatorRuntime:
             self.launched.add(card_id)
         self._launch_fn(card_id)
 
-    def mark_blocked(self, card_id: str, stop_code: str, detail: str) -> None:
+    def mark_blocked(self, card_id: str, stop_code: str, detail: str) -> bool:
+        """Record a blocked outcome for a card that never started. True if recorded.
+
+        A launched card is never recorded here: a block on it is a stop request, the
+        card stays in flight, and its own thread's outcome is the one recorded.
+        """
         with self.lock:
+            if card_id in self.launched or card_id in self.finished:
+                return False
             if card_id in self.pending:
                 self.pending.remove(card_id)
         self._block_unstarted_fn(card_id, stop_code, detail)
+        return True
 
     def ready_cards_snapshot(self) -> list[dict]:
         with self.lock:
@@ -816,6 +824,10 @@ class ModelCoordinator:
                     )
                     if target_card and cid == target_card:
                         resolution = {"action": "block", "reason": reason}
+                    elif cid in rt.launched:
+                        # A running card: the post is a stop request. Its thread notices
+                        # it and ends; the run loop records that one outcome.
+                        pass
                     else:
                         rt.mark_blocked(cid, StopCode.REFUSED.value, reason)
                 elif name == "remove":
