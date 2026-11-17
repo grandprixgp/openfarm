@@ -277,14 +277,19 @@ def parse_restatement(content: str, card: Card) -> Restatement:
     """Compare the checker's restatement with the named tests.
 
     A shared misreading is the one thing a same-model checker cannot remove, so a
-    restatement that drifts from the tests is flagged in the dossier.
+    restatement that drifts from the tests is flagged in the dossier. `content`
+    is the first pass's answer (`parse_pass1` reads the form and calls this with
+    the restatement alone), or old text with a `RESTATEMENT:` marker.
     """
     text = content.strip()
     marker = re.search(r"RESTATEMENT\s*:\s*(.+)", content,
                        flags=re.IGNORECASE | re.DOTALL)
     if marker:
         text = marker.group(1).strip()
+    return _compare_restatement(text, card)
 
+
+def _compare_restatement(text: str, card: Card) -> Restatement:
     test_words = set(_words(" ".join(card.test_names)) + _words(card.done_text))
     said = set(_words(text))
     if not test_words:
@@ -297,6 +302,163 @@ def parse_restatement(content: str, card: Card) -> Restatement:
 def _words(text: str) -> list[str]:
     return [w.lower() for w in re.findall(r"[A-Za-z][A-Za-z0-9]+", text)
             if len(w) > 3]
+
+
+# -- the first pass's answer ---------------------------------------------------
+#
+# As with the second pass, the brief sends `pass1_answer_form()` and
+# `parse_pass1` reads that form. Older answers (a `RESTATEMENT:` marker anywhere,
+# or bare text that is only a restatement) are still read as before.
+
+#: Whether the tests would catch a bad implementation, as written in the answer.
+CATCHES_YES = "yes"
+CATCHES_PARTLY = "partly"
+CATCHES_NO = "no"
+PASS1_CATCHES = (CATCHES_YES, CATCHES_PARTLY, CATCHES_NO)
+#: The section labels, in the order the answer gives them.
+PASS1_SECTIONS = ("RESTATEMENT", "CATCHES", "MISSES")
+
+
+def pass1_answer_form() -> str:
+    """The exact form the checker's first pass answers in. `parse_pass1` reads it."""
+    catches = " or ".join(f"`{v}`" for v in PASS1_CATCHES)
+    return f"""How to answer. openfarm reads only this form. Give the three sections in
+this order, each starting with its label at the start of a line. No code fences,
+no other headings.
+
+RESTATEMENT:
+<the done text in your own words: what the code must do once the card is done.
+Restate it from the card, not from the tests>
+
+CATCHES: {CATCHES_YES}
+  or
+CATCHES: {CATCHES_PARTLY}
+  or
+CATCHES: {CATCHES_NO}
+
+  One of {catches}, alone on the line: would these tests fail on a bad
+  implementation of the done text? `{CATCHES_YES}` when every line of the done
+  text is pinned by an assertion, `{CATCHES_NO}` when a bad implementation could
+  pass them easily.
+
+MISSES:
+<what a bad implementation could do and still pass these tests, one per line,
+naming the line of the done text it breaks; or `nothing`>
+
+What you say about the tests is shown to the reviewer. It does not pass or block
+the card."""
+
+
+class Pass1Answer:
+    """What the checker's first pass said, read from its answer.
+
+    `readable` is False when no restatement could be told apart from the rest
+    (an empty or cut-off answer, or a critique of the tests with no
+    `RESTATEMENT:` section); `problem` says why. An unreadable answer is never
+    taken as the restatement: the flow asks once more, then records it so.
+    """
+
+    def __init__(self, *, restatement: Restatement | None = None,
+                 catches: str = "", misses: str = "", readable: bool = False,
+                 problem: str = "", form: str = "", raw: str = "") -> None:
+        self.restatement = restatement or Restatement("", mismatch=False, overlap=0.0)
+        self.catches = catches
+        self.misses = misses
+        self.readable = readable
+        self.problem = problem
+        self.form = form
+        self.raw = raw
+
+    def as_dict(self) -> dict:
+        return {"readable": self.readable, "problem": self.problem,
+                "form": self.form, "catches": self.catches,
+                "misses": self.misses[:4000]}
+
+
+_PASS1_LABEL_RE = re.compile(
+    r"^[ \t>#*_]*(?P<label>restatement(?:\s+of\s+(?:the\s+)?done[ -]text)?|"
+    r"restated\s+done[ -]text|done[ -]text\s+restated|catch(?:es)?|miss(?:es)?)"
+    r"(?:\s+in\s+my\s+own\s+words)?[ \t*_]*(?::|\s-|[ \t]*$)[ \t*_]*(?P<rest>.*)$",
+    re.IGNORECASE | re.MULTILINE)
+#: Words that mark an answer as being about the tests rather than the done text.
+_CRITIQUE_RE = re.compile(
+    r"bad\s+implementations?|\bwould\s+(?:not\s+|n't\s+)?(?:catch|miss|detect)|"
+    r"\b(?:these|the|this)\s+tests?\s+(?:would|will|are|is|only|cover|do|does|"
+    r"catch|miss)|\bnot\s+(?:sufficient|enough)\b|```",
+    re.IGNORECASE)
+
+
+def _catches_of(text: str) -> str:
+    """`yes`, `partly`, `no`, or "" for anything else, from a line's first words."""
+    words = re.sub(r"[^a-z]+", " ", str(text or "").lower()).split()
+    head = " ".join(words[:4])
+    if head.startswith(("partly", "partially", "only partially", "partial",
+                        "some", "somewhat", "in part")):
+        return CATCHES_PARTLY
+    if head.startswith(("no", "not", "none", "insufficient", "weak", "too weak")):
+        return CATCHES_NO
+    if head.startswith(("yes", "fully", "they would", "it would", "sufficient")):
+        return CATCHES_YES
+    return ""
+
+
+def parse_pass1(content: str, card: Card, cut_off: bool = False) -> Pass1Answer:
+    """Read the first pass's answer: the form, or an old answer.
+
+    The restatement alone goes to the mismatch rule; what the answer says the
+    tests miss is kept beside it, as an opinion that blocks nothing.
+    """
+    raw = str(content or "")
+    text = _clean(raw)
+    if cut_off:
+        return Pass1Answer(problem="the answer was cut off before it ended",
+                           raw=raw)
+    if not text:
+        return Pass1Answer(problem="the answer is empty", raw=raw)
+    labels = list(_PASS1_LABEL_RE.finditer(text))
+    sections: dict[str, str] = {}
+    first_at: dict[str, int] = {}
+    for index, match in enumerate(labels):
+        label = match.group("label").lower()
+        key = ("catches" if label.startswith("catch")
+               else "misses" if label.startswith("miss") else "restatement")
+        end = labels[index + 1].start() if index + 1 < len(labels) else len(text)
+        body = (match.group("rest") + "\n" + text[match.end():end]).strip()
+        if key not in sections:
+            sections[key] = body
+            first_at[key] = match.start()
+    restatement_text = sections.get("restatement", "").strip()
+    if restatement_text:
+        catches_text = sections.get("catches", "")
+        catches = _catches_of(catches_text.split("\n", 1)[0])
+        misses = sections.get("misses", "").strip()
+        if "\n" in catches_text and not misses:
+            misses = catches_text.split("\n", 1)[1].strip()
+        form = "form" if ("catches" in sections or "misses" in sections) else "marker"
+        if form == "marker":
+            # An old answer: what it says about the tests is the prose before
+            # its restatement.
+            before = text[:first_at["restatement"]].strip()
+            misses = misses or before
+            catches = catches or _catches_of(
+                re.sub(r"^\W*(?:verdict|assessment)\W*", "", before,
+                       flags=re.IGNORECASE))
+        return Pass1Answer(restatement=_compare_restatement(restatement_text, card),
+                           catches=catches, misses=misses, readable=True,
+                           form=form, raw=raw)
+    marker = re.search(r"RESTATEMENT\s*:\s*(.+)", text, flags=re.IGNORECASE | re.DOTALL)
+    if marker:
+        # The old marker anywhere in a line, read as it always was.
+        return Pass1Answer(restatement=parse_restatement(text, card), readable=True,
+                           form="marker", raw=raw)
+    if _CRITIQUE_RE.search(text):
+        return Pass1Answer(
+            problem=("it has no `RESTATEMENT:` section, and it talks about the tests, "
+                     "so no restatement of the done text can be told apart from it"),
+            raw=raw)
+    # Bare text that is only a restatement: the oldest answer form.
+    return Pass1Answer(restatement=_compare_restatement(text, card), readable=True,
+                       form="bare", raw=raw)
 
 
 class CounterTests:
@@ -515,11 +677,27 @@ def _unfence(text: str) -> str:
     return "\n".join(lines).rstrip() + "\n" if lines else ""
 
 
+#: After a test's name in a header: where it lives or what it does, not its name.
+_PATH_TAIL_RE = re.compile(r"\s+(?:(?:in|at)\s+\S*[/.]\S*|\([^()]*[/.][^()]*\))\s*$")
+_NAME_TAIL_RE = re.compile(
+    r"\s+(?:(?:in|at)\s+\S*[/.]\S*|\(.*\)|[-–—:]\s.*|[-–—])\s*$")
+
+
 def _test_name(raw: str) -> str:
+    """The test's name from a header or a JSON entry.
+
+    `name in tests/x.py`, `name (tests/x.py)` and `name - what it checks` give
+    `name`. A name with spaces is kept whole: a `node:test` title is a sentence
+    ("a value below the range becomes the bottom"), and the runner reports it so.
+    """
     name = raw.strip().strip("`'\"*").strip()
-    # `name in tests/x.py` or `name (tests/x.py)`: the name is the first word.
-    name = re.split(r"\s+(?:in|at|\()\s*|\s+", name, maxsplit=1)[0]
-    return name.strip("`'\"*:()")
+    first, _, rest = name.partition(" ")
+    if rest and re.fullmatch(r"[A-Za-z_][\w:.]*", first.strip("`'\"*")) \
+            and _NAME_TAIL_RE.match(" " + rest.strip()):
+        name = first
+    else:
+        name = _PATH_TAIL_RE.sub("", name)
+    return name.strip().strip("`'\"*:").strip()
 
 
 def _add_test(tests: list[dict], dropped: list[dict], name: str, content: str,

@@ -37,8 +37,8 @@ from .harness_scope import project_markers
 from .harness_memory import (GuidanceSelection, HarnessLibrary, _classify_failure,
                              _is_unsafe_path)
 from .micromanager import open_micromanager
-from .roles import (Plan, Roles, parse_answer_edits,
-                    parse_handback, parse_plan, parse_restatement, wants_planner)
+from .roles import (Plan, Roles, parse_answer_edits, parse_handback, parse_pass1,
+                    parse_plan, pass1_answer_form, wants_planner)
 from .state import append_jsonl, baseline_lock_for, utc_now, utc_after, write_json
 from .swarm import WORKER_ROLES, swarm_set, worker_kind_for_config, worker_member_name
 
@@ -226,6 +226,9 @@ class CardRun:
         self.current_diff = ""
         self.started_at = utc_now()
         self.checker_restatement = None
+        #: What the checker's first pass said: its form, whether the tests
+        #: would catch a bad implementation, what they miss (an opinion).
+        self.checker_pass1: dict = {}
         self.checker_adjudication: dict = {}
         self.reviewer_brief = ""
         self.clarified_notes = ""
@@ -1766,11 +1769,41 @@ class CardRun:
         # The worktree was made by the controller and entered here; one target
         # folder per card, never shared between branches.
         self.git.checkout(self.branch, detach=False)
+        # The pack decides from this run's config (as eligibility did), not from
+        # the base checkout's config file, which `--config` may not be.
+        if hasattr(self.pack, "apply_settings"):
+            self.pack.apply_settings(self.cfg)
         if hasattr(self.pack, "configure"):
             self.pack.configure(self.worktree)
         self.effective_unit = self.card.unit or derive_cargo_unit(
             self.card.touches, self.worktree
         )
+
+    def _pack_gate_evidence(self, gate: str) -> dict:
+        """What the pack says a gate's record should carry (see `Pack.gate_evidence`)."""
+        evidence = getattr(self.pack, "gate_evidence", None)
+        if evidence is None:
+            return {}
+        try:
+            found = evidence(gate)
+        except Exception:  # noqa: BLE001 - a pack's extra words never stop a gate
+            return {}
+        return dict(found) if isinstance(found, dict) else {}
+
+    def _prepare_checkout(self, path: Path) -> None:
+        """A checkout gets what the pack gives the card's own worktree.
+
+        A TypeScript project's linked `node_modules`, for one: without it a run in
+        a revert-check or catch-up checkout could not import what the card's runs
+        import. Also used to set the card's worktree up again after a
+        counter-test removed part of it.
+        """
+        prepare = getattr(self.pack, "prepare_worktree", None)
+        if prepare is None:
+            return
+        note = prepare(path)
+        if note:
+            self.log(f"{self.card.id}: {note}")
 
     def _base_ref(self) -> str:
         name = f"refs/heads/{self.cfg.base_branch}"
@@ -2861,11 +2894,12 @@ class CardRun:
         lint_result = self._run(runner_kind("lint"),
                                 self.pack.commands("lint", unit=unit)["argv"])
         lint_out, lint_err = self._output(lint_result)
+        lint_evidence = self._pack_gate_evidence("lint")
         lint_gate = self._record_gate(
             GateResult("lint", PASS if lint_result.cls == PASS else
                        (INFRA if lint_result.cls == INFRA else FAIL),
                        "" if lint_result.cls == PASS else
-                       (lint_err or lint_out).strip()[-800:]))
+                       (lint_err or lint_out).strip()[-800:], lint_evidence))
         if lint_result.cls == INFRA or suite.result == INFRA:
             raise Infra("attempt-infra",
                         "a gate did not finish, so the attempt is not judged")
@@ -3157,10 +3191,12 @@ class CardRun:
             ws = self._run(runner_kind("ws-lint"),
                            self.pack.commands("ws-lint")["argv"], counted="fixed")
             ws_out, ws_err = self._output(ws)
+            ws_evidence = self._pack_gate_evidence("workspace-lint")
             ws_gate = self._record_gate(GateResult(
                 "workspace-lint", PASS if ws.cls == PASS else
                 (INFRA if ws.cls == INFRA else FAIL),
-                "" if ws.cls == PASS else (ws_err or ws_out).strip()[-800:]))
+                "" if ws.cls == PASS else (ws_err or ws_out).strip()[-800:],
+                ws_evidence))
             if ws_gate.result == INFRA:
                 raise Infra("workspace-lint-infra", "the workspace lint did not finish")
             if not ws_gate.ok:
@@ -3220,6 +3256,7 @@ class CardRun:
                 shutil.rmtree(revert_target, ignore_errors=True)
                 base_ref = self.scaffold_commit or self.base_commit or "HEAD"
                 self.git.worktree_add(trial_wt, base_ref)
+                self._prepare_checkout(trial_wt)
                 try:
                     overlay = sorted(set(self.frozen_tests) | set(self.phase_a_stub_files))
                     for rel in overlay:
@@ -3582,20 +3619,50 @@ class CardRun:
             self.worktree,
             [path for path in changed if self._is_test_path(path)],
             ref=self.base_commit or "HEAD")
-        brief1 = checker_pass1_brief(self.card, test_diff, handback=self.swarm_on)
+        form1 = pass1_answer_form()
+        brief1 = checker_pass1_brief(self.card, test_diff, handback=self.swarm_on,
+                                     answer_form=form1)
         # A checker's answer is checked for a hand-back before anything reads it: a
         # hand-back is never a restatement and never a passing checker gate.
         call1, limit_err = self._call_role_with_handbacks(
             "checker_pass1", brief1, first_attempt=1, response_name="checker-pass1")
         if limit_err is not None:
             self._checker_handback_limit("checker-pass1", limit_err)
-        restatement = parse_restatement(call1.content, self.card)
+        first = parse_pass1(call1.content, self.card, cut_off=call1.cut_off)
+        first_problem1 = ""
+        if not first.readable:
+            # Never taken as the restatement: ask once more with the form
+            # restated. A hand-back is still read first.
+            first_problem1 = first.problem
+            retry1 = checker_pass1_brief(self.card, test_diff, handback=self.swarm_on,
+                                         answer_form=form1,
+                                         retry_problem=first.problem)
+            asked1 = sum(1 for c in getattr(self.roles, "calls", []) or []
+                         if getattr(c, "role", "") == "checker_pass1")
+            call1, limit_err = self._call_role_with_handbacks(
+                "checker_pass1", retry1, first_attempt=1 + max(1, asked1),
+                response_name="checker-pass1-again")
+            if limit_err is not None:
+                self._checker_handback_limit("checker-pass1", limit_err)
+            first = parse_pass1(call1.content, self.card, cut_off=call1.cut_off)
+        restatement = first.restatement
         self.checker_restatement = restatement
+        self.checker_pass1 = {**first.as_dict(), "asked_again": bool(first_problem1),
+                              "first_problem": first_problem1}
+        if not first.readable:
+            detail1 = ("the first pass could not be read, even when asked again "
+                       f"({first.problem}): no restatement to compare with the tests")
+        else:
+            detail1 = ("restatement flagged as drifting" if restatement.mismatch
+                       else "restatement matches the named tests")
+            said1 = {"yes": "would catch a bad implementation",
+                     "partly": "would partly catch a bad implementation",
+                     "no": "would not catch a bad implementation"}.get(first.catches)
+            if said1:
+                detail1 += f"; the checker says the tests {said1}"
         gate1 = self._record_gate(GateResult(
-            "checker-pass1", PASS,
-            "restatement flagged as drifting" if restatement.mismatch
-            else "restatement matches the named tests",
-            {"restatement": restatement.as_dict()}))
+            "checker-pass1", PASS, detail1,
+            {"restatement": restatement.as_dict(), "checker": self.checker_pass1}))
 
         from .roles import MAX_COUNTER_TESTS, parse_pass2, pass2_answer_form
 
@@ -3798,8 +3865,10 @@ class CardRun:
     def _counter_fallback_path(self, index: int) -> str:
         unit = self._effective_unit()
         ext = self._extension()
-        # Python test files are found by their `test_` prefix.
+        # Python test files are found by their `test_` prefix, TypeScript ones by
+        # their `.test` suffix (the pack's own test-file rule).
         stem = (f"test_openfarm_counter_{index}" if ext == ".py"
+                else f"openfarm_counter_{index}.test" if ext == ".ts"
                 else f"openfarm_counter_{index}")
         if unit and unit != "." and (self.worktree / unit).is_dir() and any(
                 (self.worktree / unit / manifest).is_file()
@@ -3837,6 +3906,14 @@ class CardRun:
                 files[rel] = (full.read_bytes()
                               if full.is_file() and not full.is_symlink() else None)
             ignored = set(listing("--others", "--ignored", "--exclude-standard"))
+            # Ignored links (a TypeScript worktree's linked `node_modules`): git
+            # never restores them, and a run can remove or re-point one.
+            links = {}
+            for rel in ignored:
+                full = self.worktree / rel
+                if full.is_symlink():
+                    with contextlib.suppress(OSError):
+                        links[rel] = os.readlink(full)
             dirs = {""}
             for rel in list(ignored) + listing() + list(files):
                 parent = Path(rel).parent
@@ -3845,7 +3922,7 @@ class CardRun:
                     parent = parent.parent
             return {"head": self.git.head(), "branch": self.git.current_branch(),
                     "files": files, "ignored": ignored, "dirs": dirs,
-                    "status": self.git.status_lines()}
+                    "links": links, "status": self.git.status_lines()}
 
         def restore(before: dict) -> None:
             if self.git.current_branch() != before["branch"] and before["branch"]:
@@ -3869,8 +3946,28 @@ class CardRun:
                     with contextlib.suppress(OSError):
                         (self.worktree / parent).rmdir()
                     parent = parent.parent
+            # Ignored entries the run removed: the pack sets its own up again
+            # (a removed `node_modules` comes back with its marker and links).
+            if any(not os.path.lexists(self.worktree / rel)
+                   for rel in before["ignored"]):
+                self._prepare_checkout(self.worktree)
+            # Every ignored link exactly as it was, never followed: a link
+            # removed, re-pointed or replaced is made again.
+            for rel, link_to in sorted(before["links"].items()):
+                full = self.worktree / rel
+                with contextlib.suppress(OSError):
+                    if full.is_symlink() and os.readlink(full) == link_to:
+                        continue
+                    if full.is_symlink() or full.is_file():
+                        full.unlink()
+                    elif full.is_dir():
+                        shutil.rmtree(full)
+                    full.parent.mkdir(parents=True, exist_ok=True)
+                    os.symlink(link_to, full)
+            after_ignored = set(listing("--others", "--ignored", "--exclude-standard"))
             if (self.git.head() != before["head"]
-                    or self.git.status_lines() != before["status"]):
+                    or self.git.status_lines() != before["status"]
+                    or after_ignored != before["ignored"]):
                 self.log(f"{self.card.id}: the worktree did not come back exactly "
                          "as it was after a counter-test")
 
@@ -3892,6 +3989,11 @@ class CardRun:
                 if got and (got.endswith(("::" + name, "." + name))
                             or name.endswith(("::" + got, "." + got))):
                     return entry.get("status", "")
+            # `test_x checks the start`: a header with words after a one-word
+            # name, from a language whose test names have no spaces.
+            first = name.split(" ", 1)[0]
+            if first != name:
+                return status_of(parsed, first)
             return "not-run"
 
         for index, counter in enumerate(tests, start=1):
@@ -4006,6 +4108,7 @@ class CardRun:
         if trial.exists():
             shutil.rmtree(trial, ignore_errors=True)
         self.git.worktree_add(trial, self.branch)
+        self._prepare_checkout(trial)
         trial_git = Git(trial)
         try:
             merged, output = trial_git.merge_no_commit(current_base)
@@ -4355,6 +4458,11 @@ class CardRun:
             "team": self.team_summary(),
             "handbacks": list(self.handbacks),
         }
+        summary = getattr(self.pack, "tooling_summary", None)
+        if summary is not None:
+            # The runner, tools and the pack's notes this card was judged with.
+            with contextlib.suppress(Exception):
+                record["tooling"] = summary()
         if self.board is not None:
             record["by_effort"] = dict(self.effort_tokens)
         return complete_record(record, CARD_FIELDS)

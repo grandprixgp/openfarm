@@ -223,6 +223,17 @@ def cmd_check(ctx: Context, args) -> int:
     payload = {"card": card.id, "eligible": eligibility.ok,
                "card_hash": card.hash(),
                "failures": eligibility.failures}
+    # What the card's gates will run it with: the runner, the checker and
+    # formatter and the pack's notes, decided from the same config as above.
+    payload.update(eligibility.info)
+    try:
+        pack = _configured_pack(ctx.cfg, ctx.repo)
+        summary = getattr(pack, "tooling_summary", None)
+        payload["tooling"] = (summary() if summary is not None else
+                              {"pack": str(getattr(pack, "name", "") or "external"),
+                               "notes": [str(n) for n in getattr(pack, "notes", [])]})
+    except (AdapterError, Invalid, OSError) as exc:
+        payload["tooling"] = {"error": str(getattr(exc, "message", exc))}
 
     if args.baseline and eligibility.ok:
         try:
@@ -238,6 +249,30 @@ def cmd_check(ctx: Context, args) -> int:
                payload)
     _emit_ctx(ctx, payload, "check")
     return EXIT_OK if payload["eligible"] else EXIT_REFUSED
+
+
+def _pack_with_config(cfg, cwd: Path):
+    """The project's pack, given the loaded config's settings.
+
+    Straight after `pack_for`: a pack that reads `[runner]` settings (the
+    TypeScript pack) then decides from the same config eligibility was given
+    (`--config` included), not from the file in the base checkout.
+    """
+    pack = pack_for(cfg.languages[0], cfg.cargo_flags, spec=cfg.pack_adapter,
+                    cwd=cwd, python=cfg.runner_python)
+    apply_settings = getattr(pack, "apply_settings", None)
+    if apply_settings is not None:
+        apply_settings(cfg)
+    return pack
+
+
+def _configured_pack(cfg, worktree: Path):
+    """`_pack_with_config`, then configured for `worktree`."""
+    pack = _pack_with_config(cfg, worktree)
+    configure = getattr(pack, "configure", None)
+    if configure is not None:
+        configure(worktree)
+    return pack
 
 
 def _deps_done(source: FileCardSource, card: Card) -> bool:
@@ -258,12 +293,7 @@ def _baseline_check(ctx: Context, source: FileCardSource, card: Card) -> dict:
         git.worktree_remove(worktree)
     git.worktree_add(worktree, base)
     try:
-        pack = pack_for(
-            ctx.cfg.languages[0], ctx.cfg.cargo_flags,
-            spec=ctx.cfg.pack_adapter, cwd=worktree,
-            python=ctx.cfg.runner_python,
-        )
-        pack.configure(worktree)
+        pack = _configured_pack(ctx.cfg, worktree)
         unit = card.unit or derive_cargo_unit(card.touches, worktree)
         runner = ctx.runner(worktree)
         target = ctx.state.check_dir(card.id) / "target"
@@ -354,19 +384,31 @@ def _baseline_check(ctx: Context, source: FileCardSource, card: Card) -> dict:
                  for name in card.test_names}
         passing = [name for name, status in named.items() if status == "ok"]
         mixed = [name for name, status in named.items() if status == "mixed"]
+        # Skipped or expected to fail on base (`ignored`): the fail-before gate
+        # refuses those too, since a test that did not run proves nothing. Only
+        # a test that is not there yet (`not-run`) is left to the test writer.
+        ignored = [name for name, status in named.items()
+                   if status not in ("ok", "mixed", "FAILED", "not-run")]
         out = {
-            "ok": not passing and not mixed,
+            "ok": not passing and not mixed and not ignored,
             "class": result.cls,
             "named": named,
             "failed_on_base": [name for name, status in named.items()
                                if status == "FAILED"],
             "passing_on_base": passing,
         }
+        problems = []
         if mixed:
             out["mixed_on_base"] = mixed
-            out["error"] = ("these named tests were reported both failing and not "
+            problems.append("these named tests were reported both failing and not "
                             "failing on base, so they prove nothing: "
                             + ", ".join(mixed))
+        if ignored:
+            out["ignored_on_base"] = ignored
+            problems.append("these named tests were skipped or expected to fail on "
+                            "base, so they prove nothing: " + ", ".join(ignored))
+        if problems:
+            out["error"] = "; ".join(problems)
         return out
     finally:
         if lock_held and cache_lock is not None:
@@ -1010,10 +1052,7 @@ def _run_card(ctx: Context, source: FileCardSource, card_id: str, run_id: str,
     Git(ctx.repo).worktree_add(worktree, base_ref)
 
     card_dir = ctx.state.create_card(card.id, run_id)
-    pack = pack_for(cfg.languages[0], cfg.cargo_flags,
-                    spec=cfg.pack_adapter, cwd=worktree,
-                    python=cfg.runner_python)
-    pack.configure(worktree)
+    pack = _configured_pack(cfg, worktree)
     owns_backend = backend is None
     backend = backend if backend is not None else open_backend(cfg, script)
     runner = ctx.runner(worktree, output_dir=card_dir / "gates" / "output")
@@ -1156,9 +1195,7 @@ def _handshake(ctx: Context, source, args, telemetry_raw=None) -> dict:
                 "adapters": names}
 
     try:
-        pack = pack_for(ctx.cfg.languages[0], ctx.cfg.cargo_flags,
-                        spec=ctx.cfg.pack_adapter, cwd=ctx.repo,
-                        python=ctx.cfg.runner_python)
+        pack = _pack_with_config(ctx.cfg, ctx.repo)
         hello = pack.hello()
         needed = set(REQUIRED_OPS["pack"])
         offered = set(hello.get("ops") or [])
@@ -2808,9 +2845,6 @@ def cmd_acp(args) -> int:
         raise UsageError(f"unknown acp action: {action}")
     want_json = bool(getattr(args, "json", False))
     _emit_standalone(payload, want_json, kind=f"acp_{action}")
-    if not want_json and action in ("status", "probe"):
-        for line in _acp_confinement_lines(payload):
-            print(line)
     if action == "probe" and payload.get("ok") is False:
         return EXIT_TROUBLE
     return EXIT_OK

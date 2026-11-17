@@ -868,6 +868,47 @@ class TypeScriptPack(Pack):
             notes.append(tooling["test_script"])
         self.notes = notes
 
+    def gate_evidence(self, gate: str) -> dict:
+        """The lint gates say whether types were checked or only syntax."""
+        if gate not in ("lint", "workspace-lint", "ws-lint", "typecheck", "build"):
+            return {}
+        if self.has_tsc:
+            return {"typecheck": "tsc", "syntax_only": False}
+        return {"typecheck": "syntax", "syntax_only": True,
+                "note": ("syntax only: node's type stripping parsed the code, no "
+                         "types were checked (no tsc)")}
+
+    def tooling_summary(self) -> dict:
+        """The runner, the type check and the formatter this pack decided on."""
+        tooling = self.tooling or {}
+        return {
+            "pack": self.name,
+            "runner": str(tooling.get("runner") or "node --test"),
+            "typecheck": "tsc" if self.has_tsc else "syntax",
+            "syntax_only": not self.has_tsc,
+            "tsc": str(tooling.get("tsc") or "") if self.has_tsc else "",
+            "format": "prettier" if self.has_prettier else "off",
+            "prettier": (str(tooling.get("prettier") or "") if self.has_prettier
+                         else ""),
+            "notes": list(self.notes),
+        }
+
+    def prepare_worktree(self, worktree: Path) -> str:
+        """Link the base checkout's `node_modules` into a trial checkout too.
+
+        The same rule as a card worktree's (`link_node_modules`), so a revert-check
+        or catch-up run imports the same packages the card's own runs did. The
+        pack's tools and notes stay those of the card's worktree.
+        """
+        root = Path(worktree)
+        settings = (self._settings if self._settings is not None
+                    else runner_settings(base_checkout(root)))
+        chosen = dict(DEFAULT_SETTINGS)
+        chosen.update(settings or {})
+        if not bool(chosen.get("link_node_modules", True)):
+            return ""
+        return link_node_modules(root, base_checkout(root))
+
     # -- commands -------------------------------------------------------------
 
     def _top(self, unit: str) -> str:

@@ -356,6 +356,7 @@ class BackendEffortRecordingTests(unittest.TestCase):
                 return
 
         backend = ClaudeAcpWorkerBackend(effort="medium", adapter=_StubAcp())
+        self.addCleanup(backend.close)
         comp = backend.complete(
             "implementer", "claude", 0.2, [{"role": "user", "content": "hi"}],
             effort="high", effort_param="reasoning_effort",
