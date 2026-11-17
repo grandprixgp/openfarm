@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.7.0-16a34a?style=flat-square" alt="version 0.7.0">
+  <img src="https://img.shields.io/badge/version-0.8.0-16a34a?style=flat-square" alt="version 0.8.0">
   <img src="https://img.shields.io/badge/status-pre--release-d97706?style=flat-square" alt="status: pre-release">
   <img src="https://img.shields.io/badge/python-3.11%2B-7c3aed?style=flat-square" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/runtime%20deps-stdlib%20only-0284c7?style=flat-square" alt="runtime dependencies: standard library only">
@@ -28,11 +28,11 @@
 </p>
 
 <p align="center">
-  <img src="docs/assets/openfarm-stats.svg" alt="596 tests passing in the full offline end-to-end suite, 18 CLI subcommands, 6 adapter interfaces, 0 runtime dependencies" width="100%">
+  <img src="docs/assets/openfarm-stats.svg" alt="686 tests passing in the full offline end-to-end suite, 21 CLI subcommands, 6 adapter interfaces, 0 runtime dependencies" width="100%">
 </p>
 
 > [!IMPORTANT]
-> **Pre-release (v0.7.0).** The core is covered by a deterministic, offline test suite, and v0.6 and v0.7 were partly built by openfarm itself: 19 cards on its own repository, worked live by a cheap worker model with Claude supervising, reviewed and merged. That is a working pipeline, not an efficacy result. The bench that would measure one now ships but has not been run live. Nothing here is a benchmark or a measured cost saving; see [Not yet tested](#not-yet-tested) for exactly what is still open.
+> **Pre-release (v0.8.0).** The core is covered by a deterministic, offline test suite (with v0.8 adding shared message boards, named `[tiers.*]` / `effort`, parallel non-colliding cards, worker hand-back, coordinator/supervisor seats, `StallMonitor`, and the stdlib TUI; when `[swarm] enabled = false` runs behave identically to v0.7). Previously, v0.6 and v0.7 were partly built by openfarm itself: 19 cards on its own repository, worked live by a cheap worker model with Claude supervising, reviewed and merged. That is a working pipeline, not an efficacy result. Live DeepSeek-only v0.8 runs and `openfarm bench` live arms remain **untested**; see [Not yet tested](#not-yet-tested) for exactly what is still open.
 
 ---
 
@@ -169,6 +169,16 @@ Each run starts from a fresh copy of the task's project and runs its card. Then 
 
 An arm file sets only the model and supervisor tables; copy one from [`bench/arms/`](bench/arms/). Each task runs 3 times per arm by default. The report (`bench-report.md` and `.json`) gives pass rate, tokens, tokens per pass, the worker's share of those tokens and per-category pass rates for each arm, and stays on your machine. The workers and Claude still see each card and starting project, as in any run.
 
+## Swarm, board, parallel cards, and TUI (v0.8)
+
+Enable `[swarm]` (`enabled = true` in `.openfarm/config.toml`; off by default so v0.7 queues behave identically) to run cards through a shared message board:
+
+- **Tiers & effort (`[tiers.<name>]`, `RoleModel.effort`)**: Define model tiers and effort ladders (`off`..`max`) injected cleanly via `effort_param` (`reasoning_effort` by default) on OpenAI-compatible payloads, while keeping `[model]` endpoint allowlists and `headers` (e.g. `x-cmd-zdr: 1`) invariant across every call.
+- **Shared board & checked actions (`openfarm board`, `openfarm swarm`)**: Every claim, brief, worker result, gate check, hand-back (`<<<HANDBACK ... >>>` when `replan_if` fires), and `answer` (validated against structured `expects`) lands on `<state_dir>/runs/<run_id>/board/`. Non-code members can never post `done`/`gate` or bypass deterministic gates.
+- **Coordinators & seats**: Plug in `"code"` (default deterministic escalation), `"tier:<name>"` (model coordinator with call/token caps and 2-bad-answer fallback), or `"external"` (`openfarm swarm join|start|set|hint|block|remove`, timed by `external_wait` -> `fallback` or `seat-silent`) for `[swarm] coordinator` and `supervisor` (`config`, `external`, `off`, or `tier:<name>`).
+- **Parallel non-colliding cards & `StallMonitor`**: Exact glob overlap (`globs_overlap`) + dependency/ID checks schedule independent cards concurrently (`concurrent_cards`, bounded by `[budget] concurrent_builds`), while `StallMonitor` (`role = "monitor"`, `stall_after`) posts a single `stall` alert when all active members pause on an unanswered question.
+- **Pure-stdlib TUI (`openfarm tui`)**: Inspect 7 views (`overview`, `cards`, `dossier`, `board`, `swarm`, `harness`, `ops`), view evidence safely confined inside `state_dir`, or drive board/swarm actions live or one-shot via `--once` / `--json`. Live smoke instructions for a first `tier:dsf` run are in [`docs/v0.8-smoke.md`](docs/v0.8-smoke.md).
+
 ## How it works
 
 <p align="center">
@@ -241,40 +251,45 @@ Every adapter also accepts `cmd:<argv>`. Card state lives on its own `openfarm-c
 
 ## Commands
 
-One `openfarm` command with 15 subcommands, shared exit codes (`0` done, `1` refused or ineligible, `2` usage or config error, `3` trouble or infra) and `--json` output.
+One `openfarm` command with 21 subcommands (`6` pre-config helpers + `15` repository commands), shared exit codes (`0` done, `1` refused or ineligible, `2` usage or config error, `3` trouble or infra) and `--json` output.
 
 | Command | Purpose |
 | --- | --- |
 | `openfarm init NAME` | Scaffold a new repo with validated config (Frontier Claude ACP OAuth default + Worker API key), protected invariants, Rust starter files, `Cargo.lock` and git |
+| `openfarm adopt` | Adopt an existing Rust or Python repository with baseline verification |
+| `openfarm bench` | List or run the 12 efficacy bench tasks (`list`, `run --dry-run` or live arms) |
 | `openfarm install-skill` | Deploy the bundled skills (`/openfarm-grill-me`, `/openfarm-initialize`, `openfarm`), slash commands, Antigravity plugin and optional launcher |
 | `openfarm acp [ACTION]` | Check Frontier OAuth & ACP transport readiness (`status`), run interactive `claude auth login` (`login`), update `.openfarm/config.toml` (`configure`), or run a zero-token ACP handshake (`probe`) |
+| `openfarm tui` | Launch the 7-view stdlib TUI (`--run`, `--refresh`, `--once`, `--view`, `--json`; works pre-config too) |
 | `openfarm run` | Work Ready cards, bounded by `--cards`, `--spend`, `--for` or `--until`; `--dry-run` checks without model calls |
 | `openfarm status` | Show farm, card and harness-memory status |
 | `openfarm pause` / `resume` / `stop` | Operator controls, including clearing the circuit breaker or kill switch |
-| `openfarm release CARD` | Release a card back to the queue |
+| `openfarm release CARD` / `done CARD` | Release a card back to the queue, or mark a locally merged card done |
 | `openfarm dossier CARD` | Print a card's reviewer dossier as Markdown or JSON |
 | `openfarm check CARD` | Check a card's eligibility, and optionally its baseline |
 | `openfarm verdict CARD` | Record the review outcome (`clean`, `minor-fix`, `bounced`, `scrapped`) and its cost |
 | `openfarm escape CARD` | Record a defect that got past review |
 | `openfarm supervise` | Run bounded micromanager triage of blocked cards or queue preparation |
-| `openfarm harness` | Inspect or manage harness memory (`status`, `index`, `show`, `promote`, `demote`, `reset --yes`) |
+| `openfarm harness` | Inspect or manage harness memory (`status`, `index`, `show`, `promote`, `demote`, `reset --yes`, `--global`) |
+| `openfarm board` | Inspect or interact with a live run's board (`read`, `post`, `answer`, `wait`) |
+| `openfarm swarm` | Inspect tiers/roster or act as external coordinator (`status`, `tiers`, `join`, `start`, `set`, `hint`, `block`, `remove`) |
 
 ## Configuration
 
-Each repository carries `.openfarm/config.toml` on its base branch, and `openfarm init` writes a validated one for you.
+Each repository carries `.openfarm/config.toml` on its base branch, and `openfarm init` / `openfarm adopt` writes a validated one for you.
 
 <details>
-<summary><b>The 13 config tables, budgets and hooks</b></summary>
+<summary><b>The 15 config tables, budgets and hooks</b></summary>
 
 <br>
 
-**Tables:** `[project]`, `[adapters]`, `[model]`, `[policy]`, `[eligibility]`, `[brief]`, `[runner]`, `[budget]`, `[gates]`, `[cards]`, `[micromanager]`, `[state]` and `[harness]`.
+**Tables:** `[project]`, `[adapters]`, `[model]`, `[policy]`, `[eligibility]`, `[brief]`, `[runner]`, `[budget]`, `[gates]`, `[cards]`, `[micromanager]`, `[state]`, `[harness]`, `[tiers.*]` and `[swarm]`.
 
-**Budgets** are absolute and enforced in code: implementer and test-writer attempts, model-driven builds, mutation builds, tokens and wall clock per card, spend per night, plus a kill switch and a circuit breaker. The micromanager has its own separate budget, so supervision spend stays visible in the payback numbers.
+**Budgets** are absolute and enforced in code: implementer and test-writer attempts, model-driven builds, mutation builds, tokens and wall clock per card, spend per night, per-run coordinator call/token caps, concurrent builds/cards limits, plus a kill switch and a circuit breaker. The micromanager has its own separate budget, so supervision spend stays visible in the payback numbers.
 
 **Three hooks** keep a repository's quirks out of the core: `[[gates.extra]]` for named commands that must pass, `[runner.env]` for per-unit environment variables, and `[brief] test_conventions` for a test-writing guide.
 
-Every key, gate, stop code and record format is documented in [`docs/openfarm-internals.md`](docs/openfarm-internals.md) (and the owner's local spec `openfarm spec v0.6.md` when present).
+Every key, gate, stop code (`19` per-card stop codes including `handed-back` and `seat-silent`) and record format is documented in [`docs/openfarm-internals.md`](docs/openfarm-internals.md) (and the owner's local spec `openfarm spec v0.8.md` when present).
 
 </details>
 
@@ -284,8 +299,8 @@ All checks below are deterministic and offline (see [`tests/test_v05_skill_boots
 
 | Suite | Result |
 | --- | --- |
-| Fast suite | **486 tests ran**, 59 opt-in end-to-end tests skipped, **0 failures** |
-| Full suite (`OPENFARM_E2E=1`, real `git` and `cargo`) | **545 tests passed**, 0 skipped, **0 failures** |
+| Fast suite | **627 tests ran** (686 discovered, 59 opt-in end-to-end tests skipped), **0 failures** |
+| Full suite (`OPENFARM_E2E=1`, real `git` and `cargo`) | **686 tests passed**, 0 skipped, **0 failures** |
 
 The full suite includes:
 
@@ -317,6 +332,7 @@ Model calls in these tests use a scripted backend and local HTTP test servers, a
 > - The TypeScript language pack, which is not implemented and refuses with `Invalid("no-typescript-pack")`.
 > - The Python pack (v0.6 branch) against pytest: pytest is not installed here, so its output parsing is tested on copied `-v` and `--collect-only -q` shapes only. `unittest` parsing is tested against real interpreter output.
 > - The Python pack's `ruff` lint and format path: `ruff` is not installed here, so only the no-ruff path (syntax check, formatting not checked) has run.
+> - A live v0.8 run against Command Code with DeepSeek in every seat (`workers`, `supervisor`, `coordinator`), whether `reasoning_effort` improves live model output, an outside agent holding a seat across a full live run, and parallel cards against real `cargo` builds (see [`docs/v0.8-smoke.md`](docs/v0.8-smoke.md)).
 >
 > No bench has run live, so there are no efficacy numbers yet: no acceptance rate, review time, or cost comparison against a frontier-only baseline.
 

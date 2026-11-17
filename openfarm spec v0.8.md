@@ -1,6 +1,6 @@
 # openfarm spec v0.8
 
-Nov 16, 2026 · draft, nothing built yet
+Nov 17, 2026 · implemented on `v0.8` (Stages 1–10 + stdlib TUI; live DeepSeek-only run untested)
 
 v0.8 builds on v0.7. Until now openfarm ran a fixed team, one card at a time, and openfarm itself called the supervisor. v0.8 adds a shared board that every step of a run is posted to, a team whose members a coordinator chooses (which model tier, which effort), cards worked in parallel, and seats that an agent or person outside openfarm can hold. Everything in v0.7 that this file does not change still holds, and with `[swarm] enabled = false` (the default) a run behaves exactly as in v0.7.
 

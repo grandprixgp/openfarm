@@ -45,6 +45,13 @@ class ConfigTemplateTests(unittest.TestCase):
         self.assertEqual(config["runner"]["python"], "")
         self.assertIn("pyproject.toml", config["policy"]["forbidden_files"])
 
+    def test_swarm_section_defaults_present_and_disabled(self) -> None:
+        config = tomllib.loads(self.init)
+        self.assertEqual(
+            config["swarm"],
+            {"enabled": False, "coordinator": "code", "supervisor": "config"},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,13 +1,13 @@
 ---
 name: openfarm-installer
 description: >-
-  Install the Openfarm v0.7.0 CLI package, native Claude ACP OAuth bridge,
+  Install the Openfarm v0.8.0 CLI package, native Claude ACP OAuth bridge,
   /openfarm-grill-me design interview, and /openfarm-initialize skills into
   Claude Code, Antigravity, or workspace customization directories from a single
   repository or package target.
 ---
 
-# Openfarm Installer Skill (`v0.7.0`)
+# Openfarm Installer Skill (`v0.8.0`)
 
 Follow these steps when the user asks you to read and install this skill (`"Read and install this skill <github_or_local_link>"`):
 
@@ -57,7 +57,7 @@ Confirm both the CLI binary and installed customization files exist:
 openfarm --help
 ```
 
-Check that the output lists `init`, `install-skill`, and `acp` alongside `run`, `status`, `pause`, `resume`, `stop`, `release`, `dossier`, `check`, `verdict`, `escape`, `supervise`, and `harness`, and confirm the installed skill files exist in at least one active discovery root:
+Check that the output lists all 21 subcommands (`init`, `adopt`, `bench`, `install-skill`, `acp`, `tui` alongside `run`, `status`, `pause`, `resume`, `stop`, `release`, `dossier`, `check`, `verdict`, `escape`, `supervise`, `harness`, `done`, `board`, and `swarm`), and confirm the installed skill files exist in at least one active discovery root:
 - `~/.claude/skills/openfarm-initialize/SKILL.md`, `~/.claude/skills/openfarm-grill-me/SKILL.md`, `~/.claude/commands/openfarm-initialize.md`, and `~/.claude/commands/openfarm-grill-me.md`
 - `~/.gemini/config/skills/openfarm-initialize/SKILL.md`, `~/.gemini/config/skills/openfarm-grill-me/SKILL.md`, and `~/.gemini/config/plugins/openfarm/plugin.json`
 - `~/.agents/skills/openfarm-initialize/SKILL.md` and `~/.agents/skills/openfarm-grill-me/SKILL.md`

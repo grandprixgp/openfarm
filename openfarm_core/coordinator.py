@@ -843,7 +843,7 @@ class ExternalCoordinator:
             else contextlib.nullcontext()
         )
 
-        with pause_cm:
+        with pause_cm, rt.board.external_wait(card_id=card_id, member_name=member_name):
             while True:
                 if (
                     callable(cancel_check) and cancel_check()
