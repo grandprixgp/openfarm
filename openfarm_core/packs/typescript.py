@@ -14,6 +14,7 @@ Shaped by the same principles as the Rust and Python packs:
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import re
@@ -36,235 +37,295 @@ _TS_EXTS = (".ts", ".mts", ".cts", ".tsx")
 _JS_EXTS = (".js", ".mjs", ".cjs", ".jsx")
 _CODE_EXTS = _TS_EXTS + _JS_EXTS
 
-_TEST_FILE_RE = re.compile(
-    r"(?:\.(?:test|spec)|_test)\.(?:ts|mts|cts|tsx|js|mjs|cjs|jsx)$"
-)
+_TEST_FILE_PATTERN = r"(?:\.(?:test|spec)|_test)\.(?:ts|mts|cts|tsx|js|mjs|cjs|jsx)$"
+_TEST_FILE_RE = re.compile(_TEST_FILE_PATTERN)
 _NODE_TEST_GLOBS = (
     "tests/**/*.test.{ts,mts,js,mjs}",
     "src/**/*.test.{ts,mts,js,mjs}",
 )
 
+#: Lines the pack's own reporter writes to stderr. Code under test cannot write
+#: there: `node --test` turns a test file's stdout and stderr into `# ` comments.
+_REPORT_MARK = "openfarm-node-test "
+
+
+def _js(template: str) -> str:
+    """A JS source with the pack's shared constants filled in."""
+    return (template
+            .replace("__SKIP_DIRS__", json.dumps(list(_SKIP_DIRS)))
+            .replace("__TEST_FILE_RE__", json.dumps(_TEST_FILE_PATTERN))
+            .replace("__REPORT_MARK__", json.dumps(_REPORT_MARK)))
+
+
+#: The walk every script shares: which folders are skipped, which files are tests.
+_JS_WALK = r'''
+const skip = new Set(__SKIP_DIRS__);
+const testFileRe = new RegExp(__TEST_FILE_RE__);
+function isTestFile(rel) {
+  const name = rel.split("/").pop();
+  return testFileRe.test(name);
+}
+function walk(dir, onFile) {
+  let entries;
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
+  catch { return; }
+  entries.sort((a, b) => a.name.localeCompare(b.name));
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      if (!skip.has(entry.name)) walk(full, onFile);
+      continue;
+    }
+    if (entry.isFile()) onFile(full);
+  }
+}
+'''
+
+#: Static test names in one source text: `test(...)`/`it(...)` calls with a
+#: literal first argument, and how many such calls there are at all.
+_JS_EXTRACT = r'''
+function extractTests(src) {
+  const names = [];
+  let calls = 0;
+  const n = src.length;
+  let i = 0;
+  let prevCode = "";
+  function skipWsComments(pos) {
+    while (pos < n) {
+      const c = src[pos];
+      if (c === " " || c === "\t" || c === "\n" || c === "\r") { pos++; continue; }
+      if (src.startsWith("//", pos)) {
+        const nl = src.indexOf("\n", pos + 2);
+        pos = nl === -1 ? n : nl + 1;
+        continue;
+      }
+      if (src.startsWith("/*", pos)) {
+        const end = src.indexOf("*/", pos + 2);
+        pos = end === -1 ? n : end + 2;
+        continue;
+      }
+      break;
+    }
+    return pos;
+  }
+  const escapes = { n: "\n", t: "\t", r: "\r" };
+  function readString(pos) {
+    const q = src[pos];
+    let j = pos + 1;
+    let out = "";
+    while (j < n) {
+      const ch = src[j];
+      if (ch === "\\") {
+        if (j + 1 < n) { out += escapes[src[j + 1]] || src[j + 1]; j += 2; continue; }
+        break;
+      }
+      if (q === "`" && ch === "$" && src[j + 1] === "{") return { ok: false, end: pos + 1 };
+      if (ch === q) return { ok: true, value: out, end: j + 1 };
+      out += ch;
+      j++;
+    }
+    return { ok: false, end: j };
+  }
+  while (i < n) {
+    const ch = src[i];
+    if (src.startsWith("//", i)) {
+      const nl = src.indexOf("\n", i + 2);
+      i = nl === -1 ? n : nl + 1;
+      continue;
+    }
+    if (src.startsWith("/*", i)) {
+      const end = src.indexOf("*/", i + 2);
+      i = end === -1 ? n : end + 2;
+      continue;
+    }
+    if (ch === "'" || ch === '"' || ch === "`") {
+      let j = i + 1;
+      while (j < n) {
+        if (src[j] === "\\") { j += 2; continue; }
+        if (src[j] === ch) { j++; break; }
+        j++;
+      }
+      prevCode = ch;
+      i = j;
+      continue;
+    }
+    if (/[A-Za-z_$]/.test(ch)) {
+      let j = i + 1;
+      while (j < n && /[A-Za-z0-9_$]/.test(src[j])) j++;
+      const ident = src.slice(i, j);
+      const canCall = !prevCode || !/[A-Za-z0-9_$]/.test(prevCode);
+      if (canCall && (ident === "test" || ident === "it")) {
+        const before = src.slice(Math.max(0, i - 16), i).replace(/\s+$/, "");
+        const dotOk = !before.endsWith(".") || /(?:^|[^A-Za-z0-9_$])t\.$/.test(before);
+        if (dotOk) {
+          let k = skipWsComments(j);
+          if (src[k] === ".") {
+            k = skipWsComments(k + 1);
+            let m = k;
+            while (m < n && /[A-Za-z0-9_$]/.test(src[m])) m++;
+            const mod = src.slice(k, m);
+            if (mod === "skip" || mod === "only" || mod === "todo") {
+              k = skipWsComments(m);
+            } else {
+              k = -1;
+            }
+          }
+          if (k !== -1 && src[k] === "(") {
+            calls++;
+            k = skipWsComments(k + 1);
+            if (k < n && (src[k] === "'" || src[k] === '"' || src[k] === "`")) {
+              const str = readString(k);
+              if (str.ok && str.value) names.push(str.value);
+            }
+          }
+        }
+      }
+      prevCode = src[j - 1];
+      i = j;
+      continue;
+    }
+    if (!/\s/.test(ch)) prevCode = ch;
+    i++;
+  }
+  return { names, calls };
+}
+function cleanName(name) {
+  return String(name).replace(/[\t\r\n]+/g, " ");
+}
+'''
+
+_JS_SYNTAX = r'''
+const tsExts = new Set([".ts", ".mts", ".cts"]);
+const jsExts = new Set([".js", ".mjs", ".cjs"]);
+function syntaxError(full) {
+  const ext = path.extname(full);
+  if (tsExts.has(ext)) {
+    try {
+      stripTypeScriptTypes(fs.readFileSync(full, "utf8"), { mode: "strip" });
+    } catch (err) {
+      const msg = String(err && err.message ? err.message : err).split(/\r?\n/)[0];
+      return `SyntaxError: ${msg}`;
+    }
+  } else if (jsExts.has(ext)) {
+    try {
+      execFileSync(process.execPath, ["--check", full], { stdio: "pipe" });
+    } catch (err) {
+      const text = String((err && err.stderr) || (err && err.message) || err);
+      const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+      return lines.find((l) => /SyntaxError/.test(l)) || lines[lines.length - 1] || "syntax error";
+    }
+  }
+  return "";
+}
+'''
+
+_JS_IMPORTS = r'''
+import fs from "node:fs";
+import path from "node:path";
+import { execFileSync } from "node:child_process";
+import { stripTypeScriptTypes } from "node:module";
+'''
+
 #: Syntax check script executed via `node --no-warnings --input-type=module -e`.
-_CHECK_SCRIPT = (
-    'import fs from "node:fs";\n'
-    'import path from "node:path";\n'
-    'import { execFileSync } from "node:child_process";\n'
-    'import { stripTypeScriptTypes } from "node:module";\n'
-    'const root = process.argv[1] || ".";\n'
-    f'const skip = new Set({json.dumps(list(_SKIP_DIRS))});\n'
-    'const tsExts = new Set([".ts", ".mts", ".cts"]);\n'
-    'const jsExts = new Set([".js", ".mjs", ".cjs"]);\n'
-    'let bad = 0;\n'
-    'function walk(dir) {\n'
-    '  let entries;\n'
-    '  try { entries = fs.readdirSync(dir, { withFileTypes: true }); }\n'
-    '  catch { return; }\n'
-    '  entries.sort((a, b) => a.name.localeCompare(b.name));\n'
-    '  for (const entry of entries) {\n'
-    '    const full = path.join(dir, entry.name);\n'
-    '    if (entry.isDirectory()) {\n'
-    '      if (!skip.has(entry.name)) walk(full);\n'
-    '      continue;\n'
-    '    }\n'
-    '    if (!entry.isFile()) continue;\n'
-    '    const ext = path.extname(entry.name);\n'
-    '    if (tsExts.has(ext)) {\n'
-    '      try {\n'
-    '        const src = fs.readFileSync(full, "utf8");\n'
-    '        stripTypeScriptTypes(src, { mode: "strip" });\n'
-    '      } catch (err) {\n'
-    '        bad += 1;\n'
-    '        const msg = String(err && err.message ? err.message : err).split(/\\r?\\n/)[0];\n'
-    '        console.error(`${full}: SyntaxError: ${msg}`);\n'
-    '      }\n'
-    '    } else if (jsExts.has(ext)) {\n'
-    '      try {\n'
-    '        execFileSync(process.execPath, ["--check", full], { stdio: "pipe" });\n'
-    '      } catch (err) {\n'
-    '        bad += 1;\n'
-    '        const text = String((err && err.stderr) || (err && err.message) || err);\n'
-    '        const lines = text.split(/\\r?\\n/).map((l) => l.trim()).filter(Boolean);\n'
-    '        const reason = lines.find((l) => /SyntaxError/.test(l)) || lines[lines.length - 1] || "syntax error";\n'
-    '        console.error(`${full}: ${reason}`);\n'
-    '      }\n'
-    '    }\n'
-    '  }\n'
-    '}\n'
-    'walk(root);\n'
-    'process.exit(bad ? 1 : 0);\n'
-)
+_CHECK_SCRIPT = _js(_JS_IMPORTS + _JS_WALK + _JS_SYNTAX + r'''
+const root = process.argv[1] || ".";
+let bad = 0;
+walk(root, (full) => {
+  const reason = syntaxError(full);
+  if (reason) {
+    bad += 1;
+    console.error(`${full}: ${reason}`);
+  }
+});
+process.exit(bad ? 1 : 0);
+''')
 
 #: Lists `test(...)` and `it(...)` names from test files without executing them.
-_LIST_SCRIPT = (
-    'import fs from "node:fs";\n'
-    'import path from "node:path";\n'
-    'import { execFileSync } from "node:child_process";\n'
-    'import { stripTypeScriptTypes } from "node:module";\n'
-    'const root = process.argv[1] || ".";\n'
-    f'const skip = new Set({json.dumps(list(_SKIP_DIRS))});\n'
-    'const testFileRe = /\\.(?:test|spec)\\.(?:ts|mts|cts|tsx|js|mjs|cjs|jsx)$/;\n'
-    'const tsExts = new Set([".ts", ".mts", ".cts"]);\n'
-    'const jsExts = new Set([".js", ".mjs", ".cjs"]);\n'
-    'const files = [];\n'
-    'function walk(dir) {\n'
-    '  let entries;\n'
-    '  try { entries = fs.readdirSync(dir, { withFileTypes: true }); }\n'
-    '  catch { return; }\n'
-    '  entries.sort((a, b) => a.name.localeCompare(b.name));\n'
-    '  for (const entry of entries) {\n'
-    '    const full = path.join(dir, entry.name);\n'
-    '    if (entry.isDirectory()) {\n'
-    '      if (!skip.has(entry.name)) walk(full);\n'
-    '      continue;\n'
-    '    }\n'
-    '    if (entry.isFile() && testFileRe.test(entry.name)) files.push(full);\n'
-    '  }\n'
-    '}\n'
-    'function extractTests(src) {\n'
-    '  const names = [];\n'
-    '  const n = src.length;\n'
-    '  let i = 0;\n'
-    '  let prevCode = "";\n'
-    '  function skipWsComments(pos) {\n'
-    '    while (pos < n) {\n'
-    '      const c = src[pos];\n'
-    '      if (c === " " || c === "\\t" || c === "\\n" || c === "\\r") { pos++; continue; }\n'
-    '      if (src.startsWith("//", pos)) {\n'
-    '        const nl = src.indexOf("\\n", pos + 2);\n'
-    '        pos = nl === -1 ? n : nl + 1;\n'
-    '        continue;\n'
-    '      }\n'
-    '      if (src.startsWith("/*", pos)) {\n'
-    '        const end = src.indexOf("*/", pos + 2);\n'
-    '        pos = end === -1 ? n : end + 2;\n'
-    '        continue;\n'
-    '      }\n'
-    '      break;\n'
-    '    }\n'
-    '    return pos;\n'
-    '  }\n'
-    '  function readString(pos) {\n'
-    '    const q = src[pos];\n'
-    '    let j = pos + 1;\n'
-    '    let out = "";\n'
-    '    while (j < n) {\n'
-    '      const ch = src[j];\n'
-    '      if (ch === "\\\\") {\n'
-    '        if (j + 1 < n) { out += src[j + 1]; j += 2; continue; }\n'
-    '        break;\n'
-    '      }\n'
-    '      if (q === "`" && ch === "$" && src[j + 1] === "{") return { ok: false, end: pos + 1 };\n'
-    '      if (ch === q) return { ok: true, value: out, end: j + 1 };\n'
-    '      out += ch;\n'
-    '      j++;\n'
-    '    }\n'
-    '    return { ok: false, end: j };\n'
-    '  }\n'
-    '  while (i < n) {\n'
-    '    const ch = src[i];\n'
-    '    if (src.startsWith("//", i)) {\n'
-    '      const nl = src.indexOf("\\n", i + 2);\n'
-    '      i = nl === -1 ? n : nl + 1;\n'
-    '      continue;\n'
-    '    }\n'
-    '    if (src.startsWith("/*", i)) {\n'
-    '      const end = src.indexOf("*/", i + 2);\n'
-    '      i = end === -1 ? n : end + 2;\n'
-    '      continue;\n'
-    '    }\n'
-    '    if (ch === "\'" || ch === \'"\' || ch === "`") {\n'
-    '      let j = i + 1;\n'
-    '      while (j < n) {\n'
-    '        if (src[j] === "\\\\") { j += 2; continue; }\n'
-    '        if (src[j] === ch) { j++; break; }\n'
-    '        j++;\n'
-    '      }\n'
-    '      prevCode = ch;\n'
-    '      i = j;\n'
-    '      continue;\n'
-    '    }\n'
-    '    if (/[A-Za-z_$]/.test(ch)) {\n'
-    '      let j = i + 1;\n'
-    '      while (j < n && /[A-Za-z0-9_$]/.test(src[j])) j++;\n'
-    '      const ident = src.slice(i, j);\n'
-    '      const canCall = !prevCode || !/[A-Za-z0-9_$]/.test(prevCode);\n'
-    '      if (canCall && (ident === "test" || ident === "it")) {\n'
-    '        const before = src.slice(Math.max(0, i - 16), i).replace(/\\s+$/, "");\n'
-    '        const dotOk = !before.endsWith(".") || /(?:^|[^A-Za-z0-9_$])t\\.$/.test(before);\n'
-    '        if (dotOk) {\n'
-    '          let k = skipWsComments(j);\n'
-    '          if (src[k] === ".") {\n'
-    '            k = skipWsComments(k + 1);\n'
-    '            let m = k;\n'
-    '            while (m < n && /[A-Za-z0-9_$]/.test(src[m])) m++;\n'
-    '            const mod = src.slice(k, m);\n'
-    '            if (mod === "skip" || mod === "only" || mod === "todo") {\n'
-    '              k = skipWsComments(m);\n'
-    '            } else {\n'
-    '              k = -1;\n'
-    '            }\n'
-    '          }\n'
-    '          if (k !== -1 && src[k] === "(") {\n'
-    '            k = skipWsComments(k + 1);\n'
-    '            if (k < n && (src[k] === "\'" || src[k] === \'"\' || src[k] === "`")) {\n'
-    '              const str = readString(k);\n'
-    '              if (str.ok && str.value) names.push(str.value);\n'
-    '            }\n'
-    '          }\n'
-    '        }\n'
-    '      }\n'
-    '      prevCode = src[j - 1];\n'
-    '      i = j;\n'
-    '      continue;\n'
-    '    }\n'
-    '    if (!/\\s/.test(ch)) prevCode = ch;\n'
-    '    i++;\n'
-    '  }\n'
-    '  return names;\n'
-    '}\n'
-    'walk(root);\n'
-    'for (const full of files) {\n'
-    '  const rel = path.relative(".", full).replace(/\\\\/g, "/");\n'
-    '  const ext = path.extname(full);\n'
-    '  let src = "";\n'
-    '  try { src = fs.readFileSync(full, "utf8"); }\n'
-    '  catch (err) { console.log(`ERROR ${rel}: ${err.message}`); continue; }\n'
-    '  if (tsExts.has(ext)) {\n'
-    '    try { stripTypeScriptTypes(src, { mode: "strip" }); }\n'
-    '    catch (err) {\n'
-    '      const msg = String(err && err.message ? err.message : err).split(/\\r?\\n/)[0];\n'
-    '      console.log(`ERROR ${rel}: SyntaxError: ${msg}`);\n'
-    '      continue;\n'
-    '    }\n'
-    '  } else if (jsExts.has(ext)) {\n'
-    '    try { execFileSync(process.execPath, ["--check", full], { stdio: "pipe" }); }\n'
-    '    catch (err) {\n'
-    '      const text = String((err && err.stderr) || (err && err.message) || err);\n'
-    '      const lines = text.split(/\\r?\\n/).map((l) => l.trim()).filter(Boolean);\n'
-    '      const reason = lines.find((l) => /SyntaxError/.test(l)) || lines[lines.length - 1] || "syntax error";\n'
-    '      console.log(`ERROR ${rel}: ${reason}`);\n'
-    '      continue;\n'
-    '    }\n'
-    '  }\n'
-    '  for (const name of extractTests(src)) {\n'
-    '    const safe = name.replace(/[\\t\\r\\n]+/g, " ");\n'
-    '    console.log(`TEST ${rel}\\t${safe}`);\n'
-    '  }\n'
-    '}\n'
-)
+_LIST_SCRIPT = _js(_JS_IMPORTS + _JS_WALK + _JS_SYNTAX + _JS_EXTRACT + r'''
+const root = process.argv[1] || ".";
+const files = [];
+walk(root, (full) => {
+  const rel = path.relative(".", full).replace(/\\/g, "/");
+  if (isTestFile(rel)) files.push(full);
+});
+for (const full of files) {
+  const rel = path.relative(".", full).replace(/\\/g, "/");
+  let src = "";
+  try { src = fs.readFileSync(full, "utf8"); }
+  catch (err) { console.log(`ERROR ${rel}: ${err.message}`); continue; }
+  const reason = syntaxError(full);
+  if (reason) { console.log(`ERROR ${rel}: ${reason}`); continue; }
+  for (const name of extractTests(src).names) {
+    console.log(`TEST ${rel}\t${cleanName(name)}`);
+  }
+}
+''')
+
+#: A second `node --test` reporter, beside TAP, writing to stderr: every result
+#: with the file it came from, each test file's static listing (unless the run
+#: is filtered by name), and the exit code. The parser compares the two, so a
+#: test file that stops part way, or never registers its tests, is a failure.
+_REPORTER_SCRIPT = _js(r'''
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+''' + _JS_EXTRACT + r'''
+const MARK = __REPORT_MARK__;
+const filtered = process.execArgv.some(
+  (a) => /^--test-(?:name|skip)-pattern/.test(a) || a === "--test-only");
+function emit(obj) { return MARK + JSON.stringify(obj) + "\n"; }
+function rel(file) {
+  let full = String(file);
+  if (full.startsWith("file://")) full = fileURLToPath(full);
+  return path.relative(process.cwd(), full).split(path.sep).join("/");
+}
+process.on("exit", (code) => {
+  try { fs.writeSync(2, emit({ e: "exit", code })); } catch {}
+});
+export default async function* openfarmReporter(source) {
+  const seen = [];
+  const known = new Set();
+  for await (const event of source) {
+    if (event.type !== "test:pass" && event.type !== "test:fail") continue;
+    const data = event.data || {};
+    const file = data.file ? rel(data.file) : "";
+    if (file && !known.has(file)) { known.add(file); seen.push(file); }
+    const details = data.details || {};
+    yield emit({
+      e: event.type === "test:pass" ? "pass" : "fail",
+      file,
+      name: String(data.name ?? ""),
+      nesting: Number(data.nesting) || 0,
+      type: details.type === "suite" ? "suite" : "test",
+      skip: data.skip !== undefined && data.skip !== false,
+      todo: data.todo !== undefined && data.todo !== false,
+    });
+  }
+  if (!filtered) {
+    for (const file of seen) {
+      let src;
+      try { src = fs.readFileSync(path.resolve(file), "utf8"); } catch { continue; }
+      const found = extractTests(src);
+      yield emit({ e: "listed", file, names: found.names.map(cleanName), calls: found.calls });
+    }
+  }
+  yield emit({ e: "end", filtered });
+}
+''')
+
+_REPORTER_URL = ("data:text/javascript;base64,"
+                 + base64.b64encode(_REPORTER_SCRIPT.encode("utf-8")).decode("ascii"))
 
 #: TAP v13 test result line: `[indent](not )ok N - name [# SKIP|TODO ...]`
 _TAP_RESULT_RE = re.compile(
     r"^(?P<indent>[ \t]*)(?P<ok>not ok|ok)\s+\d+\s*-\s*(?P<rest>.+?)\s*$"
 )
-_TAP_DIRECTIVE_RE = re.compile(r"\s+#\s*(?P<kind>SKIP|TODO)(?:\s.*)?$", re.IGNORECASE)
+_TAP_DIRECTIVE_AT_RE = re.compile(r"#\s*(?:SKIP|TODO)\b", re.IGNORECASE)
 _TAP_PLAN_RE = re.compile(r"^1\.\.(?P<count>\d+)\s*$")
 _TAP_STAT_RE = re.compile(
     r"^#\s*(?P<kind>tests|suites|pass|fail|cancelled|skipped|todo)\s+(?P<n>\d+)\s*$"
 )
 _TAP_YAML_START_RE = re.compile(r"^(?P<indent>[ \t]+)---\s*$")
-_TAP_YAML_END_RE = re.compile(r"^(?P<indent>[ \t]+)\.\.\.\s*$")
-_TAP_YAML_TYPE_RE = re.compile(r"^\s*type:\s*['\"]?(?P<kind>\w+)['\"]?\s*$")
 
 #: `node --test` spec reporter lines.
 _SPEC_LINE_RE = re.compile(
@@ -460,7 +521,10 @@ class TypeScriptPack(Pack):
                     argv += ["--", *fwd]
                 return {"argv": argv}
 
-            argv = [self.node, "--test", "--test-reporter=tap"]
+            argv = [self.node, "--test",
+                    "--test-reporter=tap", "--test-reporter-destination=stdout",
+                    f"--test-reporter={_REPORTER_URL}",
+                    "--test-reporter-destination=stderr"]
             if name_pattern:
                 argv.append(f"--test-name-pattern={name_pattern}")
             if files:
@@ -530,8 +594,7 @@ class TypeScriptPack(Pack):
         return {"tests": tests, "errors": errors} if errors else {"tests": tests}
 
     def parse_tests(self, stdout: str, stderr: str = "") -> dict:
-        text = f"{stdout or ''}\n{stderr or ''}"
-        return _parse_node_output(text)
+        return _parse_node_output(stdout, stderr)
 
     def parse_mutation(self, stdout: str) -> dict:
         raise Invalid("no-typescript-mutation",
@@ -714,46 +777,68 @@ def _add_compile_error(compile_errors: list[dict], target: str) -> None:
         compile_errors.append({"pkg": clean, "target": clean, "binary": clean})
 
 
-def _parse_node_output(text: str) -> dict:
-    """Parse TAP v13 and/or `node --test` spec output."""
+def _parse_node_output(stdout: str, stderr: str = "") -> dict:
+    """Parse TAP v13 and/or `node --test` spec output.
+
+    TAP is what the pack's own argv prints. Only node writes raw TAP lines:
+    whatever a test file prints, on stdout or stderr, reaches the stream as a
+    `# ` comment. So a result row, a plan or a stat line is read only where
+    node itself puts one, and nothing inside a YAML block (an error message,
+    a stack) is read as anything at all.
+    """
+    events, err_rest = _split_reporter_lines(stderr)
+    text = f"{stdout or ''}\n{err_rest}"
     results: list[dict] = []
     footers: list[dict] = []
     compile_errors: list[dict] = []
 
-    tap_stats: dict[str, int] = {}
+    rows: list[dict] = []
+    stat_lines: list[tuple[int, str, int]] = []
+    top_plans: list[tuple[int, int]] = []
     spec_stats: dict[str, int] = {}
-    tap_plan: int | None = None
-    tap_plan_after_results = False
-    seen_tap_tests = 0
+    spec_results: list[dict] = []
     seen_tap_version = False
     seen_spec_tests = False
     in_spec_failures = False
 
     yaml_indent: str | None = None
-    last_tap_is_file_compile = False
+    yaml_row: dict | None = None
+    last_row_line = -2
+    pending_compile: list[str] = []
     last_seen_source_file = ""
 
-    for raw_line in text.splitlines():
+    for index, raw_line in enumerate(text.splitlines()):
+        line = raw_line.rstrip("\r")
         if yaml_indent is not None:
-            if _TAP_YAML_END_RE.match(raw_line) and raw_line.startswith(yaml_indent):
+            # A block ends only at `...` on exactly its own indent. Every other
+            # line is the block's, and only its own top-level keys are read.
+            if line.rstrip() == yaml_indent + "...":
                 yaml_indent = None
+                yaml_row = None
                 continue
-            type_m = _TAP_YAML_TYPE_RE.match(raw_line)
-            if type_m and type_m.group("kind") == "suite" and results:
-                results.pop()
+            if (yaml_row is not None and line.startswith(yaml_indent)
+                    and len(line) > len(yaml_indent)
+                    and not line[len(yaml_indent)].isspace()):
+                key, sep, value = line[len(yaml_indent):].partition(":")
+                if sep:
+                    yaml_row["yaml"].setdefault(key.strip(), _yaml_scalar(value))
             continue
 
-        yaml_start = _TAP_YAML_START_RE.match(raw_line)
+        yaml_start = _TAP_YAML_START_RE.match(line)
         if yaml_start:
             yaml_indent = yaml_start.group("indent")
+            yaml_row = None
+            if rows and last_row_line == index - 1 and \
+                    len(yaml_indent) == len(rows[-1]["indent"]) + 2:
+                yaml_row = rows[-1]
             continue
 
-        stripped = raw_line.strip()
-        if stripped == "TAP version 13":
+        stripped = line.strip()
+        if stripped == "TAP version 13" and not line[:1].isspace():
             seen_tap_version = True
             continue
 
-        loc_m = _COMPILE_LOC_RE.match(raw_line)
+        loc_m = _COMPILE_LOC_RE.match(line)
         if loc_m:
             last_seen_source_file = loc_m.group("path")
 
@@ -761,43 +846,41 @@ def _parse_node_output(text: str) -> dict:
             imp_m = _IMPORTED_FROM_RE.search(stripped)
             target = (imp_m.group("path") if imp_m
                       else (last_seen_source_file or stripped.split(":", 1)[0]))
-            _add_compile_error(compile_errors, target)
-            last_tap_is_file_compile = True
+            if seen_tap_version and line.startswith("#"):
+                # Something a test file printed. It is a compile error only if
+                # the file then failed to load, which its own row will say.
+                pending_compile.append(target)
+            else:
+                _add_compile_error(compile_errors, target)
+
+        tap_m = _TAP_RESULT_RE.match(line)
+        if tap_m:
+            name, status = _tap_name_status(tap_m.group("rest"), tap_m.group("ok"))
+            indent = tap_m.group("indent")
+            row = {"name": name, "status": status, "indent": indent,
+                   "line": index, "yaml": {}, "compile": []}
+            if indent == "":
+                row["compile"] = pending_compile
+                pending_compile = []
+            rows.append(row)
+            last_row_line = index
+            continue
+
+        if line and not line[0].isspace():
+            plan_m = _TAP_PLAN_RE.match(line)
+            if plan_m:
+                top_plans.append((index, int(plan_m.group("count"))))
+                continue
+            tap_stat = _TAP_STAT_RE.match(line)
+            if tap_stat:
+                stat_lines.append((index, tap_stat.group("kind"), int(tap_stat.group("n"))))
+                continue
+
+        if seen_tap_version:
+            continue
 
         if _SPEC_FAIL_HDR_RE.match(stripped):
             in_spec_failures = True
-            continue
-
-        tap_m = _TAP_RESULT_RE.match(raw_line)
-        if tap_m:
-            rest = tap_m.group("rest")
-            dir_m = _TAP_DIRECTIVE_RE.search(rest)
-            if dir_m:
-                name = rest[:dir_m.start()].strip()
-                status = "ignored"
-            else:
-                name = rest.strip()
-                status = "ok" if tap_m.group("ok") == "ok" else "FAILED"
-            seen_tap_tests += 1
-            if (status == "FAILED" and last_tap_is_file_compile
-                    and _TEST_FILE_RE.search(name)):
-                _add_compile_error(compile_errors, name)
-                last_tap_is_file_compile = False
-                continue
-            last_tap_is_file_compile = False
-            results.append({"name": name, "binary": "", "status": status})
-            continue
-
-        if raw_line and not raw_line[0].isspace():
-            plan_m = _TAP_PLAN_RE.match(raw_line)
-            if plan_m:
-                tap_plan = int(plan_m.group("count"))
-                tap_plan_after_results = (seen_tap_tests > 0 or tap_plan == 0)
-                continue
-
-        tap_stat = _TAP_STAT_RE.match(stripped)
-        if tap_stat:
-            tap_stats[tap_stat.group("kind")] = int(tap_stat.group("n"))
             continue
 
         spec_stat = _SPEC_STAT_RE.match(stripped)
@@ -824,22 +907,63 @@ def _parse_node_output(text: str) -> dict:
                 else:
                     status = "FAILED"
                 seen_spec_tests = True
-                results.append({"name": name, "binary": "", "status": status})
+                spec_results.append({"name": name, "binary": "", "status": status})
 
-    has_tap_footer = ("tests" in tap_stats) or (
-        tap_plan is not None and tap_plan_after_results
-        and len(results) >= tap_plan
-    )
-    has_spec_footer = "tests" in spec_stats
+    report = _reporter_summary(events)
+    file_rows = report["file_rows"]
 
-    if has_tap_footer:
-        passed = tap_stats.get(
-            "pass", sum(1 for r in results if r["status"] == "ok"))
-        raw_failed = tap_stats.get(
+    for row in rows:
+        kind = str(row["yaml"].get("type", "")).strip("'\"")
+        if kind == "suite":
+            # A suite is a container: passing or skipped, it is not a test. Failing
+            # on its own (its body threw, a hook failed) it is a red row; failing
+            # only because a test in it failed, that test is already the red row.
+            if row["status"] != "FAILED":
+                continue
+            if str(row["yaml"].get("failureType", "")).strip("'\"") == "subtestsFailed":
+                continue
+            results.append({"name": row["name"], "binary": "", "status": "FAILED"})
+            continue
+        if row["indent"] == "" and (row["name"] in file_rows
+                                    or _looks_like_file_row(row)):
+            # Node's own row for a whole test file: the file failed to load or
+            # exited badly (red), or it ran no test at all (not a pass).
+            if row["status"] == "FAILED":
+                if row["compile"]:
+                    for target in row["compile"]:
+                        _add_compile_error(compile_errors, target)
+                    _add_compile_error(compile_errors, row["name"])
+                    continue
+                results.append({"name": row["name"], "binary": row["name"],
+                                "status": "FAILED"})
+            continue
+        results.append({"name": row["name"], "binary": "", "status": row["status"]})
+
+    if not seen_tap_version:
+        results.extend(spec_results)
+
+    # The footer is node's: the last top-level plan, with nothing after it but
+    # its stat lines, numbering exactly the top-level rows.
+    final_plan = top_plans[-1] if top_plans else None
+    top_rows = [row for row in rows if row["indent"] == ""]
+    tap_stats: dict[str, int] = {}
+    has_tap_footer = False
+    if final_plan is not None:
+        plan_line, plan_count = final_plan
+        has_tap_footer = (plan_count == len(top_rows)
+                          and not any(row["line"] > plan_line for row in top_rows))
+        if has_tap_footer:
+            tap_stats = {kind: n for line_no, kind, n in stat_lines if line_no > plan_line}
+    has_spec_footer = not seen_tap_version and "tests" in spec_stats
+
+    if has_tap_footer or has_spec_footer:
+        stats = tap_stats if has_tap_footer else spec_stats
+        passed = stats.get("pass", sum(1 for r in results if r["status"] == "ok"))
+        raw_failed = stats.get(
             "fail", sum(1 for r in results if r["status"] == "FAILED"))
-        cancelled = tap_stats.get("cancelled", 0)
+        cancelled = stats.get("cancelled", 0)
         failed = max(0, raw_failed + cancelled - len(compile_errors))
-        ignored = tap_stats.get("skipped", 0) + tap_stats.get("todo", 0)
+        ignored = stats.get("skipped", 0) + stats.get("todo", 0)
         if not ignored:
             ignored = sum(1 for r in results if r["status"] == "ignored")
         footers.append({
@@ -850,40 +974,155 @@ def _parse_node_output(text: str) -> dict:
             "ignored": ignored,
             "filtered": 0,
         })
-    elif has_spec_footer:
-        passed = spec_stats.get(
-            "pass", sum(1 for r in results if r["status"] == "ok"))
-        raw_failed = spec_stats.get(
-            "fail", sum(1 for r in results if r["status"] == "FAILED"))
-        cancelled = spec_stats.get("cancelled", 0)
-        failed = max(0, raw_failed + cancelled - len(compile_errors))
-        ignored = spec_stats.get("skipped", 0) + spec_stats.get("todo", 0)
-        if not ignored:
-            ignored = sum(1 for r in results if r["status"] == "ignored")
-        footers.append({
-            "binary": "node:test",
-            "status": "FAILED" if failed else "ok",
-            "passed": passed,
-            "failed": failed,
-            "ignored": ignored,
-            "filtered": 0,
-        })
 
-    # If the output had any test lines or TAP header or nothing at all without a
-    # footer, mark `missing_footers` so aborted/empty-killed runs are INFRA.
+    if report["seen"]:
+        results.extend(_lost_tests(report))
+        exit_code = report["exit"]
+        if (footers and exit_code not in (None, 0) and not compile_errors
+                and not any(r["status"] == "FAILED" for r in results)):
+            results.append({"name": f"node --test exited with code {exit_code}",
+                            "binary": "node:test", "status": "FAILED"})
+
+    # No footer means the run died partway (or never started): infra, never a pass.
     missing: list[str] = [] if footers else ["node:test"]
-    if (seen_tap_version or seen_tap_tests or seen_spec_tests) and not footers:
-        missing = ["node:test"]
+    if report["seen"] and not report["end"] and "node:test" not in missing:
+        missing.append("node:test")
     for error in compile_errors:
         if error["binary"] not in missing:
             missing.append(error["binary"])
 
-    return {
+    parsed = {
         "results": results,
         "footers": footers,
         "missing_footers": missing,
         "compile_errors": compile_errors,
     }
+    if report["seen"]:
+        parsed["files"] = {file: sorted(names)
+                           for file, names in sorted(report["reported"].items())}
+    return parsed
+
+
+def _split_reporter_lines(stderr: str) -> tuple[list[dict], str]:
+    """The pack reporter's lines out of stderr, and everything else."""
+    events: list[dict] = []
+    rest: list[str] = []
+    for line in (stderr or "").splitlines():
+        if line.startswith(_REPORT_MARK):
+            try:
+                payload = json.loads(line[len(_REPORT_MARK):])
+            except ValueError:
+                payload = None
+            if isinstance(payload, dict):
+                events.append(payload)
+                continue
+        rest.append(line)
+    return events, "\n".join(rest)
+
+
+def _reporter_summary(events: list[dict]) -> dict:
+    reported: dict[str, set[str]] = {}
+    skipped_in: set[str] = set()
+    file_rows: set[str] = set()
+    listed: dict[str, tuple[list[str], int]] = {}
+    exit_code = None
+    end = False
+    for event in events:
+        kind = event.get("e")
+        file = str(event.get("file", "") or "")
+        if kind in ("pass", "fail"):
+            name = _clean_name(event.get("name", ""))
+            if int(event.get("nesting", 0) or 0) == 0 and name == file:
+                file_rows.add(file)
+                reported.setdefault(file, set())
+                continue
+            if event.get("skip"):
+                skipped_in.add(file)
+            if event.get("type") == "suite":
+                reported.setdefault(file, set())
+                continue
+            reported.setdefault(file, set()).add(name)
+        elif kind == "listed":
+            names = [_clean_name(n) for n in (event.get("names") or [])]
+            listed[file] = (names, int(event.get("calls", 0) or 0))
+        elif kind == "exit":
+            try:
+                exit_code = int(event.get("code"))
+            except (TypeError, ValueError):
+                exit_code = None
+        elif kind == "end":
+            end = True
+    return {"seen": bool(events), "reported": reported, "skipped_in": skipped_in,
+            "file_rows": file_rows, "listed": listed, "exit": exit_code, "end": end}
+
+
+def _lost_tests(report: dict) -> list[dict]:
+    """Red rows for tests a file's static listing has and the runner never reported.
+
+    A file that reported nothing lost every listed test (it exited, or never
+    registered them). A file with a skipped test or suite can hide subtests the
+    listing sees, so a partial gap there is not counted.
+    """
+    out: list[dict] = []
+    for file, (names, calls) in sorted(report["listed"].items()):
+        got = report["reported"].get(file, set())
+        if not got:
+            lost = names
+            if not names and calls:
+                out.append({"name": f"{file}: registered no tests", "binary": file,
+                            "status": "FAILED"})
+        elif file in report["skipped_in"]:
+            lost = []
+        else:
+            lost = [name for name in names if name not in got]
+        seen: set[str] = set()
+        for name in lost:
+            if name in seen:
+                continue
+            seen.add(name)
+            out.append({"name": name, "binary": file, "status": "FAILED",
+                        "reason": "never-reported"})
+    return out
+
+
+def _clean_name(name) -> str:
+    return re.sub(r"[\t\r\n]+", " ", str(name))
+
+
+def _tap_name_status(rest: str, ok: str) -> tuple[str, str]:
+    """A TAP row's name with node's escapes (`\\#`, `\\\\`) undone, and its status."""
+    out: list[str] = []
+    i = 0
+    n = len(rest)
+    while i < n:
+        ch = rest[i]
+        if ch == "\\" and i + 1 < n and rest[i + 1] in ("\\", "#"):
+            out.append(rest[i + 1])
+            i += 2
+            continue
+        if ch == "#" and (i == 0 or rest[i - 1].isspace()) and \
+                _TAP_DIRECTIVE_AT_RE.match(rest, i):
+            return "".join(out).strip(), "ignored"
+        out.append(ch)
+        i += 1
+    return "".join(out).strip(), ("ok" if ok == "ok" else "FAILED")
+
+
+def _yaml_scalar(value: str) -> str:
+    text = value.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"'):
+        return text[1:-1]
+    return text
+
+
+def _looks_like_file_row(row: dict) -> bool:
+    """Node's row for a test file is named by its path and has no subtests."""
+    name = row["name"]
+    if not name or any(ch.isspace() for ch in name):
+        return False
+    if not name.endswith(_CODE_EXTS):
+        return False
+    return bool(_TEST_FILE_RE.search(name)) or "exitCode" in row["yaml"]
 
 
 # -- lexical scanner & signature extraction -----------------------------------
