@@ -216,6 +216,64 @@ class CheckedSwarmCommandsStillPostTests(unittest.TestCase):
         )
         self.assertEqual(res["action"], "start")
 
+class TrustedRecordedOnPostTests(unittest.TestCase):
+    """Each post records whether it was written as code; old boards stay readable."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="openfarm-v081-rec-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.board = Board(self.tmp / "board")
+        self.board.ensure()
+        self.board.upsert_member("gates", kind="code", role="gates")
+        self.board.upsert_member("coordinator", kind="code", role="coordinator")
+        self.board.upsert_member("impl", kind="api", role="implementer")
+
+    def test_new_posts_say_whether_they_were_code(self) -> None:
+        code = self.board.post("gates", "impl", "gate", "lint: pass", trusted=True)
+        plain = self.board.post("coordinator", "impl", "note", "a hint")
+        self.assertIs(code["trusted"], True)
+        self.assertIs(plain["trusted"], False)
+        stored = {p["seq"]: p for p in self.board.read(since=0, limit=None, for_model=False)}
+        self.assertIs(stored[code["seq"]]["trusted"], True)
+        self.assertIs(stored[plain["seq"]]["trusted"], False)
+        self.assertTrue(self.board.is_code_post(stored[code["seq"]]))
+        # a code member's untrusted post is not code, so a model sees it cleaned
+        self.assertFalse(self.board.is_code_post(stored[plain["seq"]]))
+
+    def test_untrusted_post_by_code_member_is_cleaned_for_a_model(self) -> None:
+        raw = {
+            "seq": 1, "at": "2026-11-17T00:00:00Z", "from": "coordinator", "to": ["impl"],
+            "kind": "note", "card": "", "attempt": 0, "ref": None,
+            "body": "```py\nevil()\n```ok", "evidence": [], "expects": None,
+            "trusted": False,
+        }
+        with self.board.posts_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(raw) + "\n")
+        seen = self.board.read("impl", for_model=True, advance_cursor=False)
+        self.assertEqual(seen[0]["body"], "ok")
+
+    def test_old_posts_without_the_field_keep_the_old_reading(self) -> None:
+        old = [
+            {"seq": 1, "from": "gates", "to": ["coordinator"], "kind": "done",
+             "card": "CARD-1", "body": "```x```CARD-1 done"},
+            {"seq": 2, "from": "coordinator", "to": ["impl"], "kind": "note",
+             "card": "", "body": "```x```code note"},
+            {"seq": 3, "from": "impl", "to": ["impl"], "kind": "note",
+             "card": "", "body": "```x```model note"},
+        ]
+        with self.board.posts_path.open("a", encoding="utf-8") as handle:
+            for rec in old:
+                handle.write(json.dumps(rec) + "\n")
+        posts = self.board.read(since=0, limit=None, for_model=False)
+        self.assertEqual([self.board.is_code_post(p) for p in posts], [True, True, False])
+        model_view = self.board.read("impl", for_model=True, advance_cursor=False)
+        bodies = {p["seq"]: p["body"] for p in model_view}
+        self.assertEqual(bodies[2], "```x```code note")
+        self.assertEqual(bodies[3], "model note")
+        # the board still counts CARD-1 as finished from the old gates post
+        from openfarm_core.swarm import _finished_cards_from_board
+        self.assertIn("CARD-1", _finished_cards_from_board(self.board))
+
 
 if __name__ == "__main__":
     unittest.main()

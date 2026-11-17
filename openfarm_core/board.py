@@ -395,6 +395,22 @@ def _post_addresses_member(post: dict, member: dict) -> bool:
     return False
 
 
+def post_is_code(post: dict, members: dict[str, dict] | None = None) -> bool:
+    """True when `post` was written as code (`Board.post(..., trusted=True)`).
+
+    Posts record it in `trusted`. Boards written before that field existed
+    fall back to the old reading: a fixed code name, or an author whose roster
+    entry is a code member.
+    """
+    if "trusted" in post:
+        return post.get("trusted") is True
+    author = str(post.get("from", "") or "")
+    if author in CODE_AUTHOR_NAMES:
+        return True
+    member = (members or {}).get(author)
+    return bool(member and member.get("kind") == "code")
+
+
 def is_stop_request(post: dict, members: dict[str, dict]) -> bool:
     """True for a `blocked` post written by a holder of the coordinator seat.
 
@@ -911,6 +927,7 @@ class Board:
             "body": final_body,
             "evidence": evidence_list,
             "expects": dict(expects) if isinstance(expects, dict) else expects,
+            "trusted": author_is_code,
         }
 
         self._append_record_unlocked(record)
@@ -1047,11 +1064,8 @@ class Board:
         out: list[dict] = []
         for post in posts:
             item = dict(post)
-            if should_clean:
-                author_member = members.get(str(item.get("from", "")))
-                author_kind = author_member.get("kind", "") if author_member else ""
-                if author_kind != "code":
-                    item["body"] = clean_post_body(item.get("body", ""))
+            if should_clean and not post_is_code(item, members):
+                item["body"] = clean_post_body(item.get("body", ""))
             out.append(item)
         return out
 
@@ -1404,6 +1418,16 @@ class Board:
     def external_wait_count(self) -> int:
         with self._ext_wait_lock:
             return self._ext_wait_count
+
+    def is_code_post(self, post: dict) -> bool:
+        """True when `post` was written as code (see `post_is_code`)."""
+        if "trusted" in post:
+            return post.get("trusted") is True
+        members = {}
+        if self.board_dir.exists():
+            with self._locked():
+                members = self._load_members_unlocked()
+        return post_is_code(post, members)
 
     def seat_of(self, name: str) -> str:
         """Seat a board name holds: 'coordinator', 'supervisor', or ''.

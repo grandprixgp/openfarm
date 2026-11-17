@@ -8,7 +8,7 @@ import time
 from typing import Callable, Iterable
 
 from .adapters.acp import is_acp_adapter
-from .board import CODE_AUTHOR_NAMES, Board, is_stop_request, normalize_role
+from .board import CODE_AUTHOR_NAMES, Board, is_stop_request, normalize_role, post_is_code
 from .cards import Card
 from .errors import Refused
 from .globs import globs_overlap
@@ -205,7 +205,7 @@ class CardProgress:
                 continue
             author = str(post.get("from", "") or "")
             kind = post.get("kind")
-            if author == "gates" and kind in ("done", "blocked"):
+            if author == "gates" and kind in ("done", "blocked") and post_is_code(post, members):
                 self.final.add(cid)
             elif _is_start_action(post, members):
                 self.started.add(cid)
