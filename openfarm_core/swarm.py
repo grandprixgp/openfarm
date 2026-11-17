@@ -123,7 +123,15 @@ def _refuse(
     return Refused(code, message)
 
 
-def _require_coordinator(board: Board, caller: str, *, card: str = "") -> dict:
+def _require_coordinator(
+    board: Board, caller: str, *, card: str = "", outside: bool = False
+) -> dict:
+    """The caller's roster entry, if it holds the coordinator seat.
+
+    `outside=True` is for a caller that named itself (`--as` on the command
+    line): only an external member that joined the seat passes then, so
+    typing the name of the code coordinator proves nothing.
+    """
     clean = str(caller or "").strip()
     if not clean:
         raise _refuse(
@@ -144,6 +152,15 @@ def _require_coordinator(board: Board, caller: str, *, card: str = "") -> dict:
             clean,
             "not-coordinator",
             f"{clean!r} (role {member.get('role')!r}) does not hold the coordinator seat",
+            card=card,
+        )
+    if outside and member.get("kind") != "external":
+        raise _refuse(
+            board,
+            clean,
+            "not-coordinator",
+            f"{clean!r} is a {member.get('kind')!r} member; from outside, only a member "
+            "that joined the coordinator seat (openfarm swarm join) can act",
             card=card,
         )
     return member
@@ -371,9 +388,10 @@ def swarm_start(
     tokens_used: int = 0,
     spend_used: float = 0.0,
     member_kind: str | None = None,
+    outside: bool = False,
 ) -> dict:
     """Validate and start a ready card with a team of worker members."""
-    _require_coordinator(board, caller, card=card_id)
+    _require_coordinator(board, caller, card=card_id, outside=outside)
 
     cards_map = _load_cards_map(source, cards_by_id)
     card = cards_map.get(card_id)
@@ -536,9 +554,10 @@ def swarm_set(
     tier: str | None = None,
     effort: str | None = None,
     reason: str = "",
+    outside: bool = False,
 ) -> dict:
     """Change a member's tier and/or effort from its next call."""
-    _require_coordinator(board, caller)
+    _require_coordinator(board, caller, outside=outside)
     if tier is None and effort is None:
         raise _refuse(board, caller, "empty-set", "set requires tier and/or effort")
 
@@ -634,9 +653,10 @@ def swarm_hint(
     caller: str,
     member_name: str,
     body: str,
+    outside: bool = False,
 ) -> dict:
     """Post a short note addressed to a member."""
-    _require_coordinator(board, caller)
+    _require_coordinator(board, caller, outside=outside)
     member = board.get_member(member_name)
     if member is None:
         raise _refuse(board, caller, "unknown-member", f"unknown member {member_name!r}")
@@ -677,9 +697,10 @@ def swarm_ask(
     attempt: int = 0,
     expects: dict | None = None,
     evidence: list[str] | None = None,
+    outside: bool = False,
 ) -> dict:
     """Post a question to the supervisor seat."""
-    _require_coordinator(board, caller, card=card)
+    _require_coordinator(board, caller, card=card, outside=outside)
     if cfg.swarm.supervisor == "off":
         raise _refuse(
             board, caller, "supervisor-off", "supervisor seat is 'off'", card=card
@@ -717,9 +738,10 @@ def swarm_block(
     reason: str,
     source=None,
     cards_by_id: dict[str, Card] | None = None,
+    outside: bool = False,
 ) -> dict:
     """Stop a card with a reason for the owner."""
-    _require_coordinator(board, caller, card=card_id)
+    _require_coordinator(board, caller, card=card_id, outside=outside)
     text = str(reason or "").strip()
     if not text:
         raise _refuse(
@@ -804,9 +826,10 @@ def swarm_remove(
     finished_cards: Iterable[str] | None = None,
     cards_by_id: dict[str, Card] | None = None,
     source=None,
+    outside: bool = False,
 ) -> dict:
     """Remove a member whose card is finished."""
-    _require_coordinator(board, caller)
+    _require_coordinator(board, caller, outside=outside)
     member = board.get_member(member_name)
     if member is None:
         raise _refuse(board, caller, "unknown-member", f"unknown member {member_name!r}")
@@ -863,9 +886,10 @@ def swarm_wait(
     *,
     caller: str,
     reason: str = "",
+    outside: bool = False,
 ) -> dict:
     """Validate and record a coordinator wait action without waking the caller."""
-    _require_coordinator(board, caller)
+    _require_coordinator(board, caller, outside=outside)
     board.post(
         author=caller,
         to=[],

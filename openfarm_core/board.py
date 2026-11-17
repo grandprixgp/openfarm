@@ -818,15 +818,18 @@ class Board:
             raise Refused("bad-ref", f"post ref must be a positive integer, got {ref!r}")
 
         author_member = members.get(clean_author)
-        author_is_code = (trusted is True) or (
-            trusted is None
-            and author_member is not None
-            and author_member.get("kind") == "code"
-        )
+        # Only the caller says a post is code's own. Being named like a code
+        # member (or registered as one) is never enough.
+        author_is_code = trusted is True
         if kind in _RESERVED_POST_KINDS and not author_is_code:
             raise Refused(
                 "reserved-kind",
                 f"post kind {kind!r} is reserved for code members",
+            )
+        if clean_author in CODE_AUTHOR_NAMES and not author_is_code:
+            raise Refused(
+                "code-author",
+                f"only code posts as {clean_author!r}",
             )
 
         evidence_list = self._validate_evidence_paths(evidence)
@@ -908,6 +911,76 @@ class Board:
                 expects=expects,
                 trusted=trusted,
                 advance_author_cursor=advance_author_cursor,
+            )
+
+    def outside_post(
+        self,
+        author: str,
+        to: list[str] | str,
+        kind: str,
+        body: str,
+        *,
+        card: str = "",
+        attempt: int = 0,
+        ref: int | None = None,
+        evidence: list[str] | None = None,
+    ) -> dict:
+        """Post typed by an outside member (`openfarm board post`).
+
+        The author must be a registered, not-removed, non-code member, and the
+        kind one an outside member writes by hand (`OUTSIDE_POST_KINDS`). Every
+        other kind has its own checked path: `action`, `blocked` and `roster`
+        the `swarm` commands, `answer` `board answer`, the rest code only.
+        The post is never trusted.
+        """
+        clean_author = str(author or "").strip()
+        if kind not in VALID_POST_KINDS:
+            raise Refused("bad-post-kind", f"invalid post kind {kind!r}")
+        if kind not in OUTSIDE_POST_KINDS:
+            code, where = _OUTSIDE_REFUSALS.get(
+                kind, ("reserved-kind", "cannot be posted by hand")
+            )
+            raise Refused(
+                code,
+                f"post kind {kind!r} {where}; `board post` writes only "
+                f"{', '.join(OUTSIDE_POST_KINDS)}",
+            )
+        if not clean_author:
+            raise Refused("bad-author", "post author (--as) must not be empty")
+        with self._locked() as cond:
+            members = self._load_members_unlocked()
+            member = members.get(clean_author)
+            if clean_author in CODE_AUTHOR_NAMES or (
+                member is not None and member.get("kind") == "code"
+            ):
+                raise Refused(
+                    "code-author",
+                    f"{clean_author!r} is a code member; only code posts as it",
+                )
+            if member is None:
+                raise Refused(
+                    "unknown-member",
+                    f"{clean_author!r} is not a member of this run's board; "
+                    "join a seat first (openfarm swarm join --name NAME --seat ...)",
+                )
+            if member.get("state") == "removed":
+                raise Refused(
+                    "removed-member", f"board member {clean_author!r} was removed"
+                )
+            return self._post_unlocked(
+                cond=cond,
+                members=members,
+                author=clean_author,
+                to=to,
+                kind=kind,
+                body=body,
+                card=card,
+                attempt=attempt,
+                ref=ref,
+                evidence=evidence,
+                expects=None,
+                trusted=False,
+                advance_author_cursor=False,
             )
 
     def _clean_posts_for_viewer(

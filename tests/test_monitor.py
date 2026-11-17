@@ -86,6 +86,7 @@ class StallMonitorUnitTests(unittest.TestCase):
             card="CARD-1",
             attempt=1,
             expects={"op": "triage", "required": ["action"]},
+            trusted=True,
         )
         q2 = self.board.post(
             "gates",
@@ -95,6 +96,7 @@ class StallMonitorUnitTests(unittest.TestCase):
             card="CARD-1",
             attempt=1,
             expects={"op": "clarify", "required": ["action"]},
+            trusted=True,
         )
 
         fake_now = [100.0]
@@ -176,7 +178,9 @@ class StallMonitorUnitTests(unittest.TestCase):
 
         # Case 3: card finished (done posted, no unanswered questions) -> no stall
         active_flag[0] = 0
-        self.board.post("gates", "coordinator", "done", "CARD-1 done", card="CARD-1")
+        self.board.post(
+            "gates", "coordinator", "done", "CARD-1 done", card="CARD-1", trusted=True
+        )
         fake_now[0] = 3000.0
         self.assertIsNone(monitor.check_once())
 
@@ -187,6 +191,7 @@ class StallMonitorUnitTests(unittest.TestCase):
             "question",
             "question after done",
             expects={"op": "ack", "required": ["ok"]},
+            trusted=True,
         )
         self.board.end_run("finished")
         fake_now[0] = 4000.0
