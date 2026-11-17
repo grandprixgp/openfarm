@@ -85,83 +85,6 @@ class DriverResponse:
     raw_argv: list[str] = dataclasses.field(default_factory=list)
 
 
-def _cred_relpath_for(provider: str) -> tuple[str, ...]:
-    if provider == "antigravity":
-        return (".gemini", "antigravity-cli", "antigravity-oauth-token")
-    if provider == "codex":
-        return (".codex", "auth.json")
-    return (".claude", ".credentials.json")
-
-
-def _sync_refreshed_oauth(
-    provider: str,
-    isolated_home: Path | None,
-    orig_home: str,
-    initial_bytes: bytes | None,
-) -> None:
-    """Atomically persist refreshed OAuth credentials back to host HOME."""
-    if isolated_home is None or not orig_home:
-        return
-    rel = _cred_relpath_for(provider)
-    iso_creds = isolated_home.joinpath(*rel)
-    if not iso_creds.is_file():
-        return
-    try:
-        raw = iso_creds.read_bytes()
-    except OSError:
-        return
-    if not raw or raw == initial_bytes:
-        return
-
-    if provider == "claude":
-        try:
-            parsed = json.loads(raw.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
-            return
-        if not isinstance(parsed, dict) or not isinstance(parsed.get("claudeAiOauth"), dict):
-            return
-        prefix = ".credentials-"
-    elif provider == "antigravity":
-        try:
-            decoded = raw.decode("utf-8")
-        except UnicodeDecodeError:
-            return
-        if not decoded.strip() or "\x00" in decoded:
-            return
-        prefix = ".antigravity-oauth-token-"
-    else:
-        try:
-            parsed = json.loads(raw.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
-            return
-        if not isinstance(parsed, dict):
-            return
-        prefix = ".auth-"
-
-    target = Path(orig_home).joinpath(*rel)
-    if not target.parent.is_dir():
-        return
-    try:
-        fd, tmp_name = tempfile.mkstemp(prefix=prefix, dir=str(target.parent))
-        tmp_path = Path(tmp_name)
-        try:
-            os.chmod(tmp_path, 0o600)
-            try:
-                view = memoryview(raw)
-                written = 0
-                while written < len(raw):
-                    written += os.write(fd, view[written:])
-            finally:
-                os.close(fd)
-            os.replace(tmp_path, target)
-            os.chmod(target, 0o600)
-        except Exception:
-            tmp_path.unlink(missing_ok=True)
-            raise
-    except OSError:
-        return
-
-
 def _extract_codex_message_text(item: dict) -> str:
     if isinstance(item.get("text"), str):
         return item["text"]
@@ -635,6 +558,23 @@ class DriverAgent:
         except confine_lib.ConfineError as exc:
             raise Refused("acp-confine-unavailable", exc.message) from exc
 
+    def _sync_back(self, isolated_home: Path, target: Path, initial: bytes | None) -> None:
+        """Copy a refreshed login back to `target` through `logins.sync_back` only.
+
+        A refused copy leaves the real login alone and is noted with its reason,
+        never its content.
+        """
+        result = logins.sync_back(
+            self.provider, isolated_home=isolated_home, target=target, initial=initial)
+        self.last_sync = result
+        if result.status == "refused":
+            note = (
+                f"the refreshed {self.provider} login was not copied back to "
+                f"{target}: {result.reason}"
+            )
+            self._note(note)
+            print(f"openfarm drive: {note}", file=sys.stderr)
+
     def _next_scripted_entry(self, turn_key: str) -> object:
         script = self._script
         if isinstance(script, list):
@@ -740,7 +680,12 @@ class DriverAgent:
             )
             sub_input = "" if self.provider == "antigravity" else stdin_text
 
+        # The login is read from where the provider keeps it (CLAUDE_CONFIG_DIR /
+        # CODEX_HOME first, $HOME second), and a refreshed one goes back there.
         orig_home = (self.extra_env or {}).get("HOME") or os.environ.get("HOME", "")
+        place = logins.login_place(
+            self.provider, env=logins.login_env_layer(None, self.extra_env))
+        cred_source = place.credential if (orig_home or place.from_env) else None
         env, isolated_home = _sanitised_env(
             extra_env=self.extra_env,
             isolate_home=True,
@@ -751,10 +696,9 @@ class DriverAgent:
         )
         initial_bytes: bytes | None = None
         if isolated_home is not None:
-            iso_creds = isolated_home.joinpath(*_cred_relpath_for(self.provider))
-            if iso_creds.is_file():
-                with contextlib.suppress(OSError):
-                    initial_bytes = iso_creds.read_bytes()
+            iso_rel = logins.isolated_place(self.provider, isolated_home).credential.relative_to(
+                isolated_home).parts
+            initial_bytes, _why = logins.read_isolated(isolated_home, iso_rel)
 
         try:
             spawn_argv = self.child_argv(argv, home_dir=isolated_home, env=env)
@@ -792,10 +736,8 @@ class DriverAgent:
             # The CLI has exited: whatever it left running in its group goes too.
             _end_process_group(proc, grace_s=0.0)
 
-            if isolated_home is not None:
-                _sync_refreshed_oauth(
-                    self.provider, isolated_home, orig_home, initial_bytes
-                )
+            if isolated_home is not None and cred_source is not None:
+                self._sync_back(isolated_home, cred_source, initial_bytes)
         finally:
             if isolated_home is not None:
                 shutil.rmtree(isolated_home, ignore_errors=True)
