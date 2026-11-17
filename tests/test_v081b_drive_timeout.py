@@ -81,9 +81,9 @@ class DriveTimeoutRuleTests(unittest.TestCase):
     def test_block_policy_blocks_the_card_seat_silent(self) -> None:
         self._set_policy("block")
         res = self._drive({"driver/*": "NOT JSON"})
-        self.assertEqual(res["on_external_timeout"], "block")
         self.assertEqual(res["outcomes"][0]["final_state"], "blocked", res["outcomes"])
         self.assertEqual(res["outcomes"][0]["stop_code"], "seat-silent", res["outcomes"])
+        self.assertEqual(res["on_external_timeout"], "block")
         self.assertEqual(res["answers_sent"], [])
         self.assertEqual(self._board_answers(res["run_id"]), [])
         self.assertTrue(res["timeouts"])
