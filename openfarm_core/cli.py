@@ -31,6 +31,7 @@ from .acp_setup import (
 )
 from .adopt import adopt_project
 from .bench import load_task
+from .board import Board, VALID_POST_KINDS, board_dir_for
 from .adapters.files import FileCardSource, open_card_source
 from .adapters.jsonl import TelemetrySink, open_telemetry
 from .adapters.openai_compat import open_backend
@@ -1275,6 +1276,129 @@ def cmd_harness(ctx: Context, args) -> int:
     raise UsageError(f"unknown harness action: {action}")
 
 
+def _resolve_board(ctx: Context, run_id: str | None) -> tuple[str, Board]:
+    if run_id:
+        rid = _check_id(run_id, "run id")
+    else:
+        holder = ctx.state.lock_holder()
+        if not holder or not holder.get("run_id"):
+            raise Refused(
+                "no-active-run",
+                "no active run holds the lock; pass --run ID",
+            )
+        rid = _check_id(str(holder["run_id"]), "run id")
+    bdir = board_dir_for(ctx.state, rid)
+    if run_id and not bdir.exists() and not ctx.state.run_dir(rid).exists():
+        raise Refused("unknown-run", f"run {rid!r} does not exist")
+    return rid, Board(bdir, state_dir=ctx.state)
+
+
+def _parse_seqs_arg(raw: str | None) -> list[int] | None:
+    if raw is None:
+        return None
+    parts = [part.strip() for part in raw.split(",") if part.strip()]
+    if not parts:
+        raise UsageError("--seqs expects comma-separated integers")
+    out: list[int] = []
+    for part in parts:
+        try:
+            seq = int(part)
+        except ValueError as exc:
+            raise UsageError(f"--seqs: {part!r} is not an integer") from exc
+        if seq < 1:
+            raise UsageError(f"--seqs: sequence numbers must be >= 1, got {seq}")
+        out.append(seq)
+    return out
+
+
+def cmd_board(ctx: Context, args) -> int:
+    """Read, post, answer, or wait on a run's board."""
+    action = getattr(args, "board_command", None)
+    if not action:
+        raise UsageError("board requires a subcommand: read, post, answer, or wait")
+    rid, board = _resolve_board(ctx, getattr(args, "run", None))
+
+    if action == "read":
+        if args.status:
+            ctx.emit({
+                "run_id": rid,
+                **board.status(),
+                "roster": board.list_members(),
+            })
+            return EXIT_OK
+        seqs = _parse_seqs_arg(args.seqs)
+        posts = board.read(
+            as_name=args.as_name,
+            since=args.since,
+            limit=args.limit,
+            seqs=seqs,
+        )
+        ctx.emit({"run_id": rid, "posts": posts, "count": len(posts)})
+        return EXIT_OK
+
+    if action == "post":
+        if args.file is not None:
+            try:
+                body = Path(args.file).read_text(encoding="utf-8")
+            except OSError as exc:
+                raise Refused(
+                    "unreadable-file", f"cannot read {args.file}: {exc}"
+                ) from exc
+        else:
+            body = args.body if args.body is not None else ""
+        post = board.post(
+            author=args.as_name,
+            to=args.to,
+            kind=args.kind,
+            body=body,
+            card=args.card,
+            attempt=args.attempt,
+            ref=args.ref,
+        )
+        ctx.emit({"run_id": rid, "post": post})
+        return EXIT_OK
+
+    if action == "answer":
+        try:
+            raw_text = Path(args.file).read_text(encoding="utf-8")
+        except OSError as exc:
+            raise Refused(
+                "unreadable-file", f"cannot read {args.file}: {exc}"
+            ) from exc
+        try:
+            data = json.loads(raw_text)
+        except ValueError as exc:
+            raise Refused(
+                "bad-json", f"{args.file} is not valid JSON: {exc}"
+            ) from exc
+        post = board.answer(
+            args.seq,
+            as_name=args.as_name,
+            data=data,
+            body=args.body,
+        )
+        ctx.emit({"run_id": rid, "post": post})
+        return EXIT_OK
+
+    if action == "wait":
+        try:
+            timeout_s = parse_duration(args.timeout, "--timeout")
+        except ConfigError as exc:
+            raise UsageError(str(exc)) from exc
+        if timeout_s < 0:
+            raise UsageError("--timeout must be >= 0")
+        result = board.wait(
+            args.as_name,
+            since=args.since,
+            timeout_s=timeout_s,
+            limit=args.limit,
+        )
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return EXIT_OK
+
+    raise UsageError(f"unknown board subcommand: {action}")
+
+
 # -- the parser ----------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1371,6 +1495,43 @@ def build_parser() -> argparse.ArgumentParser:
                          help="use the global harness library")
     harness.add_argument("--reason", default="manual")
     harness.add_argument("--yes", action="store_true")
+
+    board = sub.add_parser("board", help="read, post, answer, or wait on a run's board")
+    board_sub = board.add_subparsers(dest="board_command")
+
+    board_read = board_sub.add_parser("read", help="read posts or status from the board")
+    board_read.add_argument("--as", dest="as_name", default=None)
+    board_read.add_argument("--since", type=int, default=None)
+    board_read.add_argument("--limit", type=int, default=20)
+    board_read.add_argument("--seqs", default=None)
+    board_read.add_argument("--status", action="store_true")
+    board_read.add_argument("--run", default=None)
+
+    board_post = board_sub.add_parser("post", help="post a message to the board")
+    board_post.add_argument("--as", dest="as_name", required=True)
+    board_post.add_argument("--to", required=True)
+    board_post.add_argument("--kind", choices=VALID_POST_KINDS, default="note")
+    board_post.add_argument("--card", default="")
+    board_post.add_argument("--attempt", type=int, default=0)
+    board_post.add_argument("--ref", type=int, default=None)
+    body_group = board_post.add_mutually_exclusive_group(required=True)
+    body_group.add_argument("--body", default=None)
+    body_group.add_argument("--file", default=None)
+    board_post.add_argument("--run", default=None)
+
+    board_answer = board_sub.add_parser("answer", help="answer a board question")
+    board_answer.add_argument("seq", type=int)
+    board_answer.add_argument("--as", dest="as_name", required=True)
+    board_answer.add_argument("--file", required=True)
+    board_answer.add_argument("--body", default="")
+    board_answer.add_argument("--run", default=None)
+
+    board_wait = board_sub.add_parser("wait", help="wait for matching posts on the board")
+    board_wait.add_argument("--as", dest="as_name", required=True)
+    board_wait.add_argument("--since", type=int, default=None)
+    board_wait.add_argument("--timeout", default="30m")
+    board_wait.add_argument("--limit", type=int, default=None)
+    board_wait.add_argument("--run", default=None)
 
     bench = sub.add_parser("bench", help="run the efficacy bench")
     bench_sub = bench.add_subparsers(dest="bench_command")
@@ -1692,6 +1853,7 @@ COMMANDS = {
     "escape": cmd_escape,
     "supervise": cmd_supervise,
     "harness": cmd_harness,
+    "board": cmd_board,
 }
 
 

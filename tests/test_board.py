@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import multiprocessing
 import os
@@ -23,6 +25,7 @@ from openfarm_core.board import (
     normalize_role,
     validate_expected_answer,
 )
+from openfarm_core.cli import EXIT_OK, EXIT_REFUSED, EXIT_USAGE, main as cli_main
 from openfarm_core.errors import Refused
 from openfarm_core.state import StateDir
 
@@ -732,6 +735,161 @@ class BoardTests(unittest.TestCase):
         after = self.board.get_member("worker")
         self.assertEqual(after["state"], "removed")
         self.assertEqual(after["wait_since"], "")
+
+
+class BoardCliTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="openfarm-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.repo = self.tmp / "repo"
+        self.repo.mkdir()
+        self.state_root = self.tmp / "state"
+        self.state = StateDir(self.state_root)
+        cfg_dir = self.repo / ".openfarm"
+        cfg_dir.mkdir()
+        (cfg_dir / "config.toml").write_text(
+            f'[project]\nname = "demo"\nstate_dir = "{self.state_root}"\n\n'
+            f'[adapters]\nlanguages = ["python"]\n\n'
+            f'[model]\nimplementer = {{ model = "m" }}\n\n'
+            f'[policy]\ncategories = ["pattern"]\n',
+            encoding="utf-8",
+        )
+
+    def _run_cli(self, *args: str) -> tuple[int, str, str]:
+        out = io.StringIO()
+        err = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = cli_main(["--repo", str(self.repo), *args])
+        return code, out.getvalue(), err.getvalue()
+
+    def test_board_cli_refuses_when_no_active_run_and_resolves_lock_holder(self) -> None:
+        code, out, _ = self._run_cli("board", "read", "--json")
+        self.assertEqual(code, EXIT_REFUSED)
+        self.assertEqual(json.loads(out)["kind"], "refused")
+
+        # Explicit unknown --run also refused
+        code, out, _ = self._run_cli("board", "read", "--run", "missing-run", "--json")
+        self.assertEqual(code, EXIT_REFUSED)
+
+        # Acquire lock and create board
+        self.assertTrue(self.state.acquire_run_lock("run-1"))
+        self.addCleanup(self.state.release_run_lock, "run-1")
+        self.state.create_run("run-1")
+        board = Board(board_dir_for(self.state, "run-1"), state_dir=self.state)
+        board.ensure()
+        board.upsert_member("coord", kind="code", role="coordinator")
+        board.upsert_member("alice", kind="external", role="supervisor", owner_kind="human")
+
+        # Post via --body and --file using active lock holder
+        code, out, _ = self._run_cli(
+            "board", "post", "--as", "coord", "--to", "alice",
+            "--kind", "note", "--body", "hello from lock", "--json",
+        )
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(json.loads(out)["post"]["seq"], 1)
+
+        msg_file = self.tmp / "msg.txt"
+        msg_file.write_text("from file", encoding="utf-8")
+        code, out, _ = self._run_cli(
+            "board", "post", "--as", "alice", "--to", "coord",
+            "--file", str(msg_file), "--run", "run-1", "--json",
+        )
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(json.loads(out)["post"]["seq"], 2)
+
+        # Non-code cannot post reserved kind
+        code, out, _ = self._run_cli(
+            "board", "post", "--as", "alice", "--to", "all",
+            "--kind", "done", "--body", "nope", "--json",
+        )
+        self.assertEqual(code, EXIT_REFUSED)
+
+        # Read with --seqs does not advance cursor, read --as advances cursor
+        code, out, _ = self._run_cli("board", "read", "--seqs", "1,2", "--json")
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual([p["seq"] for p in json.loads(out)["posts"]], [1, 2])
+        self.assertEqual(board.get_member("alice")["last_read_seq"], 0)
+
+        code, out, _ = self._run_cli("board", "read", "--as", "alice", "--json")
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual([p["seq"] for p in json.loads(out)["posts"]], [1])
+        self.assertEqual(board.get_member("alice")["last_read_seq"], 1)
+
+        # Read --status
+        code, out, _ = self._run_cli("board", "read", "--status", "--json")
+        self.assertEqual(code, EXIT_OK)
+        status_payload = json.loads(out)
+        self.assertEqual(status_payload["run_id"], "run-1")
+        self.assertEqual(status_payload["posts"], 2)
+        self.assertEqual(len(status_payload["roster"]), 2)
+
+        # Invalid --seqs rejected with usage error
+        code, out, _ = self._run_cli("board", "read", "--seqs", "abc", "--json")
+        self.assertEqual(code, EXIT_USAGE)
+
+    def test_board_cli_answer_and_wait_exit_codes(self) -> None:
+        self.state.create_run("run-2")
+        board = Board(board_dir_for(self.state, "run-2"), state_dir=self.state)
+        board.ensure()
+        board.upsert_member("coord", kind="code", role="coordinator")
+        board.upsert_member("sup", kind="external", role="supervisor", owner_kind="agent")
+
+        q = board.post(
+            "coord",
+            "sup",
+            "question",
+            "Approve?",
+            card="CARD-1",
+            expects={"required": ["verdict"], "verdict": ["approve", "reject"]},
+        )
+
+        # Wait returns immediately with exit 0 when post already awaits
+        code, out, _ = self._run_cli(
+            "board", "wait", "--as", "sup", "--since", "0", "--timeout", "1s", "--run", "run-2",
+        )
+        self.assertEqual(code, EXIT_OK)
+        wait_res = json.loads(out)
+        self.assertTrue(wait_res["woke"])
+        self.assertEqual(wait_res["posts"][0]["seq"], q["seq"])
+
+        # Bad answer refused with exit 1 and nothing posted
+        bad_ans = self.tmp / "bad.json"
+        bad_ans.write_text(json.dumps({"verdict": "maybe"}), encoding="utf-8")
+        code, out, _ = self._run_cli(
+            "board", "answer", str(q["seq"]), "--as", "sup", "--file", str(bad_ans),
+            "--run", "run-2", "--json",
+        )
+        self.assertEqual(code, EXIT_REFUSED)
+        self.assertEqual(board.status()["posts"], 1)
+
+        # Valid answer accepted
+        good_ans = self.tmp / "good.json"
+        good_ans.write_text(json.dumps({"verdict": "approve"}), encoding="utf-8")
+        code, out, _ = self._run_cli(
+            "board", "answer", str(q["seq"]), "--as", "sup", "--file", str(good_ans),
+            "--run", "run-2", "--json",
+        )
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(json.loads(out)["post"]["kind"], "answer")
+
+        # Wait timeout exits 0 with {"woke": false, "reason": "timeout"}
+        code, out, _ = self._run_cli(
+            "board", "wait", "--as", "sup", "--since", "2", "--timeout", "0s", "--run", "run-2",
+        )
+        self.assertEqual(code, EXIT_OK)
+        timeout_res = json.loads(out)
+        self.assertFalse(timeout_res["woke"])
+        self.assertEqual(timeout_res["reason"], "timeout")
+
+        # Run-ended exits 0 with {"woke": false, "reason": "run-ended"}
+        board.end_run("done")
+        code, out, _ = self._run_cli(
+            "board", "wait", "--as", "sup", "--since", "2", "--timeout", "5s", "--run", "run-2",
+        )
+        self.assertEqual(code, EXIT_OK)
+        ended_res = json.loads(out)
+        self.assertFalse(ended_res["woke"])
+        self.assertEqual(ended_res["reason"], "run-ended")
 
 
 if __name__ == "__main__":
