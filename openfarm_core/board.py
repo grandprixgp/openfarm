@@ -1229,6 +1229,44 @@ class Board:
         with self._ext_wait_lock:
             return self._ext_wait_count
 
+    def seat_of(self, name: str) -> str:
+        """Seat a board name holds: 'coordinator', 'supervisor', or ''.
+
+        A removed or unknown name holds no seat. Callers use this to decide
+        whose posts may steer a run (start or stop a card, hint a worker).
+        """
+        member = self.get_member(str(name or "").strip())
+        if member is None or member.get("state") == "removed":
+            return ""
+        role = normalize_role(str(member.get("role", "") or ""))
+        return role if role in ("coordinator", "supervisor") else ""
+
+    def stop_requested(self, card_id: str) -> str:
+        """Reason the coordinator asked for `card_id` to stop, or ''.
+
+        A stop request is a `blocked` post for the card written by the
+        coordinator's seat (through `swarm block`). The card's own final
+        `done` / `blocked` post is written by code as `gates` and is not a
+        request. A running card checks this before each model call.
+        """
+        clean = str(card_id or "").strip()
+        if not clean or not self.board_dir.exists():
+            return ""
+        with self._locked():
+            posts = self._load_posts_unlocked()
+            members = self._load_members_unlocked()
+        for post in reversed(posts):
+            if post.get("kind") != "blocked" or str(post.get("card", "") or "") != clean:
+                continue
+            author = str(post.get("from", "") or "")
+            if author == "gates":
+                continue
+            member = members.get(author) or {}
+            if normalize_role(str(member.get("role", "") or "")) != "coordinator":
+                continue
+            return str(post.get("body", "") or "").strip() or "blocked by coordinator"
+        return ""
+
     def status(self) -> dict:
         if not self.board_dir.exists():
             return {
