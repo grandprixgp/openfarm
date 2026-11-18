@@ -190,6 +190,8 @@ def render_config(*, name: str, language: str, base_branch: str, state_dir: Path
         "coach_on_stall = true",
         "adjudicate_counter_tests = true",
         "pre_review = true",
+        "# openfarm's own bridges replace the provider CLI's built-in system prompt.",
+        "lean_prompt = true",
         "",
         "[state]",
         "min_free_mb = 256",

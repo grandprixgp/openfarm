@@ -70,7 +70,7 @@ _TABLE_KEYS = {
                      "auth", "auth_file", "isolate_home", "shape_cards",
                      "scaffold_contracts", "coach_on_stall",
                      "adjudicate_counter_tests", "pre_review",
-                     "confine", "confine_read_roots"},
+                     "confine", "confine_read_roots", "lean_prompt"},
     "state": {"min_free_mb"},
     "harness": {"enabled", "dir", "capture_on", "max_cues_per_brief",
                 "max_active_adaptations", "min_confidence", "probe_window",
@@ -308,7 +308,7 @@ class MicromanagerConfig:
         "auth", "auth_file", "isolate_home", "shape_cards",
         "scaffold_contracts", "coach_on_stall",
         "adjudicate_counter_tests", "pre_review",
-        "confine", "confine_read_roots",
+        "confine", "confine_read_roots", "lean_prompt",
     )
 
     def __init__(self, **kwargs) -> None:
@@ -815,6 +815,9 @@ class Config:
             confine=_as_choice(mm.get("confine"), "[micromanager] confine",
                                "auto", ("auto", "bwrap", "off")),
             confine_read_roots=self._confine_read_roots(mm.get("confine_read_roots")),
+            # openfarm's own bridges replace the provider CLI's built-in prompt.
+            lean_prompt=_as_bool(mm.get("lean_prompt"),
+                                 "[micromanager] lean_prompt", True),
         )
 
     def _confine_read_roots(self, value) -> list[str]:

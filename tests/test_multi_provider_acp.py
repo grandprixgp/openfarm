@@ -40,6 +40,7 @@ from openfarm_core.adapters.acp import (
     normalize_acp_provider,
     resolve_acp_command,
 )
+from openfarm_core.adapters.codex_native_acp import lean_codex_args
 from openfarm_core.adapters.claude_worker import (
     AcpWorkerBackend,
     ClaudeAcpWorkerBackend,
@@ -548,10 +549,13 @@ class NativeBridgesAndHandshakeTests(unittest.TestCase):
                     "gpt-5-codex",
                     "-c",
                     'model_reasoning_effort="high"',
+                    *lean_codex_args("SYS_CODEX"),
                     "-",
                 ],
             )
-            self.assertIn("SYS_CODEX", body["prompt"])
+            # A lean session sends the system prompt as Codex's own instructions,
+            # not glued onto the request.
+            self.assertNotIn("SYS_CODEX", body["prompt"])
             self.assertIn("check invariants", body["prompt"])
             self.assertFalse(body["openai_key_present"])
             self.assertTrue(body["codex_home"].endswith("/.codex"))

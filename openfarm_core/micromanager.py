@@ -2535,7 +2535,9 @@ def open_micromanager(
             )
         except confine_lib.ConfineError as exc:
             raise Invalid(exc.code, exc.message) from exc
-        command = acp_command(command, confine_settings)
+        command = acp_command(
+            command, confine_settings,
+            lean_prompt=bool(_cfg_get(mm_cfg, "lean_prompt", True)))
         model = str(
             _cfg_get(mm_cfg, "model", _cfg_get(cfg, "micromanager_model", "")) or ""
         )
