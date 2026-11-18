@@ -309,11 +309,12 @@ class RunnerAndToolingTests(unittest.TestCase):
             pack_plain.commands("fmt-check", files=["src/a.ts"])["argv"],
             ["node", "-e", ""],
         )
-        with self.assertRaises(Invalid) as caught:
-            pack_plain.commands("mutation", files=["src/a.ts"])
-        self.assertEqual(caught.exception.code, "no-typescript-mutation")
+        # v0.8.5: openfarm's own runner, not a refusal.
+        argv = pack_plain.commands("mutation", files=["src/a.ts"])["argv"]
+        self.assertIn("typescript", argv)
+        self.assertEqual(argv[-1], "src/a.ts")
         with self.assertRaises(Invalid):
-            pack_plain.parse_mutation("")
+            pack_plain.parse_mutation("")  # nothing ran: no outcomes.json
 
     def test_node_syntax_check_fallback(self) -> None:
         good = _project({

@@ -30,7 +30,7 @@ import textwrap
 from pathlib import Path
 
 from ..errors import Invalid, Refused
-from .base import Pack
+from .base import OwnMutationMixin, Pack
 
 PURPOSES = ("build", "test", "list", "lint", "ws-lint", "format", "fmt-check",
             "typecheck", "mutation", "extra")
@@ -217,7 +217,8 @@ def detect_ruff_config(worktree: Path) -> Path | None:
     return None
 
 
-class PythonPack(Pack):
+class PythonPack(OwnMutationMixin, Pack):
+    mutation_language = "python"
     name = "python"
     extension = ".py"
     test_dir = "tests"
@@ -354,9 +355,9 @@ class PythonPack(Pack):
             return {"argv": argv + names}
 
         if purpose == "mutation":
-            raise Invalid("no-python-mutation",
-                          "the Python pack has no mutation tool in v0.6; set "
-                          "[gates] mutation = \"off\"")
+            # openfarm's own mutation runner (v0.8.5): the card's named tests
+            # against small changes to the production files it changed.
+            return {"argv": self._own_mutation_argv(files, tests) + extra}
 
         return {"argv": list(extra)}
 
@@ -433,9 +434,6 @@ class PythonPack(Pack):
         module = head.rpartition(".")[0]
         return module.replace(".", "/") + ".py" if module else None
 
-    def parse_mutation(self, stdout: str) -> dict:
-        raise Invalid("no-python-mutation",
-                      "the Python pack has no mutation tool in v0.6")
 
     # -- files ----------------------------------------------------------------
 
@@ -609,7 +607,7 @@ class PythonPack(Pack):
                 "failed_tests": failed_sorted[:12]}
 
     def mutation(self, files: list[str], tests: list[str] | None = None) -> dict:
-        return self.commands("mutation", files=files)
+        return self.commands("mutation", files=files, tests=tests)
 
 
 # -- helpers -------------------------------------------------------------------

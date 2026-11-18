@@ -3609,6 +3609,9 @@ class CardRun:
             # The tool's own output folder goes with the card's evidence, never into
             # the worktree, where it would be an untracked folder on the branch.
             self.pack.mutation_output = self.card_layout / "gates" / "mutation"
+        if hasattr(self.pack, "mutation_base"):
+            # openfarm's own runner mutates only the lines this card changed.
+            self.pack.mutation_base = self.base_commit or ""
         try:
             argv = self.pack.commands(
                 "mutation", files=production, tests=self.card.test_names)["argv"]
