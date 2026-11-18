@@ -696,6 +696,8 @@ class DriverAgent:
                 isolated_home).parts
             initial_bytes, _why = logins.read_isolated(isolated_home, iso_rel)
 
+        spawned = False
+        synced = False
         try:
             spawn_argv = self.child_argv(argv, home_dir=isolated_home, env=env)
             try:
@@ -715,6 +717,7 @@ class DriverAgent:
                 raise Infra(
                     "driver-spawn-failed", f"{argv[0]} could not start: {exc}"
                 ) from exc
+            spawned = True
             try:
                 stdout_text, stderr_text = proc.communicate(
                     input=sub_input, timeout=self.timeout_s
@@ -733,8 +736,24 @@ class DriverAgent:
             _end_process_group(proc, grace_s=0.0)
 
             if isolated_home is not None and cred_source is not None:
+                synced = True
                 self._sync_back(isolated_home, cred_source, initial_bytes)
         finally:
+            if spawned and not synced and isolated_home is not None and cred_source is not None:
+                # A turn that timed out or failed may still have refreshed the
+                # login: its group is ended by now, so the same checked copy is
+                # tried before the isolated HOME goes. A failure here is a note,
+                # never a second error over the first.
+                try:
+                    self._sync_back(isolated_home, cred_source, initial_bytes)
+                except Exception as exc:  # noqa: BLE001 - noted, the turn's own error wins
+                    note = (
+                        f"the {self.provider} login could not be checked for a refresh "
+                        f"after the failed turn: {type(exc).__name__}: "
+                        f"{' '.join(str(exc).split())[:200]}"
+                    )
+                    self._note(note)
+                    print(f"openfarm drive: {note}", file=sys.stderr)
             if isolated_home is not None:
                 shutil.rmtree(isolated_home, ignore_errors=True)
                 _unregister_isolated_home(isolated_home)
