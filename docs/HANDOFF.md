@@ -1,10 +1,57 @@
-# Openfarm v0.8.5 Engineering Handoff
+# Openfarm v0.8.6 Engineering Handoff
 
-Concise entry point for engineers reviewing, testing, or extending Openfarm v0.8.5.
+Concise entry point for engineers reviewing, testing, or extending Openfarm v0.8.6.
 
 For greenfield empty-folder initialization (`"Read and install this skill <link>"` -> `/openfarm-grill-me` -> `"/openfarm-initialize calorie-log ..."`), see [docs/FROM-IDEA-TO-SHIPPED-APP.md](FROM-IDEA-TO-SHIPPED-APP.md). For step-by-step operator instructions, config table reference, provider setup, card authoring rules, and the executable `tallybox` first-deployment runbook on existing repos, see [docs/USAGE-AND-FIRST-DEPLOYMENT.md](USAGE-AND-FIRST-DEPLOYMENT.md). Module-level detail is in [docs/openfarm-internals.md](openfarm-internals.md).
 
-## Current State (v0.8.5, 18 Nov 2026)
+## Current State (v0.8.6, 18 Nov 2026)
+
+v0.8.6 ran v0.8.5's two roadmap items live and fixed what they found. The full 3-repeat bench with Claude and Codex is in [docs/bench-v0.8.5.md](bench-v0.8.5.md), and the 25-card Rust pilot with frontier baselines is in [docs/pilot-v0.8.6.md](pilot-v0.8.6.md). Every change, with the run that found it, is in [docs/v0.8.6-build-log.md](v0.8.6-build-log.md).
+
+### Done in v0.8.6
+
+- **The pre-review has a rule.** The supervisor bounces only for a missed or broken line of the Done text, and quotes it. Thin tests and unrequested robustness go in `findings`. On the five tasks the Codex farm arm had lost, it went from 6 of 15 to 12 of 15.
+- **Tests are linted and formatted before they freeze**, and a lint finding goes back to the test writer.
+- **The runner boundary** also hides the `CLAUDE_CONFIG_DIR` and `CODEX_HOME` login folders and unsets variables that look like secrets.
+- **A reference that is also a touched file is sent once** in the first implementer brief.
+- **Fixes to cards that stopped for no good reason:**
+  - scaffold stubs inside an `impl`;
+  - plan test names written the way the brief lists them;
+  - delete-only edits;
+  - Rust crate-root formatting;
+  - a stale test-lint record.
+- **ACP.** A refused effort setting is a note, and RPC errors keep the provider's reason.
+- **Tests.** 1557 offline tests on the final tree with no failures. 96 are skipped with no optional tools on `PATH`, and 6 with `OPENFARM_E2E=1` and ruff, pytest, tsc, prettier and cargo-mutants installed.
+
+### Tested live in v0.8.6
+
+- The 12-task bench, 3 repeats, Claude and Codex, farm and solo (144 runs).
+- The 25-card Rust pilot on dtolnay/semver, in three rounds (50 card runs), with five frontier baselines.
+- `counter_tests = "reject"` end to end with a live implementer fixing the bounce (TypeScript, real npm project).
+- `openfarm drive` on v0.8.5, with Ctrl-C, stale-lock takeover, turn timeout, spend cap and two drives under one name.
+- `[runner] confine = "bwrap"` on a real Rust build.
+- The mutation runner on more-itertools.
+- Remote installs with uv, pipx and pip.
+- `openfarm run` with no bubblewrap and the real Codex.
+- A standalone `codex-acp` started per card inside bwrap.
+
+### Untested in v0.8.6
+
+- Everything Antigravity since the first agent's runs. Nobody may run `agy` unattended here.
+- A completed turn through a standalone `codex-acp` server: on a ChatGPT login, codex-acp 0.16.0's bundled Codex core is refused by the backend.
+- Codex `read-only` inside the boundary on a system that allows a nested sandbox.
+- Hosted worker endpoints other than Command Code.
+- A Claude child on an API key inside the boundary.
+- The pre-review rule with Claude supervising, and a full 3-repeat bench on v0.8.6.
+- `openfarm run` with no bubblewrap and the real Antigravity program.
+
+### Known Limits found in v0.8.6
+
+- **On small single-file cards the farm still spends more tokens in total** than the frontier model alone. It moves about a third of the frontier model's own tokens off it.
+- **cargo-mutants measures the whole changed file**, so outside test-backfill its kill rate says little about the card. Keep `required` for test-backfill only.
+- **The spend cap is checked after a driver turn**, so a drive can overshoot it by about one turn.
+
+## v0.8.5 (18 Nov 2026)
 
 v0.8.5 makes the supervisor cheaper in tokens, makes `openfarm drive` behave the same as ACP mode, and fixes the v0.8.1 known limits that code can fix. Over the 12 bench tasks with scripted workers, the supervisor gets 62% fewer prompt characters in 45% fewer calls. One live call through the lean prompts takes 58% (Claude) and 57% (Codex) fewer input tokens. The details are in [docs/v0.8.5-build-log.md](v0.8.5-build-log.md).
 
@@ -42,11 +89,7 @@ v0.8.5 makes the supervisor cheaper in tokens, makes `openfarm drive` behave the
 
 ### Untested in v0.8.5
 
-- A full live bench, so there is no live worker-to-supervisor token share for v0.8.5 yet.
-- A live `openfarm drive` run since the drive changes.
-- `[runner] confine = "bwrap"` on a real project's build (only offline tests in a real bwrap).
-- openfarm's mutation runner on a large project (only the test toys and two small projects).
-- Anything with Antigravity, as before.
+Every item here except Antigravity was run live in the v0.8.6 work (above).
 
 ## v0.8.1 (17 Nov 2026)
 
@@ -65,7 +108,7 @@ v0.8.1 was built in two rounds. The first agent added Codex and Antigravity as p
 
 Real ruff, pytest, cargo-mutants, tsc and prettier; the checker with a live model on 24 runs; Codex through the bridge inside the boundary (and one bench card supervised that way); a standalone `codex-acp` up to handshake and options; Claude through the bridge and the standalone `claude-agent-acp`; `openfarm drive` with real Codex and real Claude; the 12-task bench with Codex and with Claude, farm and solo, one repeat, before and after the test-writer fixes. Numbers are in the [README](../README.md#whats-verified), the [build log](v0.8.1-build-log.md) and the [bench report](bench-v0.8.1.md).
 
-### Explicitly Untested
+### Explicitly Untested (at v0.8.1; see v0.8.6 above for the current list)
 
 - Everything Antigravity since the first agent's runs: the boundary around `agy`, the login copy, the prompt-size refusal, the driver. Nobody may run `agy` unattended here.
 - A turn through a standalone `codex-acp` server, and so per-card confined servers with it.
@@ -96,7 +139,7 @@ Real ruff, pytest, cargo-mutants, tsc and prettier; the checker with a live mode
 
 ### Where the Records Are
 
-- **In this repository:** the [v0.8.5 build log](v0.8.5-build-log.md), the [v0.8.1 build log](v0.8.1-build-log.md) (both rounds, with trees and token shares), the [bench report](bench-v0.8.1.md), the [README](../README.md) live and untested lists, and the claim-to-test table in [internals](openfarm-internals.md#verification-status--claim-to-test-mapping).
+- **In this repository:** the [v0.8.6 build log](v0.8.6-build-log.md), the [v0.8.5 bench report](bench-v0.8.5.md), the [pilot report](pilot-v0.8.6.md), the [v0.8.5 build log](v0.8.5-build-log.md), the [v0.8.1 build log](v0.8.1-build-log.md) (both rounds, with trees and token shares), the [bench report](bench-v0.8.1.md), the [README](../README.md) live and untested lists, and the claim-to-test table in [internals](openfarm-internals.md#verification-status--claim-to-test-mapping).
 - **Per run:** `<state_dir>/runs/<run_id>/run.json` (notes, token split, `tokens.with_driver` in a driven run), `<state_dir>/cards/<card>/<run>/` (briefs, responses, gate records including `gates/counter-test-N.json` and `gates/mutation/N/`, `dossier.md`, `verdict.json`), and the board under `runs/<run_id>/board/`.
 - **Bench:** `bench-report.md`, `bench-report.json` and `records.jsonl` in the `--out` folder.
 - The raw outputs of the 17 Nov live runs are kept outside the repository with the fix work's notes.

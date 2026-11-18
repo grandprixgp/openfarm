@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.8.5-16a34a?style=flat-square" alt="version 0.8.5">
+  <img src="https://img.shields.io/badge/version-0.8.6-16a34a?style=flat-square" alt="version 0.8.6">
   <img src="https://img.shields.io/badge/status-pre--release-d97706?style=flat-square" alt="status: pre-release">
   <img src="https://img.shields.io/badge/python-3.11%2B-7c3aed?style=flat-square" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/runtime%20deps-stdlib%20only-0284c7?style=flat-square" alt="runtime dependencies: standard library only">
@@ -21,7 +21,7 @@
 
 <p align="center">
   <a href="#quickstart"><b>Quickstart</b></a> &nbsp;&bull;&nbsp;
-  <a href="#what-changed-in-v085"><b>What changed in v0.8.5</b></a> &nbsp;&bull;&nbsp;
+  <a href="#what-changed-in-v086"><b>What changed in v0.8.6</b></a> &nbsp;&bull;&nbsp;
   <a href="#how-it-works"><b>How it works</b></a> &nbsp;&bull;&nbsp;
   <a href="#commands"><b>Commands</b></a> &nbsp;&bull;&nbsp;
   <a href="#whats-verified"><b>What's verified</b></a> &nbsp;&bull;&nbsp;
@@ -30,11 +30,11 @@
 </p>
 
 <p align="center">
-  <img src="docs/assets/openfarm-stats.svg" alt="1524 offline tests with 0 failures, 22 CLI subcommands, 6 adapter interfaces, 0 runtime dependencies" width="100%">
+  <img src="docs/assets/openfarm-stats.svg" alt="1557 offline tests with 0 failures, 22 CLI subcommands, 6 adapter interfaces, 0 runtime dependencies" width="100%">
 </p>
 
 > [!IMPORTANT]
-> **Pre-release (v0.8.5).** v0.8.5 makes the frontier supervisor cheaper, makes `openfarm drive` behave the same as ACP mode, and fixes the v0.8.1 known limits that code can fix. On the 12 bench tasks with scripted workers, the supervisor is sent 62% fewer prompt characters in 45% fewer calls. One live call through openfarm's own lean prompts takes 58% (Claude) and 57% (Codex) fewer input tokens. Python and TypeScript cards now get a mutation gate, and builds and tests can run in a bubblewrap boundary. The offline suite has 1524 tests with no failures. What ran live, and what has not run at all, is in [What's verified](#whats-verified) and [Not yet tested](#not-yet-tested). v0.8.1 brought Codex and Antigravity providers, `openfarm drive` and the TypeScript pack; its notes follow v0.8.5's below. With `[swarm] enabled = false` a run behaves as in v0.7.
+> **Pre-release (v0.8.6).** v0.8.6 is the release that ran v0.8.5's roadmap live: the full 3-repeat bench with Claude and Codex ([`docs/bench-v0.8.5.md`](docs/bench-v0.8.5.md)) and a 25-card Rust pilot with frontier baselines ([`docs/pilot-v0.8.6.md`](docs/pilot-v0.8.6.md)). Every openfarm defect they found is fixed, with tests. On the bench, the farm's supervisor used about a third of v0.8.1's tokens per run, and the worker's share of a farm run rose to 61–68%. The frontier model working alone was still cheaper in total on these small cards. The offline suite has 1557 tests with no failures. What ran live, and what has not run at all, is in [What's verified](#whats-verified) and [Not yet tested](#not-yet-tested). The notes for v0.8.5 and v0.8.1 follow v0.8.6's below. With `[swarm] enabled = false` a run behaves as in v0.7.
 
 ---
 
@@ -153,6 +153,23 @@ openfarm check CARD-001
 - **TypeScript** tests run only with `node --test`. A test script that uses npm, jest, vitest or mocha is refused at adopt and at check. `tsc --noEmit` runs when the project has `tsc` and a `tsconfig.json`; otherwise the type check is a syntax check by node's own type stripping, no types are checked, and the notes and gate records say "syntax only". `prettier` runs only when the project configures it. Adopt records these choices under `[runner]`, and check and every card use the same ones. Card worktrees link the base checkout's git-ignored `node_modules`.
 - **Mutation** for Python and TypeScript (v0.8.5) is openfarm's own runner. It mutates only the lines the card changed, runs the card's named tests against each mutant, and reports caught, missed, timed-out and unviable mutants, as cargo-mutants does for Rust. Nothing needs installing in the project.
 
+## What changed in v0.8.6
+
+For a reader upgrading from v0.8.5. Each change, its commit and the run that found it are in [`docs/v0.8.6-build-log.md`](docs/v0.8.6-build-log.md).
+
+- **The supervisor's pre-review has a rule.** It bounces a card only for a line of the Done text that the diff misses or breaks, and quotes that line. Thin tests, which the implementer cannot change, and robustness the card never asked for go in `findings` with `approve`. On the five tasks the Codex farm arm had lost, it went from 6 of 15 to 12 of 15.
+- **Tests are linted and formatted before they freeze.** A lint finding in a test file goes back to the test writer. Before this, a frozen `assert_eq!(x, true)` failed clippy on every implementer attempt, and frozen Rust and TypeScript test files failed `rustfmt --check` and `prettier --check`.
+- **The runner boundary hides more.** `[runner] confine = "bwrap"` also hides the login folders named by `CLAUDE_CONFIG_DIR` and `CODEX_HOME`, and unsets variables that look like tokens, keys or passwords, unless `[runner.env]` sets them.
+- **Smaller first briefs.** A reference that is also a touched file is sent once. On a 5,700-line file this halved the first implementer call.
+- **Fixes to cards that stopped for no good reason.**
+  - A scaffold stub inside an `impl` block is accepted.
+  - A plan step may name a test the way the brief lists it.
+  - A delete-only search/replace block is no longer refused.
+  - A Rust crate root with `mod x;` can be formatted.
+  - A test-lint finding fixed on retry no longer stays on file as a failure.
+- **ACP servers.** A refused effort setting is a note, not a stopped card, and an RPC error keeps the provider's reason.
+- **Install docs.** A GitHub URL needs `git+https://…`.
+
 ## What changed in v0.8.5
 
 For a reader upgrading from v0.8.1. Measurements are in [`docs/v0.8.5-build-log.md`](docs/v0.8.5-build-log.md), and every key is in [`docs/USAGE-AND-FIRST-DEPLOYMENT.md`](docs/USAGE-AND-FIRST-DEPLOYMENT.md).
@@ -262,7 +279,7 @@ Each run starts from a fresh copy of the task's project and runs its card. Then 
 - **farm**: your worker model, with a frontier supervisor if you like.
 - **solo**: the frontier model doing every worker role itself, through the same briefs and gates.
 
-An arm file sets only the model and supervisor tables; copy one from [`bench/arms/`](bench/arms/) (Claude, Codex and Antigravity examples; for Codex, set `binary = "codex-exec"` in the copy). Each task runs 3 times per arm by default. The report (`bench-report.md` and `.json`) gives pass rate, tokens, tokens per pass, the worker's share of those tokens and per-category pass rates for each arm, lists any run that did not start with its reason, and stays on your machine. The workers and the supervisor still see each card and starting project, as in any run. Results so far are in [`docs/bench-v0.8.1.md`](docs/bench-v0.8.1.md).
+An arm file sets only the model and supervisor tables; copy one from [`bench/arms/`](bench/arms/) (Claude, Codex and Antigravity examples; for Codex, set `binary = "codex-exec"` in the copy). Each task runs 3 times per arm by default. The report (`bench-report.md` and `.json`) gives pass rate, tokens, tokens per pass, the worker's share of those tokens and per-category pass rates for each arm, lists any run that did not start with its reason, and stays on your machine. The workers and the supervisor still see each card and starting project, as in any run. Results so far are in [`docs/bench-v0.8.5.md`](docs/bench-v0.8.5.md) (3 repeats) and [`docs/bench-v0.8.1.md`](docs/bench-v0.8.1.md) (one repeat). A 25-card pilot on a real Rust crate, with frontier baselines, is in [`docs/pilot-v0.8.6.md`](docs/pilot-v0.8.6.md).
 
 ## Swarm, board, parallel cards, and TUI (v0.8)
 
@@ -405,12 +422,12 @@ Every key, gate, stop code (`19` per-card stop codes including `handed-back` and
 
 ### The offline suite
 
-On the final v0.8.5 tree, Python 3.14 on Linux:
+On the final v0.8.6 tree, Python 3.14 on Linux:
 
 | Run | Result |
 | --- | --- |
-| Default, no optional tools on `PATH` | **1524 tests**, 93 skipped, **0 failures** |
-| `OPENFARM_E2E=1` with ruff 0.17.5, tsc 7.0.2, prettier 3.10.1, cargo-mutants 27.1.0 and pytest 9.2.0 on `PATH` | **1524 tests**, 5 skipped, **0 failures** |
+| Default, no optional tools on `PATH` | **1557 tests**, 96 skipped, **0 failures** |
+| `OPENFARM_E2E=1` with ruff 0.17.5, tsc 7.0.2, prettier 3.10.1, cargo-mutants 27.1.0 and pytest 9.2.0 on `PATH` | **1557 tests**, 6 skipped, **0 failures** |
 
 A test that needs a real tool skips itself when the tool is missing, so the default run's skip count depends on what you have installed. The ones skipped in the second run are stand-in tests that step aside when the real tool is there. Each test process keeps its temp files in one folder of its own and removes it at exit.
 
@@ -432,13 +449,37 @@ The suite includes, among the rest:
 
 Model calls in these tests use a scripted backend and local HTTP test servers, and the provider tests use stand-in CLIs. No test calls a real model.
 
+### Tested live in v0.8.6 (18 Nov 2026)
+
+Numbers, trees and causes are in [`docs/v0.8.6-build-log.md`](docs/v0.8.6-build-log.md), [`docs/bench-v0.8.5.md`](docs/bench-v0.8.5.md) and [`docs/pilot-v0.8.6.md`](docs/pilot-v0.8.6.md). Workers were DeepSeek V4.1 Flash on Command Code with `x-cmd-zdr: 1`.
+
+- **The 12-task bench, 3 repeats, Claude and Codex, farm and solo** (144 runs on v0.8.5).
+  - Claude: farm 34 of 36, solo 36 of 36.
+  - Codex: farm 27 of 36, solo 36 of 36.
+  - The farm's supervisor used 33% (Claude) and 32% (Codex) fewer tokens than the same model alone. The worker's share of a farm run was 68% and 61%.
+  - Solo was still cheaper in total. 11 of the 13 farm losses had code that passed the hidden tests.
+  - The Codex farm arm on its five lost tasks again, with the v0.8.6 pre-review rule: 12 of 15, up from 6 of 15.
+- **The 25-card Rust pilot** on dtolnay/semver, in three rounds (50 card runs).
+  - No escapes: every card that reached in-review passed my hidden tests, the suite and clippy.
+  - Against frontier baselines on five cards, the farm moved 78–95% of the frontier tokens off the frontier model.
+  - `counter_tests = "reject"`: 0 false rejects from counter-tests.
+  - cargo-mutants paid for itself on test-backfill cards only.
+- **`counter_tests = "reject"` end to end** on a real npm TypeScript project. A live counter-test failed, the supervisor upheld it, the implementer fixed the gap, and the card reached in-review.
+- **`openfarm drive` on v0.8.5** with the real Claude CLI: one card to in-review in 30,952 tokens, against 68,443 on v0.8.1. Also Ctrl-C, stale-lock takeover, a turn timeout, a spend cap and two drives under one name.
+- **The runner boundary on a real build** (anyhow), with the hidden folders and unset variables seen in the real `bwrap` command.
+- **openfarm's mutation runner on a large project** (more-itertools, 5,666-line file, 937 tests): 7 of 7 mutants caught, in-review in 7 minutes.
+- **TypeScript on a real npm project** (typescript 5.6.3, prettier 3.3.3) with a live model writing counter-tests.
+- **Remote installs** from the GitHub URL with uv, pipx and pip.
+- **`openfarm run` with no bubblewrap and the real Codex**: both `confine = "bwrap"` settings refused up front, and `auto` ran with a note.
+- **A standalone `codex-acp` server** (0.16.0) started inside bwrap for each card. No turn completed: its bundled Codex core is refused by the ChatGPT backend.
+
 ### Tested live in v0.8.5 (18 Nov 2026)
 
 - One `shape_and_plan` call through openfarm's Claude bridge and its Codex bridge, with and without the lean prompt. Input fell from 4,239 to 1,779 tokens on Claude and from 10,936 to 4,673 on Codex.
 - One merged `shape_and_scaffold` call through each bridge: 2,186 input tokens on Claude and 4,939 on Codex, both answering `ready` with a correct stub.
 - Command Code taking `reasoning_effort = "high"` and `"max"` for DeepSeek V4.1 Flash.
 
-There is no live bench on v0.8.5 yet, so no live worker-to-supervisor token share.
+The live bench on v0.8.5 ran in the v0.8.6 work, above.
 
 ### Tested live in the v0.8.1 fix work (17 and 18 Nov 2026)
 
@@ -457,18 +498,13 @@ The first build's live runs (before the fix work) are kept, with what has change
 ## Not yet tested
 
 > [!WARNING]
-> - A live bench on v0.8.5, a live `drive` since the v0.8.5 drive changes, `[runner] confine = "bwrap"` on a real project's build, and the mutation runner on a large project.
 > - Everything Antigravity since the first agent's runs: the boundary around `agy`, the login copy, the prompt-size refusal, the driver. Nobody may run `agy` unattended here.
-> - A turn through a standalone `codex-acp` server, and so per-card confined servers with it.
+> - A completed turn through a standalone `codex-acp` server. On a ChatGPT login, codex-acp 0.16.0's bundled Codex core is refused by the backend. A newer codex-acp or an API-key login would be needed.
 > - Codex `read-only` inside the boundary on a system that allows a nested sandbox.
-> - In `drive` with a real CLI: Ctrl-C, taking over a stale lock, a turn timeout, a spend cap stopping a priced driver, two drives under one name.
-> - TypeScript on a real npm-installed project with a live model writing counter-tests (the TypeScript counter-test path ran with real node and scripted answers).
-> - Remote installs from a GitHub URL with `uv`, `pipx` or `pip`.
 > - Hosted worker endpoints other than Command Code.
-> - The 25-card Rust pilot: not started. No card set exists for it.
-> - `counter_tests = "reject"` end to end with a live implementer fixing the bounce.
 > - A Claude child on an API key (`auth = "api-key"`) inside the boundary (`confine = "bwrap"`).
-> - `openfarm run` refusing a run up front on a machine without bubblewrap, with the real Codex or Antigravity programs (it ran with stand-ins).
+> - The v0.8.6 pre-review rule with Claude supervising, and a full 3-repeat bench on v0.8.6.
+> - `openfarm run` with no bubblewrap and the real Antigravity program.
 
 ## Roadmap
 
@@ -479,8 +515,11 @@ The first build's live runs (before the fix work) are kept, with what has change
 - [x] **Bench on the final code, one repeat:** Codex and Claude, farm and solo ([`docs/bench-v0.8.1.md`](docs/bench-v0.8.1.md)).
 - [x] **Lighter supervision (v0.8.5):** lean prompts, compact payloads, one call for shape and scaffold, no reflection on clean passes.
 - [x] **Mutation for every pack and an opt-in runner boundary (v0.8.5).**
-- [ ] **Run the full 3-repeat bench live on v0.8.5**, and measure the lighter supervision against the solo arm: on v0.8.1, with a supervisor on every card, the farm arm used more tokens than the frontier model alone.
-- [ ] **Efficacy pilot & gate calibration:** write and run the 25-card all-Rust pilot with frontier baseline cards, and measure `counter_tests = "reject"` and `cargo-mutants` payback before promoting `reject` / `required` gates.
+- [x] **Full 3-repeat bench live on v0.8.5**, the lighter supervision measured against the solo arm ([`docs/bench-v0.8.5.md`](docs/bench-v0.8.5.md)). The supervisor used about a third of v0.8.1's tokens per run, and solo is still cheaper in total on these cards.
+- [x] **Efficacy pilot & gate calibration:** the 25-card all-Rust pilot with frontier baseline cards ([`docs/pilot-v0.8.6.md`](docs/pilot-v0.8.6.md)). Counter-tests on `reject` gave no false rejects. cargo-mutants pays back on test-backfill cards, where `required` stays.
+- [ ] **Scope cargo-mutants to the card's own lines**, as openfarm's Python and TypeScript runner already is, before mutation is more than a report for other Rust categories.
+- [ ] **Re-check the pre-review rule** with Claude supervising, and on a full v0.8.6 bench, before `counter_tests = "reject"` becomes a default.
+- [ ] **Cheaper supervision on small cards:** the farm still spends more in total than the frontier model alone on single-file cards.
 
 ## Contributing
 
