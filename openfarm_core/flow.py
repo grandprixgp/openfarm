@@ -85,6 +85,9 @@ def runner_kind(purpose: str) -> str:
 
 #: How much ignored-file content a counter-test run keeps to put back (bytes).
 _COUNTER_KEEP_BYTES = 64 * 1024 * 1024
+#: Past the in-memory cap, ignored files are kept as hard links beside the
+#: worktree (no space used); where a link cannot be made, as copies up to this.
+_COUNTER_SPILL_BYTES = 1024 * 1024 * 1024
 
 class CardRun:
     """One card's whole run, from claim to in-review or blocked."""
@@ -4015,7 +4018,11 @@ class CardRun:
             # not read into memory.
             kept: dict[str, dict] = {}
             budget = _COUNTER_KEEP_BYTES
-            for rel in sorted(ignored):
+            spill_budget = _COUNTER_SPILL_BYTES
+            spill_dir = self.worktree.parent / f".{self.worktree.name}-counter-keep"
+            shutil.rmtree(spill_dir, ignore_errors=True)
+            min_free = int(getattr(self.cfg, "min_free_mb", 0) or 0) * 1024 * 1024
+            for at, rel in enumerate(sorted(ignored)):
                 full = self.worktree / rel
                 try:
                     info = os.lstat(full)
@@ -4024,11 +4031,31 @@ class CardRun:
                 if not stat.S_ISREG(info.st_mode):
                     continue
                 item = {"size": info.st_size, "mtime_ns": info.st_mtime_ns,
-                        "mode": stat.S_IMODE(info.st_mode), "data": None}
+                        "mode": stat.S_IMODE(info.st_mode), "data": None, "copy": None}
                 if info.st_size <= budget:
                     with contextlib.suppress(OSError):
                         item["data"] = full.read_bytes()
                         budget -= info.st_size
+                if item["data"] is None:
+                    # v0.8.5: past the cap, a hard link keeps the old content
+                    # through a delete or a replace; a copy where no link can be made.
+                    target = spill_dir / f"{at}"
+                    try:
+                        spill_dir.mkdir(parents=True, exist_ok=True)
+                        os.link(full, target)
+                        item["copy"] = str(target)
+                        item["linked"] = True
+                    except OSError:
+                        try:
+                            free = shutil.disk_usage(spill_dir).free
+                        except OSError:
+                            free = 0
+                        if info.st_size <= spill_budget and free - info.st_size > min_free:
+                            with contextlib.suppress(OSError):
+                                shutil.copyfile(full, target)
+                                item["copy"] = str(target)
+                                item["linked"] = False
+                                spill_budget -= info.st_size
                 kept[rel] = item
             dirs = {""}
             for rel in list(ignored) + listing() + list(files):
@@ -4038,7 +4065,22 @@ class CardRun:
                     parent = parent.parent
             return {"head": self.git.head(), "branch": self.git.current_branch(),
                     "files": files, "ignored": ignored, "dirs": dirs,
-                    "links": links, "kept": kept, "status": self.git.status_lines()}
+                    "links": links, "kept": kept, "status": self.git.status_lines(),
+                    "spill_dir": str(spill_dir)}
+
+        def kept_copy(item: dict) -> str | None:
+            """The kept copy's path when it still holds the old content."""
+            copy = item.get("copy")
+            if not copy:
+                return None
+            try:
+                info = os.lstat(copy)
+            except OSError:
+                return None
+            if info.st_size != item["size"] or (
+                    item.get("linked") and info.st_mtime_ns != item["mtime_ns"]):
+                return None  # a link to a file the run overwrote in place
+            return copy
 
         def restore(before: dict) -> None:
             if self.git.current_branch() != before["branch"] and before["branch"]:
@@ -4096,7 +4138,8 @@ class CardRun:
                     same = False
                 if same:
                     continue
-                if item["data"] is None:
+                copy = kept_copy(item) if item["data"] is None else None
+                if item["data"] is None and copy is None:
                     lost.append(rel)
                     continue
                 try:
@@ -4106,11 +4149,18 @@ class CardRun:
                         else:
                             full.unlink()
                     full.parent.mkdir(parents=True, exist_ok=True)
-                    full.write_bytes(item["data"])
+                    if copy is not None:
+                        # Never write through the link: a new file from the copy.
+                        with contextlib.suppress(FileNotFoundError):
+                            full.unlink()
+                        shutil.copyfile(copy, full)
+                    else:
+                        full.write_bytes(item["data"])
                     os.chmod(full, item["mode"])
                     os.utime(full, ns=(item["mtime_ns"], item["mtime_ns"]))
                 except OSError:
                     lost.append(rel)
+            shutil.rmtree(before.get("spill_dir") or "", ignore_errors=True)
             if lost:
                 self.log(f"{self.card.id}: a counter-test changed {len(lost)} ignored "
                          f"file(s) that could not be put back: {', '.join(lost[:5])}")

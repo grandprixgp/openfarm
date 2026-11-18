@@ -60,6 +60,37 @@ class IgnoredFilesComeBackTests(_SlugHarness):
         self.assertTrue(any("could not be put back" in line and "settings.json" in line
                             for line in logged), logged)
 
+    def _over_the_cap(self):
+        from openfarm_core import flow
+        old = flow._COUNTER_KEEP_BYTES
+        flow._COUNTER_KEEP_BYTES = 4
+        self.addCleanup(setattr, flow, "_COUNTER_KEEP_BYTES", old)
+        run = self.card_run(self.script(form_answer(tests=[("test_vandal", VANDAL)])))
+        cache = run.worktree / "__pycache__"
+        (cache / "deep").mkdir(parents=True)
+        (cache / "settings.json").write_text('{"mine": true}')
+        (cache / "deep" / "cache.bin").write_bytes(b"too large to hold" * 1000)
+        return run, cache
+
+    def test_a_large_deleted_file_comes_back_from_its_link(self) -> None:
+        # v0.8.5: past the in-memory cap a file is kept as a hard link beside the
+        # worktree, so the one the counter-test deleted comes back whole.
+        run, cache = self._over_the_cap()
+        result = run.run()
+        self.assertEqual(result["counter_tests"]["failed"], 1)
+        self.assertEqual((cache / "deep" / "cache.bin").read_bytes(), b"too large to hold" * 1000)
+        self.assertFalse(any(p.name.endswith("-counter-keep") for p in run.worktree.parent.iterdir()),
+                         "the kept links are cleared after the restore")
+
+    def test_without_links_a_copy_brings_it_back(self) -> None:
+        import os
+        from unittest import mock
+
+        run, cache = self._over_the_cap()
+        with mock.patch.object(os, "link", side_effect=OSError(18, "cross-device")):
+            run.run()
+        self.assertEqual((cache / "deep" / "cache.bin").read_bytes(), b"too large to hold" * 1000)
+
 
 def load_tests(loader, tests, pattern):
     suite = unittest.TestSuite()
