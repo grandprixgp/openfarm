@@ -253,10 +253,21 @@ class RustPack(Pack):
             return ""
         lines = []
         for name, paths in crates.items():
+            package_dir = Path(worktree) / "/".join(
+                paths[0].split("/")[:paths[0].split("/").index("tests")])
+            modules = _lib_public_modules(package_dir)
+            where = ""
+            if modules:
+                first = modules[0]
+                where = (
+                    f" Its root declares the public module{'s' if len(modules) > 1 else ''} "
+                    f"{', '.join(f'`{m}`' for m in modules)}: an item in module `{first}` is "
+                    f"`{name}::{first}::<item>`, not `{name}::<item>`, unless the root "
+                    f"re-exports it with `pub use`. The same holds for a symbol you stub there.")
             lines.append(
                 f"\nRust integration tests ({', '.join(paths)}): each file under `tests/` is "
                 f"its own crate. Reach the code under test through the library crate, "
-                f"which is named `{name}`: `use {name}::...;`. Never pull a source file in "
+                f"which is named `{name}`: `use {name}::...;`.{where} Never pull a source file in "
                 f"with `#[path = \"...\"] mod ...;` or `include!`: that compiles a second "
                 f"copy inside the test, and its unused items fail the lint gate.")
         return "\n".join(lines)
@@ -277,7 +288,24 @@ class RustPack(Pack):
                 if spot:
                     where = f" ({spot.group(1)})"
                     break
-            entry = (text + where)[:300]
+            # rustc's own label under the code and its suggestion, when it has
+            # one: "no `x` in the root", "help: ... `+ use a::b::x;`".
+            extra: list[str] = []
+            for after in lines[index + 1:index + 25]:
+                bare = after.strip()
+                if re.match(r"(error|warning)(\[E\d{4}\])?:", bare):
+                    break
+                label = re.match(r"\|\s*(?:[\^-]+\s+)?([A-Za-z`].*)$", bare)
+                fix = re.match(r"\d+\s*\+\s+(\S.*)$", bare)
+                if label:
+                    extra.append(label.group(1))
+                elif bare.startswith(("help:", "= help:", "= note:")):
+                    extra.append(bare.lstrip("= "))
+                elif fix:
+                    extra.append(f"`{fix.group(1)}`")
+                if len(extra) >= 4:
+                    break
+            entry = (text + where + ("; " + " ".join(extra) if extra else ""))[:500]
             if entry not in found:
                 found.append(entry)
             if len(found) >= 4:
@@ -876,6 +904,26 @@ def _lib_crate_name(package_dir: Path) -> str:
     name = str(lib.get("name") or (package.get("name") if isinstance(package, dict) else "") or "")
     name = name.replace("-", "_")
     return name if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) else ""
+
+
+def _lib_public_modules(package_dir: Path) -> list[str]:
+    """The `pub mod` names in a package's library root, in the order written."""
+    import tomllib
+    try:
+        manifest = tomllib.loads((package_dir / "Cargo.toml").read_text(encoding="utf-8"))
+        lib = manifest.get("lib")
+        lib_path = str((lib if isinstance(lib, dict) else {}).get("path") or "src/lib.rs")
+        root = (package_dir / lib_path).resolve()
+        if not root.is_relative_to(package_dir.resolve()):
+            return []
+        text = root.read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return []
+    found: list[str] = []
+    for match in re.finditer(r"^pub\s+mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*[;{]", text, re.MULTILINE):
+        if match.group(1) not in found:
+            found.append(match.group(1))
+    return found[:8]
 
 
 def _summary_counts(text: str) -> dict | None:

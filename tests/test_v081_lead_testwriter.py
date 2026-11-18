@@ -46,6 +46,23 @@ class RustTestWriterNoteTests(unittest.TestCase):
         self.assertIn("Never pull a source file in", note)
         self.assertIn("#[path", note)
 
+    def test_says_where_an_item_in_a_module_is_reached(self) -> None:
+        # Bench round 2: the writer was told the crate and wrote `use settings::parse_line;`
+        # twice, for a function in `src/config.rs`.
+        root = self._tree({"Cargo.toml": '[package]\nname = "settings"\n',
+                           "src/lib.rs": "//! Settings.\n\npub mod config;\nmod private;\npub mod io {\n}\n"})
+        note = RustPack().test_writer_note(root, ["tests/parse_line.rs"])
+        self.assertIn("public modules `config`, `io`", note)
+        self.assertIn("`settings::config::<item>`, not `settings::<item>`", note)
+        self.assertNotIn("private", note)
+
+    def test_a_root_without_public_modules_adds_no_module_line(self) -> None:
+        root = self._tree({"Cargo.toml": '[package]\nname = "flat"\n',
+                           "src/lib.rs": "pub fn f() {}\n"})
+        note = RustPack().test_writer_note(root, ["tests/a.rs"])
+        self.assertIn("`use flat::...;`", note)
+        self.assertNotIn("public module", note)
+
     def test_a_hyphen_in_the_package_name_is_an_underscore_in_code(self) -> None:
         root = self._tree({"Cargo.toml": '[package]\nname = "my-stacks"\n', "src/lib.rs": LIB})
         self.assertIn("`use my_stacks::...;`", RustPack().test_writer_note(root, ["tests/a.rs"]))
@@ -130,7 +147,43 @@ class BuildErrorsTests(unittest.TestCase):
         self.assertEqual(
             text,
             "error[E0428]: the name `parse_line` is defined multiple times (src/config.rs:67:1)"
+            "; previous definition of the value `parse_line` here"
             " | error: cannot find value `nope` in this scope (tests/a.rs:3:5)")
+
+    def test_the_compilers_own_label_and_hint_come_along(self) -> None:
+        # Both shapes are rustc 1.9x output, the first seen in bench round 2.
+        unresolved = (
+            "error[E0432]: unresolved import `settings::parse_line`\n"
+            " --> tests/parse_line.rs:1:5\n"
+            "  |\n"
+            "1 | use settings::parse_line;\n"
+            "  |     ^^^^^^^^^^----------\n"
+            "  |               |\n"
+            "  |               no `parse_line` in the root\n"
+            "\n"
+            "error: could not compile `settings` (test \"parse_line\") due to 1 previous error\n")
+        text = RustPack().build_errors("", unresolved)
+        self.assertIn("(tests/parse_line.rs:1:5); no `parse_line` in the root", text)
+        self.assertNotIn("use settings::parse_line;", text.split(";", 1)[1])
+        hinted = (
+            "error[E0425]: cannot find function `parse_line` in this scope\n"
+            " --> tests/parse_line.rs:4:19\n"
+            "  |\n"
+            "4 | fn t() { let _ = parse_line(\"a\", 1); }\n"
+            "  |                  ^^^^^^^^^^ not found in this scope\n"
+            "  |\n"
+            "help: consider importing this function\n"
+            "  |\n"
+            "1 + use settings::config::parse_line;\n"
+            "  |\n"
+            "\n"
+            "error[E0308]: mismatched types\n"
+            " --> tests/parse_line.rs:9:5\n")
+        text = RustPack().build_errors("", hinted)
+        first, second = text.split(" | ")
+        self.assertIn("not found in this scope", first)
+        self.assertIn("help: consider importing this function `use settings::config::parse_line;`", first)
+        self.assertEqual(second, "error[E0308]: mismatched types (tests/parse_line.rs:9:5)")
 
     def test_no_errors_no_text(self) -> None:
         self.assertEqual(RustPack().build_errors("ok", "warning: unused\n"), "")
