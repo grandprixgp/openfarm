@@ -106,6 +106,8 @@ def render_config(*, name: str, language: str, base_branch: str, state_dir: Path
         "max_tokens = 32768",
         "cost_per_1k_in = 0.0005",
         "cost_per_1k_out = 0.0015",
+        "# A role can think harder on its retries than on its first attempt, e.g.",
+        "# `effort = \"high\", retry_effort = \"max\"` (sent as reasoning_effort).",
         f"test_writer = {{ model = {toml_str(model)}, temperature = 0.2 }}",
         f"implementer = {{ model = {toml_str(model)}, temperature = 0.3, vary_seed = true }}",
         f"checker     = {{ model = {toml_str(model)}, temperature = 0.35, vary_seed = true }}",

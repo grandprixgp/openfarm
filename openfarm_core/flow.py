@@ -1294,6 +1294,25 @@ class CardRun:
             effort_param = "reasoning_effort"
         return tier_name, model_override, effort, effort_param
 
+    def _retry_effort(self, role: str, effort: str, attempt: int) -> str:
+        """`[model] <role>.retry_effort` from the second attempt on. A coordinator
+        that raised the effort keeps the higher of the two; a retry never runs
+        below `retry_effort` (owner, 18 Nov: retries on max)."""
+        if attempt <= 1 or not hasattr(self.cfg, "effort_for_role"):
+            return effort
+        try:
+            first, _ = self.cfg.effort_for_role(role, 1)
+            later, _ = self.cfg.effort_for_role(role, attempt)
+        except TypeError:
+            return effort
+        if not later:
+            return effort
+        if not effort or effort == first:
+            return later
+        from .coordinator import higher_effort
+
+        return higher_effort(effort, later)
+
     def _call_board_role(
         self,
         role: str,
@@ -1321,6 +1340,8 @@ class CardRun:
             ov_model, ov_eff, ov_ep = self._role_overrides.get(
                 board_role, (None, None, None)
             )
+            if ov_eff is not None:
+                ov_eff = self._retry_effort(role, ov_eff, attempt)
             call = self.roles.call(
                 role,
                 effective_brief,
@@ -1361,6 +1382,14 @@ class CardRun:
         tier_name, model_override, effort_val, effort_param = self._member_call_settings(
             role, member
         )
+        retry_effort = self._retry_effort(role, effort_val, attempt)
+        if retry_effort != effort_val:
+            # The member shows the effort its retries really run at, so the
+            # coordinator's escalation starts from there and never steps down.
+            with contextlib.suppress(Refused):
+                self.board.update_member(member_name, effort=retry_effort)
+            member = self.board.get_member(member_name) or member
+            effort_val = retry_effort
         self._post_board(
             author="gates",
             to=[member_name],

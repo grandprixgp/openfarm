@@ -142,7 +142,10 @@ class Roles:
         effective_model = model if model is not None else default_model
         if effort is None and effort_param is None:
             if hasattr(self.cfg, "effort_for_role"):
-                eff, eff_param = self.cfg.effort_for_role(role)
+                try:
+                    eff, eff_param = self.cfg.effort_for_role(role, attempt)
+                except TypeError:  # a stand-in config without attempts
+                    eff, eff_param = self.cfg.effort_for_role(role)
             else:
                 eff, eff_param = ("", "")
         else:

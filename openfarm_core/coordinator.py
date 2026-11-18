@@ -315,6 +315,30 @@ _KNOWN_EFFORT_RANK = {
 _ASSUMED_ENDPOINT_DEFAULT = "medium"
 
 
+def higher_effort(a: str, b: str) -> str:
+    """The higher of two effort names when both are usual ones, else `a`."""
+    ra, rb = _KNOWN_EFFORT_RANK.get(str(a).lower()), _KNOWN_EFFORT_RANK.get(str(b).lower())
+    if ra is None or rb is None:
+        return a
+    return b if rb > ra else a
+
+
+def retry_covers(cfg, role: str, current: str, step: str) -> bool:
+    """True when a role's configured `retry_effort` already runs its next attempt
+    at `step` or above, so an escalation from `current` would change nothing."""
+    effort_for_role = getattr(cfg, "effort_for_role", None)
+    if not callable(effort_for_role) or not role:
+        return False
+    try:
+        first, _ = effort_for_role(role, 1)
+        later, _ = effort_for_role(role, 2)
+    except TypeError:
+        return False
+    if not later or later == first or str(current or "") not in ("", first):
+        return False
+    return higher_effort(step, later) == later
+
+
 def escalation_step(efforts, current: str) -> str | None:
     """The effort one step above `current` on a tier's ladder, or None to do nothing.
 
@@ -408,6 +432,9 @@ class CodeCoordinator:
         current_effort = str(member.get("effort", "") or "")
         next_effort = escalation_step(tier_cfg.efforts, current_effort)
         if next_effort is None:
+            return None
+        if retry_covers(rt.cfg, str(member.get("role", "") or ""), current_effort, next_effort):
+            # `[model] <role>.retry_effort` already runs the retry at least this high.
             return None
 
         failures = info.get("failed_at_effort", 1)

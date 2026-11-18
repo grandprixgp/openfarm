@@ -151,10 +151,6 @@ class ReflectOnRecordTests(unittest.TestCase):
         self.assertEqual(len(self._record(("pass",), clean)), 1)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class DrivenTurnPromptTests(unittest.TestCase):
     """A real (scripted) drive: what each turn's prompt carries."""
 
@@ -205,3 +201,7 @@ class DrivenTurnPromptTests(unittest.TestCase):
         # The request is the whole one: its gate records and closing marker are there.
         self.assertIn('"gates":', request)
         self.assertIn("--- END DATA ---", request)
+
+
+if __name__ == "__main__":
+    unittest.main()
