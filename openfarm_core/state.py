@@ -197,7 +197,7 @@ class StateDir:
             return False
         with os.fdopen(fd, "w") as handle:
             handle.write(json.dumps({"run_id": run_id, "started_at": utc_now(),
-                                     "pid": os.getpid(), "host": _this_host()}))
+                                     **process_identity()}))
         return True
 
     def stale_lock_holder(self) -> dict | None:
@@ -209,13 +209,7 @@ class StateDir:
         holder = self.lock_holder()
         if not isinstance(holder, dict):
             return None
-        pid = holder.get("pid")
-        host = holder.get("host")
-        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
-            return None
-        if not isinstance(host, str) or not host or host != _this_host():
-            return None
-        if _pid_alive(pid):
+        if not holder_provably_gone(holder):
             return None
         return dict(holder)
 
@@ -311,6 +305,76 @@ class StateDir:
 
 def _this_host() -> str:
     return platform.node() or ""
+
+
+def _read_first(path: str) -> str:
+    try:
+        with open(path, encoding="ascii", errors="replace") as handle:
+            return handle.read().strip()
+    except OSError:
+        return ""
+
+
+def _start_time(pid: int) -> str:
+    """The process's start time in clock ticks since boot (`/proc/<pid>/stat`
+    field 22), or "" where there is no /proc: a pid reused by a newer process
+    shows a different one."""
+    raw = _read_first(f"/proc/{pid}/stat")
+    if not raw or ")" not in raw:
+        return ""
+    fields = raw.rsplit(")", 1)[1].split()
+    return fields[19] if len(fields) > 19 else ""
+
+
+def process_identity() -> dict:
+    """Who holds a lock or a seat, beyond pid and hostname (v0.8.5).
+
+    Two containers share a hostname but not a pid namespace; two machines can
+    share a hostname but not a machine id or a boot. Fields this system cannot
+    read are left out, and a record that lacks one is judged as before.
+    """
+    out = {"pid": os.getpid(), "host": _this_host()}
+    for key, value in (("machine_id", _read_first("/etc/machine-id")),
+                       ("boot_id", _read_first("/proc/sys/kernel/random/boot_id")),
+                       ("start", _start_time(os.getpid()))):
+        if value:
+            out[key] = value
+    try:
+        out["pidns"] = os.readlink("/proc/self/ns/pid")
+    except OSError:
+        pass
+    return out
+
+
+def holder_provably_gone(rec: dict) -> bool:
+    """True only when the recorded process was this system's and is gone.
+
+    Same host, and the same machine, boot and pid namespace wherever the record
+    names them; then gone when no process has the pid, or when the one that has
+    it started at another time (the pid was reused). Anything less certain,
+    another host, container or machine, counts as still there.
+    """
+    pid = rec.get("pid")
+    host = rec.get("host")
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return False
+    if not isinstance(host, str) or not host or host != _this_host():
+        return False
+    here = process_identity()
+    for key in ("machine_id", "boot_id", "pidns"):
+        recorded = rec.get(key)
+        if recorded is None:
+            continue
+        if not isinstance(recorded, str) or recorded != here.get(key):
+            return False
+    if not _pid_alive(pid):
+        return True
+    recorded_start = rec.get("start")
+    if isinstance(recorded_start, str) and recorded_start and "boot_id" in rec:
+        now_start = _start_time(pid)
+        if now_start and now_start != recorded_start:
+            return True
+    return False
 
 
 def _pid_alive(pid: int) -> bool:

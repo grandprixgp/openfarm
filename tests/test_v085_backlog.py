@@ -92,5 +92,74 @@ class KnownFailingRowsTests(unittest.TestCase):
         self.assertNotIn("known_failing list in every case", outcome.get("detail", ""))
 
 
+class HolderIdentityTests(unittest.TestCase):
+    """Locks and seats: a holder is gone only when it was provably this system's."""
+
+    def _rec(self, **over):
+        from openfarm_core.state import process_identity
+
+        rec = process_identity()
+        rec.update(over)
+        return rec
+
+    def _dead_pid(self) -> int:
+        import subprocess
+
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        proc.wait()
+        return proc.pid
+
+    def test_a_dead_process_of_this_system_is_gone(self) -> None:
+        from openfarm_core.state import holder_provably_gone
+
+        self.assertTrue(holder_provably_gone(self._rec(pid=self._dead_pid())))
+        self.assertFalse(holder_provably_gone(self._rec()), "this very process is alive")
+
+    def test_another_pid_namespace_or_machine_or_boot_is_never_gone(self) -> None:
+        from openfarm_core.state import holder_provably_gone
+
+        dead = self._dead_pid()
+        for key, value in (("pidns", "pid:[1]"), ("machine_id", "0" * 32),
+                           ("boot_id", "00000000-0000-0000-0000-000000000000")):
+            with self.subTest(key=key):
+                self.assertFalse(holder_provably_gone(self._rec(pid=dead, **{key: value})))
+
+    def test_a_reused_pid_is_gone(self) -> None:
+        import os
+
+        from openfarm_core.state import holder_provably_gone
+
+        rec = self._rec(pid=os.getpid())
+        if "start" not in rec or "boot_id" not in rec:
+            self.skipTest("no /proc here")
+        rec["start"] = str(int(rec["start"]) + 1)
+        self.assertTrue(holder_provably_gone(rec))
+
+    def test_an_old_record_is_judged_as_before(self) -> None:
+        from openfarm_core.state import _this_host, holder_provably_gone
+
+        self.assertTrue(holder_provably_gone({"pid": self._dead_pid(), "host": _this_host()}))
+        self.assertFalse(holder_provably_gone({"pid": self._dead_pid(), "host": "elsewhere"}))
+
+    def test_the_lock_and_the_seat_record_carry_it(self) -> None:
+        import tempfile
+
+        from openfarm_core.swarm import _holder_record, new_seat_holder
+
+        rec = _holder_record(new_seat_holder())
+        self.assertNotIn("token", rec)
+        tmp = Path(tempfile.mkdtemp(prefix="of-v085-lock-"))
+        self.addCleanup(__import__("shutil").rmtree, tmp, ignore_errors=True)
+        state = StateDir(tmp)
+        state.root.mkdir(parents=True, exist_ok=True)
+        self.assertTrue(state._create_run_lock("r1"))
+        holder = state.lock_holder()
+        for key in ("pid", "host"):
+            self.assertIn(key, holder)
+        if Path("/proc/self/ns/pid").exists():
+            self.assertIn("pidns", holder)
+            self.assertIn("pidns", rec)
+
+
 if __name__ == "__main__":
     unittest.main()
