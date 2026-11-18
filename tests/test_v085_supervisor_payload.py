@@ -203,5 +203,42 @@ class DrivenTurnPromptTests(unittest.TestCase):
         self.assertIn("--- END DATA ---", request)
 
 
+class DriveDefaultsTests(unittest.TestCase):
+    """`openfarm drive` with no flags runs its supervisor as ACP mode would."""
+
+    def _cfg(self, adapter="claude-acp", model="claude-opus-5-5", effort="high", timeout=600.0):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            micromanager_adapter=adapter,
+            micromanager=SimpleNamespace(model=model, effort=effort, timeout_s=timeout))
+
+    def test_the_micromanagers_settings_fill_in_for_its_own_provider(self) -> None:
+        from openfarm_core.driver import drive_defaults
+
+        self.assertEqual(drive_defaults(self._cfg(), "claude", None, None, None),
+                         ("claude-opus-5-5", "high", 600.0))
+
+    def test_flags_win(self) -> None:
+        from openfarm_core.driver import drive_defaults
+
+        self.assertEqual(drive_defaults(self._cfg(), "claude", "m", "low", 90.0),
+                         ("m", "low", 90.0))
+
+    def test_another_provider_keeps_its_own_model_and_effort(self) -> None:
+        from openfarm_core.driver import drive_defaults
+
+        self.assertEqual(drive_defaults(self._cfg(), "codex", None, None, None),
+                         (None, None, 600.0))
+
+    def test_a_short_timeout_never_goes_under_the_old_default(self) -> None:
+        from openfarm_core.driver import DEFAULT_TURN_TIMEOUT_S, drive_defaults
+
+        self.assertEqual(drive_defaults(self._cfg(timeout=30.0), "claude", None, None, None)[2],
+                         DEFAULT_TURN_TIMEOUT_S)
+        self.assertEqual(drive_defaults(self._cfg(adapter="off"), "claude", None, None, None),
+                         (None, None, 600.0))
+
+
 if __name__ == "__main__":
     unittest.main()

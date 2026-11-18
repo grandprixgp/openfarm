@@ -310,6 +310,35 @@ _POPEN = subprocess.Popen
 DEFAULT_TURN_TIMEOUT_S = 180.0
 
 
+def drive_defaults(cfg, provider: str, model, effort, turn_timeout):
+    """What `openfarm drive` runs with when its flags leave something out (v0.8.5).
+
+    The supervisor answers the same questions as an ACP micromanager, so it gets
+    the same settings: `[micromanager] model` and `effort` when the drive agent is
+    that micromanager's provider, and `[micromanager] timeout_s` for a turn (never
+    under the old 180 s, as a turn can also carry coordinator work).
+    """
+    mm = getattr(cfg, "micromanager", None)
+    same_provider = False
+    try:
+        same_provider = normalize_acp_provider(
+            str(getattr(cfg, "micromanager_adapter", "") or "")) == provider
+    except Invalid:
+        same_provider = False
+    if same_provider and mm is not None:
+        if model is None and str(getattr(mm, "model", "") or ""):
+            model = str(mm.model)
+        if effort is None and str(getattr(mm, "effort", "") or ""):
+            effort = str(mm.effort)
+    if turn_timeout is None:
+        mm_timeout = getattr(mm, "timeout_s", None) if mm is not None else None
+        try:
+            turn_timeout = max(DEFAULT_TURN_TIMEOUT_S, float(mm_timeout))
+        except (TypeError, ValueError):
+            turn_timeout = DEFAULT_TURN_TIMEOUT_S
+    return model, effort, turn_timeout
+
+
 def _end_process_group(proc, *, grace_s: float = 2.0) -> None:
     """End a driver child's whole process group: TERM, a grace, then KILL.
 
@@ -2319,10 +2348,11 @@ def drive_run(
     wave: bool = False,
     record_verdict: bool = False,
     script: Path | None = None,
-    turn_timeout: float = DEFAULT_TURN_TIMEOUT_S,
+    turn_timeout: float | None = None,
 ) -> dict:
     """Attach to an active run or start a managed external-seat run and drive it."""
     provider = normalize_acp_provider(agent)
+    model, effort, turn_timeout = drive_defaults(cfg, provider, model, effort, turn_timeout)
     clean_seat = str(seat or "both").strip().lower()
     if clean_seat not in DRIVE_SEATS:
         raise UsageError(f"invalid --seat {seat!r}: choose from {', '.join(DRIVE_SEATS)}")
