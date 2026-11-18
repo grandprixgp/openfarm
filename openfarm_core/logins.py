@@ -16,7 +16,9 @@ logs a credential's content.
 from __future__ import annotations
 
 import dataclasses
+import contextlib
 import errno
+import fcntl
 import json
 import os
 import stat
@@ -279,6 +281,19 @@ def check_shape(provider: str, raw: bytes, original: bytes | None) -> str:
             for key in _AGY_ACCOUNT_KEYS:
                 if key in old_obj and new_obj.get(key) != old_obj[key]:
                     return "the refreshed Antigravity token belongs to another account"
+            # A field that held something still holds something of the same
+            # kind: a token set to null or "" is a destroyed login, not a
+            # refreshed one.
+            for key, old_value in old_obj.items():
+                new_value = new_obj[key]
+                if old_value is None:
+                    continue
+                if type(new_value) is not type(old_value):
+                    return "the refreshed Antigravity token changed the kind of a field the old one had"
+                if isinstance(old_value, str) and old_value.strip() and not new_value.strip():
+                    return "the refreshed Antigravity token emptied a field the old one had"
+                if isinstance(old_value, (dict, list)) and old_value and not new_value:
+                    return "the refreshed Antigravity token emptied a field the old one had"
             return ""
         if new_obj is not None:
             return "the original Antigravity token was plain text and the new one is a JSON object"
@@ -342,12 +357,20 @@ def sync_back(
     isolated_home: Path | str,
     target: Path | str,
     initial: bytes | None,
+    pinned: str | None = None,
 ) -> SyncResult:
     """Copy a refreshed login from the isolated home back to `target`, safely.
 
     `target` is the file the login was copied from. The previous credential is kept
     beside it as `<name>.openfarm-backup` (mode 600). Anything that fails a check is
     left alone, and the result says why (never with the credential's content).
+
+    `pinned` is `pin_path(target)` taken when the login was copied in: the real
+    file behind `target` then. A `target` that leads somewhere else by now (a
+    link made or retargeted while the child ran) is refused, so a refresh only
+    ever goes to the file the login was read from. The comparison with what is
+    on disk and the write are one step under a lock on the login's folder, so
+    two children that started from the same login cannot both replace it.
     """
     if provider not in PROVIDERS:
         return SyncResult("refused", f"unknown provider {provider!r}")
@@ -364,7 +387,14 @@ def sync_back(
     if problem:
         return SyncResult("refused", problem)
     dest = Path(target)
-    if dest.is_symlink():
+    if pinned is not None:
+        if pin_path(target) != pinned:
+            return SyncResult(
+                "refused", "the login's path leads somewhere else than when the child "
+                "started (a link was made or changed), so nothing is copied back",
+                str(target))
+        dest = Path(pinned)
+    elif dest.is_symlink():
         # The owner keeps the login elsewhere and links to it (dotfiles). Replacing
         # the link with a file would leave the old token behind the link's target,
         # so the refreshed login goes to the file the link points at. The path is
@@ -377,6 +407,34 @@ def sync_back(
                               str(target))
     if not dest.parent.is_dir():
         return SyncResult("refused", f"{dest.parent} is not a folder", str(dest))
+    try:
+        with _folder_lock(dest.parent):
+            return _replace_checked(dest, raw, initial)
+    except OSError as exc:
+        return SyncResult("refused", f"write failed ({exc.strerror})", str(dest))
+
+
+def pin_path(target: Path | str) -> str:
+    """The real file behind a login path right now, links followed."""
+    return os.path.realpath(str(target))
+
+
+@contextlib.contextmanager
+def _folder_lock(folder: Path):
+    """An exclusive lock on a folder for as long as the block runs (all processes)."""
+    fd = os.open(str(folder), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def _replace_checked(dest: Path, raw: bytes, initial: bytes | None) -> SyncResult:
+    """Compare with what is on disk and replace it; the caller holds the lock."""
     prefix = "." + dest.name + "-"
     backup = ""
     try:

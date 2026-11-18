@@ -14,7 +14,7 @@ import tomllib
 from pathlib import Path
 
 from ..cards import Card
-from ..globs import escapes, first_match, matches_any, normalise
+from ..globs import escapes, first_match, globs_overlap, matches_any, normalise
 
 #: Categories the diet allows at all.
 KNOWN_CATEGORIES = (
@@ -303,9 +303,19 @@ def _check_typescript(card: Card, cfg, root: Path | None,
     for problem in tooling["problems"]:
         result.fail("typescript-tools", problem)
     if tooling["syntax_only"]:
+        # A path that is a .tsx/.jsx file, or a pattern that can match one
+        # (`src/**`): the card could then change or add JSX nothing checks.
         jsx = [path for path in [*card.touches, *(t.file for t in card.tests if t.file)]
-               if normalise(path).endswith((".tsx", ".jsx"))]
-        if jsx:
+               if any(globs_overlap(normalise(path), pattern)
+                      for pattern in ("**/*.tsx", "*.tsx", "**/*.jsx", "*.jsx"))]
+        if jsx and not normalise(jsx[0]).endswith((".tsx", ".jsx")):
+            result.fail("typescript-jsx-unchecked",
+                        f"touches {jsx[0]!r} can match .tsx/.jsx files and there is no tsc "
+                        "to check them: node cannot parse JSX, so a card there could reach "
+                        "review with code that does not parse. Narrow the touches to the "
+                        "files the card changes (for example `src/**/*.ts`), or set up tsc "
+                        "and a tsconfig.json")
+        elif jsx:
             result.fail("typescript-jsx-unchecked",
                         f"{jsx[0]} is a .tsx/.jsx file and there is no tsc to check it: "
                         "node cannot parse JSX, so a card there could reach review "

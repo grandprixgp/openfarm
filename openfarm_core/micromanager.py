@@ -1998,7 +1998,11 @@ _FN_DEF_RE = re.compile(r"\bfn\s+(?:r#)?[A-Za-z_][A-Za-z0-9_]*\b")
 # A stub body: `todo!()` or `unimplemented!()`, after any number of
 # `let _ = (a, b);` lines. Those keep the parameters used, so the stub passes a
 # lint run that treats warnings as errors; they name parameters and call nothing.
-_UNUSED_ARG = r"&?\s*(?:mut\s+)?[A-Za-z_][A-Za-z0-9_]*"
+# A name, never a keyword: `let _ = return;` would leave without panicking.
+_UNUSED_ARG = (
+    r"&?\s*(?:mut\s+)?(?!(?:return|break|continue|loop|unsafe|async|await|move|yield|"
+    r"if|match|while|for|true|false|super|crate)\b)[A-Za-z_][A-Za-z0-9_]*"
+)
 _TODO_ONLY_RE = re.compile(
     r"^(?:let\s+_\s*=\s*(?:" + _UNUSED_ARG + r"|\(\s*" + _UNUSED_ARG
     + r"(?:\s*,\s*" + _UNUSED_ARG + r")*\s*,?\s*\))\s*;\s*)*"
@@ -2140,6 +2144,10 @@ def _scaffold_body_to_validate(edit: Edit) -> str:
     return replace
 
 
+_SCAFFOLD_WORK_RE = re.compile(
+    r"\b(?:const|static)\b[^;{]*=|\blet\b|[A-Za-z_][A-Za-z0-9_]*!\s*[(\[{]")
+
+
 def _valid_production_scaffold(body: str) -> bool:
     """Allow todo!/unimplemented! fn stubs, brace-free signatures, or pure declarations."""
     cleaned = _strip_rust_comments_and_strings(str(body or ""))
@@ -2149,6 +2157,7 @@ def _valid_production_scaffold(body: str) -> bool:
     n = len(cleaned)
     pos = 0
     found_fn = False
+    spans: list[tuple[int, int]] = []   # every function, signature and body
     while True:
         fn_m = _FN_DEF_RE.search(cleaned, pos)
         if not fn_m:
@@ -2185,6 +2194,7 @@ def _valid_production_scaffold(body: str) -> bool:
                 if ch == ";":
                     is_sig_only = True
                     pos = idx + 1
+                    spans.append((fn_m.start(), pos))
                     break
                 if ch == "{":
                     body_start = idx
@@ -2210,10 +2220,18 @@ def _valid_production_scaffold(body: str) -> bool:
         fn_body = cleaned[body_start + 1 : idx - 1].strip()
         if not _TODO_ONLY_RE.match(fn_body):
             return False
+        spans.append((fn_m.start(), idx))
         pos = idx
 
     if found_fn:
-        return True
+        # What stands outside the functions must be declarations too: a
+        # constant or static with a value, a `let` or a macro call is work.
+        rest, last = [], 0
+        for start, end in spans:
+            rest.append(cleaned[last:start])
+            last = end
+        rest.append(cleaned[last:])
+        return not _SCAFFOLD_WORK_RE.search(" ".join(rest))
     if _TODO_ONLY_RE.match(cleaned.strip()):
         return True
     return bool(re.search(r"\b(?:struct|enum|trait|type|mod|use)\b", cleaned))

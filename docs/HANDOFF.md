@@ -15,7 +15,7 @@ v0.8.1 was built in two rounds. The first agent added Codex and Antigravity as p
 - **Checker.** Both passes answer in a fixed form and are asked once more when unreadable. Counter-tests are written as files, run one at a time, and removed, with the worktree restored exactly. The dossier shows the verdict and every counter-test's outcome.
 - **Packs.** Python uses ruff only where configured and pytest where configured. Rust mutation reads cargo-mutants' `outcomes.json` and reports timeouts and unviable mutants apart. Every row of a named test decides fail-before and pass-after. An infra run is never green. TypeScript runs `node --test` with a reporter that cannot read red as green, takes one tool set from the base checkout, and refuses other test runners.
 - **Board, coordinators, flow, CLI.** Fixes to who may post and hint, stop requests, role models, the stall monitor, late joins, escalation, hand-back triage, the human run summary, token parts, TUI background commands and per-card supervisor sessions.
-- **Tests.** 1411 offline tests on the final tree with no failures (89 skipped with no optional tools on `PATH`; 15 with `OPENFARM_E2E=1` and ruff, tsc, prettier and cargo-mutants installed). The skip count depends on what is installed.
+- **Tests.** 1438 offline tests on the final tree with no failures (89 skipped with no optional tools on `PATH`; 15 with `OPENFARM_E2E=1` and ruff, tsc, prettier and cargo-mutants installed). The skip count depends on what is installed.
 
 ### Tested live (17 Nov 2026)
 
@@ -50,7 +50,7 @@ Real ruff, pytest, cargo-mutants, tsc and prettier; the checker with a live mode
 - **A standalone `codex-acp` with `read-only`** is started although its shell cannot work inside the boundary; only the bridge refuses up front.
 - **Cached input tokens** are added to a server's input count unless its own total shows they are already in it; a server that includes them and reports no total would be counted high, which stops a cap early, never late.
 - **Lock and seat takeover** trust the pid and hostname. Two processes with the same hostname in different pid namespaces (containers), or a state folder shared between machines with the same hostname, can see each other as gone.
-- **Counter-tests on a dirty worktree.** The restore is exact for the clean worktree a card normally has; a difference after the restore is logged, not failed.
+- **Counter-tests on a dirty worktree.** The restore is exact for the clean worktree a card normally has; a difference after the restore is logged, not failed. Ignored files that were already there are put back from a copy kept in memory, up to 64 MB in total; a larger one that a counter-test changes is logged as not put back.
 - **A provider CLI that updates itself during a run** can be missing for a moment (seen with Claude Code's npm auto-update, twice in one bench). Cards that start a child then stop as `infra` ("Failed to spawn"); nothing is retried. For a long run, point `[micromanager] binary` at a fixed copy or turn the CLI's auto-update off.
 - **`openfarm swarm join` errors** carry no code in JSON, so a script cannot tell `seat-occupied` from `name-taken`.
 - **No mutation tool for Python or TypeScript.**

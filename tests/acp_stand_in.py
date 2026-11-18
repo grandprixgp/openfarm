@@ -60,6 +60,16 @@ def _send_chunk(session_id: str, text: str, *, as_list: bool = False) -> None:
     )
 
 
+_SESSIONS_MADE = [0]
+
+
+def _next_session_id(args) -> str:
+    _SESSIONS_MADE[0] += 1
+    if getattr(args, "distinct_sessions", False):
+        return f"sess-standin-{_SESSIONS_MADE[0]}"
+    return "sess-standin-1"
+
+
 def _send_usage(
     session_id: str,
     used: int,
@@ -147,6 +157,8 @@ def main() -> int:
     parser.add_argument("--tokens-in", type=int, default=120)
     parser.add_argument("--tokens-out", type=int, default=45)
     parser.add_argument("--cost", type=float, default=0.0125)
+    parser.add_argument("--distinct-sessions", action="store_true",
+                        help="each session/new gets its own id (sess-standin-1, -2, ...)")
     parser.add_argument("--hang-seconds", type=float, default=10.0)
     parser.add_argument("--ack-cancel", action="store_true")
     parser.add_argument("--auth-methods", default="")
@@ -231,7 +243,7 @@ def main() -> int:
                     "jsonrpc": "2.0",
                     "id": req_id,
                     "result": {
-                        "sessionId": "sess-standin-1",
+                        "sessionId": _next_session_id(args),
                         "authenticated": authenticated,
                     },
                 }

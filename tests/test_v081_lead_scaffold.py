@@ -68,6 +68,9 @@ class StubBodyTests(unittest.TestCase):
                      "let x = a; todo!()",
                      'let _ = (a, std::fs::remove_file("x")); todo!()',
                      "let _ = a.clone(); todo!()",
+                     "let _ = return; todo!()",
+                     "let _ = (a, break); todo!()",
+                     "let _ = loop; todo!()",
                      "evil(); todo!()",
                      "todo!(); evil()",
                      "a + 1"):
@@ -95,6 +98,17 @@ class AnchoredOnTheEndOfABlockTests(unittest.TestCase):
         # The added text is not whole blocks, so the kept lines count: a real body.
         anchor = '    fn name(&self) -> &\'static str {\n        "square"'
         self.assertFalse(_ok(anchor, anchor + "\n    }\n    fn other(&self) {\n        todo!()"))
+
+    def test_work_beside_a_stub_is_refused(self) -> None:
+        # Second outside review, 11: only the functions were looked at.
+        stub = "\npub fn area(r: f64) -> f64 {\n    let _ = r;\n    todo!()\n}\n"
+        for work in ("pub const SCALE: usize = 6 * 7;",
+                     "static START: u64 = now();",
+                     "lazy_static! { static ref X: u8 = boot(); }",
+                     "let x = launch();"):
+            with self.subTest(work=work):
+                self.assertFalse(_ok(ANCHOR, ANCHOR + "\n" + work + stub))
+        self.assertTrue(_ok(ANCHOR, ANCHOR + "\npub type Side = f64;\nuse std::fmt;\n" + stub))
 
     def test_a_changed_anchor_is_judged_whole(self) -> None:
         self.assertFalse(_ok(ANCHOR, ANCHOR.replace('"square"', '"circle"') + TRIANGLE))

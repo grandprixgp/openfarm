@@ -83,6 +83,9 @@ def runner_kind(purpose: str) -> str:
     return _RUNNER_KIND.get(purpose, "extra")
 
 
+#: How much ignored-file content a counter-test run keeps to put back (bytes).
+_COUNTER_KEEP_BYTES = 64 * 1024 * 1024
+
 class CardRun:
     """One card's whole run, from claim to in-review or blocked."""
 
@@ -3907,6 +3910,7 @@ class CardRun:
         """
         import os
         import re
+        import stat
 
         if not hasattr(self, "counter_results"):
             self.counter_results = []
@@ -3934,6 +3938,28 @@ class CardRun:
                 if full.is_symlink():
                     with contextlib.suppress(OSError):
                         links[rel] = os.readlink(full)
+            # Ignored regular files that were already there (a cache, a local
+            # settings file): git restores none of them, so what a run overwrote
+            # or deleted is put back from here. Each is kept with its size and
+            # time; the content too, up to a cap, so a large build folder is
+            # not read into memory.
+            kept: dict[str, dict] = {}
+            budget = _COUNTER_KEEP_BYTES
+            for rel in sorted(ignored):
+                full = self.worktree / rel
+                try:
+                    info = os.lstat(full)
+                except OSError:
+                    continue
+                if not stat.S_ISREG(info.st_mode):
+                    continue
+                item = {"size": info.st_size, "mtime_ns": info.st_mtime_ns,
+                        "mode": stat.S_IMODE(info.st_mode), "data": None}
+                if info.st_size <= budget:
+                    with contextlib.suppress(OSError):
+                        item["data"] = full.read_bytes()
+                        budget -= info.st_size
+                kept[rel] = item
             dirs = {""}
             for rel in list(ignored) + listing() + list(files):
                 parent = Path(rel).parent
@@ -3942,7 +3968,7 @@ class CardRun:
                     parent = parent.parent
             return {"head": self.git.head(), "branch": self.git.current_branch(),
                     "files": files, "ignored": ignored, "dirs": dirs,
-                    "links": links, "status": self.git.status_lines()}
+                    "links": links, "kept": kept, "status": self.git.status_lines()}
 
         def restore(before: dict) -> None:
             if self.git.current_branch() != before["branch"] and before["branch"]:
@@ -3984,8 +4010,42 @@ class CardRun:
                         shutil.rmtree(full)
                     full.parent.mkdir(parents=True, exist_ok=True)
                     os.symlink(link_to, full)
+            # Ignored files that were there: one a run overwrote or deleted is
+            # written again with its mode and time. One too large to have been
+            # kept is said, never passed over.
+            lost: list[str] = []
+            for rel, item in before["kept"].items():
+                full = self.worktree / rel
+                try:
+                    info = os.lstat(full)
+                    same = (stat.S_ISREG(info.st_mode) and info.st_size == item["size"]
+                            and info.st_mtime_ns == item["mtime_ns"])
+                    if same and item["data"] is not None and info.st_size <= 1 << 20:
+                        same = full.read_bytes() == item["data"]
+                except OSError:
+                    same = False
+                if same:
+                    continue
+                if item["data"] is None:
+                    lost.append(rel)
+                    continue
+                try:
+                    if full.is_symlink() or (full.exists() and not full.is_file()):
+                        if full.is_dir() and not full.is_symlink():
+                            shutil.rmtree(full)
+                        else:
+                            full.unlink()
+                    full.parent.mkdir(parents=True, exist_ok=True)
+                    full.write_bytes(item["data"])
+                    os.chmod(full, item["mode"])
+                    os.utime(full, ns=(item["mtime_ns"], item["mtime_ns"]))
+                except OSError:
+                    lost.append(rel)
+            if lost:
+                self.log(f"{self.card.id}: a counter-test changed {len(lost)} ignored "
+                         f"file(s) that could not be put back: {', '.join(lost[:5])}")
             after_ignored = set(listing("--others", "--ignored", "--exclude-standard"))
-            if (self.git.head() != before["head"]
+            if (lost or self.git.head() != before["head"]
                     or self.git.status_lines() != before["status"]
                     or after_ignored != before["ignored"]):
                 self.log(f"{self.card.id}: the worktree did not come back exactly "
