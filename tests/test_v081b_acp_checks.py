@@ -255,13 +255,25 @@ class ProbeAndChildTests(_Tmp):
                                cwd=self.tmp, provider="codex", auth_mode="api-key", confine="off")
         self.addCleanup(acp.close)
         sid = acp.new_session(cwd=self.tmp, tool_policy="none")
-        th = threading.Thread(target=lambda: self.assertRaises(AdapterError, acp.prompt, sid, "hang",
-                                                               timeout_s=60), daemon=True)
+        seen: dict = {}
+
+        def turn() -> None:
+            # An assertion in a thread is lost, so the result is kept for the test.
+            try:
+                seen["result"] = acp.prompt(sid, "hang", timeout_s=60)
+            except BaseException as exc:
+                seen["error"] = exc
+
+        th = threading.Thread(target=turn, daemon=True)
         th.start()
         pid = self._wait_for(pid_file)
         os.killpg(acp._proc.pid, signal.SIGTERM)
         th.join(timeout=30)
+        self.assertFalse(th.is_alive(), "the turn never came back")
         self.assertTrue(self._gone(pid), "the bridge's child group outlived the bridge")
+        # Lead: a turn whose bridge was stopped is an error, never an empty answer.
+        self.assertNotIn("result", seen, "a stopped bridge's turn read as an answer")
+        self.assertIsInstance(seen.get("error"), AdapterError)
 
 
 class AgyPromptLimitTests(_Tmp):
