@@ -592,6 +592,84 @@ _OP_RULES = {
 }
 
 
+#: Gates whose evidence a supervisor reads even when they pass: what the checker
+#: said it would and would not catch, and the counter-tests it wrote.
+_EVIDENCE_ON_PASS = ("checker", "counter")
+
+#: Keys no supervisor can use: local paths it has no tool to open.
+_DROPPED_KEYS = frozenset({"detail_path", "_card_dir"})
+
+
+def _prune_empty(value):
+    """`value` without empty strings, lists, objects or nulls inside it."""
+    if isinstance(value, dict):
+        out = {}
+        for key, item in value.items():
+            if key in _DROPPED_KEYS:
+                continue
+            item = _prune_empty(item)
+            if item in (None, "", [], {}):
+                continue
+            out[key] = item
+        return out
+    if isinstance(value, list):
+        return [_prune_empty(item) for item in value if item not in (None, "", [], {})]
+    return value
+
+
+def _compact_gates(gates: list) -> list:
+    """The gate records a supervisor needs, smallest form first.
+
+    A gate that ran twice (suite, pass-after) is shown once, as its last run. A
+    passing gate is its name and detail; its evidence goes only for the checker
+    and counter-test gates, or when it did not pass.
+    """
+    last: dict[str, int] = {}
+    for idx, gate in enumerate(gates):
+        if isinstance(gate, dict):
+            last[str(gate.get("name", ""))] = idx
+    out: list = []
+    for idx, gate in enumerate(gates):
+        if not isinstance(gate, dict):
+            out.append(gate)
+            continue
+        name = str(gate.get("name", ""))
+        if last.get(name) != idx:
+            continue
+        entry = {"name": name, "result": gate.get("result", "")}
+        if gate.get("detail"):
+            entry["detail"] = gate["detail"]
+        keep_evidence = (gate.get("result") != "pass"
+                         or name.startswith(_EVIDENCE_ON_PASS))
+        evidence = _prune_empty(gate.get("evidence") or {}) if keep_evidence else {}
+        if evidence:
+            entry["evidence"] = evidence
+        out.append(entry)
+    return out
+
+
+def compact_supervisor_payload(payload: dict) -> dict:
+    """What a supervisor is sent for `payload`: the same facts, in fewer tokens.
+
+    Local paths are dropped (no supervisor can open them) and gate records are
+    cut to what a review reads. Every backend gets this same form: an ACP child,
+    a tier model, and an external seat or `openfarm drive`.
+    """
+    out = {}
+    for key, value in payload.items():
+        if key in _DROPPED_KEYS:
+            continue
+        if key == "gates" and isinstance(value, list):
+            value = _compact_gates(value)
+        out[key] = value
+    return out
+
+
+def build_supervisor_prompt(op: str, payload: dict) -> str:
+    """The prompt text for one supervisor op, the same for every backend."""
+    return _build_op_prompt(op, payload)
+
+
 def _build_op_prompt(op: str, payload: dict) -> str:
     schemas = {
         "shape_and_plan": (
@@ -637,7 +715,10 @@ def _build_op_prompt(op: str, payload: dict) -> str:
         ),
     }
     schema = schemas.get(op, "{}")
-    body = json.dumps(payload, indent=2, ensure_ascii=False, default=str)
+    # Compact JSON: indentation costs a token or more on every line and tells the
+    # model nothing (v0.8.5).
+    body = json.dumps(compact_supervisor_payload(payload), ensure_ascii=False,
+                      default=str, separators=(",", ":"))
     rules = _OP_RULES.get(op, "")
     return (
         f"Operation: {op}\n"

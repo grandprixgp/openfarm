@@ -151,7 +151,8 @@ if mode == "refuse-then-recover":
 req = {{}}
 for cand_start in [0, *[i + 1 for i, ch in enumerate(prompt_raw) if ch == "\\n" and i + 1 < len(prompt_raw) and prompt_raw[i + 1] == "{{"]]:
     try:
-        cand = json.loads(prompt_raw[cand_start:])
+        # The turn's JSON state may be followed by the open questions' requests.
+        cand, _end = json.JSONDecoder().raw_decode(prompt_raw[cand_start:])
         if isinstance(cand, dict) and ("run_id" in cand or "dossier" in cand):
             req = cand
             break
@@ -338,10 +339,12 @@ class DriverAgentUnitTests(unittest.TestCase):
             "claude-sonnet-4-6",
             "--effort",
             "high",
-            "--append-system-prompt",
+            # The driver replaces Claude Code's own prompt (lean_prompt, v0.8.5).
+            "--system-prompt",
             "SYS",
         ):
             self.assertIn(req_flag, c_info["args"])
+        self.assertNotIn("--append-system-prompt", c_info["args"])
         self.assertNotEqual(c_info["home"], str(fake_host_home))
         self.assertFalse(Path(c_info["home"]).exists(), "isolated HOME must be cleaned up")
         self.assertEqual(c_info["anthropic_key"], "")
@@ -413,7 +416,10 @@ class DriverAgentUnitTests(unittest.TestCase):
         # The child works in an empty private folder of the driver's, not in `cwd`.
         self.assertEqual(x_info["args"][x_info["args"].index("-C") + 1], x_info["cwd"])
         self.assertNotEqual(Path(x_info["cwd"]), self.work_dir.resolve())
-        self.assertIn("SYS_CX", x_info["stdin"])
+        # The system prompt is Codex's own instructions, not glued onto stdin.
+        self.assertIn('instructions="SYS_CX"', x_info["args"])
+        self.assertNotIn("SYS_CX", x_info["stdin"])
+        self.assertIn("hello codex", x_info["stdin"])
         self.assertTrue(x_info["codex_home"].startswith(x_info["home"]))
         self.assertEqual(x_info["openai_key"], "")
         self.assertEqual(res_cx.tokens_in, 50)

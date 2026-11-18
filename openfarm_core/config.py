@@ -75,7 +75,8 @@ _TABLE_KEYS = {
     "harness": {"enabled", "dir", "capture_on", "max_cues_per_brief",
                 "max_active_adaptations", "min_confidence", "probe_window",
                 "auto_demote", "allow_micromanager_reflection",
-                "editable_surfaces", "global_dir", "learn_from", "share"},
+                "editable_surfaces", "global_dir", "learn_from", "share",
+                "reflect_on"},
     "swarm": {"enabled", "coordinator", "supervisor", "coordinator_effort",
               "supervisor_effort", "default_tier", "escalate_after",
               "handbacks_per_card", "max_members", "coordinator_calls_per_run",
@@ -326,6 +327,10 @@ class MicromanagerConfig:
 
 VALID_LEARN_FROM = ("both", "project", "global")
 VALID_HARNESS_CAPTURE_ON = ("retry_recovery", "fail", "counter_fail", "pass")
+#: When the supervisor is asked to reflect on a card (v0.8.5). A clean first-try
+#: pass is left out: across the v0.8.1 bench, 41 of 47 reflection calls were on
+#: such cards and what they proposed was about openfarm's own bookkeeping.
+DEFAULT_HARNESS_REFLECT_ON = ("retry_recovery", "fail", "counter_fail")
 VALID_HARNESS_SURFACES = (
     "test_writer_guidance",
     "implementer_guidance",
@@ -348,6 +353,7 @@ class HarnessConfig:
     probe_window: int = 3
     auto_demote: bool = True
     allow_micromanager_reflection: bool = True
+    reflect_on: tuple[str, ...] = ("retry_recovery", "fail", "counter_fail")
     editable_surfaces: tuple[str, ...] = (
         "test_writer_guidance",
         "implementer_guidance",
@@ -372,6 +378,7 @@ class HarnessConfig:
             "probe_window": self.probe_window,
             "auto_demote": self.auto_demote,
             "allow_micromanager_reflection": self.allow_micromanager_reflection,
+            "reflect_on": list(self.reflect_on),
             "editable_surfaces": list(self.editable_surfaces),
             "global_dir": self.global_dir,
             "learn_from": self.learn_from,
@@ -707,6 +714,18 @@ class Config:
             True,
         )
 
+        if "reflect_on" in h and h["reflect_on"] is not None:
+            raw_reflect = _as_str_list(h["reflect_on"], "[harness] reflect_on")
+            for item in raw_reflect:
+                if item not in VALID_HARNESS_CAPTURE_ON:
+                    raise ConfigError(
+                        f"[harness] reflect_on: {item!r} is not one of "
+                        f"{', '.join(VALID_HARNESS_CAPTURE_ON)}"
+                    )
+            reflect_on = tuple(dict.fromkeys(raw_reflect))
+        else:
+            reflect_on = DEFAULT_HARNESS_REFLECT_ON
+
         if "editable_surfaces" in h and h["editable_surfaces"] is not None:
             raw_surfaces = _as_str_list(
                 h["editable_surfaces"], "[harness] editable_surfaces"
@@ -743,6 +762,7 @@ class Config:
             probe_window=probe_window,
             auto_demote=auto_demote,
             allow_micromanager_reflection=allow_mm_refl,
+            reflect_on=reflect_on,
             editable_surfaces=editable_surfaces,
             global_dir=global_dir,
             learn_from=learn_from,

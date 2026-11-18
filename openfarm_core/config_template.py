@@ -211,6 +211,8 @@ def render_config(*, name: str, language: str, base_branch: str, state_dir: Path
         "enabled = true",
         'dir = ""',
         'capture_on = ["retry_recovery", "fail", "counter_fail", "pass"]',
+        "# When the supervisor reflects on a card; add \"pass\" to include clean first-try passes.",
+        'reflect_on = ["retry_recovery", "fail", "counter_fail"]',
         "max_cues_per_brief = 4",
         "max_active_adaptations = 8",
         "min_confidence = 0.55",

@@ -2040,9 +2040,13 @@ class HarnessLibrary:
                 self.harness_cfg.enabled
                 and contrast["outcome_kind"] in self.harness_cfg.capture_on
             )
+            reflect_on = getattr(self.harness_cfg, "reflect_on", None)
+            if reflect_on is None:
+                reflect_on = self.harness_cfg.capture_on
             if (
                 will_capture
                 and reflect
+                and contrast["outcome_kind"] in reflect_on
                 and self.harness_cfg.allow_micromanager_reflection
                 and micromanager is not None
                 and getattr(micromanager, "enabled", False)

@@ -84,22 +84,24 @@ class DriverSpendTests(unittest.TestCase):
         self.assertEqual(res["outcomes"][0]["final_state"], "in-review")
         members = self._members(res["run_id"])
         self.assertEqual(members["driver-coord"]["tokens_in"], 1000)
-        self.assertEqual(members["driver-sup"].get("tokens_in", 0), 180,
+        # A clean first-try pass is not reflected on (`[harness] reflect_on`,
+        # v0.8.5), so the two question turns are shape and pre-review.
+        self.assertEqual(members["driver-sup"].get("tokens_in", 0), 110,
                          "question turns belong to the supervisor's member")
 
-        self.assertAlmostEqual(res["driver_spend"], 0.019, places=6)
+        self.assertAlmostEqual(res["driver_spend"], 0.015, places=6)
         self.assertTrue(res["driver_spend_measured"])
         self.assertFalse(res["driver_tokens_estimated"])
         self.assertEqual(res["notes"], [])
         self.assertEqual(res["driver_by_part"]["coordinator"]["tokens_in"], 1000)
-        self.assertEqual(res["driver_by_part"]["supervisor"]["tokens_in"], 180)
+        self.assertEqual(res["driver_by_part"]["supervisor"]["tokens_in"], 110)
 
         record = read_json(self.toy.state_dir / "runs" / res["run_id"] / "run.json", {})
         self.assertTrue(res["run_record_updated"])
-        self.assertAlmostEqual(record["driver_spend"], 0.019, places=6)
-        self.assertGreaterEqual(record["spend"], 0.019 - 1e-9, "the driver's spend is the run's spend")
+        self.assertAlmostEqual(record["driver_spend"], 0.015, places=6)
+        self.assertGreaterEqual(record["spend"], 0.015 - 1e-9, "the driver's spend is the run's spend")
         self.assertFalse(record["driver"]["tokens_estimated"])
-        self.assertEqual(record["driver"]["tokens_in"], 1180)
+        self.assertEqual(record["driver"]["tokens_in"], 1110)
 
     def test_guessed_tokens_and_unpriced_turns_are_marked(self) -> None:
         sp = self._script({
