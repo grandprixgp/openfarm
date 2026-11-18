@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import re
 import shutil
 from pathlib import Path
 
@@ -2274,6 +2275,7 @@ class CardRun:
 
             try:
                 self._prove_current_tests()
+                self._lint_new_tests()
             except GateFailure as exc:
                 if exc.code != StopCode.TESTS_UNPROVABLE:
                     raise
@@ -2434,6 +2436,46 @@ class CardRun:
         if self._tests_proven_in_phase_a:
             return
         self._prove_current_tests()
+
+    def _lint_new_tests(self) -> None:
+        """Lint once before the tests freeze, and give the test writer its own lint.
+
+        Once frozen, a lint finding in a test file is one nobody may fix: the
+        implementer may not touch tests and `#[allow]` is banned (pilot card F1,
+        18 Nov 2026: `assert_eq!(x, true)` failed clippy after the code was right,
+        and the card was lost). A finding located in any other file, the stub
+        included, is left for the implementer's attempts as before.
+        """
+        test_files = [normalise(t.file) for t in self.card.tests if t.file]
+        if not test_files:
+            return
+        unit = self._effective_unit()
+        try:
+            argv = self.pack.commands("lint", unit=unit)["argv"]
+        except (Invalid, KeyError):
+            return
+        if not argv:
+            return
+        result = self._run(runner_kind("lint"), argv, counted="fixed")
+        if result.cls == PASS or result.cls == INFRA:
+            return
+        out, err = self._output(result)
+        text = (err or "") + "\n" + (out or "")
+        located = []
+        for path in dict.fromkeys(test_files):
+            if re.search(r"(?:^|[\s(>'\"/])" + re.escape(path) + r":\d+", text):
+                located.append(path)
+        if not located:
+            return
+        lines = [line for line in text.splitlines()
+                 if any(path in line for path in located)
+                 or line.lstrip().startswith(("error", "warning", "= help", "help:"))]
+        detail = ("the lint gate flags the tests you wrote, and they cannot change "
+                  "once frozen; write them so the lint passes (" + ", ".join(located)
+                  + "):\n" + "\n".join(lines[-40:])[-1500:])
+        self._record_gate(GateResult("test-lint", FAIL, detail[:800],
+                                     {"files": located}))
+        raise GateFailure(StopCode.TESTS_UNPROVABLE, detail)
 
     def _prove_current_tests(self) -> None:
         self.phase = "prove"
