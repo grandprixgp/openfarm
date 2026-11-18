@@ -2206,6 +2206,15 @@ class ClaudeAcpAdapter:
                     if not isinstance(result, dict):
                         result = {}
                     stop_reason = str(result.get("stopReason", ""))
+                    if stop_reason == "cancelled":
+                        # Nobody here asked for a cancel (that path raises above):
+                        # the child was stopped or interrupted, and whatever it
+                        # had said so far is not an answer.
+                        raise Infra(
+                            "acp-turn-cancelled",
+                            "the ACP child ended the turn as cancelled (it was stopped or "
+                            "interrupted); what it had answered so far was not used",
+                        )
 
                     resp_usage = result.get("usage")
                     if resp_usage is not None and not isinstance(resp_usage, dict):
