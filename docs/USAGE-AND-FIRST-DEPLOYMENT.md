@@ -87,7 +87,7 @@ Openfarm is a **deterministic Python 3.11+ (stdlib-only) orchestrator** that dri
 
 #### Honest Verification Boundaries
 
-The offline suite (1400 tests on the final v0.8.1 tree, no failures) covers the core with scripted models, local HTTP test servers and stand-in provider CLIs; tests that need a real tool (`bwrap`, `node`, `cargo`, ruff, pytest, cargo-mutants, `tsc`, `prettier`) skip themselves when it is missing. What ran live on 17 Nov 2026 is listed in the [README](../README.md#whats-verified) and the [build log](v0.8.1-build-log.md). Still **untested**:
+The offline suite (1411 tests on the final v0.8.1 tree, no failures) covers the core with scripted models, local HTTP test servers and stand-in provider CLIs; tests that need a real tool (`bwrap`, `node`, `cargo`, ruff, pytest, cargo-mutants, `tsc`, `prettier`) skip themselves when it is missing. What ran live on 17 Nov 2026 is listed in the [README](../README.md#whats-verified) and the [build log](v0.8.1-build-log.md). Still **untested**:
 
 - Everything Antigravity since the first agent's runs: the boundary around `agy`, the login copy, the prompt-size refusal, the driver. Nobody may run `agy` unattended here.
 - A turn through a standalone `codex-acp` server, and so per-card confined servers with it.

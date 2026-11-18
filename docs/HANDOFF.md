@@ -15,7 +15,7 @@ v0.8.1 was built in two rounds. The first agent added Codex and Antigravity as p
 - **Checker.** Both passes answer in a fixed form and are asked once more when unreadable. Counter-tests are written as files, run one at a time, and removed, with the worktree restored exactly. The dossier shows the verdict and every counter-test's outcome.
 - **Packs.** Python uses ruff only where configured and pytest where configured. Rust mutation reads cargo-mutants' `outcomes.json` and reports timeouts and unviable mutants apart. Every row of a named test decides fail-before and pass-after. An infra run is never green. TypeScript runs `node --test` with a reporter that cannot read red as green, takes one tool set from the base checkout, and refuses other test runners.
 - **Board, coordinators, flow, CLI.** Fixes to who may post and hint, stop requests, role models, the stall monitor, late joins, escalation, hand-back triage, the human run summary, token parts, TUI background commands and per-card supervisor sessions.
-- **Tests.** 1400 offline tests on the final tree with no failures (89 skipped with no optional tools on `PATH`; 15 with `OPENFARM_E2E=1` and ruff, tsc, prettier and cargo-mutants installed). The skip count depends on what is installed.
+- **Tests.** 1411 offline tests on the final tree with no failures (89 skipped with no optional tools on `PATH`; 15 with `OPENFARM_E2E=1` and ruff, tsc, prettier and cargo-mutants installed). The skip count depends on what is installed.
 
 ### Tested live (17 Nov 2026)
 
