@@ -220,8 +220,9 @@ def codex_read_only_refusal(reason: str = "") -> str:
 
 def needs_nested(provider: str, transport: str, tool_policy: str, mode: str) -> bool:
     """Whether `decide` needs `nested_status` for this child."""
-    return (provider == "codex" and transport == "bridge" and tool_policy == "read-only"
-            and mode != "off")
+    # A standalone Codex ACP server runs the same sandboxed shell (v0.8.5).
+    return (provider == "codex" and transport in ("bridge", "server")
+            and tool_policy == "read-only" and mode != "off")
 
 
 def flags_only_note(provider: str, bwrap_reason: str = "") -> str:
@@ -311,6 +312,10 @@ def decide(
     if bwrap_usable:
         if flags and tool_policy == "read-only" and not nested_usable:
             return Hold(provider, mode, flags=True, refused=codex_read_only_refusal(nested_reason))
+        if (provider == "codex" and transport == "server" and tool_policy == "read-only"
+                and not nested_usable):
+            # v0.8.5: refused up front as the bridge is, not started to read nothing.
+            return Hold(provider, mode, refused=codex_read_only_refusal(nested_reason))
         return Hold(provider, mode, flags=flags, boundary=True)
     if mode == "bwrap":
         why = f'{CONFINE_SETTING} = "bwrap" confines every provider'

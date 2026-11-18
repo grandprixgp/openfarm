@@ -275,5 +275,24 @@ class ConfineLinkTests(unittest.TestCase):
         self.assertNotIn("s", result.stdout)
 
 
+class StandaloneCodexReadOnlyTests(unittest.TestCase):
+    def test_a_standalone_server_with_read_only_is_refused_without_nesting(self) -> None:
+        from openfarm_core import confine
+
+        self.assertTrue(confine.needs_nested("codex", "server", "read-only", "auto"))
+        hold = confine.decide("codex", transport="server", tool_policy="read-only",
+                              mode="auto", bwrap_usable=True, nested_usable=False,
+                              nested_reason="nested sandboxes are refused")
+        self.assertTrue(hold.refused)
+        self.assertIn("read-only", hold.refused)
+        ok = confine.decide("codex", transport="server", tool_policy="read-only",
+                            mode="auto", bwrap_usable=True, nested_usable=True)
+        self.assertFalse(ok.refused)
+        self.assertTrue(ok.boundary)
+        plain = confine.decide("codex", transport="server", tool_policy="none",
+                               mode="auto", bwrap_usable=True, nested_usable=False)
+        self.assertFalse(plain.refused)
+
+
 if __name__ == "__main__":
     unittest.main()
