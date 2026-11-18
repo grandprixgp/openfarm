@@ -294,5 +294,55 @@ class StandaloneCodexReadOnlyTests(unittest.TestCase):
         self.assertFalse(plain.refused)
 
 
+class ParallelSupervisorSpendTests(unittest.TestCase):
+    """Two cards in parallel on one supervisor: each card's spend is its own,
+    even when the calls interleave (the v0.8.1 "unproven" known limit)."""
+
+    def test_interleaved_calls_are_booked_to_their_own_card(self) -> None:
+        import threading
+
+        from openfarm_core.cards import Card
+        from openfarm_core.micromanager import Micromanager, ScriptedMicromanager
+
+        card_two_done = threading.Event()
+
+        def answer(card_id, spend, wait_for=None):
+            def entry(op, payload):
+                if wait_for is not None:
+                    self.assertTrue(wait_for.wait(10), "the other card never ran")
+                return {"verdict": "ready", "clarified_notes": card_id,
+                        "_usage": {"tokens_in": int(spend * 10_000), "tokens_out": 1,
+                                   "spend": spend}}
+            return entry
+
+        backend = ScriptedMicromanager({
+            "CARD-1/shape_and_plan": answer("CARD-1", 0.5, wait_for=card_two_done),
+            "CARD-2/shape_and_plan": answer("CARD-2", 0.01)})
+        # One Micromanager for both cards, as `openfarm run` shares in a swarm run.
+        mm = Micromanager(backend)
+        backend._lock = threading.RLock()  # the script lock is not held across answers
+
+        def card(cid):
+            return Card(id=cid, title=cid, state="ready", done_text="d", touches=["a.py"],
+                        fields={"category": "pinned-bugfix",
+                                "tests": [{"name": "test_a", "file": "tests/test_a.py"}]})
+
+        def run(cid, after=None):
+            mm.shape_and_plan(card(cid), {}, {}, known_tests=[])
+            if after is not None:
+                after.set()
+
+        one = threading.Thread(target=run, args=("CARD-1",))
+        one.start()
+        two = threading.Thread(target=run, args=("CARD-2", card_two_done))
+        two.start()
+        one.join(20)
+        two.join(20)
+        self.assertAlmostEqual(mm.budget.usage_for("CARD-1")["spend"], 0.5)
+        self.assertAlmostEqual(mm.budget.usage_for("CARD-2")["spend"], 0.01)
+        self.assertEqual(mm.budget.usage_for("CARD-1")["tokens_in"], 5000)
+        self.assertEqual(mm.budget.usage_for("CARD-2")["tokens_in"], 100)
+
+
 if __name__ == "__main__":
     unittest.main()
