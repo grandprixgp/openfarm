@@ -30,11 +30,11 @@
 </p>
 
 <p align="center">
-  <img src="docs/assets/openfarm-stats.svg" alt="@@N@@ offline tests with 0 failures, 22 CLI subcommands, 6 adapter interfaces, 0 runtime dependencies" width="100%">
+  <img src="docs/assets/openfarm-stats.svg" alt="1400 offline tests with 0 failures, 22 CLI subcommands, 6 adapter interfaces, 0 runtime dependencies" width="100%">
 </p>
 
 > [!IMPORTANT]
-> **Pre-release (v0.8.1).** v0.8.1 adds Codex and Antigravity as frontier providers next to Claude, `openfarm drive` to hold the coordinator and supervisor seats with a CLI agent, and a TypeScript pack. After the first build, two reviews and live runs with the real tools found gaps, and the fix work closed them: Codex and Antigravity children now run inside a bubblewrap boundary, the checker's counter-tests are read and run, and ruff, pytest, cargo-mutants, tsc and prettier are called the way the real programs need. An outside review of the fix work then found no blockers, and its larger findings are fixed too. The offline suite has @@N@@ tests with no failures. What ran live on 17 Nov 2026, and what has not run at all, is in [What's verified](#whats-verified) and [Not yet tested](#not-yet-tested). With `[swarm] enabled = false` a run behaves as in v0.7.
+> **Pre-release (v0.8.1).** v0.8.1 adds Codex and Antigravity as frontier providers next to Claude, `openfarm drive` to hold the coordinator and supervisor seats with a CLI agent, and a TypeScript pack. After the first build, two reviews and live runs with the real tools found gaps, and the fix work closed them: Codex and Antigravity children now run inside a bubblewrap boundary, the checker's counter-tests are read and run, and ruff, pytest, cargo-mutants, tsc and prettier are called the way the real programs need. An outside review of the fix work then found no blockers, and its larger findings are fixed too. The offline suite has 1400 tests with no failures. What ran live on 17 Nov 2026, and what has not run at all, is in [What's verified](#whats-verified) and [Not yet tested](#not-yet-tested). With `[swarm] enabled = false` a run behaves as in v0.7.
 
 ---
 
@@ -162,7 +162,7 @@ For a reader upgrading from v0.8. Details are in [`docs/USAGE-AND-FIRST-DEPLOYME
 - **New config keys.** `[micromanager] confine` (`"auto"`, `"bwrap"` or `"off"`, default `"auto"`) and `confine_read_roots`. `[runner] typescript` (only `"node"`), `typescript_typecheck`, `typescript_format` and `link_node_modules`. `[micromanager] effort` also takes `"xhigh"` and `"max"`.
 - **New refusals.** A Codex or Antigravity child that needs the boundary is refused when `bwrap` cannot run; `openfarm run` checks this for its worker backend, ACP coordinator and supervisor before any card is claimed, and the refusal names the child. Codex with tool policy `read-only` is refused where Codex's own sandbox cannot start inside the boundary, as on Ubuntu with its default AppArmor rule. A `binary` that names another provider than its adapter is refused (`acp-provider-mismatch`). An Antigravity prompt over 131072 bytes is refused before `agy` starts (`agy-prompt-too-large`). `[gates] mutation = "required"` is a config error when TypeScript is in `languages`.
 - **Changed behaviour for Python.** v0.8 used `ruff` whenever it was installed; v0.8.1 uses it only where the project configures it.
-- **Changed behaviour for every language.** A named test must fail on base in every row and pass after in every row; a parametrized test's rows count as the test's. A test run the runner classes as infra (timed out, killed) is never green, and neither is one that fails without naming a failing test. `check --baseline` refuses a named test that is skipped or expected to fail on base (`ignored_on_base`).
+- **Changed behaviour for every language.** A named test must fail on base in every row and pass after in every row; a parametrized test's rows count as the test's. A test run the runner classes as infra (timed out, killed) is never green, and neither is one that fails without naming a failing test. A provider turn the child ends as cancelled is an error (`acp-turn-cancelled`), never a short answer. `check --baseline` refuses a named test that is skipped or expected to fail on base (`ignored_on_base`).
 - **The checker.** Both checker passes answer in a fixed form and are asked once more when the answer cannot be read. Counter-tests are written as new files, run one at a time, and removed, and the worktree is put back exactly.
 - **The test writer.** For a Rust integration test the brief names the library crate and says to import through it, never with `#[path]`. When the named tests cannot be listed because the test build failed, the message carries the compiler's errors. A stub the pack cannot take (malformed, or one that does not fail when called) is sent back to the test writer with the reason instead of ending the card.
 - **Logins.** openfarm finds the Claude and Codex logins through `CLAUDE_CONFIG_DIR` and `CODEX_HOME` first, then `$HOME`. A refreshed login is copied back only when it has the provider's shape for the same account and the login on disk is still the one the child started from (another child's refresh, or a new login of yours, is never overwritten); the old one is kept as `<name>.openfarm-backup`. A login kept behind a symlink is updated where the link points. `install-skill` writes to those folders too.
@@ -380,8 +380,8 @@ On the final v0.8.1 tree, Python 3.14 on Linux:
 
 | Run | Result |
 | --- | --- |
-| Default, no optional tools on `PATH` | **@@N@@ tests**, @@S0@@ skipped, **0 failures** |
-| `OPENFARM_E2E=1` with ruff 0.17.5, tsc 7.0.2, prettier 3.10.1 and cargo-mutants 27.1.0 on `PATH` | **@@N@@ tests**, @@S1@@ skipped, **0 failures** |
+| Default, no optional tools on `PATH` | **1400 tests**, 89 skipped, **0 failures** |
+| `OPENFARM_E2E=1` with ruff 0.17.5, tsc 7.0.2, prettier 3.10.1 and cargo-mutants 27.1.0 on `PATH` | **1400 tests**, 15 skipped, **0 failures** |
 
 A test that needs a real tool skips itself when the tool is missing, so the default run's skip count depends on what you have installed. Of the 15 skipped in the second run, 12 need a Python that can import pytest and pass when run under one (pytest 9.2.0); the others are stand-in tests that step aside when the real tool is there. Each test process keeps its temp files in one folder of its own and removes it at exit.
 
