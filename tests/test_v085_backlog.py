@@ -161,5 +161,66 @@ class HolderIdentityTests(unittest.TestCase):
             self.assertIn("pidns", rec)
 
 
+class SpawnRetryTests(unittest.TestCase):
+    """A CLI missing for a moment (mid-update) is tried again; others are not."""
+
+    def test_missing_then_there(self) -> None:
+        import errno
+
+        from openfarm_core.spawn import popen_with_retry
+
+        tries, waits = [], []
+
+        def popen(argv, **kw):
+            tries.append(argv)
+            if len(tries) < 3:
+                raise FileNotFoundError(errno.ENOENT, "No such file", argv[0])
+            return "proc"
+
+        self.assertEqual(popen_with_retry(["claude"], delays=(1, 2, 4), popen=popen,
+                                          sleep=waits.append), "proc")
+        self.assertEqual(waits, [1, 2])
+
+    def test_gives_up_after_the_last_wait_and_never_retries_other_errors(self) -> None:
+        import errno
+
+        from openfarm_core.spawn import popen_with_retry
+
+        def missing(argv, **kw):
+            raise FileNotFoundError(errno.ENOENT, "gone", argv[0])
+
+        waits = []
+        with self.assertRaises(FileNotFoundError):
+            popen_with_retry(["claude"], delays=(1, 2), popen=missing, sleep=waits.append)
+        self.assertEqual(waits, [1, 2])
+
+        def other(argv, **kw):
+            raise OSError(errno.E2BIG, "argument list too long")
+
+        waits = []
+        with self.assertRaises(OSError):
+            popen_with_retry(["claude"], delays=(1, 2), popen=other, sleep=waits.append)
+        self.assertEqual(waits, [])
+
+    def test_the_default_waits_and_the_suite_switch(self) -> None:
+        import os
+        from unittest import mock
+
+        from openfarm_core.spawn import SPAWN_RETRY_DELAYS, retry_delays
+
+        self.assertGreaterEqual(sum(SPAWN_RETRY_DELAYS), 10)
+        with mock.patch.dict(os.environ, {"OPENFARM_SPAWN_RETRY_DELAYS": "0.5,1"}):
+            self.assertEqual(retry_delays(), (0.5, 1.0))
+        env = {k: v for k, v in os.environ.items() if k != "OPENFARM_SPAWN_RETRY_DELAYS"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(retry_delays(), SPAWN_RETRY_DELAYS)
+
+    def test_the_bridges_and_the_driver_use_it(self) -> None:
+        for name in ("adapters/claude_native_acp.py", "adapters/codex_native_acp.py",
+                     "adapters/agy_native_acp.py", "driver.py"):
+            text = (ROOT / "openfarm_core" / name).read_text()
+            self.assertIn("popen_with_retry(", text, name)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -24,6 +24,10 @@ TEST_TMP_ROOT = tempfile.mkdtemp(prefix="openfarm-tests-", dir=os.environ.get("T
 os.environ["TMPDIR"] = TEST_TMP_ROOT
 tempfile.tempdir = TEST_TMP_ROOT
 
+# v0.8.5: a provider CLI that cannot start is tried again for about 15 s; the
+# many tests that start a missing one on purpose would each wait that long.
+os.environ.setdefault("OPENFARM_SPAWN_RETRY_DELAYS", "")
+
 os.environ["OPENFARM_GLOBAL_HARNESS"] = os.path.join(
     tempfile.mkdtemp(prefix="openfarm-test-global-"), "harness")
 

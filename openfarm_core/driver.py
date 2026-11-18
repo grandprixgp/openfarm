@@ -51,6 +51,7 @@ from .cards import Card
 from .config import Config
 from .coordinator import _clean_json_payload
 from .errors import AdapterError, Infra, Invalid, Refused, UsageError
+from .spawn import popen_with_retry
 from .git import Git
 from .globs import matches_any, normalise
 from .micromanager import SEAT_TIMEOUT_PREFIX
@@ -768,8 +769,9 @@ class DriverAgent:
             try:
                 # Its own session, so the whole group (the CLI and anything it
                 # started) can be ended before the isolated HOME is deleted.
-                proc = _POPEN(
+                proc = popen_with_retry(
                     spawn_argv,
+                    popen=_POPEN,
                     cwd=str(self.child_dir),
                     env=env,
                     stdin=subprocess.PIPE,

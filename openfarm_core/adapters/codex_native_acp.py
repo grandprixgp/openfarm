@@ -24,6 +24,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from openfarm_core import confine as confine_lib
+from openfarm_core.spawn import popen_with_retry
 
 PROTOCOL_VERSION = 1
 _AUTH_HINT_RE = re.compile(
@@ -354,7 +355,8 @@ class NativeCodexAcpServer:
             )
             return
         try:
-            proc = subprocess.Popen(
+            # A CLI mid-update is missing for a moment: try again (v0.8.5).
+            proc = popen_with_retry(
                 argv,
                 cwd=session["cwd"],
                 stdin=subprocess.PIPE,
