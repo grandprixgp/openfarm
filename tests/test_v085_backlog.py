@@ -222,5 +222,58 @@ class SpawnRetryTests(unittest.TestCase):
             self.assertIn("popen_with_retry(", text, name)
 
 
+class ConfineLinkTests(unittest.TestCase):
+    """A never_touch path written through a symlinked folder is hidden; a read
+    root that holds the home folder is refused."""
+
+    def setUp(self) -> None:
+        import os
+        import tempfile
+
+        self.base = Path(tempfile.mkdtemp(prefix="of-v085-confine-"))
+        self.addCleanup(__import__("shutil").rmtree, self.base, ignore_errors=True)
+        self.sess = self.base / "sess"
+        (self.sess / "sub").mkdir(parents=True)
+        (self.sess / "sub" / "secret").write_text("s")
+        (self.sess / "sub" / "open.txt").write_text("o")
+        os.symlink("sub", self.sess / "link")
+        os.symlink(".", self.sess / "sub" / "self")  # a loop is walked once
+
+    def _argv(self, globs, **kw):
+        from openfarm_core import confine
+
+        return confine.boundary_argv(["/bin/true"], session_dir=self.sess, home_dir=None,
+                                     hide_globs=globs, bwrap="/usr/bin/bwrap", **kw)
+
+    def test_a_glob_through_a_link_hides_the_real_file(self) -> None:
+        text = " ".join(self._argv(["link/secret"]))
+        self.assertIn(str((self.sess / "sub" / "secret").resolve()), text)
+        self.assertNotIn(str((self.sess / "sub" / "open.txt").resolve()), text)
+
+    def test_a_read_root_holding_home_is_refused(self) -> None:
+        from openfarm_core import confine
+
+        home = confine._real_home()
+        if home is None:
+            self.skipTest("no home folder")
+        with self.assertRaises(confine.ConfineError) as caught:
+            self._argv([], read_roots=[str(home.parent)])
+        self.assertEqual(caught.exception.code, "confine-read-root-holds-home")
+
+    def test_in_a_real_boundary_the_link_reads_nothing(self) -> None:
+        import subprocess
+
+        from openfarm_core import confine
+
+        ok, _why = confine.bwrap_status()
+        if not ok:
+            self.skipTest("bwrap cannot run here")
+        argv = confine.boundary_argv(["/bin/cat", str(self.sess / "link" / "secret")],
+                                     session_dir=self.sess, home_dir=None,
+                                     hide_globs=["link/secret"])
+        result = subprocess.run(argv, capture_output=True, text=True)
+        self.assertNotIn("s", result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -558,9 +558,13 @@ def scan_masks(
     if not globs and not hide_git:
         return files, dirs
     seen = 0
-    stack = [root]
+    # Each entry is (the real folder, the path it is reached by inside the session).
+    # A symlinked folder inside the session is walked again under its link's name
+    # (v0.8.5): `never_touch = ["link/secret"]` must hide the file `link/` leads to.
+    stack: list[tuple[Path, str]] = [(root, "")]
+    walked_links: set[Path] = set()
     while stack:
-        current = stack.pop()
+        current, prefix = stack.pop()
         try:
             entries = list(os.scandir(current))
         except OSError:
@@ -574,22 +578,27 @@ def scan_masks(
                     "never_touch / forbidden_files masks; the child is not started",
                 )
             full = Path(entry.path)
-            rel = full.relative_to(root).as_posix()
+            rel = f"{prefix}/{entry.name}" if prefix else full.relative_to(root).as_posix()
             hit = bool(globs) and matches_any(rel, globs)
             if hide_git and entry.name == ".git":
                 hit = True
             try:
                 if entry.is_symlink():
+                    target = full.resolve()
+                    inside = _within(target, root) and target != root
                     if hit:
-                        target = full.resolve()
-                        if _within(target, root) and target != root:
+                        if inside:
                             (dirs if target.is_dir() else files).append(target)
+                    elif (inside and globs and target.is_dir()
+                          and target not in walked_links):
+                        walked_links.add(target)
+                        stack.append((target, rel))
                     continue
                 if entry.is_dir(follow_symlinks=False):
                     if hit:
                         dirs.append(full)
                     elif entry.name != ".git":
-                        stack.append(full)
+                        stack.append((full, rel))
                 elif hit:
                     files.append(full)
             except OSError:
@@ -643,7 +652,16 @@ def boundary_argv(
     for raw in read_roots or ():
         p = Path(os.path.expanduser(str(raw)))
         if p.is_absolute() and p.exists():
-            extra_roots.append(p.resolve())
+            resolved = p.resolve()
+            # v0.8.5: a read root gets the guard an install folder gets: never
+            # the home folder or anything holding it (its keys and logins).
+            if real_home is not None and _within(real_home, resolved):
+                raise ConfineError(
+                    "confine-read-root-holds-home",
+                    f"refusing to mount confine_read_roots entry {raw!r}: it holds your "
+                    "home folder; name the folders inside it the child needs",
+                )
+            extra_roots.append(resolved)
 
     args: list[str] = [exe, *_base_args(), "--tmpfs", "/tmp"]
     bound: list[Path] = []
