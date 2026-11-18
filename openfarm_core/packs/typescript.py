@@ -1033,6 +1033,16 @@ class TypeScriptPack(Pack):
                     tests.append({"name": name.strip(), "binary": binary.strip()})
         return {"tests": tests, "errors": errors} if errors else {"tests": tests}
 
+    def row_file(self, row: dict) -> str | None:
+        """The test file of a row: the reporter's for a result, the listing's own."""
+        file = str(row.get("file", "") or "")
+        if file:
+            return file
+        binary = str(row.get("binary", "") or "")
+        if binary.endswith(_TS_EXTS + _JS_EXTS):
+            return binary
+        return None
+
     def parse_tests(self, stdout: str, stderr: str = "") -> dict:
         return _parse_node_output(stdout, stderr)
 
@@ -1417,6 +1427,8 @@ def _parse_node_output(stdout: str, stderr: str = "") -> dict:
             continue
         results.append({"name": row["name"], "binary": "", "status": row["status"]})
 
+    _name_result_files(results, events)
+
     if not seen_tap_version:
         results.extend(spec_results)
 
@@ -1499,6 +1511,38 @@ def _split_reporter_lines(stderr: str) -> tuple[list[dict], str]:
                 continue
         rest.append(line)
     return events, "\n".join(rest)
+
+
+def _name_result_files(results: list[dict], events: list[dict]) -> None:
+    """Give each result row the test file openfarm's reporter saw it in.
+
+    TAP rows carry no file, so a test named like one in another file would count
+    for it. The reporter's events do carry the file, in the same order: the rows
+    of one name are matched to that name's events one for one. Where the two
+    do not line up (a different count), the rows are left without a file, which
+    the gates read as "unknown", as before.
+    """
+    by_name: dict[str, list[str]] = {}
+    for event in events:
+        if event.get("e") not in ("pass", "fail") or event.get("type") == "suite":
+            continue
+        file = str(event.get("file", "") or "")
+        name = _clean_name(event.get("name", ""))
+        if not file or (int(event.get("nesting", 0) or 0) == 0 and name == file):
+            continue
+        by_name.setdefault(name, []).append(file)
+    rows_by_name: dict[str, list[dict]] = {}
+    for row in results:
+        if not row.get("binary"):
+            rows_by_name.setdefault(str(row.get("name", "")), []).append(row)
+    for name, rows in rows_by_name.items():
+        files = by_name.get(name) or []
+        if len(set(files)) == 1:
+            for row in rows:
+                row["file"] = files[0]
+        elif len(files) == len(rows):
+            for row, file in zip(rows, files):
+                row["file"] = file
 
 
 def _reporter_summary(events: list[dict]) -> dict:
