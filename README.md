@@ -30,11 +30,11 @@
 </p>
 
 <p align="center">
-  <img src="docs/assets/openfarm-stats.svg" alt="1411 offline tests with 0 failures, 22 CLI subcommands, 6 adapter interfaces, 0 runtime dependencies" width="100%">
+  <img src="docs/assets/openfarm-stats.svg" alt="1438 offline tests with 0 failures, 22 CLI subcommands, 6 adapter interfaces, 0 runtime dependencies" width="100%">
 </p>
 
 > [!IMPORTANT]
-> **Pre-release (v0.8.1).** v0.8.1 adds Codex and Antigravity as frontier providers next to Claude, `openfarm drive` to hold the coordinator and supervisor seats with a CLI agent, and a TypeScript pack. After the first build, two reviews and live runs with the real tools found gaps, and the fix work closed them: Codex and Antigravity children now run inside a bubblewrap boundary, the checker's counter-tests are read and run, and ruff, pytest, cargo-mutants, tsc and prettier are called the way the real programs need. An outside review of the fix work then found no blockers, and its larger findings are fixed too. The offline suite has 1411 tests with no failures. What ran live on 17 Nov 2026, and what has not run at all, is in [What's verified](#whats-verified) and [Not yet tested](#not-yet-tested). With `[swarm] enabled = false` a run behaves as in v0.7.
+> **Pre-release (v0.8.1).** v0.8.1 adds Codex and Antigravity as frontier providers next to Claude, `openfarm drive` to hold the coordinator and supervisor seats with a CLI agent, and a TypeScript pack. After the first build, two reviews and live runs with the real tools found gaps, and the fix work closed them: Codex and Antigravity children now run inside a bubblewrap boundary, the checker's counter-tests are read and run, and ruff, pytest, cargo-mutants, tsc and prettier are called the way the real programs need. An outside review of the fix work then found no blockers, and its larger findings are fixed too. The offline suite has 1438 tests with no failures. What ran live on 17 Nov 2026, and what has not run at all, is in [What's verified](#whats-verified) and [Not yet tested](#not-yet-tested). With `[swarm] enabled = false` a run behaves as in v0.7.
 
 ---
 
@@ -380,8 +380,8 @@ On the final v0.8.1 tree, Python 3.14 on Linux:
 
 | Run | Result |
 | --- | --- |
-| Default, no optional tools on `PATH` | **1411 tests**, 89 skipped, **0 failures** |
-| `OPENFARM_E2E=1` with ruff 0.17.5, tsc 7.0.2, prettier 3.10.1 and cargo-mutants 27.1.0 on `PATH` | **1411 tests**, 15 skipped, **0 failures** |
+| Default, no optional tools on `PATH` | **1438 tests**, 89 skipped, **0 failures** |
+| `OPENFARM_E2E=1` with ruff 0.17.5, tsc 7.0.2, prettier 3.10.1 and cargo-mutants 27.1.0 on `PATH` | **1438 tests**, 15 skipped, **0 failures** |
 
 A test that needs a real tool skips itself when the tool is missing, so the default run's skip count depends on what you have installed. Of the 15 skipped in the second run, 12 need a Python that can import pytest and pass when run under one (pytest 9.2.0); the others are stand-in tests that step aside when the real tool is there. Each test process keeps its temp files in one folder of its own and removes it at exit.
 
