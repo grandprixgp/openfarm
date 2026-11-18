@@ -32,13 +32,15 @@ Ensure `~/.local/bin` is on `PATH` (`export PATH="$HOME/.local/bin:$PATH"`), or 
 
 ```bash
 # Using uv (recommended if installed):
-uv tool install <GITHUB_URL_OR_LOCAL_PATH>
+uv tool install git+https://github.com/grandprixgp/openfarm   # or a local path
 
 # Or pipx:
-pipx install <GITHUB_URL_OR_LOCAL_PATH>
+pipx install git+https://github.com/grandprixgp/openfarm
 
 # Or pip (editable or standard):
-pip install --user <GITHUB_URL_OR_LOCAL_PATH>
+pip install --user git+https://github.com/grandprixgp/openfarm
+
+# A GitHub URL needs the git+ prefix: all three refuse the plain https://github.com/... URL.
 
 # Then install the bundled skill, slash command, and plugin files:
 openfarm install-skill --target all --json
