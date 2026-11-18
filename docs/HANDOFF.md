@@ -50,7 +50,7 @@ Real ruff, pytest, cargo-mutants, tsc and prettier; the checker with a live mode
 - **A standalone `codex-acp` with `read-only`** is started although its shell cannot work inside the boundary; only the bridge refuses up front.
 - **Cached input tokens** are added to a server's input count unless its own total shows they are already in it; a server that includes them and reports no total would be counted high, which stops a cap early, never late.
 - **Lock and seat takeover** trust the pid and hostname. Two processes with the same hostname in different pid namespaces (containers), or a state folder shared between machines with the same hostname, can see each other as gone.
-- **Counter-tests on a dirty worktree.** The restore is exact for the clean worktree a card normally has; a difference after the restore is logged, not failed.
+- **Counter-tests on a dirty worktree.** The restore is exact for the clean worktree a card normally has; a difference after the restore is logged, not failed. Ignored files that were already there are put back from a copy kept in memory, up to 64 MB in total; a larger one that a counter-test changes is logged as not put back.
 - **A provider CLI that updates itself during a run** can be missing for a moment (seen with Claude Code's npm auto-update, twice in one bench). Cards that start a child then stop as `infra` ("Failed to spawn"); nothing is retried. For a long run, point `[micromanager] binary` at a fixed copy or turn the CLI's auto-update off.
 - **`openfarm swarm join` errors** carry no code in JSON, so a script cannot tell `seat-occupied` from `name-taken`.
 - **No mutation tool for Python or TypeScript.**
