@@ -3603,6 +3603,11 @@ class CardRun:
         blob = self.git.show_blob(f"{self.base_commit}:{path}")
         if blob is None:
             return True  # a new file: nothing at base to compare
+        judge = getattr(self.pack, "format_clean_text", None)
+        if judge is not None:
+            verdict = judge(blob, self.worktree)
+            if verdict is not None:
+                return verdict
         scratch = self.card_layout / "frozen" / "format-check"
         scratch.mkdir(parents=True, exist_ok=True)
         temp = scratch / Path(path).name
