@@ -1447,7 +1447,7 @@ class ClaudeAcpAdapter:
                             "acp-auth-required",
                             _auth_error_hint(self.provider, message),
                         )
-                    raise Infra(f"acp-rpc-{code}", message)
+                    raise Infra(f"acp-rpc-{code}", _rpc_error_text(message, data))
                 result = msg.get("result")
                 return result if isinstance(result, dict) else {}
 
@@ -1552,7 +1552,7 @@ class ClaudeAcpAdapter:
         effort: str = "",
         timeout_s: float = 15.0,
     ) -> None:
-        targets: list[tuple[str, str]] = []
+        targets: list[tuple[str, str, str]] = []
         for opt in config_options:
             if not isinstance(opt, dict):
                 continue
@@ -1561,7 +1561,7 @@ class ClaudeAcpAdapter:
             if not opt_id:
                 continue
             if model and (opt_id == "model" or cat == "model"):
-                targets.append((opt_id, str(model)))
+                targets.append((opt_id, str(model), "model"))
             elif effort and (
                 opt_id in ("thought_level", "effort", "reasoning_effort")
                 or cat == "thought_level"
@@ -1580,13 +1580,25 @@ class ClaudeAcpAdapter:
                         resolved_eff = "high"
                     elif resolved_eff == "off" and "low" in allowed_vals:
                         resolved_eff = "low"
-                targets.append((opt_id, resolved_eff))
+                targets.append((opt_id, resolved_eff, "effort"))
 
-        for opt_id, val in targets:
+        for opt_id, val, kind in targets:
             try:
                 self.set_config_option(session_id, opt_id, val, timeout_s=timeout_s)
             except Infra as exc:
                 if exc.code == "acp-rpc--32601":
+                    continue
+                if exc.code == "acp-rpc--32602" and kind == "effort":
+                    # An effort the server refuses is a preference lost, not a
+                    # card lost: codex-acp 0.16.0 refuses any effort for a model
+                    # it has no preset for ("Reasoning effort can only be set for
+                    # known model presets"), live on 18 Nov 2026. The model
+                    # itself is still required.
+                    note = (f"the {self.provider} server refused effort {val!r} "
+                            f"({opt_id}), so its own default effort is used: {exc}")
+                    if note not in self.notes:
+                        self.notes.append(note)
+                        print(f"openfarm: {note}", file=sys.stderr)
                     continue
                 raise
 
@@ -2218,7 +2230,7 @@ class ClaudeAcpAdapter:
                                 "acp-auth-required",
                                 _auth_error_hint(self.provider, message),
                             )
-                        raise Infra(f"acp-rpc-{code}", message)
+                        raise Infra(f"acp-rpc-{code}", _rpc_error_text(message, data))
 
                     result = msg.get("result")
                     if not isinstance(result, dict):
@@ -2320,6 +2332,38 @@ class ClaudeAcpAdapter:
                     vendor_cost_usd=partial_cost,
                 )
 
+
+
+def _rpc_error_text(message: str, data: object, limit: int = 400) -> str:
+    """A JSON-RPC error's message with the server's own detail, when it gave one.
+
+    codex-acp answers a refused model with only "Internal error" in `message`
+    and the provider's reason in `data` (live, 18 Nov 2026: "The 'gpt-5.5' model
+    is not supported when using Codex with a ChatGPT account"). Without the
+    detail a dossier said only "Internal error".
+    """
+    detail = ""
+    if isinstance(data, str):
+        detail = data
+    elif isinstance(data, dict):
+        raw = data.get("message") or data.get("detail") or ""
+        detail = str(raw)
+        try:
+            nested = json.loads(detail) if detail.startswith("{") else None
+        except ValueError:
+            nested = None
+        if isinstance(nested, dict):
+            inner = nested.get("error")
+            if isinstance(inner, dict) and inner.get("message"):
+                detail = str(inner["message"])
+                if inner.get("code"):
+                    detail += f" ({inner['code']})"
+            elif nested.get("message"):
+                detail = str(nested["message"])
+    detail = " ".join(detail.split())
+    if not detail or detail == message:
+        return message
+    return f"{message}: {detail[:limit]}"
 
 def _with_cached_input(usage: dict, tokens_in: int, tokens_out: int) -> int:
     """Input tokens with the cached ones counted.

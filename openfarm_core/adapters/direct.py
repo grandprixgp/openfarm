@@ -202,7 +202,9 @@ class DirectRunner:
             try:
                 run_argv = confine_lib.runner_argv(
                     run_argv, worktree=Path(cwd or self.repo), write_roots=write_roots,
-                    hide_paths=self.confine.get("hide_paths") or ())
+                    hide_paths=self.confine.get("hide_paths") or (),
+                    unset_env=confine_lib.secret_env_names(run_env, keep=(env or {})),
+                    environ=run_env)
             except confine_lib.ConfineError as exc:
                 raise Refused("runner-confine-unavailable", exc.message) from exc
 

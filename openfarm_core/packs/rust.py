@@ -805,6 +805,31 @@ class RustPack(Pack):
     def format_check(self, paths: list[Path]) -> dict:
         return self.commands("fmt-check", files=[str(p) for p in paths])
 
+    def format_clean_text(self, text: str, cwd: Path | str | None = None) -> bool | None:
+        """Whether `text` is already rustfmt-clean, judged from stdin.
+
+        The base-commit check used to copy a file out on its own and run
+        `rustfmt --check` on it, which fails on any `mod x;` it cannot resolve.
+        So a crate root such as `src/lib.rs` always read as "not clean at base",
+        it was never formatted, and every card that touched it ended with
+        `cargo fmt --check` red (pilot, 18 Nov 2026). From stdin rustfmt does
+        not follow child modules; `cwd` lets it find the project's rustfmt.toml.
+        None when rustfmt is missing or cannot parse the text.
+        """
+        import subprocess
+        rustfmt = shutil.which("rustfmt")
+        if not rustfmt:
+            return None
+        try:
+            done = subprocess.run([rustfmt, "--edition", self.edition, "--emit", "stdout"],
+                                  input=text, capture_output=True, text=True,
+                                  cwd=str(cwd) if cwd else None, timeout=60)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if done.returncode != 0:
+            return None
+        return done.stdout == text
+
     # -- patterns -------------------------------------------------------------
 
     def patterns(self, added_lines: list[dict],

@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import re
 import shutil
 from pathlib import Path
 
@@ -2273,7 +2274,9 @@ class CardRun:
                 continue
 
             try:
+                self._format_new_tests()
                 self._prove_current_tests()
+                self._lint_new_tests()
             except GateFailure as exc:
                 if exc.code != StopCode.TESTS_UNPROVABLE:
                     raise
@@ -2434,6 +2437,80 @@ class CardRun:
         if self._tests_proven_in_phase_a:
             return
         self._prove_current_tests()
+
+    def _format_new_tests(self) -> None:
+        """Run the pack's formatter over the card's test files before they freeze.
+
+        `_format_touched` leaves frozen files alone, so whatever the test writer
+        wrote was frozen unformatted: every Rust test file in the 18 Nov 2026
+        pilot lacked its final newline and failed `cargo fmt --check`, and a
+        live TypeScript card's test file failed `prettier --check`. Formatting
+        changes no test's meaning, so it happens once here, before the proof
+        and the hashes. A file that was not format-clean at base is left alone,
+        as `_format_touched` does.
+        """
+        paths = [normalise(t.file) for t in self.card.tests if t.file]
+        paths = [p for p in dict.fromkeys(paths) if (self.worktree / p).is_file()]
+        if not paths:
+            return
+        kinds = self.pack.classify_paths(paths)
+        clean = [p for p in paths if kinds.get(p, "other") != "other"
+                 and self._was_format_clean_at_base(p)]
+        if not clean:
+            return
+        try:
+            argv = self.pack.commands("format", files=clean)["argv"]
+        except (Invalid, KeyError):
+            return
+        if not argv:
+            return
+        result = self._run(runner_kind("extra"), argv, counted="fixed")
+        if result.cls != PASS:
+            # A file the formatter cannot parse fails the proof or the lint
+            # with a clearer message; nothing to add here.
+            self.log(f"{self.card.id}: the formatter could not format the new tests")
+
+    def _lint_new_tests(self) -> None:
+        """Lint once before the tests freeze, and give the test writer its own lint.
+
+        Once frozen, a lint finding in a test file is one nobody may fix: the
+        implementer may not touch tests and `#[allow]` is banned (pilot card F1,
+        18 Nov 2026: `assert_eq!(x, true)` failed clippy after the code was right,
+        and the card was lost). A finding located in any other file, the stub
+        included, is left for the implementer's attempts as before.
+        """
+        test_files = [normalise(t.file) for t in self.card.tests if t.file]
+        if not test_files:
+            return
+        unit = self._effective_unit()
+        try:
+            argv = self.pack.commands("lint", unit=unit)["argv"]
+        except (Invalid, KeyError):
+            return
+        if not argv:
+            return
+        result = self._run(runner_kind("lint"), argv, counted="fixed")
+        if result.cls == PASS or result.cls == INFRA:
+            return
+        out, err = self._output(result)
+        text = (err or "") + "\n" + (out or "")
+        located = []
+        for path in dict.fromkeys(test_files):
+            if re.search(r"(?:^|[\s(>'\"/])" + re.escape(path) + r":\d+", text):
+                located.append(path)
+        if not located:
+            return
+        lines = [line for line in text.splitlines()
+                 if any(path in line for path in located)
+                 or line.lstrip().startswith(("error", "warning", "= help", "help:"))]
+        detail = ("the lint gate flags the tests you wrote, and they cannot change "
+                  "once frozen; write them so the lint passes (" + ", ".join(located)
+                  + "):\n" + "\n".join(lines[-40:])[-1500:])
+        # No gate record: the test writer gets this as its retry reason and the
+        # attempt log keeps it. A `fail` record stayed on file after the retry
+        # fixed the tests, and a supervisor read it as a live failure and bounced
+        # a correct card (pilot round 2, card P6, 18 Nov 2026).
+        raise GateFailure(StopCode.TESTS_UNPROVABLE, detail)
 
     def _prove_current_tests(self) -> None:
         self.phase = "prove"
@@ -3528,6 +3605,11 @@ class CardRun:
         blob = self.git.show_blob(f"{self.base_commit}:{path}")
         if blob is None:
             return True  # a new file: nothing at base to compare
+        judge = getattr(self.pack, "format_clean_text", None)
+        if judge is not None:
+            verdict = judge(blob, self.worktree)
+            if verdict is not None:
+                return verdict
         scratch = self.card_layout / "frozen" / "format-check"
         scratch.mkdir(parents=True, exist_ok=True)
         temp = scratch / Path(path).name

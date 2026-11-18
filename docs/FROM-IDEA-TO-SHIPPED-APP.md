@@ -74,9 +74,9 @@ Codex and Antigravity can supervise instead (`--provider codex|antigravity`). Re
 #### Option B — Package Install (`uv`, `pipx`, or `pip`)
 
 ```bash
-uv tool install <GITHUB_URL_OR_LOCAL_PATH>
-# or: pipx install <GITHUB_URL_OR_LOCAL_PATH>
-# or: pip install --user <GITHUB_URL_OR_LOCAL_PATH>
+uv tool install git+https://github.com/grandprixgp/openfarm   # or a local path
+# or: pipx install git+https://github.com/grandprixgp/openfarm
+# or: pip install --user git+https://github.com/grandprixgp/openfarm
 
 openfarm install-skill --target all --json
 ```

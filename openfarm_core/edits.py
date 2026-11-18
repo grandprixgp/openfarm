@@ -114,7 +114,7 @@ def parse_edits(text: str) -> list[Edit]:
         fmt = header.group("fmt")
         path = header.group("path").strip()
 
-        body = _unfence(body, path)
+        body = _unfence(body, path, search_replace=fmt not in (FORMAT_WHOLE_FILE, FORMAT_APPEND_STUB))
         if fmt == FORMAT_WHOLE_FILE:
             content = body.lstrip("\n")
             if content.endswith("\n\n"):
@@ -207,7 +207,7 @@ _TAGLESS_SUFFIXES = (
 )
 
 
-def _unfence(body: str, path: str = "") -> str:
+def _unfence(body: str, path: str = "", search_replace: bool = False) -> str:
     """Drop a Markdown code fence a model wrapped around a block.
 
     A leading fence line right under the header, and a closing fence as the
@@ -232,6 +232,12 @@ def _unfence(body: str, path: str = "") -> str:
         if last is None or not (
                 _TRAILING_JUNK.match(lines[last])
                 or (tagless and _CLOSING_TAG.match(lines[last]))):
+            break
+        if (search_replace and _SEARCH_END.match(lines[last])
+                and not any(_SEARCH_END.match(line) for line in lines[:last])):
+            # The block's own separator, with nothing after it: a deletion
+            # (live, pilot card M2, 18 Nov 2026: moving two functions out of a
+            # file ended on `>>> REPLACE` and was refused as malformed).
             break
         del lines[last:]
         trimmed = True

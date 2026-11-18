@@ -1,4 +1,4 @@
-# Openfarm v0.8.5 Usage, Operations Guide & First-Deployment Runbook
+# Openfarm v0.8.6 Usage, Operations Guide & First-Deployment Runbook
 
 > **Audience**: Human operators and autonomous frontier agents bringing up **Openfarm v0.8.1** on a Rust, Python or TypeScript repository. Part 2 and Part 3 walk through a first deployment on a Rust example crate.  
 > **Local-only guarantee**: Openfarm has **no `git push` code path**. Every passing card ends on a local branch (`openfarm/<card-id>-<slug>`) for human/frontier review and local landing.
@@ -87,19 +87,15 @@ Openfarm is a **deterministic Python 3.11+ (stdlib-only) orchestrator** that dri
 
 #### Honest Verification Boundaries
 
-The offline suite (1438 tests on the final v0.8.1 tree, no failures) covers the core with scripted models, local HTTP test servers and stand-in provider CLIs; tests that need a real tool (`bwrap`, `node`, `cargo`, ruff, pytest, cargo-mutants, `tsc`, `prettier`) skip themselves when it is missing. What ran live on 17 Nov 2026 is listed in the [README](../README.md#whats-verified) and the [build log](v0.8.1-build-log.md). Still **untested**:
+The offline suite (1557 tests on the final v0.8.6 tree, no failures) covers the core with scripted models, local HTTP test servers and stand-in provider CLIs; tests that need a real tool (`bwrap`, `node`, `cargo`, ruff, pytest, cargo-mutants, `tsc`, `prettier`) skip themselves when it is missing. What ran live is listed in the [README](../README.md#whats-verified) and the build logs ([v0.8.6](v0.8.6-build-log.md), [v0.8.1](v0.8.1-build-log.md)), with the [3-repeat bench](bench-v0.8.5.md) and the [25-card Rust pilot](pilot-v0.8.6.md). Still **untested**:
 
 - Everything Antigravity since the first agent's runs: the boundary around `agy`, the login copy, the prompt-size refusal, the driver. Nobody may run `agy` unattended here.
-- A turn through a standalone `codex-acp` server, and so per-card confined servers with it.
+- A completed turn through a standalone `codex-acp` server. On a ChatGPT login, codex-acp 0.16.0's bundled Codex core is refused by the backend.
 - Codex `read-only` inside the boundary on a system that allows a nested sandbox.
-- In `drive` with a real CLI: Ctrl-C, taking over a stale lock, a turn timeout, a spend cap stopping a priced driver, two drives under one name.
-- TypeScript on a real npm-installed project with a live model writing counter-tests (the TypeScript counter-test path ran with real node and scripted answers).
-- Remote installs from a GitHub URL with `uv`, `pipx` or `pip`.
 - Hosted worker endpoints other than Command Code.
-- The 25-card Rust pilot: not started. No card set exists for it.
-- `counter_tests = "reject"` end to end with a live implementer fixing the bounce.
 - A Claude child on an API key (`auth = "api-key"`) inside the boundary (`confine = "bwrap"`).
-- `openfarm run` refusing a run up front on a machine without bubblewrap, with the real Codex or Antigravity programs (it ran with stand-ins).
+- The v0.8.6 pre-review rule with Claude supervising, and a full 3-repeat bench on v0.8.6.
+- `openfarm run` with no bubblewrap and the real Antigravity program.
 
 ---
 
@@ -545,7 +541,7 @@ The checker is a worker role (`[model] checker`) with two passes after the end g
 - **Second pass.** `VERDICT: accept|changes-requested`, `REASONS:`, `TRACEABILITY:`, `EDGE CASES:` (at least two), then up to two counter-tests, each a complete test file under a `=== counter_test: <name>` header. An unreadable answer is asked for once more (`responses/checker-pass2-again.json`).
 - **Running counter-tests.** Each is written as a new test file (`tests/test_openfarm_counter_N.py`, `tests/openfarm_counter_N.rs` or `tests/openfarm_counter_N.test.ts`, in the unit's folder when it has a manifest, unless the model named a new test path), run alone against the card's diff, and removed. The worktree is put back exactly afterwards and checked. Each outcome (`failed`, `passed`, `dropped` when it did not compile or run, `not-run`) is written to `gates/counter-test-N.json` and shown in dossier section 6.
 - **`[gates] counter_tests = "report"`** (default): a failing counter-test is reported. A second pass that is still unreadable passes the gate with "nothing was checked".
-- **`counter_tests = "reject"`**: a failing counter-test goes to the micromanager's `adjudicate_checker` (which may dismiss it as a false reject) or, without one, back to the implementer once with the counter-test's output. Still failing, the card blocks `checker-reject`. A second pass still unreadable after the second ask also blocks `checker-reject`. Untested live end to end.
+- **`counter_tests = "reject"`**: a failing counter-test goes to the micromanager's `adjudicate_checker` (which may dismiss it as a false reject) or, without one, back to the implementer once with the counter-test's output. Still failing, the card blocks `checker-reject`. A second pass still unreadable after the second ask also blocks `checker-reject`. Tested live end to end on 18 Nov 2026 on a TypeScript card: a live counter-test failed, the supervisor upheld it and the implementer fixed the gap. In the 25-card Rust pilot no counter-test was a false reject ([pilot report](pilot-v0.8.6.md#4-counter_tests--reject)).
 - The verdict alone never blocks a card; only a failing counter-test does.
 
 ---
