@@ -48,5 +48,49 @@ class JoinErrorCodeTests(unittest.TestCase):
         self.assertEqual(payload["code"], "name-taken")
 
 
+import importlib.util
+
+HAS_PYTEST = importlib.util.find_spec("pytest") is not None
+
+
+@unittest.skipUnless(HAS_PYTEST, "the Python running the suite cannot import pytest")
+class KnownFailingRowsTests(unittest.TestCase):
+    """A parametrized named test with every case on `known_failing` is refused;
+    one with only some cases there goes on as before."""
+
+    def _run(self, known):
+        from tests.test_python_e2e import GOOD_IMPLEMENTATION, run_cli, script
+        from tests.test_v081b_packs_pytest import PARAM_TEST, PYTEST_PYPROJECT
+
+        toy = build_python_toy()
+        self.addCleanup(toy.cleanup)
+        toy.write("pyproject.toml", PYTEST_PYPROJECT)
+        toy.config.write_text(toy.config.read_text().replace(
+            "known_failing = []", "known_failing = [" + ", ".join(f'"{k}"' for k in known) + "]"))
+        toy.write_card(
+            "CARD-1", title="A full bundle refuses a push", category="pinned-bugfix",
+            unit=".", touches=["tally/bounded.py"],
+            tests=[{"name": "test_a_full_bundle_refuses_a_push", "file": "tests/test_full.py"}],
+            done_text="`Bounded(1).push(8)` after one push raises `FullError`.")
+        toy.commit("tally: pytest, CARD-1")
+        sp = script(**{
+            "CARD-1/test_writer": "=== whole_file: tests/test_full.py\n" + PARAM_TEST,
+            "CARD-1/implementer": GOOD_IMPLEMENTATION,
+            "CARD-1/checker_pass1": "RESTATEMENT: a full bundle refuses a push",
+            "CARD-1/checker_pass2": "{}"})
+        result = run_cli(toy.root, "run", "--card", "CARD-1", "--script", str(sp), "--cards", "1")
+        return json.loads(result.stdout)["outcomes"][0]
+
+    def test_every_case_known_failing_is_refused(self) -> None:
+        rows = [f"test_a_full_bundle_refuses_a_push[{n}]" for n in (1, 2, 3)]
+        outcome = self._run(rows)
+        self.assertEqual(outcome["stop_code"], "ineligible", outcome)
+        self.assertIn("known_failing list in every case", outcome.get("detail", ""))
+
+    def test_some_cases_known_failing_is_not_refused_here(self) -> None:
+        outcome = self._run(["test_a_full_bundle_refuses_a_push[1]"])
+        self.assertNotIn("known_failing list in every case", outcome.get("detail", ""))
+
+
 if __name__ == "__main__":
     unittest.main()

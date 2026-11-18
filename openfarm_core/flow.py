@@ -2477,6 +2477,22 @@ class CardRun:
             raise GateFailure(StopCode.TESTS_UNPROVABLE,
                               "the test binary does not list: "
                               + ", ".join(missing[:10]) + why)
+        # The eligibility rule compares exact names, so a parametrized test whose
+        # every case is on `known_failing` got past it: its rows say so here.
+        known = set(self.cfg.known_failing or ())
+        all_known = [name for name in self.card.test_names
+                     if listed_rows[name]
+                     and all(str(r.get("name", "")) in known for r in listed_rows[name])]
+        if all_known:
+            self._record_gate(GateResult(
+                "named-tests-exist", FAIL,
+                "every case of these named tests is on the known_failing list: "
+                + ", ".join(all_known[:10]),
+                {"known_failing_rows": {n: [r.get("name") for r in listed_rows[n]]
+                                        for n in all_known}}))
+            raise GateFailure(StopCode.INELIGIBLE,
+                              "the card's test(s) " + ", ".join(all_known[:10])
+                              + " are on the known_failing list in every case")
         self._record_gate(GateResult("named-tests-exist", PASS,
                                      f"{len(self.card.test_names)} named test(s) "
                                      f"listed"))
