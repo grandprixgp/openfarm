@@ -546,14 +546,16 @@ class DriverAgent:
         except confine_lib.ConfineError as exc:
             raise Refused("acp-confine-unavailable", exc.message) from exc
 
-    def _sync_back(self, isolated_home: Path, target: Path, initial: bytes | None) -> None:
+    def _sync_back(self, isolated_home: Path, target: Path, initial: bytes | None,
+                   pinned: str | None = None) -> None:
         """Copy a refreshed login back to `target` through `logins.sync_back` only.
 
         A refused copy leaves the real login alone and is noted with its reason,
         never its content.
         """
         result = logins.sync_back(
-            self.provider, isolated_home=isolated_home, target=target, initial=initial)
+            self.provider, isolated_home=isolated_home, target=target, initial=initial,
+            pinned=pinned)
         self.last_sync = result
         if result.status == "refused":
             note = (
@@ -697,6 +699,7 @@ class DriverAgent:
             iso_rel = logins.isolated_place(self.provider, isolated_home).credential.relative_to(
                 isolated_home).parts
             initial_bytes, _why = logins.read_isolated(isolated_home, iso_rel)
+        cred_pin = logins.pin_path(cred_source) if cred_source is not None else None
 
         spawned = False
         synced = False
@@ -739,7 +742,7 @@ class DriverAgent:
 
             if isolated_home is not None and cred_source is not None:
                 synced = True
-                self._sync_back(isolated_home, cred_source, initial_bytes)
+                self._sync_back(isolated_home, cred_source, initial_bytes, cred_pin)
         finally:
             if spawned and not synced and isolated_home is not None and cred_source is not None:
                 # A turn that timed out or failed may still have refreshed the
@@ -747,7 +750,7 @@ class DriverAgent:
                 # tried before the isolated HOME goes. A failure here is a note,
                 # never a second error over the first.
                 try:
-                    self._sync_back(isolated_home, cred_source, initial_bytes)
+                    self._sync_back(isolated_home, cred_source, initial_bytes, cred_pin)
                 except Exception as exc:  # noted: the turn's own error wins
                     note = (
                         f"the {self.provider} login could not be checked for a refresh "

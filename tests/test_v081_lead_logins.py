@@ -104,7 +104,110 @@ class CopyBackOnlyOverItsOwnStartTests(unittest.TestCase):
         self.assertTrue(self.dest.is_symlink())
 
 
+class PinnedAndLockedTests(CopyBackOnlyOverItsOwnStartTests):
+    """Second outside review, 1 and 2."""
+
+    def test_a_link_made_while_the_child_ran_is_not_followed(self) -> None:
+        # The login was a plain file at copy-in; by copy-back the path is a link
+        # to another profile that holds the same bytes.
+        pin = logins.pin_path(self.dest)
+        other = self.tmp / "other" / "auth.json"
+        other.parent.mkdir()
+        other.write_bytes(self.initial)
+        self.dest.unlink()
+        self.dest.symlink_to(other)
+        iso = self._child("a", _codex("a2", "r2", "2026-11-02T00:00:00Z"))
+        result = logins.sync_back("codex", isolated_home=iso, target=self.dest,
+                                  initial=self.initial, pinned=pin)
+        self.assertEqual(result.status, "refused")
+        self.assertIn("leads somewhere else", result.reason)
+        self.assertEqual(other.read_bytes(), self.initial)
+
+    def test_a_retargeted_link_is_not_followed(self) -> None:
+        store = self.tmp / "store" / "auth.json"
+        store.parent.mkdir()
+        store.write_bytes(self.initial)
+        self.dest.unlink()
+        self.dest.symlink_to(store)
+        pin = logins.pin_path(self.dest)
+        other = self.tmp / "other" / "auth.json"
+        other.parent.mkdir()
+        other.write_bytes(self.initial)
+        self.dest.unlink()
+        self.dest.symlink_to(other)
+        iso = self._child("a", _codex("a2", "r2", "2026-11-02T00:00:00Z"))
+        result = logins.sync_back("codex", isolated_home=iso, target=self.dest,
+                                  initial=self.initial, pinned=pin)
+        self.assertEqual(result.status, "refused")
+        self.assertEqual(other.read_bytes(), self.initial)
+        self.assertEqual(store.read_bytes(), self.initial)
+
+    def test_an_unchanged_link_still_updates_where_it_points(self) -> None:
+        store = self.tmp / "store" / "auth.json"
+        store.parent.mkdir()
+        store.write_bytes(self.initial)
+        self.dest.unlink()
+        self.dest.symlink_to(store)
+        new = _codex("a2", "r2", "2026-11-02T00:00:00Z")
+        result = logins.sync_back("codex", isolated_home=self._child("a", new), target=self.dest,
+                                  initial=self.initial, pinned=logins.pin_path(self.dest))
+        self.assertEqual(result.status, "synced")
+        self.assertTrue(self.dest.is_symlink())
+        self.assertEqual(store.read_bytes(), new)
+
+    def test_two_children_at_once_cannot_both_replace_the_login(self) -> None:
+        # Both pass the read of the old login together unless the compare and the
+        # write are one step: the first holds the lock inside the compare until
+        # the second is waiting for it.
+        import threading
+        import time
+        first = _codex("a2", "r2", "2026-11-02T00:00:00Z")
+        second = _codex("a3", "r3", "2026-11-02T00:00:05Z")
+        isos = [self._child("a", first), self._child("b", second)]
+        real_replace = logins._replace_checked
+        inside = threading.Event()
+
+        def slow_replace(dest, raw, initial):
+            inside.set()
+            time.sleep(0.4)
+            return real_replace(dest, raw, initial)
+
+        results: dict[int, logins.SyncResult] = {}
+
+        def run(index: int) -> None:
+            results[index] = self._sync(isos[index])
+
+        logins._replace_checked = slow_replace
+        self.addCleanup(setattr, logins, "_replace_checked", real_replace)
+        one = threading.Thread(target=run, args=(0,))
+        one.start()
+        self.assertTrue(inside.wait(5))
+        two = threading.Thread(target=run, args=(1,))
+        two.start()
+        one.join(10)
+        two.join(10)
+        self.assertEqual(sorted(r.status for r in results.values()), ["refused", "synced"])
+        self.assertEqual(results[0].status, "synced")
+        self.assertEqual(self.dest.read_bytes(), first)
+        self.assertEqual((self.real / ("auth.json" + logins.BACKUP_SUFFIX)).read_bytes(),
+                         self.initial)
+
+
 class AntigravityTokenShapeTests(unittest.TestCase):
+    def test_a_json_token_with_its_tokens_emptied_is_refused(self) -> None:
+        # Second outside review, 3: the fields were there, the values were gone.
+        old = json.dumps({"access_token": "at-1", "refresh_token": "rt-1",
+                          "email": "a@example.com", "expiry": 100, "scopes": ["x"]}).encode()
+        for change in ({"access_token": None}, {"refresh_token": ""}, {"access_token": 7},
+                       {"scopes": []}, {"refresh_token": "   "}):
+            with self.subTest(change=change):
+                new = dict(json.loads(old), **change)
+                problem = logins.check_shape("antigravity", json.dumps(new).encode(), old)
+                self.assertTrue(problem)
+                self.assertNotIn("at-1", problem)
+        fine = dict(json.loads(old), access_token="at-2", expiry=200)
+        self.assertEqual(logins.check_shape("antigravity", json.dumps(fine).encode(), old), "")
+
     def _check(self, new: bytes, old: bytes | None) -> str:
         return logins.check_shape("antigravity", new, old)
 

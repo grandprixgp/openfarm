@@ -951,6 +951,10 @@ class ClaudeAcpAdapter:
             iso_rel = self._isolated_cred_path(isolated_home).relative_to(isolated_home).parts
             initial, _why = logins.read_isolated(isolated_home, iso_rel)
             self._initial_creds_bytes = initial
+            # Where the login really was when it was copied in: the copy-back
+            # goes there or nowhere.
+            self._cred_pin = (logins.pin_path(self._cred_source)
+                              if self._cred_source is not None else None)
         argv = list(self.argv)
         if self.transport == "server":
             self.process_hold = hold
@@ -1277,6 +1281,7 @@ class ClaudeAcpAdapter:
             isolated_home=self._isolated_home,
             target=self._cred_source,
             initial=self._initial_creds_bytes,
+            pinned=getattr(self, "_cred_pin", None),
         )
         self.last_sync = result
         if result.status == "refused":
