@@ -566,7 +566,7 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
                 _transport, hold = _SharedAcpSupervisor.hold_of(
                     backend.command, backend.provider, "none", backend.confine)
                 out.append((child, backend.provider, hold, None))
-            except Exception as exc:  # noqa: BLE001 - said by the caller, never lost
+            except Exception as exc:  # said by the caller, never lost
                 out.append((child, provider, None, exc))
             finally:
                 if backend is not None:
@@ -578,7 +578,7 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
                     sup_proto.command, sup_proto.provider, sup_proto.tool_policy,
                     getattr(sup_proto, "confine", None))
                 out.append(("supervisor", sup_proto.provider, hold, None))
-            except Exception as exc:  # noqa: BLE001 - said by the caller, never lost
+            except Exception as exc:  # said by the caller, never lost
                 out.append(("supervisor", sup_proto.provider, None, exc))
         return out
 
