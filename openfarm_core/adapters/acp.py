@@ -890,6 +890,9 @@ class ClaudeAcpAdapter:
         self._seen_request_ids: dict[str, set[tuple[type, object]]] = {}
         self._session_ids: list[str] = []
         self._session_cost_usd: float = 0.0
+        #: Cumulative cost the server has reported, per session: sessions of
+        #: parallel cards share this process and each counts from its own total.
+        self._session_costs: dict[str, float] = {}
         self.last_usage: AcpUsage = AcpUsage()
 
     def __enter__(self) -> "ClaudeAcpAdapter":
@@ -1333,6 +1336,7 @@ class ClaudeAcpAdapter:
             self._session_ids.clear()
             self._session_roots.clear()
             self._session_cost_usd = 0.0
+            self._session_costs.clear()
             self._initial_creds_bytes = None
             self._boundary_root = None
             self._cleanup_isolated_home()
@@ -1678,7 +1682,7 @@ class ClaudeAcpAdapter:
                     effort=effort,
                     timeout_s=min(15.0, float(timeout_s)),
                 )
-        self._session_cost_usd = 0.0
+        self._session_costs[session_id] = 0.0
         self._session_policies[session_id] = tool_policy
         self._remember_session_root(session_id, cwd)
         self._seen_request_ids.setdefault(session_id, set())
@@ -1744,7 +1748,7 @@ class ClaudeAcpAdapter:
         finally:
             self._replaying_history = False
 
-        self._session_cost_usd = 0.0
+        self._session_costs[session_id] = 0.0
         self._session_policies[session_id] = tool_policy
         self._remember_session_root(session_id, cwd)
         self._seen_request_ids.setdefault(session_id, set())
@@ -2268,10 +2272,9 @@ class ClaudeAcpAdapter:
                         raise
 
                     if latest_cum_cost is not None:
-                        turn_vendor_cost = max(0.0, latest_cum_cost - self._session_cost_usd)
-                        self._session_cost_usd = max(
-                            self._session_cost_usd, latest_cum_cost
-                        )
+                        seen_cost = self._session_costs.get(session_id, 0.0)
+                        turn_vendor_cost = max(0.0, latest_cum_cost - seen_cost)
+                        self._session_costs[session_id] = max(seen_cost, latest_cum_cost)
                     else:
                         turn_vendor_cost = 0.0
 
@@ -2294,15 +2297,14 @@ class ClaudeAcpAdapter:
                     )
         finally:
             if not turn_completed:
+                seen_cost = self._session_costs.get(session_id, 0.0)
                 partial_cost = (
-                    max(0.0, latest_cum_cost - self._session_cost_usd)
+                    max(0.0, latest_cum_cost - seen_cost)
                     if latest_cum_cost is not None
                     else 0.0
                 )
                 if latest_cum_cost is not None:
-                    self._session_cost_usd = max(
-                        self._session_cost_usd, latest_cum_cost
-                    )
+                    self._session_costs[session_id] = max(seen_cost, latest_cum_cost)
                 self.last_usage = AcpUsage(
                     tokens_in=update_tokens_in or 0,
                     tokens_out=update_tokens_out or 0,
