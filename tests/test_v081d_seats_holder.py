@@ -313,6 +313,48 @@ class TwoDrivesOneNameTests(unittest.TestCase):
         self.assertEqual(roster.count("d-sup joined seat supervisor (agent)"), 1, roster)
         self.assertEqual(roster.count("d-sup left seat supervisor (drive ended)"), 1, roster)
 
+    def test_a_drive_takes_over_a_seat_whose_holder_is_gone(self) -> None:
+        run_id = "run-takeover"
+        board = Board(self.toy.state_dir / "runs" / run_id / "board",
+                      state_dir=StateDir(self.toy.state_dir))
+        board.ensure()
+        # A drive that died without ending (kill -9, say) left its seat behind.
+        gone = {**new_seat_holder(), "pid": _dead_pid()}
+        swarm_join(board, load_config(self.toy.root), name="d-sup", seat="supervisor",
+                   owner_kind="agent", holder=gone)
+        run_result: dict = {}
+
+        def _run() -> None:
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                run_result["rc"] = cli_main(["--repo", str(self.toy.root), "--json", "run",
+                                             "--card", "CARD-1", "--run-id", run_id,
+                                             "--script", str(self.worker)])
+            run_result["err"] = err.getvalue()
+
+        run_th = threading.Thread(target=_run, daemon=True)
+        run_th.start()
+        self.addCleanup(run_th.join, 60.0)
+        ev = threading.Event()
+        for _ in range(500):
+            if board.head_seq() > 1 or not run_th.is_alive():
+                break
+            ev.wait(0.02)
+        with contextlib.redirect_stderr(io.StringIO()):
+            res = drive_run(self.toy.root, load_config(self.toy.root),
+                            StateDir(self.toy.state_dir), agent="claude", seat="supervisor",
+                            run_id=run_id, driver_name="d", script=self.driver)
+        run_th.join(60.0)
+        self.assertEqual(run_result.get("rc"), EXIT_OK, run_result.get("err", "")[-1500:])
+        self.assertEqual(res["outcomes"][0]["final_state"], "in-review", res["outcomes"])
+        self.assertTrue(any(n.startswith("took over seat supervisor as d-sup from a holder "
+                                         f"that is no longer running (pid {gone['pid']}")
+                            for n in res["notes"]), res["notes"])
+        roster = _roster(board)
+        self.assertTrue(any(r.startswith("d-sup took over seat supervisor (agent)")
+                            for r in roster), roster)
+        self.assertEqual(roster.count("d-sup left seat supervisor (drive ended)"), 1, roster)
+
 
 if __name__ == "__main__":
     unittest.main()

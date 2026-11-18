@@ -151,6 +151,30 @@ class RefusedChildStopsTheRunTests(unittest.TestCase):
                                                                "supervisor"))
         self._assert_nothing_claimed()
 
+    def test_a_codex_server_coordinator_without_bwrap_refuses_the_run(self) -> None:
+        self._configure(supervisor="off", swarm='coordinator = "codex-acp"\n')
+        rc, payload, _err = self._run()
+        self.assertEqual(rc, EXIT_REFUSED, payload)
+        self.assertEqual((payload["code"], payload["child"]), ("acp-confine-unavailable",
+                                                               "coordinator"))
+        self._assert_nothing_claimed()
+
+    def test_a_managed_drive_whose_run_is_refused_says_so(self) -> None:
+        from openfarm_core.config import load_config
+        from openfarm_core.driver import drive_run
+        from openfarm_core.state import StateDir
+        self._configure(worker="codex-acp", supervisor="off")
+        driver = Path(self.toy.base) / "driver.json"
+        driver.write_text(json.dumps({"driver/*": {"actions": [], "answers": []}}))
+        with mock.patch.object(confine_lib, "bwrap_status", return_value=UNUSABLE):
+            res = drive_run(self.toy.root, load_config(self.toy.root),
+                            StateDir(self.toy.state_dir), agent="claude", seat="supervisor",
+                            card_ids=["CARD-1"], script=driver)
+        self.assertTrue(res["refused"], res)
+        self.assertEqual(res["code"], "acp-confine-unavailable")
+        self.assertEqual(res["driver_turns"], 0)
+        self._assert_nothing_claimed()
+
     def test_a_swarm_seat_set_to_off_is_no_acp_child(self) -> None:
         self._configure(swarm='supervisor = "off"\n')
         rc, payload, err = self._run("--script", str(self.worker))
