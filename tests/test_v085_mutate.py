@@ -117,21 +117,24 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(parsed["total"], 2)
         self.assertTrue(parsed["capped"])
 
-    def test_with_a_base_only_changed_lines(self) -> None:
+    def test_with_lines_only_those_lines(self) -> None:
+        self._run("--lines", json.dumps({"pkg/m.py": [8]}))
+        lines = {o["line"] for o in json.loads((self.out / "outcomes.json").read_text())["outcomes"]}
+        self.assertEqual(lines, {8})
+        self.assertEqual((self.root / "pkg" / "m.py").read_text(), MODULE)
+
+    def test_changed_lines_are_read_from_a_diff(self) -> None:
         git = ["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"]
         subprocess.run(["git", "init", "-q"], cwd=self.root, check=True)
         subprocess.run([*git, "add", "-A"], cwd=self.root, check=True)
         subprocess.run([*git, "commit", "-qm", "base"], cwd=self.root, check=True)
-        base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.root,
-                              capture_output=True, text=True).stdout.strip()
         text = MODULE.replace("    return hi if x > hi else x\n",
-                              "    return hi if x >= hi else x\n")
+                              "    return hi if x >= hi else x\n") + "\n\nLIMIT = 3\n"
         (self.root / "pkg" / "m.py").write_text(text)
-        self.assertEqual(mutate.changed_lines(self.root, base, "pkg/m.py"), {8})
-        self._run("--base", base)
-        lines = {o["line"] for o in json.loads((self.out / "outcomes.json").read_text())["outcomes"]}
-        self.assertEqual(lines, {8})
-        self.assertEqual((self.root / "pkg" / "m.py").read_text(), text)
+        diff = subprocess.run(["git", "diff", "HEAD", "--", "pkg/m.py"], cwd=self.root,
+                              capture_output=True, text=True, check=True).stdout
+        self.assertEqual(mutate.changed_lines_from_diff(diff), {"pkg/m.py": {8, 9, 10, 11}})
+        self.assertEqual(mutate.changed_lines_from_diff(""), {})
 
 
 class PackTests(unittest.TestCase):
@@ -143,11 +146,11 @@ class PackTests(unittest.TestCase):
             out = Path(tempfile.mkdtemp(prefix="of-v085-mut-out-"))
             self.addCleanup(shutil.rmtree, out, ignore_errors=True)
             pack.mutation_output = out
-            pack.mutation_base = "abc123"
+            pack.mutation_lines = {"a.py": {3, 1}}
             argv = pack.commands("mutation", files=["a.py"], tests=["test_a"])["argv"]
             self.assertIn("--lang", argv)
             self.assertEqual(argv[argv.index("--lang") + 1], lang)
-            self.assertEqual(argv[argv.index("--base") + 1], "abc123")
+            self.assertEqual(json.loads(argv[argv.index("--lines") + 1]), {"a.py": [1, 3]})
             self.assertEqual(argv[-1], "a.py")
             test_argv = json.loads(argv[argv.index("--test-argv") + 1])
             self.assertTrue(test_argv)

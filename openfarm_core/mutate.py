@@ -8,14 +8,15 @@ fail and `missed` when they still pass. It is run as a script (standard library
 only), so it needs nothing installed in the project:
 
     python mutate.py --lang python --out DIR --test-argv JSON
-                     [--base SHA] [--max N] [--timeout S] FILE...
+                     [--lines JSON] [--max N] [--timeout S] FILE...
 
 Python mutants come from the syntax tree (comparison and arithmetic operators,
 `and`/`or`, `not`, `True`/`False`, number constants, returned values). TypeScript
 mutants are token swaps outside strings and comments; `<` and `>` are swapped only
 with spaces round them, so generics (`Array<string>`) are left alone. With
-`--base`, only lines the card changed since that commit are mutated; a file with
-no changed line (a test-backfill card's unit) is mutated whole.
+`--lines` (`{"path": [line, ...]}`, the lines the card changed, which the flow
+reads from git), only those lines are mutated; a file with no changed line (a
+test-backfill card's unit) is mutated whole.
 
 Before any mutant the named tests run once on the code as it is: if they fail
 there, nothing is judged (exit 4, as cargo-mutants does). A mutant whose test run
@@ -228,20 +229,31 @@ def typescript_mutants(source: str, lines: set[int] | None) -> list[dict]:
 
 # -- running --------------------------------------------------------------------
 
-def changed_lines(root: Path, base: str, rel: str) -> set[int] | None:
-    """Lines of `rel` added or changed since `base`, or None when git cannot say."""
-    try:
-        diff = subprocess.run(["git", "diff", "--no-color", "-U0", base, "--", rel],
-                              cwd=root, capture_output=True, text=True, timeout=60)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if diff.returncode != 0:
-        return None
-    lines: set[int] = set()
-    for match in re.finditer(r"^@@ -\S+ \+(\d+)(?:,(\d+))? @@", diff.stdout, re.M):
-        first, count = int(match.group(1)), int(match.group(2) or 1)
-        lines.update(range(first, first + count))
-    return lines
+def changed_lines_from_diff(diff: str) -> dict[str, set[int]]:
+    """`{path: lines}` added or changed, read from a unified diff (any context)."""
+    out: dict[str, set[int]] = {}
+    path, line = None, 0
+    for raw in diff.splitlines():
+        if raw.startswith("+++ "):
+            name = raw[4:].strip()
+            path = None if name == "/dev/null" else (name[2:] if name.startswith("b/") else name)
+            if path is not None:
+                out.setdefault(path, set())
+            continue
+        if raw.startswith("--- ") or raw.startswith("diff ") or raw.startswith("index "):
+            continue
+        hunk = re.match(r"^@@ -\S+ \+(\d+)(?:,\d+)? @@", raw)
+        if hunk:
+            line = int(hunk.group(1))
+            continue
+        if path is None or not raw or raw.startswith("\\"):
+            continue
+        if raw[0] == "+":
+            out[path].add(line)
+            line += 1
+        elif raw[0] == " ":
+            line += 1
+    return out
 
 
 def spread(items: list, limit: int) -> list:
@@ -297,7 +309,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--lang", choices=("python", "typescript"), required=True)
     parser.add_argument("--out", required=True)
     parser.add_argument("--test-argv", required=True, help="JSON list: the named tests' command")
-    parser.add_argument("--base", default="")
+    parser.add_argument("--lines", default="", help='JSON {"path": [line, ...]}')
     parser.add_argument("--max", type=int, default=DEFAULT_MAX_MUTANTS)
     parser.add_argument("--timeout", type=float, default=0.0,
                         help="seconds per mutant (default: 3x the baseline run + 10)")
@@ -307,6 +319,9 @@ def main(argv: list[str] | None = None) -> int:
         test_argv = json.loads(args.test_argv)
         if not isinstance(test_argv, list) or not test_argv:
             raise ValueError("--test-argv must be a non-empty JSON list")
+        wanted = json.loads(args.lines) if args.lines else None
+        if wanted is not None and not isinstance(wanted, dict):
+            raise ValueError("--lines must be a JSON object")
     except (SystemExit, ValueError) as exc:
         print(f"openfarm-mutate: usage: {exc}", file=sys.stderr)
         return EXIT_USAGE
@@ -336,7 +351,7 @@ def main(argv: list[str] | None = None) -> int:
             continue
         originals[rel] = data
         mtimes[rel] = (info.st_atime_ns, info.st_mtime_ns)
-        lines = changed_lines(root, args.base, rel) if args.base else None
+        lines = set(wanted.get(rel) or ()) if wanted is not None else None
         mutants = make(data.decode("utf-8", errors="replace"), lines or None)
         plan.extend((rel, m) for m in mutants)
     total_found = len(plan)

@@ -271,14 +271,14 @@ class OwnMutationMixin:
     """`[gates] mutation` through openfarm's own runner (`openfarm_core/mutate.py`,
     v0.8.5), for packs whose language has no mutation tool openfarm can call.
 
-    The flow sets `mutation_output` (the card's evidence folder) and, where the
-    pack has it, `mutation_base` (the card's base commit, so only changed lines are
-    mutated). The runner's result is read from its `outcomes.json`.
+    The flow sets `mutation_output` (the card's evidence folder) and
+    `mutation_lines` (`{path: [line, ...]}` changed since the card's base, so only
+    those lines are mutated). The runner's result is read from its `outcomes.json`.
     """
 
     mutation_language = ""
     mutation_output = None
-    mutation_base = ""
+    mutation_lines = None
     _mutation_dir = None
     _mutation_runs = 0
 
@@ -301,8 +301,9 @@ class OwnMutationMixin:
         test_argv = self.commands("test", tests=list(tests or []))["argv"]
         argv = [sys.executable, "-I", str(Path(mutate.__file__)), "--lang", self.mutation_language,
                 "--out", str(out), "--test-argv", json.dumps(test_argv)]
-        if self.mutation_base:
-            argv += ["--base", str(self.mutation_base)]
+        if self.mutation_lines is not None:
+            argv += ["--lines", json.dumps({str(k): sorted(v) for k, v in
+                                            self.mutation_lines.items()})]
         return argv + [str(f) for f in (files or [])]
 
     def read_mutation(self, stdout: str, stderr: str = "", exit_code=None) -> dict:

@@ -1702,8 +1702,7 @@ class Micromanager:
         raw = self._call_backend("scaffold_contract", card.id, payload)
         return self._scaffold_from_answer(card, raw, nt, fb)
 
-    def _scaffold_from_answer(self, card: Card, raw: dict, nt, fb,
-                              *, missing_ok: bool = False) -> list[Edit]:
+    def _scaffold_from_answer(self, card: Card, raw: dict, nt, fb) -> list[Edit]:
         parsed_edits: list[Edit] = []
         raw_blocks = raw.get("edit_blocks")
         raw_list = raw.get("edits")
@@ -1755,8 +1754,6 @@ class Micromanager:
                         test_name=str(entry.get("test_name", "")),
                     )
                 )
-        elif missing_ok and raw_blocks is None and raw_list is None:
-            return []
         else:
             raise Invalid(
                 "bad-micromanager-edits",
@@ -1840,12 +1837,14 @@ class Micromanager:
         base_files: dict,
         known_tests=None,
         cfg=None,
-    ) -> tuple[ShapeDecision, list[Edit] | AdapterError | ValueError]:
+    ) -> tuple[ShapeDecision, list[Edit] | AdapterError | ValueError | None]:
         """Shape the card and declare its contract in one supervisor call.
 
         The scaffold half comes back as the edits, or as the error the separate
         `scaffold_contract` would have raised, so the test-writer step handles it
         exactly as before. A bad shape answer raises, as `shape_and_plan` does.
+        None means the answer carried no contract at all, so the flow falls back
+        to a separate `scaffold_contract` call.
         """
         nt, fb = self._effective_lists(cfg=cfg)
         payload = {
@@ -1860,9 +1859,13 @@ class Micromanager:
             payload["harness_context"] = dict(self.harness_context)
         raw = self._call_backend("shape_and_scaffold", card.id, payload)
         decision = self._shape_from_answer(card, raw, nt, fb, op="shape_and_scaffold")
+        if raw.get("edit_blocks") is None and raw.get("edits") is None:
+            # The answer shaped the card but left the contract out altogether (an
+            # empty list is "nothing to declare"): the flow asks for it on its own.
+            return decision, None
         try:
             edits: list[Edit] | AdapterError | ValueError = self._scaffold_from_answer(
-                card, raw, nt, fb, missing_ok=True)
+                card, raw, nt, fb)
         except (AdapterError, ValueError) as exc:
             edits = exc
         return decision, edits

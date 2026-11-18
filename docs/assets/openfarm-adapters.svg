@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1280" height="404" viewBox="0 0 1280 404" role="img" aria-labelledby="arch-t arch-d">
 <title id="arch-t">openfarm core and six adapter interfaces</title>
-<desc id="arch-d">openfarm core (Python 3.11+ stdlib, one config file) enforcing gates, budgets, swarm board, and stdlib TUI across six replaceable adapter interfaces: Card source (files: folder on openfarm-cards), Runner (direct cargo, python, node, BuildLimiter), Language pack (rust, python, typescript), Model backend (openai-compatible, claude/agy/codex-acp, scripted), Telemetry (jsonl plus run board and dossiers), and Micromanager and seats (claude/agy/codex-acp, openfarm drive, tier:&lt;name&gt;, external, off). Every interface also accepts cmd:&lt;argv&gt;.</desc>
+<desc id="arch-d">openfarm core (Python 3.11+ stdlib, one config file) enforcing gates, budgets, swarm board, and stdlib TUI across six replaceable adapter interfaces: Card source (files: folder on openfarm-cards), Runner (direct cargo, python, node, BuildLimiter, an opt-in bwrap boundary), Language pack (rust, python, typescript), Model backend (openai-compatible, claude/agy/codex-acp, scripted), Telemetry (jsonl plus run board and dossiers), and Micromanager and seats (claude/agy/codex-acp, openfarm drive, tier:&lt;name&gt;, external, off). Every interface also accepts cmd:&lt;argv&gt;.</desc>
 <defs>
   <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
     <stop offset="0" stop-color="#0b1220"/><stop offset="1" stop-color="#17233d"/>
@@ -31,7 +31,7 @@
 
 <rect x="40" y="184" width="360" height="86" rx="12" fill="#38bdf8" fill-opacity="0.10" stroke="#38bdf8" stroke-opacity="0.75" stroke-width="1.5"/>
 <text x="62" y="217" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="17.5" font-weight="700" fill="#f1f5f9" text-anchor="start">Runner</text>
-<text x="62" y="245" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="12.5" font-weight="600" fill="#38bdf8" text-anchor="start">direct<tspan fill="#9fb0c8" font-weight="400"> (cargo, python, node, BuildLimiter)</tspan></text>
+<text x="62" y="245" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="12.5" font-weight="600" fill="#38bdf8" text-anchor="start">direct<tspan fill="#9fb0c8" font-weight="400"> (cargo, python, node; bwrap opt-in)</tspan></text>
 
 <rect x="40" y="286" width="360" height="86" rx="12" fill="#38bdf8" fill-opacity="0.10" stroke="#38bdf8" stroke-opacity="0.75" stroke-width="1.5"/>
 <text x="62" y="319" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="17.5" font-weight="700" fill="#f1f5f9" text-anchor="start">Language pack</text>

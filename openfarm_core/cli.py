@@ -389,8 +389,16 @@ def _baseline_check(ctx: Context, source: FileCardSource, card: Card) -> dict:
         # a test that is not there yet (`not-run`) is left to the test writer.
         ignored = [name for name, status in named.items()
                    if status not in ("ok", "mixed", "FAILED", "not-run")]
+        # v0.8.5, as the run's named-tests check: a named test whose every row (a
+        # parametrized test's every case) is on known_failing proves nothing.
+        known = set(ctx.cfg.known_failing or ())
+        all_known = []
+        for name in card.test_names:
+            own = rows_for_test(rows, name, files.get(name, ""), row_file)
+            if own and all(str(r.get("name", "")) in known for r in own):
+                all_known.append(name)
         out = {
-            "ok": not passing and not mixed and not ignored,
+            "ok": not passing and not mixed and not ignored and not all_known,
             "class": result.cls,
             "named": named,
             "failed_on_base": [name for name, status in named.items()
@@ -407,6 +415,10 @@ def _baseline_check(ctx: Context, source: FileCardSource, card: Card) -> dict:
             out["ignored_on_base"] = ignored
             problems.append("these named tests were skipped or expected to fail on "
                             "base, so they prove nothing: " + ", ".join(ignored))
+        if all_known:
+            out["known_failing_on_base"] = all_known
+            problems.append("every case of these named tests is on the known_failing "
+                            "list, so they prove nothing: " + ", ".join(all_known))
         if problems:
             out["error"] = "; ".join(problems)
         return out

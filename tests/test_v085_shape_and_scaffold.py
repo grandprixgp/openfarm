@@ -85,9 +85,13 @@ class AnswerTests(unittest.TestCase):
         self.assertEqual([c["op"] for c in backend.calls], ["shape_and_scaffold"])
         self.assertIn("base_files", backend.calls[0]["payload"])
 
-    def test_no_edits_is_no_scaffold(self) -> None:
-        (decision, edits), _ = self._call(READY)
+    def test_an_empty_list_is_no_scaffold(self) -> None:
+        (decision, edits), _ = self._call({**READY, "edits": []})
         self.assertEqual(edits, [])
+
+    def test_no_contract_at_all_asks_again_on_its_own(self) -> None:
+        (decision, edits), _ = self._call(READY)
+        self.assertIsNone(edits, "the flow then makes a separate scaffold_contract call")
 
     def test_a_bad_scaffold_is_handed_back_not_raised(self) -> None:
         bad = {**STUB, "replace": "    def is_full(self) -> bool:\n        return True\n"}
@@ -180,6 +184,13 @@ class FlowTests(unittest.TestCase):
 
     def test_two_scripted_ops_still_run_as_two(self) -> None:
         outcome, run_dir = self._run({"CARD-1/shape_and_plan": READY,
+                                      "CARD-1/scaffold_contract": {"edits": [STUB]}})
+        self.assertEqual(outcome["final_state"], "in-review", outcome.get("detail"))
+        scaffold = json.loads((run_dir / "gates" / "1" / "micromanager-scaffold.json").read_text())
+        self.assertEqual(scaffold["detail"], "scaffold applied")
+
+    def test_a_merged_answer_without_a_contract_gets_the_separate_call(self) -> None:
+        outcome, run_dir = self._run({"CARD-1/shape_and_scaffold": READY,
                                       "CARD-1/scaffold_contract": {"edits": [STUB]}})
         self.assertEqual(outcome["final_state"], "in-review", outcome.get("detail"))
         scaffold = json.loads((run_dir / "gates" / "1" / "micromanager-scaffold.json").read_text())
