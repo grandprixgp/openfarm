@@ -15,7 +15,7 @@ v0.8.1 was built in two rounds. The first agent added Codex and Antigravity as p
 - **Checker.** Both passes answer in a fixed form and are asked once more when unreadable. Counter-tests are written as files, run one at a time, and removed, with the worktree restored exactly. The dossier shows the verdict and every counter-test's outcome.
 - **Packs.** Python uses ruff only where configured and pytest where configured. Rust mutation reads cargo-mutants' `outcomes.json` and reports timeouts and unviable mutants apart. Every row of a named test decides fail-before and pass-after. An infra run is never green. TypeScript runs `node --test` with a reporter that cannot read red as green, takes one tool set from the base checkout, and refuses other test runners.
 - **Board, coordinators, flow, CLI.** Fixes to who may post and hint, stop requests, role models, the stall monitor, late joins, escalation, hand-back triage, the human run summary, token parts, TUI background commands and per-card supervisor sessions.
-- **Tests.** 1321 offline tests on the final tree with no failures (88 skipped with no optional tools on `PATH`; 15 with `OPENFARM_E2E=1` and ruff, tsc, prettier and cargo-mutants installed). The skip count depends on what is installed.
+- **Tests.** @@N@@ offline tests on the final tree with no failures (@@S0@@ skipped with no optional tools on `PATH`; @@S1@@ with `OPENFARM_E2E=1` and ruff, tsc, prettier and cargo-mutants installed). The skip count depends on what is installed.
 
 ### Tested live (17 Nov 2026)
 
@@ -26,12 +26,14 @@ Real ruff, pytest, cargo-mutants, tsc and prettier; the checker with a live mode
 - Everything Antigravity since the first agent's runs: the boundary around `agy`, the login copy, the prompt-size refusal, the driver. Nobody may run `agy` unattended here.
 - A turn through a standalone `codex-acp` server, and so per-card confined servers with it.
 - Codex `read-only` inside the boundary on a system that allows a nested sandbox.
-- In `drive` with a real CLI: Ctrl-C, taking over a stale lock, a turn timeout, a spend cap stopping a priced driver.
+- In `drive` with a real CLI: Ctrl-C, taking over a stale lock, a turn timeout, a spend cap stopping a priced driver, two drives under one name.
 - TypeScript on a real npm-installed project with a live model writing counter-tests (the TypeScript counter-test path ran with real node and scripted answers).
 - Remote installs from a GitHub URL with `uv`, `pipx` or `pip`.
 - Hosted worker endpoints other than Command Code.
 - The 25-card Rust pilot: not started. No card set exists for it.
 - `counter_tests = "reject"` end to end with a live implementer fixing the bounce.
+- A Claude child on an API key (`auth = "api-key"`) inside the boundary (`confine = "bwrap"`).
+- `openfarm run` refusing a run up front on a machine without bubblewrap, with the real Codex or Antigravity programs (it ran with stand-ins).
 
 ### Known Limits
 
@@ -41,8 +43,15 @@ Real ruff, pytest, cargo-mutants, tsc and prettier; the checker with a live mode
 - **Claude under `confine = "auto"`** has no OS boundary from openfarm; Claude Code's own settings hold it. `confine = "bwrap"` puts it in the boundary.
 - **Codex `read-only`** cannot run inside the boundary where Codex's own sandbox cannot start (Ubuntu's default AppArmor rule) and is refused there.
 - **Standalone `codex-acp`** (0.16.0) completed no turn on a ChatGPT login; use `binary = "codex-exec"`.
-- **Unpriced providers.** Codex and Antigravity report no cost. Without per-1k rates their spend reads zero and the spend caps cannot fire on it.
-- **The boundary shares the network**, because the model call needs it.
+- **Unpriced providers.** Codex and Antigravity report no cost. Without per-1k rates their spend reads zero and the spend caps cannot fire on it; the run's notes say so.
+- **The boundary shares the network**, because the model call needs it. That includes this machine's loopback services.
+- **What the boundary mounts.** A provider program installed outside a `bin` folder or a `node_modules` tree gets its whole folder mounted read-only. `confine_read_roots` are mounted as given, without the guards the install folders get, and the worker key file is not hidden inside them.
+- **Hidden files and links.** A `never_touch` file reached through a symlinked folder in the worktree is not hidden from a confined child. A standalone server's hidden-file list is fixed when the server starts.
+- **A standalone `codex-acp` with `read-only`** is started although its shell cannot work inside the boundary; only the bridge refuses up front.
+- **Cached input tokens** are added to a server's input count unless its own total shows they are already in it; a server that includes them and reports no total would be counted high, which stops a cap early, never late.
+- **Lock and seat takeover** trust the pid and hostname. Two processes with the same hostname in different pid namespaces (containers), or a state folder shared between machines with the same hostname, can see each other as gone.
+- **Counter-tests on a dirty worktree.** The restore is exact for the clean worktree a card normally has; a difference after the restore is logged, not failed.
+- **`openfarm swarm join` errors** carry no code in JSON, so a script cannot tell `seat-occupied` from `name-taken`.
 - **No mutation tool for Python or TypeScript.**
 
 ### Where the Records Are

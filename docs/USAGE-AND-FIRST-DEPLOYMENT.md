@@ -87,17 +87,19 @@ Openfarm is a **deterministic Python 3.11+ (stdlib-only) orchestrator** that dri
 
 #### Honest Verification Boundaries
 
-The offline suite (1321 tests on the final v0.8.1 tree, no failures) covers the core with scripted models, local HTTP test servers and stand-in provider CLIs; tests that need a real tool (`bwrap`, `node`, `cargo`, ruff, pytest, cargo-mutants, `tsc`, `prettier`) skip themselves when it is missing. What ran live on 17 Nov 2026 is listed in the [README](../README.md#whats-verified) and the [build log](v0.8.1-build-log.md). Still **untested**:
+The offline suite (@@N@@ tests on the final v0.8.1 tree, no failures) covers the core with scripted models, local HTTP test servers and stand-in provider CLIs; tests that need a real tool (`bwrap`, `node`, `cargo`, ruff, pytest, cargo-mutants, `tsc`, `prettier`) skip themselves when it is missing. What ran live on 17 Nov 2026 is listed in the [README](../README.md#whats-verified) and the [build log](v0.8.1-build-log.md). Still **untested**:
 
 - Everything Antigravity since the first agent's runs: the boundary around `agy`, the login copy, the prompt-size refusal, the driver. Nobody may run `agy` unattended here.
 - A turn through a standalone `codex-acp` server, and so per-card confined servers with it.
 - Codex `read-only` inside the boundary on a system that allows a nested sandbox.
-- In `drive` with a real CLI: Ctrl-C, taking over a stale lock, a turn timeout, a spend cap stopping a priced driver.
+- In `drive` with a real CLI: Ctrl-C, taking over a stale lock, a turn timeout, a spend cap stopping a priced driver, two drives under one name.
 - TypeScript on a real npm-installed project with a live model writing counter-tests (the TypeScript counter-test path ran with real node and scripted answers).
 - Remote installs from a GitHub URL with `uv`, `pipx` or `pip`.
 - Hosted worker endpoints other than Command Code.
 - The 25-card Rust pilot: not started. No card set exists for it.
 - `counter_tests = "reject"` end to end with a live implementer fixing the bounce.
+- A Claude child on an API key (`auth = "api-key"`) inside the boundary (`confine = "bwrap"`).
+- `openfarm run` refusing a run up front on a machine without bubblewrap, with the real Codex or Antigravity programs (it ran with stand-ins).
 
 ---
 
@@ -483,7 +485,7 @@ openfarm drive --agent claude --seat supervisor --run <RUN_ID>
 - **Ending.** On return, error or Ctrl-C, drive ends the board, keeps the kill switch until the run thread is gone, and frees its seats. If that wait is interrupted, the kill switch stays and the message tells you to clear it with `openfarm resume --clear-kill`. `run.lock` records the holder's pid, host and start time; a later run on the same host takes over a lock whose holder is gone, with a note.
 - **Spend.** A managed drive counts the driver's cost against `--spend` and `spend_per_night` with the run's. An attached drive does not count against the owner's caps, and says so. `run.json` gets `tokens.with_driver`, and the payload `run_tokens`: the run's token split with the driver's turns counted.
 - **Wave verdicts.** With `--record-verdict`, drive writes `verdict.json` with `by: driver/<agent>` only where no verdict exists, never `clean` on a cut diff, and nothing when the driver gave no usable answer. `review_tokens` is measured from the turns, not the model's claim. It is a cheap model's opinion, not your review; `openfarm verdict` overwrites it.
-- **Rejoining.** A drive that ended can join the same run again under the same `--driver-name` and take its seat back if nobody else holds it.
+- **Rejoining.** A drive that ended can join the same run again under the same `--driver-name` and take its seat back if nobody else holds it. While a drive runs, its seats cannot be taken by reusing its name: a second drive or `openfarm swarm join` under that name is refused (`seat-occupied`), naming the holder's pid and host. If that drive died without ending (its pid is gone on this host), a new drive under the same name takes the seat over and the board says so.
 
 ---
 
@@ -541,7 +543,7 @@ The checker is a worker role (`[model] checker`) with two passes after the end g
 
 | You see | Why | What to do |
 | --- | --- | --- |
-| `... needs the boundary, but bubblewrap is not usable here (...)` (`acp-confine-unavailable`) | A Codex or Antigravity child (or any child under `confine = "bwrap"`) needs the boundary and `bwrap` cannot run | Install bubblewrap. Or use Codex through `binary = "codex-exec"` with tool policy `none`, which runs on its flags without `bwrap`. Or set `confine = "off"`, knowing the child can then read whatever your user can |
+| `... needs the boundary, but bubblewrap is not usable here (...)` (`acp-confine-unavailable`) | A Codex or Antigravity child (or any child under `confine = "bwrap"`) needs the boundary and `bwrap` cannot run. `openfarm run` checks this before any card is claimed, and the refusal names the child (`worker`, `coordinator` or `supervisor`) | Install bubblewrap. Or use Codex through `binary = "codex-exec"` with tool policy `none`, which runs on its flags without `bwrap`. Or set `confine = "off"`, knowing the child can then read whatever your user can |
 | `Codex with tool policy 'read-only' reads files through its shell ... cannot start inside openfarm's boundary here` | Codex's own sandbox cannot start inside the boundary (Ubuntu's AppArmor rule) | Use tool policy `none`, the Claude provider for a seat that reads files, or `confine = "off"` |
 | `acp-provider-mismatch` | `[micromanager] binary` names another provider's program than `[adapters] micromanager` | Make them agree, or use `binary = "auto"` |
 | `agy-prompt-too-large` | A prompt over 131072 bytes for `agy -p` | Use smaller cards or another provider |

@@ -30,11 +30,11 @@
 </p>
 
 <p align="center">
-  <img src="docs/assets/openfarm-stats.svg" alt="1321 offline tests with 0 failures, 22 CLI subcommands, 6 adapter interfaces, 0 runtime dependencies" width="100%">
+  <img src="docs/assets/openfarm-stats.svg" alt="@@N@@ offline tests with 0 failures, 22 CLI subcommands, 6 adapter interfaces, 0 runtime dependencies" width="100%">
 </p>
 
 > [!IMPORTANT]
-> **Pre-release (v0.8.1).** v0.8.1 adds Codex and Antigravity as frontier providers next to Claude, `openfarm drive` to hold the coordinator and supervisor seats with a CLI agent, and a TypeScript pack. After the first build, two reviews and live runs with the real tools found gaps, and the fix work closed them: Codex and Antigravity children now run inside a bubblewrap boundary, the checker's counter-tests are read and run, and ruff, pytest, cargo-mutants, tsc and prettier are called the way the real programs need. The offline suite has 1321 tests with no failures. What ran live on 17 Nov 2026, and what has not run at all, is in [What's verified](#whats-verified) and [Not yet tested](#not-yet-tested). With `[swarm] enabled = false` a run behaves as in v0.7.
+> **Pre-release (v0.8.1).** v0.8.1 adds Codex and Antigravity as frontier providers next to Claude, `openfarm drive` to hold the coordinator and supervisor seats with a CLI agent, and a TypeScript pack. After the first build, two reviews and live runs with the real tools found gaps, and the fix work closed them: Codex and Antigravity children now run inside a bubblewrap boundary, the checker's counter-tests are read and run, and ruff, pytest, cargo-mutants, tsc and prettier are called the way the real programs need. An outside review of the fix work then found no blockers, and its larger findings are fixed too. The offline suite has @@N@@ tests with no failures. What ran live on 17 Nov 2026, and what has not run at all, is in [What's verified](#whats-verified) and [Not yet tested](#not-yet-tested). With `[swarm] enabled = false` a run behaves as in v0.7.
 
 ---
 
@@ -160,12 +160,12 @@ For a reader upgrading from v0.8. Details are in [`docs/USAGE-AND-FIRST-DEPLOYME
 - **New subcommand.** `openfarm drive` holds the external seats with a `claude`, `codex` or `agy` CLI. There are now 22 subcommands.
 - **New language.** `openfarm adopt --lang typescript` (see above).
 - **New config keys.** `[micromanager] confine` (`"auto"`, `"bwrap"` or `"off"`, default `"auto"`) and `confine_read_roots`. `[runner] typescript` (only `"node"`), `typescript_typecheck`, `typescript_format` and `link_node_modules`. `[micromanager] effort` also takes `"xhigh"` and `"max"`.
-- **New refusals.** A Codex or Antigravity child that needs the boundary is refused when `bwrap` cannot run. Codex with tool policy `read-only` is refused where Codex's own sandbox cannot start inside the boundary, as on Ubuntu with its default AppArmor rule. A `binary` that names another provider than its adapter is refused (`acp-provider-mismatch`). An Antigravity prompt over 131072 bytes is refused before `agy` starts (`agy-prompt-too-large`). `[gates] mutation = "required"` is a config error when TypeScript is in `languages`.
+- **New refusals.** A Codex or Antigravity child that needs the boundary is refused when `bwrap` cannot run; `openfarm run` checks this for its worker backend, ACP coordinator and supervisor before any card is claimed, and the refusal names the child. Codex with tool policy `read-only` is refused where Codex's own sandbox cannot start inside the boundary, as on Ubuntu with its default AppArmor rule. A `binary` that names another provider than its adapter is refused (`acp-provider-mismatch`). An Antigravity prompt over 131072 bytes is refused before `agy` starts (`agy-prompt-too-large`). `[gates] mutation = "required"` is a config error when TypeScript is in `languages`.
 - **Changed behaviour for Python.** v0.8 used `ruff` whenever it was installed; v0.8.1 uses it only where the project configures it.
-- **Changed behaviour for every language.** A named test must fail on base in every row and pass after in every row; a parametrized test's rows count as the test's. A test run the runner classes as infra (timed out, killed) is never green. `check --baseline` refuses a named test that is skipped or expected to fail on base (`ignored_on_base`).
+- **Changed behaviour for every language.** A named test must fail on base in every row and pass after in every row; a parametrized test's rows count as the test's. A test run the runner classes as infra (timed out, killed) is never green, and neither is one that fails without naming a failing test. `check --baseline` refuses a named test that is skipped or expected to fail on base (`ignored_on_base`).
 - **The checker.** Both checker passes answer in a fixed form and are asked once more when the answer cannot be read. Counter-tests are written as new files, run one at a time, and removed, and the worktree is put back exactly.
-- **The test writer.** For a Rust integration test the brief names the library crate and says to import through it, never with `#[path]`. When the named tests cannot be listed because the test build failed, the message carries the compiler's errors.
-- **Logins.** openfarm finds the Claude and Codex logins through `CLAUDE_CONFIG_DIR` and `CODEX_HOME` first, then `$HOME`. A refreshed login is copied back only when it has the provider's shape for the same account; the old one is kept as `<name>.openfarm-backup`. `install-skill` writes to those folders too.
+- **The test writer.** For a Rust integration test the brief names the library crate and says to import through it, never with `#[path]`. When the named tests cannot be listed because the test build failed, the message carries the compiler's errors. A stub the pack cannot take (malformed, or one that does not fail when called) is sent back to the test writer with the reason instead of ending the card.
+- **Logins.** openfarm finds the Claude and Codex logins through `CLAUDE_CONFIG_DIR` and `CODEX_HOME` first, then `$HOME`. A refreshed login is copied back only when it has the provider's shape for the same account and the login on disk is still the one the child started from (another child's refresh, or a new login of yours, is never overwritten); the old one is kept as `<name>.openfarm-backup`. A login kept behind a symlink is updated where the link points. `install-skill` writes to those folders too.
 - **ACP workers and the ACP coordinator** run in an empty private folder, not the state folder.
 - **Spend.** Codex and Antigravity report no cost, so without per-1k rates their spend reads zero and a spend cap cannot fire on it. As workers (`[adapters] model`), set `[model] cost_per_1k_in` / `cost_per_1k_out`; without them `run.json` says `spend_measured: false` and the run's notes say the caps cannot fire. As the micromanager, set `[micromanager] cost_per_1k_in` / `cost_per_1k_out`; without them the run's notes say its spend caps cannot fire.
 - **`openfarm acp`.** `acp status` with no `--provider` covers all three providers and runs `codex login status` as well as `claude auth status`; it never starts `agy`. `acp probe --provider all` skips Antigravity and exits `3` unless every probed provider is ok.
@@ -174,7 +174,7 @@ For a reader upgrading from v0.8. Details are in [`docs/USAGE-AND-FIRST-DEPLOYME
 
 ## Providers: Claude, Codex and Antigravity
 
-The frontier supervisor (the micromanager), the solo bench arm's workers and the swarm seats can run on any of three providers. Each provider's child runs with an isolated home (`isolate_home = true`, the default), a cleaned environment, and the provider's login copied in. What the child can read depends on the provider, its tool policy (`[micromanager] tool_policy`) and `[micromanager] confine`:
+The frontier supervisor (the micromanager), the solo bench arm's workers and the swarm seats can run on any of three providers. Each provider's child runs with an isolated home (`isolate_home = true`, the default), a cleaned environment (credentials in your environment that are not that provider's own, such as GitHub or cloud tokens and other providers' keys, are not passed on), and the provider's login copied in. What the child can read depends on the provider, its tool policy (`[micromanager] tool_policy`) and `[micromanager] confine`:
 
 | Provider | `confine = "auto"` (default) | Recommended |
 | --- | --- | --- |
@@ -206,7 +206,7 @@ openfarm drive --agent codex --seat both --cards 1 --wave --json
 - Each turn runs in its own process group and is ended after `--turn-timeout` seconds (default 180).
 - A managed drive's spend counts against `--spend` and `spend_per_night` with the run's. An attached drive's spend does not count against the other process's caps, and it says so.
 - `--wave` adds the driver's own look at each `in-review` card. `--record-verdict` writes it as `by: driver/<agent>`, only where no verdict exists yet, never `clean` on a cut diff, and nothing when the driver gave no usable answer. It is a cheap model's opinion, not your review: `openfarm verdict` overwrites it.
-- A drive that ended can be started again on the same run under the same `--driver-name`; it takes its seat back if nobody else holds it.
+- A drive that ended can be started again on the same run under the same `--driver-name`; it takes its seat back if nobody else holds it. While a drive runs, its seats cannot be taken by reusing its name: a second drive or `openfarm swarm join` under that name is refused (`seat-occupied`), naming the holder's pid and host. If that drive died without ending (its pid is gone on this host), a new drive under the same name takes the seat over and the board says so.
 
 ## Global learning
 
@@ -380,8 +380,8 @@ On the final v0.8.1 tree, Python 3.14 on Linux:
 
 | Run | Result |
 | --- | --- |
-| Default, no optional tools on `PATH` | **1321 tests**, 88 skipped, **0 failures** |
-| `OPENFARM_E2E=1` with ruff 0.17.5, tsc 7.0.2, prettier 3.10.1 and cargo-mutants 27.1.0 on `PATH` | **1321 tests**, 15 skipped, **0 failures** |
+| Default, no optional tools on `PATH` | **@@N@@ tests**, @@S0@@ skipped, **0 failures** |
+| `OPENFARM_E2E=1` with ruff 0.17.5, tsc 7.0.2, prettier 3.10.1 and cargo-mutants 27.1.0 on `PATH` | **@@N@@ tests**, @@S1@@ skipped, **0 failures** |
 
 A test that needs a real tool skips itself when the tool is missing, so the default run's skip count depends on what you have installed. Of the 15 skipped in the second run, 12 need a Python that can import pytest and pass when run under one (pytest 9.2.0); the others are stand-in tests that step aside when the real tool is there. Each test process keeps its temp files in one folder of its own and removes it at exit.
 
@@ -421,12 +421,14 @@ The first build's live runs (before the fix work) are kept, with what has change
 > - Everything Antigravity since the first agent's runs: the boundary around `agy`, the login copy, the prompt-size refusal, the driver. Nobody may run `agy` unattended here.
 > - A turn through a standalone `codex-acp` server, and so per-card confined servers with it.
 > - Codex `read-only` inside the boundary on a system that allows a nested sandbox.
-> - In `drive` with a real CLI: Ctrl-C, taking over a stale lock, a turn timeout, a spend cap stopping a priced driver.
+> - In `drive` with a real CLI: Ctrl-C, taking over a stale lock, a turn timeout, a spend cap stopping a priced driver, two drives under one name.
 > - TypeScript on a real npm-installed project with a live model writing counter-tests (the TypeScript counter-test path ran with real node and scripted answers).
 > - Remote installs from a GitHub URL with `uv`, `pipx` or `pip`.
 > - Hosted worker endpoints other than Command Code.
 > - The 25-card Rust pilot: not started. No card set exists for it.
 > - `counter_tests = "reject"` end to end with a live implementer fixing the bounce.
+> - A Claude child on an API key (`auth = "api-key"`) inside the boundary (`confine = "bwrap"`).
+> - `openfarm run` refusing a run up front on a machine without bubblewrap, with the real Codex or Antigravity programs (it ran with stand-ins).
 
 ## Roadmap
 
