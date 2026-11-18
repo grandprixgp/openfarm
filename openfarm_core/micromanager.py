@@ -30,7 +30,13 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from .adapters.acp import ClaudeAcpAdapter
+from .adapters.acp import (
+    ClaudeAcpAdapter,
+    acp_adapter_for_provider,
+    infer_acp_provider,
+    is_acp_adapter,
+    normalize_acp_provider,
+)
 from .packs.python import valid_python_scaffold
 from .cards import Card
 from .edits import (
@@ -549,12 +555,19 @@ class CmdMicromanager(_ThreadLocalUsageMixin):
 
 # What an operation's answer may contain, where the schema alone does not say.
 _OP_RULES = {
+    "shape_and_plan": (
+        "Set `steps` to `[]` unless the card genuinely needs sequential steps. "
+        "When `steps` is non-empty, every entry in each step's `tests` list MUST "
+        "be an exact test name from `card.test_names` (never a CLI command or file "
+        "path), and every entry in `touches` must belong to `card.touches`."
+    ),
     "scaffold_contract": (
         "Declare the new symbols' contracts so the frozen tests can import them, "
         "and nothing else. Edit only production files listed in card.touches, "
         "never a test file: the test writer writes those. Every new function's "
         "body is only a stub that fails when called: Rust `todo!()` or "
-        "`unimplemented!()`, Python `raise NotImplementedError`. Imports, types, "
+        "`unimplemented!()`, Python `raise NotImplementedError`, TypeScript "
+        "`throw new Error(\"not implemented\")`. Imports, types, "
         "classes and typed fields are fine; no other logic, no default values "
         "computed from input. Return {\"edits\": []} if nothing is needed."
     ),
@@ -565,6 +578,16 @@ _OP_RULES = {
         "Say why in scope_reason. A general lesson may later be shared with other "
         "projects, so when in doubt say \"project\". Notes about openfarm's own "
         "harness bookkeeping are always \"project\"."
+    ),
+    "handback_triage": (
+        "A worker handed its card back instead of answering with edits. Read the "
+        "worker's reason (`handback_reason`), the failing detail and the card, and "
+        "choose one action. \"hint\": a short note the worker sees in its next brief "
+        "(put it in `body`; prose only, never code or edit blocks). \"set\": run the "
+        "worker again at another tier and/or effort (`tier`, `effort`; each must be one "
+        "listed under `tiers`). \"block\": stop the card for the owner (say why in "
+        "`reason`), for example when the card or its frozen tests are wrong, which only "
+        "the owner may change. Nobody but the owner changes the card or its tests."
     ),
 }
 
@@ -608,6 +631,10 @@ def _build_op_prompt(op: str, payload: dict) -> str:
             '"confidence": 0.75, "tags": ["..."], "proposed_patch": {}, '
             '"scope": "project|general", "scope_reason": "..."}]}'
         ),
+        "handback_triage": (
+            '{"action": "hint|set|block", "body": "...", "tier": "...", '
+            '"effort": "...", "reason": "..."}'
+        ),
     }
     schema = schemas.get(op, "{}")
     body = json.dumps(payload, indent=2, ensure_ascii=False, default=str)
@@ -622,7 +649,7 @@ def _build_op_prompt(op: str, payload: dict) -> str:
 
 
 class ClaudeAcpMicromanager(_ThreadLocalUsageMixin):
-    """ACP-backed micromanager running against ``claude-agent-acp`` or native ``claude``."""
+    """ACP-backed micromanager targeting Claude, Antigravity, or Codex ACP."""
 
     name = "claude-acp"
     enabled = True
@@ -632,6 +659,7 @@ class ClaudeAcpMicromanager(_ThreadLocalUsageMixin):
         command: str | list[str] = "auto",
         cwd: Path | str | None = None,
         *,
+        provider: str = "",
         model: str = "",
         effort: str = "",
         tool_policy: str = "none",
@@ -647,9 +675,21 @@ class ClaudeAcpMicromanager(_ThreadLocalUsageMixin):
         card_dir: Path | str | None = None,
         cancel_check: Callable[[], bool] | None = None,
         adapter: ClaudeAcpAdapter | None = None,
+        confine=None,
     ) -> None:
         self._init_usage()
         self.command = command
+        # How the provider's child is held; passed to every adapter this opens.
+        # Without it, the settings a command list carries (`acp_command`) apply.
+        from . import confine as confine_lib
+
+        try:
+            self.confine = confine_lib.as_settings(
+                confine if confine is not None else getattr(command, "confine", None))
+        except confine_lib.ConfineError as exc:
+            raise Invalid(exc.code, exc.message) from exc
+        self.provider = infer_acp_provider(command, provider)
+        self.name = acp_adapter_for_provider(self.provider)
         self.cwd = Path(cwd or state_dir or Path.cwd())
         self.model = model
         self.effort = effort
@@ -689,12 +729,14 @@ class ClaudeAcpMicromanager(_ThreadLocalUsageMixin):
             self._adapter = ClaudeAcpAdapter(
                 command=self.command,
                 cwd=self.cwd,
+                provider=self.provider,
                 isolate_home=self.isolate_home,
                 auth_file=self.auth_file,
                 auth_mode=self.auth_mode,
                 never_touch=self.never_touch,
                 forbidden_files=self.forbidden_files,
                 allowed_root=self.cwd,
+                confine=self.confine,
             )
         if not self._adapter._initialized:
             self._adapter.initialize(timeout_s=min(30.0, self.timeout_s))
@@ -881,7 +923,52 @@ SUPERVISOR_OP_EXPECTS: dict[str, dict] = {
             "adaptations": {"type": "list", "items": "dict"},
         },
     },
+    "handback_triage": {
+        "op": "handback_triage",
+        "required": ["action"],
+        "properties": {
+            "action": {"type": "str", "enum": ["hint", "set", "block"]},
+            "body": {"type": "str"},
+            "tier": {"type": "str"},
+            "effort": {"type": "str"},
+            "reason": {"type": "str"},
+        },
+    },
 }
+
+
+def normalise_handback_triage(raw) -> dict:
+    """Check a `handback_triage` answer and return `{action, body, tier, effort, reason}`.
+
+    Raises `Invalid` for an answer nobody can act on: not an object, an unknown
+    action, a `hint` with no body, or a `set` naming neither tier nor effort.
+    Hint and reason text lose any raw edit blocks: the worker stays the only author.
+    """
+    if not isinstance(raw, dict):
+        raise Invalid("bad-handback-triage", "handback_triage answer must be a JSON object")
+    action = str(raw.get("action", "") or "").strip().lower()
+    if action not in ("hint", "set", "block"):
+        raise Invalid(
+            "bad-handback-triage",
+            f"handback_triage action must be hint, set or block, got {raw.get('action')!r}",
+        )
+
+    def _text(key: str) -> str:
+        value = raw.get(key)
+        return value.strip() if isinstance(value, str) else ""
+
+    out = {
+        "action": action,
+        "body": _strip_edit_blocks(_text("body")),
+        "tier": _text("tier"),
+        "effort": _text("effort"),
+        "reason": _strip_edit_blocks(_text("reason")),
+    }
+    if action == "hint" and not out["body"]:
+        raise Invalid("bad-handback-triage", "handback_triage hint needs a non-empty body")
+    if action == "set" and not (out["tier"] or out["effort"]):
+        raise Invalid("bad-handback-triage", "handback_triage set needs a tier or an effort")
+    return out
 
 
 def expects_for_supervisor_op(op: str) -> dict:
@@ -1093,6 +1180,31 @@ class TierMicromanagerBackend(_ThreadLocalUsageMixin):
             self.backend.close()
 
 
+#: Body prefix of the code post that ends a card's wait on a silent seat early.
+SEAT_TIMEOUT_PREFIX = "timeout: "
+
+
+def seat_timeout_post(board, *, card_id: str, since_seq: int = 0) -> dict | None:
+    """A code post after `since_seq` telling `card_id`'s wait on a silent seat to time out.
+
+    The coordinator's stall rule writes it (author a `code` member, kind `action`,
+    body starting with `SEAT_TIMEOUT_PREFIX`). Posts by anyone else are ignored.
+    """
+    clean = str(card_id or "").strip()
+    if board is None or not clean or not board.board_dir.exists():
+        return None
+    for post in board.read(as_name="*", since=int(since_seq or 0), limit=None, for_model=False):
+        if post.get("kind") != "action" or str(post.get("card", "") or "") != clean:
+            continue
+        if not str(post.get("body", "") or "").startswith(SEAT_TIMEOUT_PREFIX):
+            continue
+        author = board.get_member(str(post.get("from", "") or ""))
+        if author is None or author.get("kind") != "code":
+            continue
+        return post
+    return None
+
+
 class ExternalMicromanagerBackend(_ThreadLocalUsageMixin):
     """Supervisor seat held outside openfarm over the shared board."""
 
@@ -1177,6 +1289,7 @@ class ExternalMicromanagerBackend(_ThreadLocalUsageMixin):
         )
 
         cursor = int(q["seq"])
+        timed_out_by_stall = False
         pause_ctx = (
             self.budget.pause_clock()
             if self.budget is not None and hasattr(self.budget, "pause_clock")
@@ -1221,6 +1334,15 @@ class ExternalMicromanagerBackend(_ThreadLocalUsageMixin):
                             except (OSError, ValueError):
                                 data = None  # fall back to answer body below
                         return parse_json_answer(str(ans.get("body", "") or ""))
+                if card_id:
+                    # The coordinator asked this card to stop: end the wait now.
+                    stop_reason = self.board.stop_requested(card_id)
+                    if stop_reason:
+                        raise GateFailure(StopCode.REFUSED, stop_reason)
+                    # The stall rule timed this silent seat out early.
+                    if seat_timeout_post(self.board, card_id=card_id, since_seq=int(q["seq"])):
+                        timed_out_by_stall = True
+                        break
                 if self.heartbeat_fn is not None:
                     self.heartbeat_fn()
                 if res.get("reason") == "run-ended" or time.monotonic() >= deadline:
@@ -1229,7 +1351,8 @@ class ExternalMicromanagerBackend(_ThreadLocalUsageMixin):
         if self.on_timeout == "block":
             raise GateFailure(
                 StopCode.SEAT_SILENT,
-                f"external supervisor did not answer question #{q['seq']} ({op})",
+                f"external supervisor did not answer question #{q['seq']} ({op})"
+                + (" before the run stalled" if timed_out_by_stall else ""),
             )
         raise Infra(
             "acp-timeout",
@@ -1521,6 +1644,19 @@ class Micromanager:
                         "classes, typed fields and functions whose body is "
                         "`raise NotImplementedError`",
                     )
+            elif norm_path.endswith((".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs")):
+                from .packs.typescript import typescript_scaffold_edit_problem
+
+                problem = typescript_scaffold_edit_problem(
+                    edit.format, edit.search or "", edit.replace or "", edit.content)
+                if problem:
+                    raise Refused(
+                        "scaffold-missing-todo",
+                        f"{edit.path}: a TypeScript scaffold may only declare: imports, "
+                        "types, interfaces, classes with typed fields, and functions, "
+                        "methods and arrows whose whole body is one "
+                        f"`throw new Error(...)` ({problem})",
+                    )
             elif not _valid_production_scaffold(body):
                 raise Refused(
                     "scaffold-missing-todo",
@@ -1723,6 +1859,28 @@ class Micromanager:
             findings=_normalise_findings(raw.get("findings")),
         )
 
+    def handback_triage(self, card_id: str, payload: dict) -> dict:
+        """Ask the supervisor's seat how to resolve a worker's hand-back.
+
+        One op for every kind of supervisor (config, tier, ACP, external): the
+        backend gets the op's rules and answer shape, an external seat answers on the
+        board, and the call's tokens go to the supervisor's budget like any other op.
+        Returns the checked answer (see `normalise_handback_triage`), or `{}` when the
+        seat is off. Raises `Invalid` for an unusable answer, `Refused` past the
+        supervisor's caps, and whatever the backend raises (`Infra`, `GateFailure`).
+        In advisory mode a `set` is dropped: advice only, the card's effort is not
+        changed by the supervisor.
+        """
+        if not self.enabled:
+            return {}
+        req_payload = dict(payload)
+        req_payload["card_id"] = str(card_id or req_payload.get("card_id", "") or "")
+        raw = self._call_backend("handback_triage", req_payload["card_id"], req_payload)
+        answer = normalise_handback_triage(raw)
+        if self.mode == "advisory" and answer["action"] == "set":
+            return {}
+        return answer
+
     # -- 6. reflect_harness ---------------------------------------------------
 
     def reflect_harness(
@@ -1837,8 +1995,14 @@ _RUST_CHAR_RE = re.compile(
 )
 _RUST_RAW_STR_RE = re.compile(r"(?:[bc])?r(#*)\"")
 _FN_DEF_RE = re.compile(r"\bfn\s+(?:r#)?[A-Za-z_][A-Za-z0-9_]*\b")
+# A stub body: `todo!()` or `unimplemented!()`, after any number of
+# `let _ = (a, b);` lines. Those keep the parameters used, so the stub passes a
+# lint run that treats warnings as errors; they name parameters and call nothing.
+_UNUSED_ARG = r"&?\s*(?:mut\s+)?[A-Za-z_][A-Za-z0-9_]*"
 _TODO_ONLY_RE = re.compile(
-    r"^(?:todo|unimplemented)!\s*\(\s*(?:\"\"\s*(?:,\s*\"\")*\s*)?\)\s*;?$"
+    r"^(?:let\s+_\s*=\s*(?:" + _UNUSED_ARG + r"|\(\s*" + _UNUSED_ARG
+    + r"(?:\s*,\s*" + _UNUSED_ARG + r")*\s*,?\s*\))\s*;\s*)*"
+    r"(?:todo|unimplemented)!\s*\(\s*(?:\"\"\s*(?:,\s*\"\")*\s*)?\)\s*;?$"
 )
 
 
@@ -1946,13 +2110,23 @@ def _scaffold_body_to_validate(edit: Edit) -> str:
     search = edit.search or ""
     if search:
         s_stripped = search.strip("\n")
-        if s_stripped and s_stripped.count("{") == s_stripped.count("}"):
+        search_whole = bool(s_stripped) and s_stripped.count("{") == s_stripped.count("}")
+
+        def _added(delta: str) -> str:
+            # The anchor is either whole blocks itself, or (the end of an `impl`,
+            # say) the added text is: the kept lines are not the scaffold.
+            delta = delta.strip()
+            if delta and (search_whole or delta.count("{") == delta.count("}")):
+                return delta
+            return ""
+
+        if s_stripped:
             if replace.startswith(search) and (
                 len(replace) == len(search)
                 or replace[len(search)] == "\n"
                 or search.endswith("\n")
             ):
-                delta = replace[len(search) :].strip()
+                delta = _added(replace[len(search) :])
                 if delta:
                     return delta
             if replace.endswith(search) and (
@@ -1960,7 +2134,7 @@ def _scaffold_body_to_validate(edit: Edit) -> str:
                 or replace[-len(search) - 1] == "\n"
                 or search.startswith("\n")
             ):
-                delta = replace[: len(replace) - len(search)].strip()
+                delta = _added(replace[: len(replace) - len(search)])
                 if delta:
                     return delta
     return replace
@@ -2182,6 +2356,8 @@ def open_micromanager(
         )
 
     swarm_cfg = _cfg_get(cfg, "swarm", None)
+    swarm_acp_spec = ""
+    swarm_sup_effort = ""
     if swarm_cfg is not None and bool(_cfg_get(swarm_cfg, "enabled", False)):
         swarm_sup = str(_cfg_get(swarm_cfg, "supervisor", "config") or "config")
         if swarm_sup == "off":
@@ -2246,6 +2422,9 @@ def open_micromanager(
                 mode="active" if mode == "off" else mode,
                 feature_flags=feature_flags,
             )
+        if is_acp_adapter(swarm_sup):
+            swarm_acp_spec = swarm_sup
+            swarm_sup_effort = str(_cfg_get(swarm_cfg, "supervisor_effort", "") or "")
 
     enabled_flag = _cfg_get(mm_cfg, "enabled", None) if mm_cfg is not None else None
     spec = _cfg_get(mm_cfg, "adapter", None) if mm_cfg is not None else None
@@ -2255,11 +2434,12 @@ def open_micromanager(
             "micromanager_adapter",
             _cfg_get(cfg, "supervisor_adapter", "off"),
         )
-    spec_str = str(spec or "off").strip()
+    spec_str = str(swarm_acp_spec or spec or "off").strip()
+    if swarm_acp_spec and mode == "off":
+        mode = "active"
 
     if (
-        enabled_flag is False
-        or mode == "off"
+        (not swarm_acp_spec and (enabled_flag is False or mode == "off"))
         or spec_str.lower() in ("", "off", "none", "null", "disabled")
     ):
         return Micromanager(
@@ -2302,7 +2482,8 @@ def open_micromanager(
             feature_flags=feature_flags,
         )
 
-    if spec_str.lower() in ("claude-acp", "acp", "claude"):
+    if is_acp_adapter(spec_str):
+        acp_provider = normalize_acp_provider(spec_str)
         explicit_cmd = _cfg_get(
             mm_cfg,
             "command",
@@ -2314,11 +2495,36 @@ def open_micromanager(
             binary = str(_cfg_get(mm_cfg, "binary", "auto") or "auto")
             raw_args = _cfg_get(mm_cfg, "args", None) or []
             command = [binary, *[str(a) for a in raw_args]] if raw_args else binary
+        from . import confine as confine_lib
+        from .adapters.acp import acp_command
+        from .adapters.acp import check_provider_matches
+
+        # One provider decides the argv, env, home and sync-back: a binary that
+        # names another provider than the adapter is refused, naming both.
+        check_provider_matches(
+            command, acp_provider,
+            where=f"[adapters] micromanager / [swarm] supervisor is {spec_str!r}, "
+                  "binary from [micromanager] binary",
+        )
+        # The confinement settings ride on the command to every adapter it opens,
+        # including the run's shared supervisor process.
+        key_file = _cfg_get(cfg, "key_file", None)
+        try:
+            confine_settings = confine_lib.ConfineSettings(
+                mode=str(_cfg_get(mm_cfg, "confine", "auto") or "auto"),
+                read_roots=tuple(str(r) for r in (_cfg_get(mm_cfg, "confine_read_roots", ()) or ())),
+                hide_paths=(str(key_file),) if key_file else (),
+            )
+        except confine_lib.ConfineError as exc:
+            raise Invalid(exc.code, exc.message) from exc
+        command = acp_command(command, confine_settings)
         model = str(
             _cfg_get(mm_cfg, "model", _cfg_get(cfg, "micromanager_model", "")) or ""
         )
         effort = str(
-            _cfg_get(mm_cfg, "effort", _cfg_get(cfg, "micromanager_effort", "")) or ""
+            swarm_sup_effort
+            or _cfg_get(mm_cfg, "effort", _cfg_get(cfg, "micromanager_effort", ""))
+            or ""
         )
         tool_policy = str(
             _cfg_get(
@@ -2360,6 +2566,7 @@ def open_micromanager(
         backend = ClaudeAcpMicromanager(
             command=command,
             cwd=cwd,
+            provider=acp_provider,
             model=model,
             effort=effort,
             tool_policy=tool_policy,

@@ -7,8 +7,10 @@ points at it, never the other way round.
 from __future__ import annotations
 
 import datetime as _dt
+import fcntl
 import json
 import os
+import platform
 import shutil
 import tempfile
 import threading
@@ -77,6 +79,8 @@ class StateDir:
     def __init__(self, root: Path) -> None:
         self.root = Path(root).expanduser()
         self.root.mkdir(parents=True, exist_ok=True)
+        #: The dead holder the last `acquire_run_lock` took the lock over from.
+        self.last_lock_takeover: dict | None = None
 
     # -- fixed paths ----------------------------------------------------------
 
@@ -154,14 +158,66 @@ class StateDir:
     # -- lock, pause, kill switch --------------------------------------------
 
     def acquire_run_lock(self, run_id: str) -> bool:
-        """Exclusive: one live run at a time."""
+        """Exclusive: one live run at a time.
+
+        The lock records who holds it (`pid`, `host`, `started_at`). A lock whose
+        holder was on this host and is no longer alive is taken over, and what was
+        taken over is kept in `last_lock_takeover` for the caller to report. A lock
+        whose holder is alive, is on another host, or does not say who it is (a
+        lock file from before those fields) is refused as before.
+        """
+        self.last_lock_takeover = None
+        # The guard serialises takeovers: two commands that both find the same
+        # dead holder must not both delete the lock and both think they hold it.
+        guard_path = self.root / "run.lock.guard"
+        guard_fd = os.open(guard_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(guard_fd, fcntl.LOCK_EX)
+            if self._create_run_lock(run_id):
+                return True
+            stale = self.stale_lock_holder()
+            if stale is None:
+                return False
+            try:
+                self.run_lock.unlink()
+            except FileNotFoundError:
+                pass
+            if not self._create_run_lock(run_id):
+                return False
+            self.last_lock_takeover = stale
+            return True
+        finally:
+            fcntl.flock(guard_fd, fcntl.LOCK_UN)
+            os.close(guard_fd)
+
+    def _create_run_lock(self, run_id: str) -> bool:
         try:
             fd = os.open(self.run_lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         except FileExistsError:
             return False
         with os.fdopen(fd, "w") as handle:
-            handle.write(json.dumps({"run_id": run_id, "started_at": utc_now()}))
+            handle.write(json.dumps({"run_id": run_id, "started_at": utc_now(),
+                                     "pid": os.getpid(), "host": _this_host()}))
         return True
+
+    def stale_lock_holder(self) -> dict | None:
+        """The lock's holder when it is provably gone, else None.
+
+        Provably gone means the lock names a pid and this host, and no process
+        with that pid exists here. Anything less certain counts as alive.
+        """
+        holder = self.lock_holder()
+        if not isinstance(holder, dict):
+            return None
+        pid = holder.get("pid")
+        host = holder.get("host")
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            return None
+        if not isinstance(host, str) or not host or host != _this_host():
+            return None
+        if _pid_alive(pid):
+            return None
+        return dict(holder)
 
     def release_run_lock(self, run_id: str) -> None:
         try:
@@ -251,6 +307,22 @@ class StateDir:
                 f"state dir has {free_mb:.1f} MiB free, below {min_free_mb} MiB",
             )
         return free
+
+
+def _this_host() -> str:
+    return platform.node() or ""
+
+
+def _pid_alive(pid: int) -> bool:
+    """True unless no process with `pid` exists on this host."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        # EPERM and the like: something is there, just not ours to signal.
+        return True
+    return True
 
 
 def _safe_id(name: str, what: str) -> str:

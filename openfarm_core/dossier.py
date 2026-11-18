@@ -48,6 +48,8 @@ def build_dossier(card_run, final_state: str,
     mutation = dict(card_run.mutation_summary)
     restatement = (card_run.checker_restatement.as_dict()
                    if card_run.checker_restatement else {})
+    pass1 = dict(getattr(card_run, "checker_pass1", {}) or {})
+    pass2 = dict(getattr(card_run, "checker_pass2", {}) or {})
     adjudication = dict(getattr(card_run, "checker_adjudication", {}) or {})
     mm_summary = dict(getattr(card_run, "micromanager_summary", {}) or {})
     if not mm_summary and getattr(card_run, "micromanager", None) is not None:
@@ -106,7 +108,10 @@ def build_dossier(card_run, final_state: str,
         "6_checker": {
             "restatement": restatement,
             "restatement_mismatch": bool(restatement.get("mismatch")),
+            "pass1": pass1,
             "counter_tests": counter,
+            "pass2": pass2,
+            "said": checker_said(pass2, counter),
             "checker_adjudication": adjudication,
             "micromanager": mm_summary,
         },
@@ -244,12 +249,63 @@ def _not_checked(card_run) -> list[str]:
         out.append("mutation is report-only for this category")
     if card_run.cfg.counter_tests == "report":
         out.append("counter-tests are report-only")
+    pass1 = getattr(card_run, "checker_pass1", None) or {}
+    if pass1 and not pass1.get("readable", True):
+        out.append("the checker's first pass could not be read, so its restatement "
+                   "was not compared with the tests")
+    pass2 = getattr(card_run, "checker_pass2", None) or {}
+    if pass2 and not pass2.get("readable", True):
+        out.append("the checker's second pass could not be read, so no counter-test "
+                   "ran and nothing was checked by it")
     # A language pack may have had to drop something. Say so rather than let a
     # reader assume the gate ran the way it would elsewhere.
     for note in getattr(card_run.pack, "notes", []) or []:
         out.append(note)
     out.append("visual layout and behaviour across units are not checked by any gate")
     return out
+
+
+def checker_said(pass2: dict, counter: dict) -> str:
+    """One line on what the checker's second pass concluded, for the dossier's top.
+
+    The verdict is a model's claim and decides nothing; the counter-tests that
+    failed on the diff are what count, so the line always says both.
+    """
+    if not pass2:
+        return ""
+    if not pass2.get("readable", True):
+        return ("could not be read, even when asked again "
+                f"({pass2.get('problem') or 'no answer in the form'}): no counter-test "
+                "ran, nothing was checked")
+    failed = int(counter.get("failed", 0) or 0)
+    passed = int(counter.get("passed", 0) or 0)
+    dropped = (int(counter.get("dropped_uncompiled", 0) or 0)
+               + int(counter.get("not_run", 0) or 0))
+    verdict = pass2.get("verdict", "")
+    if verdict == "changes-requested":
+        head = "changes requested"
+        if not failed:
+            head += ", but no counter-test fails on the diff"
+    elif verdict == "accept":
+        head = "accepts the diff"
+    else:
+        head = "no verdict stated (old answer form)"
+    tests = []
+    if failed:
+        tests.append(f"{failed} failed on the diff")
+    if passed:
+        tests.append(f"{passed} passed")
+    if dropped:
+        tests.append(f"{dropped} dropped")
+    return head + "; counter-tests: " + (", ".join(tests) if tests else "none written")
+
+
+def _quoted_block(text: str, limit: int) -> list[str]:
+    """Model text shown as text, never as markdown the dossier would render."""
+    body = (text or "").replace("```", "` ` `").strip()
+    if len(body) > limit:
+        body = body[:limit].rstrip() + "\n[... cut]"
+    return ["  ```text", *("  " + line for line in body.splitlines()), "  ```"]
 
 
 def _test_diff(card_run) -> str:
@@ -294,6 +350,9 @@ def render_markdown(payload: dict) -> str:
     ]
     if payload.get("stop_detail"):
         lines += [f"Why it stopped: {payload['stop_detail']}", ""]
+    said = (payload.get("6_checker") or {}).get("said", "")
+    if said:
+        lines += [f"**Checker, second pass: {said}.** Details in section 6.", ""]
     if payload.get("orchestrator"):
         from .selfhost import describe
         lines += [f"Judged by {describe(payload['orchestrator'])}", ""]
@@ -364,11 +423,71 @@ def render_markdown(payload: dict) -> str:
               f"- Restatement mismatch: {'**yes**' if checker['restatement_mismatch'] else 'no'}"]
     if checker["restatement"].get("text"):
         lines.append(f"  > {checker['restatement']['text'][:400]}")
+    pass1 = checker.get("pass1") or {}
+    if pass1:
+        if not pass1.get("readable", True):
+            lines.append("- First pass: **could not be read**, even when asked again "
+                         f"({pass1.get('problem', '')}). No restatement was compared "
+                         "with the tests.")
+        else:
+            catches = {"yes": "yes", "partly": "partly", "no": "**no**"}.get(
+                pass1.get("catches", ""), "not stated")
+            lines.append("- First pass, would the tests catch a bad implementation: "
+                         f"{catches}")
+        if pass1.get("asked_again"):
+            lines.append("- First pass asked again once: the first answer could not "
+                         f"be read ({pass1.get('first_problem', '')})")
+        if pass1.get("misses"):
+            lines.append("- What the first pass says the tests miss (a model's "
+                         "opinion; it blocks nothing):")
+            lines += _quoted_block(pass1["misses"], 1500)
     counters = checker["counter_tests"]
+    pass2 = checker.get("pass2") or {}
+    if pass2:
+        if not pass2.get("readable", True):
+            lines.append("- Second pass: **could not be read**, even when asked again "
+                         f"({pass2.get('problem', '')}). No counter-test ran; the "
+                         "checker checked nothing.")
+        else:
+            verdict = {"accept": "accepts the diff",
+                       "changes-requested": "**changes requested**"}.get(
+                           pass2.get("verdict", ""), "no verdict stated (old answer form)")
+            lines.append(f"- Second pass verdict: {verdict}")
+        if pass2.get("asked_again"):
+            lines.append("- Asked again once: the first answer could not be read "
+                         f"({pass2.get('first_problem', '')})")
+        if pass2.get("reasons"):
+            lines.append("- Reasons:")
+            lines += _quoted_block(pass2["reasons"], 1500)
     lines.append(f"- Counter-tests: {counters['written']} written, "
                  f"{counters['dropped_uncompiled']} dropped (did not compile), "
                  f"{counters['passed']} passed, {counters['failed']} failed, "
                  f"{counters.get('not_run', 0)} not-run")
+    for result in pass2.get("counter_results") or []:
+        name = result.get("name") or "(no name)"
+        where = f" ({result['file']})" if result.get("file") else ""
+        outcome = result.get("outcome", "")
+        if outcome == "failed":
+            lines.append(f"  - `{name}`{where}: **failed on the diff**. First lines "
+                         "of its output:")
+            lines += ["  " + line for line in
+                      _quoted_block(result.get("output_head", ""), 1500)]
+        elif outcome == "passed":
+            lines.append(f"  - `{name}`{where}: passed")
+        else:
+            lines.append(f"  - `{name}`{where}: {outcome or 'dropped'}, "
+                         f"{result.get('why', '')}")
+            if result.get("output_head"):
+                lines += ["  " + line for line in
+                          _quoted_block(result["output_head"], 800)]
+    if pass2.get("readable", False):
+        for key, title in (("traceability", "Traceability"),
+                           ("edge_cases", "Traced edge cases")):
+            if pass2.get(key):
+                lines.append(f"- {title}:")
+                lines += _quoted_block(pass2[key], 2500)
+            elif key.replace("_", " ") in (pass2.get("missing") or []):
+                lines.append(f"- {title}: not given")
     adj = checker.get("checker_adjudication") or {}
     if adj:
         lines.append(f"- Checker adjudication: {adj.get('verdict', '')} — "

@@ -8,6 +8,7 @@ contextual next-step hints.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -129,6 +130,46 @@ def _fmt_usd(value: object, *, measured: bool = True) -> str:
         return str(value)
     text = f"${num:.4f}"
     return text if measured else f"{text} (unpriced)"
+
+
+def _as_int(value: object) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _as_float(value: object) -> float:
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def format_token_split(tokens: dict, *, style: Style | None = None, bar_width: int = 16) -> str:
+    """`12,180 total [████░] 91% worker (11,100) / 0% supervisor (0) / 9% coordinator (1,080)`.
+
+    The coordinator's part is shown only when it used tokens, so a run without a
+    model coordinator reads as it always did. Older splits have no coordinator.
+    """
+    st = style or Style(enabled=False)
+    tokens = tokens if isinstance(tokens, dict) else {}
+    total_tok = _as_int(tokens.get("total", 0))
+    worker_tok = _as_int(tokens.get("worker", 0))
+    sup_tok = _as_int(tokens.get("supervisor", 0))
+    coord_tok = _as_int(tokens.get("coordinator", 0))
+    w_share = _as_float(tokens.get("worker_share", 0.0))
+    s_share = _as_float(tokens.get("supervisor_share", 0.0))
+    c_share = _as_float(tokens.get("coordinator_share", 0.0))
+    bar = format_bar(w_share, width=bar_width, style=st)
+    text = (
+        f"{_fmt_int(total_tok)} total  {bar}  "
+        f"{w_share * 100:.0f}% worker ({_fmt_int(worker_tok)}) / "
+        f"{s_share * 100:.0f}% supervisor ({_fmt_int(sup_tok)})"
+    )
+    if coord_tok > 0:
+        text += f" / {c_share * 100:.0f}% coordinator ({_fmt_int(coord_tok)})"
+    return text
 
 
 def format_table(
@@ -347,6 +388,13 @@ def _format_status(payload: dict, style: Style) -> str:
     elif paused:
         banner = style.yellow(f"{ICON_PAUSED} PAUSED")
         next_tips = ["openfarm resume  (allow new card claims)"]
+    elif run.get("run_id") and run.get("stale"):
+        banner = style.yellow(f"{ICON_PAUSED} STALE LOCK {run['run_id']}") + "  " + style.dim(
+            f"pid {run.get('pid')} is no longer running")
+        next_tips = [
+            "openfarm run --cards 3  (takes the lock over)",
+            f"openfarm board read --run {run['run_id']}",
+        ]
     elif run.get("run_id"):
         started = run.get("started_at") or ""
         banner = style.cyan(f"{ICON_DOT} ACTIVE RUN {run['run_id']}") + (
@@ -421,6 +469,44 @@ def _format_status(payload: dict, style: Style) -> str:
     return "\n".join(lines)
 
 
+def _format_tooling(tooling: object, style: Style) -> list[str]:
+    """What the card's gates will run it with, the same way for every language."""
+    if not isinstance(tooling, dict) or not tooling:
+        return []
+    if tooling.get("error"):
+        return _render_kv_section("Tooling", [("error", style.red(tooling["error"]))],
+                                  style=style)
+    pairs: list[tuple[str, object]] = []
+    if tooling.get("pack"):
+        pairs.append(("language", tooling["pack"]))
+    if tooling.get("runner"):
+        pairs.append(("tests", tooling["runner"]))
+    if tooling.get("typecheck"):
+        check = tooling["typecheck"]
+        if tooling.get("syntax_only") or check == "syntax":
+            check = style.yellow("syntax only (no types are checked)")
+        elif tooling.get("tsc"):
+            check = f"{check} ({tooling['tsc']})"
+        pairs.append(("typecheck", check))
+    if tooling.get("lint"):
+        lint = tooling["lint"]
+        pairs.append(("lint", style.yellow("syntax only") if lint == "syntax" else lint))
+    if tooling.get("format"):
+        fmt = tooling["format"]
+        if fmt == "off":
+            fmt = style.yellow("off (formatting is not checked)")
+        elif tooling.get("prettier"):
+            fmt = f"{fmt} ({tooling['prettier']})"
+        pairs.append(("format", fmt))
+    lines = _render_kv_section("Tooling", pairs, style=style) if pairs else []
+    notes = [str(note) for note in tooling.get("notes") or [] if str(note).strip()]
+    if notes:
+        lines.append(style.bold("Tooling Notes"))
+        for note in notes:
+            lines.append(f"  {style.yellow(ICON_DOT)} {note}")
+    return lines
+
+
 def _format_check(payload: dict, style: Style) -> str:
     card = payload.get("card", "?")
     eligible = bool(payload.get("eligible"))
@@ -432,6 +518,8 @@ def _format_check(payload: dict, style: Style) -> str:
 
     if payload.get("card_hash"):
         lines.append(format_kv([("card_hash", payload["card_hash"])], style=style))
+
+    lines.extend(_format_tooling(payload.get("tooling"), style))
 
     failures = payload.get("failures") or []
     if failures:
@@ -470,6 +558,12 @@ def _format_check(payload: dict, style: Style) -> str:
                     note = style.red(f"{ICON_FAIL} already passes on base")
                 elif st_val == "FAILED":
                     note = style.green(f"{ICON_OK} fails on base (expected)")
+                elif st_val == "mixed":
+                    note = style.red(f"{ICON_FAIL} fails in some rows only, proves nothing")
+                elif st_val == "ignored":
+                    note = style.red(f"{ICON_FAIL} skipped or expected to fail, proves nothing")
+                elif st_val == "not-run":
+                    note = style.yellow(f"{ICON_DOT} not on base yet (the test writer adds it)")
                 else:
                     note = style.yellow(f"{ICON_DOT} {st_val}")
                 rows.append([test_name, st_val, note])
@@ -485,8 +579,18 @@ def _format_check(payload: dict, style: Style) -> str:
     return "\n".join(lines)
 
 
+def _outcome_card(outcome: object) -> str:
+    """The card an outcome belongs to.
+
+    A real card record carries `card_id`; dry-run and skipped records carry `card`.
+    """
+    if not isinstance(outcome, dict):
+        return ""
+    return str(outcome.get("card_id") or outcome.get("card") or "")
+
+
 def _outcome_row(outcome: dict, style: Style) -> list[str]:
-    card = str(outcome.get("card", ""))
+    card = _outcome_card(outcome)
     if "skipped" in outcome:
         return [
             card,
@@ -527,6 +631,10 @@ def _format_run(payload: dict, style: Style) -> str:
         lines = [style.red(f"{ICON_FAIL} Run refused: {reason}")]
         if payload.get("code"):
             lines.append(format_kv([("code", payload["code"])], style=style))
+        if payload.get("child"):
+            # Which ACP child the confinement rules refused (worker, coordinator, supervisor).
+            child = f"{payload['child']} ({payload.get('provider') or '?'})"
+            lines.append(format_kv([("ACP child", child)], style=style))
         adapters = payload.get("adapters")
         if isinstance(adapters, dict) and adapters:
             lines.append(format_kv([(k, v) for k, v in adapters.items()], style=style))
@@ -553,12 +661,23 @@ def _format_run(payload: dict, style: Style) -> str:
     spend_cap = caps.get("spend", 0.0)
     cap_text = f"cards={caps.get('cards', '-')}, spend={'$' + f'{float(spend_cap):.2f}' if spend_cap else 'unlimited'}"
     measured = bool(payload.get("spend_measured", True))
-    lines.extend(_render_kv_section("Summary", [
+    tokens = payload.get("tokens") or {}
+    total_spend = _as_float(payload.get("spend", 0.0))
+    sup_spend = _as_float(payload.get("micromanager_spend", 0.0))
+    coord_spend = _as_float(payload.get("coordinator_spend", 0.0))
+    # Older run records have no `worker_spend`; their `spend` is the total.
+    worker_spend = (_as_float(payload["worker_spend"]) if "worker_spend" in payload
+                    else max(0.0, total_spend - sup_spend - coord_spend))
+    summary_pairs: list[tuple[str, object]] = [
         ("finished_at", payload.get("finished_at", "-")),
         ("caps", cap_text),
-        ("worker_spend", _fmt_usd(payload.get("spend", 0.0), measured=measured)),
-        ("supervisor_spend", _fmt_usd(payload.get("micromanager_spend", 0.0), measured=measured)),
-    ], style=style))
+        ("spend", _fmt_usd(total_spend, measured=measured)),
+        ("worker_spend", _fmt_usd(worker_spend, measured=measured)),
+        ("supervisor_spend", _fmt_usd(sup_spend, measured=measured)),
+    ]
+    if coord_spend or _as_int(tokens.get("coordinator", 0)):
+        summary_pairs.append(("coordinator_spend", _fmt_usd(coord_spend, measured=measured)))
+    lines.extend(_render_kv_section("Summary", summary_pairs, style=style))
 
     outcomes = payload.get("outcomes") or []
     lines.append(style.bold(f"Outcomes ({len(outcomes)})"))
@@ -573,33 +692,21 @@ def _format_run(payload: dict, style: Style) -> str:
     else:
         lines.append(f"  {style.dim('(no ready cards claimed)')}")
 
-    tokens = payload.get("tokens") or {}
-    total_tok = int(tokens.get("total", 0) or 0)
-    worker_tok = int(tokens.get("worker", 0) or 0)
-    sup_tok = int(tokens.get("supervisor", 0) or 0)
-    w_share = float(tokens.get("worker_share", 0.0) or 0.0)
-    s_share = float(tokens.get("supervisor_share", 0.0) or 0.0)
     lines.append(style.bold("Token Split"))
-    bar = format_bar(w_share, width=16, style=style)
-    lines.append(
-        f"  {_fmt_int(total_tok)} total  {bar}  "
-        f"{w_share * 100:.0f}% worker ({_fmt_int(worker_tok)}) / "
-        f"{s_share * 100:.0f}% supervisor ({_fmt_int(sup_tok)})"
-    )
-    by_member = tokens.get("by_member") or {}
-    if by_member:
-        m_rows = [
-            [name, _fmt_int(tok)]
-            for name, tok in sorted(by_member.items(), key=lambda kv: (-int(kv[1]), kv[0]))
-        ]
-        lines.append(format_table(["MEMBER", "TOKENS"], m_rows, style=style, right_align={1}))
-    by_effort = tokens.get("by_effort") or {}
-    if by_effort:
-        e_rows = [
-            [eff, _fmt_int(tok)]
-            for eff, tok in sorted(by_effort.items(), key=lambda kv: (-int(kv[1]), kv[0]))
-        ]
-        lines.append(format_table(["EFFORT", "TOKENS"], e_rows, style=style, right_align={1}))
+    lines.append("  " + format_token_split(tokens, style=style))
+    for title, key in (("MEMBER", "by_member"), ("EFFORT", "by_effort")):
+        table = tokens.get(key) or {}
+        if isinstance(table, dict) and table:
+            rows = [
+                [name, _fmt_int(tok)]
+                for name, tok in sorted(table.items(), key=lambda kv: (-_as_int(kv[1]), kv[0]))
+            ]
+            lines.append(format_table([title, "TOKENS"], rows, style=style, right_align={1}))
+    external = tokens.get("external_by_member") or {}
+    if isinstance(external, dict) and external:
+        lines.append(f"  {style.dim('outside seats (their own spend, not in the total):')}")
+        rows = [[name, _fmt_int(tok)] for name, tok in sorted(external.items())]
+        lines.append(format_table(["MEMBER", "TOKENS"], rows, style=style, right_align={1}))
 
     harness = payload.get("harness") or {}
     if harness.get("enabled"):
@@ -621,8 +728,9 @@ def _format_run(payload: dict, style: Style) -> str:
             lines.append(f"  {style.red(ICON_FAIL)} {prob}")
 
     next_tips: list[str] = []
-    in_review = [o["card"] for o in outcomes if o.get("final_state") in ("in-review", "in_review")]
-    blocked = [o["card"] for o in outcomes if o.get("final_state") == "blocked"]
+    in_review = [_outcome_card(o) for o in outcomes
+                 if o.get("final_state") in ("in-review", "in_review")]
+    blocked = [_outcome_card(o) for o in outcomes if o.get("final_state") == "blocked"]
     if in_review:
         sample = in_review[0]
         next_tips.extend([
@@ -633,7 +741,7 @@ def _format_run(payload: dict, style: Style) -> str:
     if blocked:
         next_tips.append(f"openfarm dossier {blocked[0]}  (or: openfarm supervise --triage-blocked)")
     if dry:
-        eligible_dry = [o["card"] for o in outcomes if o.get("eligible")]
+        eligible_dry = [_outcome_card(o) for o in outcomes if o.get("eligible")]
         if eligible_dry:
             next_tips.append(f"openfarm run --cards {len(eligible_dry)}")
     if not next_tips:
@@ -1246,15 +1354,105 @@ def _check_line(ok: bool, text: str, style: Style) -> str:
     return f"  {icon} {text}"
 
 
+_ACP_PROVIDER_LABELS = {
+    "claude": "Claude",
+    "antigravity": "Antigravity",
+    "codex": "Codex",
+}
+
+
+def _acp_held(value: object) -> str:
+    """One tool policy's hold, from the status form (a word) or a probe's hold."""
+    if isinstance(value, dict):
+        return str(value.get("held_by") or ("refused" if value.get("refused") else "?"))
+    return str(value or "?")
+
+
+def _acp_login_place(info: dict) -> str:
+    """Where a provider's login was looked for, and whether it was there."""
+    provider = str(info.get("provider") or "")
+    where = str(info.get("credentials_from") or "HOME")
+    where = "$HOME" if where == "HOME" else where
+    found = bool(info.get("credentials_file_present"))
+    text = f"{where} ({'found' if found else 'not found'})"
+    if info.get("oauth_token_env"):
+        text += ", CLAUDE_CODE_OAUTH_TOKEN set"
+    if info.get("api_key_env") and provider == "antigravity":
+        text += ", API key in the environment"
+    return text
+
+
+def _format_acp_children(payload: dict, style: Style) -> list[str]:
+    """How each provider's child is held, and where its login was found."""
+    providers = payload.get("providers")
+    if not isinstance(providers, dict) or not providers:
+        return []
+    results = payload.get("results") if isinstance(payload.get("results"), dict) else {}
+    top = payload.get("confinement") if isinstance(payload.get("confinement"), dict) else {}
+    rows = []
+    refusals: list[str] = []
+    for name, info in providers.items():
+        if not isinstance(info, dict):
+            continue
+        held = info.get("confinement") if isinstance(info.get("confinement"), dict) else {}
+        probed = (results.get(name) or {}).get("confinement") if isinstance(
+            results.get(name), dict) else None
+        if isinstance(probed, dict) and probed.get("none") is not None:
+            held = probed
+        elif isinstance(top.get("none"), dict) and len(providers) == 1:
+            # A single probe's payload carries the hold the probe itself used.
+            held = top
+        cells = [name, _acp_login_place(info)]
+        for policy in ("none", "read-only"):
+            word = _acp_held(held.get(policy)) if held else "?"
+            cells.append(style.red(word) if word == "refused" else
+                         style.yellow(word) if word == "nothing" else word)
+            why = held.get(f"{policy}_refused") if held else None
+            if not why and isinstance(held.get(policy), dict):
+                why = held[policy].get("refused")
+            if why:
+                refusals.append(f"{name}, tool policy {policy}: {why}")
+        cells.append(str(held.get("transport") or info.get("resolved_transport") or "missing"))
+        rows.append(cells)
+    if not rows:
+        return []
+    lines = ["", style.bold("Provider Children")]
+    lines.append(format_table(["PROVIDER", "LOGIN FOUND IN", "TOOLS NONE", "READ-ONLY",
+                               "TRANSPORT"], rows, style=style))
+    for line in refusals:
+        lines.append(f"  {style.red(ICON_FAIL)} {line}")
+    if top.get("setting") or top.get("bwrap") or top.get("mode"):
+        pairs: list[tuple[str, object]] = [
+            ("setting", f'{top.get("setting", "[micromanager] confine")} = '
+                        f'"{top.get("mode", "auto")}"')]
+        if isinstance(top.get("bwrap"), dict):
+            bwrap = top["bwrap"]
+            badge = (style.green(f"{ICON_OK} usable") if bwrap.get("usable")
+                     else style.yellow(f"{ICON_DOT} not usable"))
+            pairs.append(("bwrap", f"{badge} ({bwrap.get('detail', 'unknown')})"))
+        if top.get("read_roots"):
+            pairs.append(("read_roots", ", ".join(str(r) for r in top["read_roots"])))
+        lines.extend(_render_kv_section("Confinement", pairs, style=style))
+        for note in top.get("notes") or ():
+            lines.append(f"  {style.yellow(ICON_DOT)} {note}")
+    return lines
+
+
 def _format_acp(kind: str, payload: dict, style: Style) -> str:
     action = payload.get("action") or (kind[4:] if kind.startswith("acp_") else "status")
+    raw_prov = str(payload.get("provider") or "").strip().lower()
+    if not raw_prov or raw_prov == "all":
+        display_prov = str(payload.get("primary_provider") or "claude").strip().lower()
+    else:
+        display_prov = raw_prov
+    label = _ACP_PROVIDER_LABELS.get(display_prov, "Claude")
     titles = {
-        "status": "Frontier Claude ACP Status",
-        "login": "Frontier Claude OAuth Login",
-        "configure": "Frontier Claude ACP Configured",
-        "probe": "Frontier Claude ACP Probe",
+        "status": f"Frontier {label} ACP Status",
+        "login": f"Frontier {label} OAuth Login",
+        "configure": f"Frontier {label} ACP Configured",
+        "probe": f"Frontier {label} ACP Probe",
     }
-    lines = [style.heading(titles.get(action, "Frontier Claude ACP"))]
+    lines = [style.heading(titles.get(action, f"Frontier {label} ACP"))]
 
     oauth_ready = bool(payload.get("oauth_ready"))
     transport = str(payload.get("resolved_transport") or "missing")
@@ -1270,10 +1468,24 @@ def _format_acp(kind: str, payload: dict, style: Style) -> str:
         f"(cli_logged_in={logged_in}, credentials_file={creds_present}, env_token={env_tok})",
         style,
     ))
+    if display_prov == "antigravity":
+        tr_detail = (
+            f"(agy={payload.get('agy_cli') or 'missing'}, "
+            f"acp={payload.get('antigravity_acp') or 'missing'})"
+        )
+    elif display_prov == "codex":
+        tr_detail = (
+            f"(codex={payload.get('codex_cli') or 'missing'}, "
+            f"acp={payload.get('codex_acp') or 'missing'})"
+        )
+    else:
+        tr_detail = (
+            f"(claude={payload.get('claude_cli') or 'missing'}, "
+            f"acp={payload.get('claude_agent_acp') or 'missing'})"
+        )
     lines.append(_check_line(
         transport != "missing",
-        f"ACP transport: {transport} "
-        f"(claude={payload.get('claude_cli') or 'missing'}, acp={payload.get('claude_agent_acp') or 'missing'})",
+        f"ACP transport: {transport} {tr_detail}",
         style,
     ))
 
@@ -1282,13 +1494,54 @@ def _format_acp(kind: str, payload: dict, style: Style) -> str:
     if action == "configure" and payload.get("config_path"):
         lines.append(_check_line(True, f"Updated config: {payload['config_path']}", style))
     if action == "probe":
-        methods = ", ".join(str(m.get("id", m)) if isinstance(m, dict) else str(m)
-                            for m in (payload.get("auth_methods") or ())) or "none"
-        lines.append(_check_line(
-            True,
-            f"Handshake protocol v{payload.get('protocol_version', '?')} (auth_methods: {methods})",
-            style,
-        ))
+        if isinstance(payload.get("results"), dict):
+            for pname, pres in payload["results"].items():
+                if not isinstance(pres, dict):
+                    continue
+                if pres.get("ok"):
+                    methods = ", ".join(
+                        str(m.get("id", m)) if isinstance(m, dict) else str(m)
+                        for m in (pres.get("auth_methods") or ())
+                    ) or "none"
+                    lines.append(_check_line(
+                        True,
+                        f"{pname}: protocol v{pres.get('protocol_version', '?')} (auth_methods: {methods})",
+                        style,
+                    ))
+                else:
+                    lines.append(_check_line(
+                        False,
+                        f"{pname}: {pres.get('error', 'probe failed')}",
+                        style,
+                    ))
+        else:
+            methods = ", ".join(str(m.get("id", m)) if isinstance(m, dict) else str(m)
+                                for m in (payload.get("auth_methods") or ())) or "none"
+            lines.append(_check_line(
+                True,
+                f"Handshake protocol v{payload.get('protocol_version', '?')} (auth_methods: {methods})",
+                style,
+            ))
+
+    providers = payload.get("providers")
+    if isinstance(providers, dict) and len(providers) > 1:
+        rows = []
+        for pname, pinfo in providers.items():
+            if not isinstance(pinfo, dict):
+                continue
+            rows.append([
+                pname,
+                str(pinfo.get("resolved_transport") or "missing"),
+                "ready" if pinfo.get("oauth_ready") else "not logged in",
+                str(pinfo.get("cli_path") or "missing"),
+            ])
+        if rows:
+            lines.append("")
+            lines.append(style.bold("Providers"))
+            lines.append(format_table(["PROVIDER", "TRANSPORT", "OAUTH", "CLI"], rows, style=style))
+
+    if action in ("status", "probe"):
+        lines.extend(_format_acp_children(payload, style))
 
     frontier = payload.get("repo_frontier")
     if isinstance(frontier, dict):
@@ -1314,11 +1567,19 @@ def _format_acp(kind: str, payload: dict, style: Style) -> str:
     if payload.get("hint"):
         tips.append(str(payload["hint"]))
     if not oauth_ready:
-        tips.append("openfarm acp login")
+        tips.append(
+            "openfarm acp login"
+            if display_prov == "claude"
+            else f"openfarm acp login --provider {display_prov}"
+        )
     if isinstance(workers, dict) and workers.get("key_file") and not workers.get("key_file_present"):
         tips.append(f"Create worker key file at {workers['key_file']} (chmod 600)")
     if not tips and action != "probe":
-        tips.append("openfarm acp probe")
+        tips.append(
+            "openfarm acp probe"
+            if display_prov == "claude"
+            else f"openfarm acp probe --provider {display_prov}"
+        )
     elif not tips:
         tips.append("openfarm check <CARD>")
     lines.extend(_render_next(tips, style=style, numbered=True))
@@ -1339,6 +1600,151 @@ def _format_bench_list(payload: dict, style: Style) -> str:
     return "\n".join(lines)
 
 
+def _format_drive(payload: dict, style: Style) -> str:
+    if payload.get("refused"):
+        reason = payload.get("reason", "refused")
+        lines = [style.red(f"{ICON_FAIL} Drive refused: {reason}")]
+        if payload.get("code"):
+            lines.append(format_kv([("code", payload["code"])], style=style))
+        lines.extend(_render_next(["openfarm status"], style=style))
+        return "\n".join(lines)
+
+    run_id = payload.get("run_id", "?")
+    agent = payload.get("agent", "?")
+    seat = payload.get("seat", "both")
+    ok = bool(payload.get("ok", True))
+    badge = style.green(f"{ICON_OK} ok") if ok else style.red(f"{ICON_FAIL} failed")
+    lines = [style.heading(f"Driver Run {run_id}") + f"  [{agent} / {seat}]  {badge}"]
+    tokens_txt = (
+        f"{_fmt_int(payload.get('driver_tokens_in', 0))} in / "
+        f"{_fmt_int(payload.get('driver_tokens_out', 0))} out"
+    )
+    if payload.get("driver_tokens_estimated"):
+        tokens_txt += " (estimated)"
+    pairs: list[tuple[str, object]] = [
+        ("agent", agent),
+        ("seat", seat),
+        ("driver_turns", payload.get("driver_turns", 0)),
+        ("driver_tokens", tokens_txt),
+    ]
+    if "driver_spend" in payload:
+        pairs.append(("driver_spend", _fmt_usd(
+            payload.get("driver_spend", 0.0),
+            measured=bool(payload.get("driver_spend_measured", False)),
+        )))
+    if payload.get("run_spend") is not None:
+        pairs.append(("run_spend", _fmt_usd(payload["run_spend"]) + " (driver included)"))
+    elif payload.get("driver_counted_in_run") is False:
+        pairs.append(("run_spend", "not counted: the run belongs to another process"))
+    if isinstance(payload.get("run_tokens"), dict):
+        from .budget import describe_split
+        split = payload["run_tokens"]
+        pairs.append(("run_tokens", describe_split(split) + " (driver included"
+                      + (", driver tokens estimated)" if split.get("estimated") else ")")))
+    for part, vals in (payload.get("driver_by_part") or {}).items():
+        part_txt = (
+            f"{_fmt_int(vals.get('tokens_in', 0))} in / {_fmt_int(vals.get('tokens_out', 0))} out, "
+            f"{vals.get('turns', 0)} turn(s)"
+        )
+        if vals.get("estimated"):
+            part_txt += " (estimated)"
+        pairs.append((f"  {part}", part_txt))
+    pairs.extend([
+        ("actions_taken", len(payload.get("actions_taken") or ())),
+        ("answers_sent", len(payload.get("answers_sent") or ())),
+    ])
+    if payload.get("timeouts"):
+        pairs.append((
+            "timed_out",
+            f"{len(payload['timeouts'])} (on_external_timeout = "
+            f"{payload.get('on_external_timeout', 'fallback')})",
+        ))
+    if payload.get("driver_errors"):
+        pairs.append(("failed_turns", len(payload["driver_errors"])))
+    if payload.get("spend_stopped"):
+        pairs.append(("stopped", payload["spend_stopped"]))
+    lines.extend(_render_kv_section("Driver", pairs, style=style))
+
+    outcomes = payload.get("outcomes") or []
+    lines.append(style.bold(f"Outcomes ({len(outcomes)})"))
+    if outcomes:
+        rows = [_outcome_row(o, style) for o in outcomes]
+        lines.append(format_table(
+            ["CARD", "STATE", "STOP CODE", "ATTEMPTS", "DETAIL"],
+            rows,
+            style=style,
+            right_align={3},
+        ))
+    else:
+        lines.append(f"  {style.dim('(no card outcomes)')}")
+
+    reviews = payload.get("reviews") or []
+    if reviews:
+        lines.append(style.bold(f"Wave Reviews ({len(reviews)})"))
+        def _rev_note(r: dict) -> str:
+            if r.get("not_reviewed_reason"):
+                return f"not reviewed: {r['not_reviewed_reason']}"
+            if r.get("not_recorded_reason"):
+                return f"{r.get('note') or ''} (not recorded: {r['not_recorded_reason']})".strip()
+            return r.get("note") or "-"
+
+        rev_rows = [
+            [
+                _outcome_card(r),
+                format_state(r.get("verdict") or "not reviewed", style=style),
+                _fmt_int(r.get("review_tokens", 0)) + ("~" if r.get("review_tokens_estimated") else ""),
+                "yes" if r.get("recorded") else (
+                    "kept existing" if r.get("kept_existing") else "no"
+                ),
+                _truncate(_rev_note(r), 72),
+            ]
+            for r in reviews
+        ]
+        lines.append(format_table(
+            ["CARD", "VERDICT", "TOKENS", "RECORDED", "NOTE"],
+            rev_rows,
+            style=style,
+            right_align={2},
+        ))
+
+    for title, items, fmt in (
+        ("Timed Out (no usable driver answer)", payload.get("timeouts") or [],
+         lambda t: f"{t.get('card') or '-'} {t.get('op') or t.get('event') or ''} "
+                   f"#{t.get('seq')}: {t.get('policy')}; {t.get('reason')}"),
+        ("Failed Driver Turns", payload.get("driver_errors") or [],
+         lambda e: f"turn {e.get('turn')}: {e.get('code')}: {e.get('message')}"),
+    ):
+        if items:
+            lines.append(style.bold(f"{title} ({len(items)})"))
+            for item in items[:10]:
+                lines.append(f"  {style.yellow(ICON_DOT)} {_truncate(fmt(item), 110)}")
+            if len(items) > 10:
+                lines.append(f"  {style.dim(f'... {len(items) - 10} more (see --json)')}")
+
+    notes = payload.get("notes") or []
+    if notes:
+        lines.append(style.bold("Notes"))
+        for note in notes:
+            lines.append(f"  {style.yellow(ICON_DOT)} {note}")
+    for problem in payload.get("cleanup_problems") or []:
+        lines.append(f"  {style.red(ICON_FAIL)} clean-up: {problem}")
+
+    next_tips: list[str] = []
+    in_review = [
+        _outcome_card(o)
+        for o in outcomes
+        if o.get("final_state") in ("in-review", "in_review")
+    ]
+    if in_review:
+        sample = in_review[0]
+        next_tips.append(f"openfarm dossier {sample}")
+        next_tips.append(f"git merge --no-ff openfarm/{sample}-<slug> && openfarm done {sample}")
+    else:
+        next_tips.append("openfarm status")
+    lines.extend(_render_next(next_tips, style=style))
+    return "\n".join(lines)
+
+
 def _format_fallback(payload: dict, style: Style) -> str:
     if payload.get("error"):
         kind = payload.get("kind") or "error"
@@ -1353,8 +1759,34 @@ def _format_fallback(payload: dict, style: Style) -> str:
 
 
 def format_human(kind: str, payload: dict, *, style: Style | None = None) -> str:
-    """Format a command payload for human readers when `--json` is False."""
+    """Format a command payload for human readers when `--json` is False.
+
+    A formatter bug must never turn a command that worked into a failure: the
+    work is already done and its exit code already decided. So any error here
+    falls back to the JSON the command would have printed with `--json`, with a
+    one-line note on stderr.
+    """
     st = style or Style(sys.stdout)
+    try:
+        return format_human_strict(kind, payload, style=st)
+    except Exception as exc:  # any formatter bug, by design
+        with contextlib.suppress(OSError, ValueError):
+            print(
+                f"openfarm: could not format the {kind or 'command'} result for "
+                f"people ({type(exc).__name__}: {exc}); showing it as JSON",
+                file=sys.stderr,
+            )
+        try:
+            return json.dumps(payload, indent=2, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            return str(payload)
+
+
+def format_human_strict(kind: str, payload: dict, *, style: Style | None = None) -> str:
+    """Like `format_human`, but a formatter error raises. For tests."""
+    st = style or Style(sys.stdout)
+    if not isinstance(payload, dict):
+        payload = {"value": payload}
     if kind == "status":
         return _format_status(payload, st)
     if kind == "check":
@@ -1413,6 +1845,8 @@ def format_human(kind: str, payload: dict, *, style: Style | None = None) -> str
         return _format_acp(kind, payload, st)
     if kind == "bench_list":
         return _format_bench_list(payload, st)
+    if kind == "drive":
+        return _format_drive(payload, st)
     return _format_fallback(payload, st)
 
 
@@ -1455,5 +1889,5 @@ def error_hint(kind: str, message: str) -> str:
     if "outside the repository" in low:
         return "point state_dir and key_file outside the repository (e.g. ~/.openfarm/<name> and ~/.config/openfarm/<name>.key)"
     if kind == "usage error" and "no subcommand" in low:
-        return "run 'openfarm --help' to list all 21 commands and workflows"
+        return "run 'openfarm --help' to list all 22 commands and workflows"
     return ""

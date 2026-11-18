@@ -649,6 +649,31 @@ class HumanCliCommandsTests(unittest.TestCase):
         self.assertEqual(c_blk, EXIT_OK)
         self.assertIn("Blocked CARD-1", out_blk)
 
+        # Typing the code coordinator's name after --as proves nothing: from the
+        # command line only a member that joined the seat may steer.
+        board.upsert_member("coordinator", kind="code", role="coordinator", added_by="system")
+        before = len(board.read(as_name="*", since=0, limit=None, for_model=False))
+        c_fake, out_fake, err_fake = _run_cli(
+            "--repo", str(self.repo), "swarm", "hint", "CARD-1-implementer",
+            "--body", "do it my way", "--as", "coordinator",
+        )
+        self.assertNotEqual(c_fake, EXIT_OK)
+        self.assertIn("joined the coordinator seat", out_fake + err_fake)
+        notes = [
+            p for p in board.read(as_name="*", since=0, limit=None, for_model=False)[before:]
+            if p["kind"] == "note"
+        ]
+        self.assertEqual(notes, [])
+        board.upsert_member(
+            "coordinator", kind="code", role="coordinator", state="removed", added_by="system"
+        )
+        # CARD-1 was running, so the block is a stop request: its members stay
+        # until the card's own final post (code, as `gates`) lands.
+        board.post(
+            "gates", ["coordinator"], "blocked", "CARD-1 blocked (refused): stop test",
+            card="CARD-1", trusted=True,
+        )
+
         c_rm, out_rm, _ = _run_cli(
             "--repo", str(self.repo), "swarm", "remove", "CARD-1-implementer", "--as", "alice",
         )

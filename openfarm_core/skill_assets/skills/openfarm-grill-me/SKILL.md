@@ -7,7 +7,7 @@ description: >-
   setup, and concrete card Done assertions into .openfarm/GRILL_DECISIONS.md.
 ---
 
-# Openfarm Grill-Me Skill (`v0.8.0`)
+# Openfarm Grill-Me Skill (`v0.8.1`)
 
 Use this skill whenever the user invokes `/openfarm-grill-me`, asks to stress-test a project idea before `/openfarm-initialize`, or wants to sharpen a multi-card feature specification on an existing Openfarm repository.
 
@@ -41,13 +41,14 @@ Read [prompts/grill_protocol.md](./prompts/grill_protocol.md) for the exact 5-br
    - **Branch 1 — Protected Seam Invariants (`src/invariants.rs`)**: bounds, overflow rules, validation laws, and `DomainError` variants locked under `never_touch`.
    - **Branch 2 — Public Surface & Golden Reference Slice**: `pub` types (`rust_tests_in_separate_files = true`) and which single vertical slice workers will imitate.
    - **Branch 3 — Scope Boundaries, Crate Dependencies & Extra Gates**: non-goals for v1 and pinned dependencies (`**/Cargo.toml` and `Cargo.lock` are `forbidden_files` for workers).
-   - **Branch 4 — Frontier (Claude ACP OAuth) & Worker (API Key) Runtime**:
-     - Default Frontier supervision is native Claude ACP via OAuth (`[micromanager] auth = "oauth"`, `binary = "auto"`). If `openfarm acp status --json` shows `oauth_ready: false`, confirm whether the owner wants to run `openfarm acp login` now (default) or fall back to `--profile solo`.
+   - **Branch 4 — Frontier (Claude / Antigravity / Codex ACP or Driver Mode) & Worker (API Key) Runtime**:
+     - Default Frontier supervision is native ACP via OAuth (`claude-acp`, `antigravity-acp`/`agy-acp`, or `codex-acp` via `init --acp-provider <provider>`, or automated Driver mode `openfarm drive --agent claude|antigravity|codex`). If `openfarm acp status --json` shows `oauth_ready: false`, confirm whether the owner wants to run `openfarm acp login --provider <provider>` now (default) or fall back to `--profile solo`.
+     - Recommend Claude with `tool_policy = "none"`. For Codex recommend `binary = "codex-exec"` with `tool_policy = "none"`. For Antigravity, openfarm starts `agy` with no person typing: ask the owner to confirm their Antigravity plan's terms allow that before choosing OAuth, and offer an API key (`auth = "api-key"`, `auth_file`) as the other route. Codex and Antigravity need bubblewrap (`bwrap`) for their boundary; never recommend `confine = "off"`, which lets the child read whatever the owner's user can.
      - Confirm Worker ZDR OpenAI-compatible endpoint/model + `~/.config/openfarm/<project>.key` and spend caps (unless offline/scripted test only).
    - **Branch 5 — Concrete Wave 1–3 Boundaries & Eligibility**: resolve edge-case outputs so card `## Done` bullets never contain banned vague words (`handle`, `properly`, `robust`, `decide how`).
 
 4. **Shared Understanding Gate Before Writing Code**:
-   Do **not** run `openfarm init` edits or write application code while frontier questions remain open. When the frontier is empty, summarize the agreed design tree concisely and wait for the owner's confirmation (`"Confirmed"` / `"Proceed"`). Then write `.openfarm/GRILL_DECISIONS.md` (with zero secrets or API keys) and hand off seamlessly into `/openfarm-initialize` (greenfield) or `openfarm` wave card authoring (existing repo).
+   Do **not** run `openfarm init` edits or write application code while frontier questions remain open. When the frontier is empty, summarize the agreed design tree concisely and wait for the owner's confirmation (`"Confirmed"` / `"Proceed"`). Then write `.openfarm/GRILL_DECISIONS.md` (with zero secrets or API keys) and hand off into `/openfarm-initialize` (greenfield) or `openfarm` wave card authoring (existing repo).
 
 ## Batch Mode (`--batch`)
 

@@ -357,9 +357,10 @@ def open_backend(cfg, script_path: Path | None = None):
         return ScriptedBackend(load_script(script_path))
     if cfg.model_adapter in ("scripted", "stub"):
         return ScriptedBackend()
-    if cfg.model_adapter == "claude-acp":
-        from .claude_worker import open_claude_worker
-        return open_claude_worker(cfg)
+    from .acp import is_acp_adapter
+    if is_acp_adapter(cfg.model_adapter):
+        from .claude_worker import open_acp_worker
+        return open_acp_worker(cfg)
     if cfg.model_adapter.startswith("cmd:"):
         from ..protocol import CmdModelBackend
         return CmdModelBackend(

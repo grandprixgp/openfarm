@@ -51,6 +51,70 @@ class Pack:
     def error_signature(self, stderr: str) -> dict:
         raise NotImplementedError
 
+    def row_file(self, row: dict) -> str | None:
+        """The source file a result or listing row came from, or None if unknown.
+
+        The gates use it to keep a same-named test in another file from counting
+        for a card's named test. None (the default) leaves every row in, as
+        before; a pack whose rows name their file says so here.
+        """
+        return None
+
+    def prepare_worktree(self, worktree: Path) -> str:
+        """Ready another checkout of this project for a run, as `configure` does.
+
+        The flow calls it on the trial checkouts it makes beside a card's worktree
+        (revert-check, catch-up), so a run there sees what the card's own runs see.
+        It never changes the pack's own settings. Returns a note, or "" (the
+        default: nothing to do).
+        """
+        return ""
+
+    def test_writer_note(self, worktree: Path, test_paths: list[str]) -> str:
+        """What the test writer must know to write tests this project can build.
+
+        For instance how a test file reaches the code under test. "" (the
+        default) adds nothing to the brief.
+        """
+        return ""
+
+    def build_errors(self, stdout: str, stderr: str) -> str:
+        """The errors of a build that failed, a few lines, or "" when none are found.
+
+        The flow adds it where a gate would otherwise only say the tests were not
+        listed, so the role asked to try again sees why.
+        """
+        return ""
+
+    def gate_evidence(self, gate: str) -> dict:
+        """What a gate's record should say about how this pack ran it.
+
+        For instance, that a lint gate was a syntax check only, so nobody reading
+        the record takes it for a type check; a `note` key says it in a sentence.
+        Empty (the default) adds nothing.
+        """
+        return {}
+
+    def tooling_summary(self) -> dict:
+        """What this pack will run a card with, for `check` and a card record.
+
+        `pack`, `runner` (when the pack has one: unittest or pytest, node
+        --test), `lint` and `format` (when the pack says which tool), and
+        `notes`, the pack's own sentences on what it could not use. A pack that
+        knows more says it by overriding this.
+        """
+        out: dict = {"pack": str(self.name)}
+        runner = str(getattr(self, "runner", "") or "")
+        if runner:
+            out["runner"] = runner
+        # A pack whose lint and formatting are ruff only where configured.
+        use_ruff = getattr(self, "use_ruff", None)
+        if isinstance(use_ruff, bool):
+            out["lint"] = "ruff" if use_ruff else "syntax"
+            out["format"] = "ruff" if use_ruff else "off"
+        out["notes"] = [str(note) for note in getattr(self, "notes", []) or []]
+        return out
+
     # -- files ----------------------------------------------------------------
 
     def classify_paths(self, paths: list[str]) -> dict:
@@ -198,7 +262,6 @@ def pack_for(language: str, cargo_flags: list[str] | None = None,
         from .python import PythonPack
         return PythonPack(python or None)
     if language in ("typescript", "ts", "javascript", "js"):
-        raise Invalid(
-            "no-typescript-pack",
-            "the TypeScript pack comes after the pilot and is not implemented")
+        from .typescript import TypeScriptPack
+        return TypeScriptPack()
     return UnsupportedPack(language)

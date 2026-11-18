@@ -1,0 +1,25 @@
+# The solo arm: Codex does every worker role itself, through the same briefs,
+# edit format and gates, with no supervisor. It uses your Codex CLI login over
+# ACP; no key file. Pass it as --arm solo=<file>.
+
+[adapters]
+model = "codex-acp"
+micromanager = "off"
+
+[model]
+max_tokens = 32768
+# An empty model name means Codex's default model.
+test_writer = { model = "", temperature = 0.2 }
+implementer = { model = "", temperature = 0.3 }
+checker     = { model = "", temperature = 0.35 }
+planner     = { model = "", temperature = 0.2 }
+
+# How to reach Codex. mode stays "off": in this arm nothing supervises.
+[micromanager]
+mode = "off"
+auth = "oauth"
+binary = "auto"
+args = []
+effort = "medium"
+timeout_s = 600.0
+isolate_home = true

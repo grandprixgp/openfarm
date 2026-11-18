@@ -356,6 +356,7 @@ class BackendEffortRecordingTests(unittest.TestCase):
                 return
 
         backend = ClaudeAcpWorkerBackend(effort="medium", adapter=_StubAcp())
+        self.addCleanup(backend.close)
         comp = backend.complete(
             "implementer", "claude", 0.2, [{"role": "user", "content": "hi"}],
             effort="high", effort_param="reasoning_effort",
@@ -413,6 +414,13 @@ class StopCodeReplanAndGlobTests(unittest.TestCase):
                     "replan_if": bad_val,
                 },
             )
+            # With the swarm off the field is unknown, as in v0.7, and is ignored.
+            cfg.swarm.enabled = False
+            self.assertNotIn(
+                "replan-if",
+                [f["rule"] for f in check_eligibility(bad_card, cfg).failures],
+            )
+            cfg.swarm.enabled = True
             res = check_eligibility(bad_card, cfg)
             self.assertFalse(res.ok, repr(bad_val))
             self.assertIn("replan-if", [f["rule"] for f in res.failures])

@@ -156,9 +156,14 @@ class SwarmActionsTests(unittest.TestCase):
             swarm_join(self.board, self.cfg, name="bob", seat="coordinator", owner_kind="human")
         self.assertEqual(caught.exception.code, "seat-occupied")
 
-        # Idempotent re-join for same name succeeds
-        again = swarm_join(self.board, self.cfg, name="alice", seat="coordinator", owner_kind="human")
-        self.assertEqual(again["owner_kind"], "human")
+        # Idempotent re-join for same name and owner kind succeeds
+        again = swarm_join(self.board, self.cfg, name="alice", seat="coordinator", owner_kind="agent")
+        self.assertEqual(again["owner_kind"], "agent")
+        # A re-join never changes an active member's owner kind (v0.8.1 seats, M4)
+        with self.assertRaises(Refused) as caught_kind:
+            swarm_join(self.board, self.cfg, name="alice", seat="coordinator", owner_kind="human")
+        self.assertEqual(caught_kind.exception.code, "seat-occupied")
+        self.assertEqual(self.board.get_member("alice")["owner_kind"], "agent")
 
         # Non-external seat refused
         code_cfg = _make_config(
@@ -325,12 +330,24 @@ class SwarmActionsTests(unittest.TestCase):
         status_running = swarm_status(self.board, self.cfg)
         self.assertEqual(status_running["running_cards"], ["CARD-1"])
 
-        # Block posts blocked event, clearing slot before remove runs, and allowing remove
+        # Block on a running card is a stop request: the card keeps its slot and
+        # its members until its own final post lands.
         blk = swarm_block(
             self.board, self.cfg, caller="alice", card_id="CARD-1",
             reason="needs owner", cards_by_id=cards,
         )
         self.assertEqual(blk["post"]["kind"], "blocked")
+        self.assertTrue(blk["running"])
+        self.assertIn("still running", blk["message"])
+        self.assertEqual(self.board.stop_requested("CARD-1"), "needs owner")
+        self.assertEqual(swarm_status(self.board, self.cfg)["running_cards"], ["CARD-1"])
+        with self.assertRaises(Refused) as still_running:
+            swarm_remove(self.board, self.cfg, caller="alice", member_name=impl)
+        self.assertEqual(still_running.exception.code, "card-not-finished")
+        self.board.post(
+            author="gates", to=["coordinator"], kind="blocked", card="CARD-1",
+            body="CARD-1 blocked (refused): needs owner", trusted=True,
+        )
         removed = swarm_remove(self.board, self.cfg, caller="alice", member_name=impl)
         self.assertEqual(removed["member"]["state"], "removed")
 
@@ -443,6 +460,14 @@ class SwarmCliTests(unittest.TestCase):
         )
         self.assertEqual(code, EXIT_OK)
         self.assertEqual(json.loads(out)["post"]["kind"], "blocked")
+
+        # Still running until the card's own final post lands
+        code, _, _ = self._run_cli("swarm", "remove", impl, "--as", "alice", "--json")
+        self.assertEqual(code, EXIT_REFUSED)
+        Board(board_dir_for(self.state, "run-cli"), state_dir=self.state).post(
+            author="gates", to=["coordinator"], kind="blocked", card="CARD-1",
+            body="CARD-1 blocked (refused): wrong spec", trusted=True,
+        )
 
         code, out, _ = self._run_cli("swarm", "remove", impl, "--as", "alice", "--json")
         self.assertEqual(code, EXIT_OK)

@@ -820,6 +820,16 @@ global_dir = "{self.global_harness}"
         )
         self.assertEqual(block_res["exit_code"], 0, block_res["output"])
 
+        # CARD-3 was running, so its block is a stop request: its members stay
+        # until the card's own final post (code, as `gates`) lands.
+        from openfarm_core.board import Board, board_dir_for
+        Board(
+            board_dir_for(StateDir(self.state_root), self.run_id), state_dir=self.state_root
+        ).post(
+            "gates", ["coordinator"], "blocked", "CARD-3 blocked (refused): needs review",
+            card="CARD-3", trusted=True,
+        )
+
         rm_res = dispatch_cli_command(
             self.repo,
             None,
@@ -917,7 +927,7 @@ class PrettifiedTuiThemeAndControllerTests(unittest.TestCase):
 
     def test_once_snapshots_include_unicode_chrome_bars_and_icons(self) -> None:
         ov_txt = render_snapshot(self.repo, view="overview")
-        self.assertIn("openfarm tui v0.8.0", ov_txt)
+        self.assertIn("openfarm tui v0.8.1", ov_txt)
         self.assertIn("╭─", ov_txt)
         self.assertIn("╰─", ov_txt)
         self.assertIn("█", ov_txt)

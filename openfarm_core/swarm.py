@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import os
+import secrets
 import sys
 import threading
 import time
 from typing import Callable, Iterable
 
-from .board import Board, normalize_role
+from .adapters.acp import is_acp_adapter
+from .board import CODE_AUTHOR_NAMES, Board, is_stop_request, normalize_role, post_is_code
 from .cards import Card
 from .errors import Refused
 from .globs import globs_overlap
+from .state import _pid_alive, _this_host, utc_now
 
 WORKER_ROLES: tuple[str, ...] = ("planner", "test-writer", "implementer", "checker")
 SEAT_ROLES: tuple[str, ...] = ("coordinator", "supervisor")
@@ -47,7 +53,7 @@ def worker_kind_for_config(cfg) -> str:
     adapter = str(getattr(cfg, "model_adapter", "openai-compatible") or "")
     if adapter in ("scripted", "stub"):
         return "scripted"
-    if adapter == "claude-acp":
+    if is_acp_adapter(adapter):
         return "acp"
     return "api"
 
@@ -122,7 +128,15 @@ def _refuse(
     return Refused(code, message)
 
 
-def _require_coordinator(board: Board, caller: str, *, card: str = "") -> dict:
+def _require_coordinator(
+    board: Board, caller: str, *, card: str = "", outside: bool = False
+) -> dict:
+    """The caller's roster entry, if it holds the coordinator seat.
+
+    `outside=True` is for a caller that named itself (`--as` on the command
+    line): only an external member that joined the seat passes then, so
+    typing the name of the code coordinator proves nothing.
+    """
     clean = str(caller or "").strip()
     if not clean:
         raise _refuse(
@@ -145,6 +159,15 @@ def _require_coordinator(board: Board, caller: str, *, card: str = "") -> dict:
             f"{clean!r} (role {member.get('role')!r}) does not hold the coordinator seat",
             card=card,
         )
+    if outside and member.get("kind") != "external":
+        raise _refuse(
+            board,
+            clean,
+            "not-coordinator",
+            f"{clean!r} is a {member.get('kind')!r} member; from outside, only a member "
+            "that joined the coordinator seat (openfarm swarm join) can act",
+            card=card,
+        )
     return member
 
 
@@ -154,6 +177,73 @@ def _load_cards_map(source=None, cards_by_id: dict[str, Card] | None = None) -> 
     if source is not None and hasattr(source, "all_cards"):
         return {card.id: card for card in source.all_cards()}
     return {}
+
+
+def _is_start_action(post: dict, members: dict[str, dict]) -> bool:
+    """A `start CARD` action posted by a holder of the coordinator seat."""
+    if post.get("kind") != "action" or not post.get("card"):
+        return False
+    if not str(post.get("body", "") or "").startswith("start "):
+        return False
+    member = members.get(str(post.get("from", "") or ""))
+    return member is not None and normalize_role(str(member.get("role", ""))) == "coordinator"
+
+
+class CardProgress:
+    """What the board says about each card: started, finished, asked to stop.
+
+    A card is finished only on its own final post (code, author `gates`, kind
+    `done` or `blocked`), or when the coordinator blocked it before it ever
+    started. A stop request on a running card leaves it running until its
+    thread ends and posts that final post.
+    """
+
+    def __init__(self) -> None:
+        self.started: set[str] = set()
+        self.final: set[str] = set()
+        self.stop_requested: set[str] = set()
+
+    def feed(self, posts: Iterable[dict], members: dict[str, dict]) -> None:
+        for post in posts:
+            cid = str(post.get("card", "") or "")
+            if not cid:
+                continue
+            author = str(post.get("from", "") or "")
+            kind = post.get("kind")
+            if author == "gates" and kind in ("done", "blocked") and post_is_code(post, members):
+                self.final.add(cid)
+            elif _is_start_action(post, members):
+                self.started.add(cid)
+            elif is_stop_request(post, members):
+                self.stop_requested.add(cid)
+
+    def note_members(self, members: Iterable[dict]) -> None:
+        # A card with team members on the roster was started, whatever path
+        # registered them.
+        for member in members:
+            cid = str(member.get("card", "") or "")
+            if cid:
+                self.started.add(cid)
+
+    @property
+    def finished(self) -> set[str]:
+        return self.final | (self.stop_requested - self.started)
+
+    @property
+    def stopping(self) -> set[str]:
+        """Running cards the coordinator asked to stop."""
+        return (self.stop_requested & self.started) - self.final
+
+
+def _card_progress(board: Board) -> CardProgress:
+    progress = CardProgress()
+    if not board.board_dir.exists():
+        return progress
+    roster = board.list_members(include_removed=True)
+    members = {str(m.get("name", "")): m for m in roster}
+    progress.note_members(roster)
+    progress.feed(board.read(as_name="*", since=0, limit=None, for_model=False), members)
+    return progress
 
 
 def _running_cards_from_board(board: Board) -> set[str]:
@@ -166,14 +256,7 @@ def _running_cards_from_board(board: Board) -> set[str]:
 
 
 def _finished_cards_from_board(board: Board) -> set[str]:
-    if not board.board_dir.exists():
-        return set()
-    posts = board.read(as_name="*", since=0, limit=None, for_model=False)
-    return {
-        str(p.get("card", ""))
-        for p in posts
-        if p.get("kind") in ("done", "blocked") and p.get("card")
-    }
+    return _card_progress(board).finished
 
 
 def swarm_tiers(cfg) -> dict:
@@ -187,14 +270,75 @@ def swarm_tiers(cfg) -> dict:
 def swarm_status(board: Board, cfg) -> dict:
     """Board summary, swarm settings, configured tiers, and non-removed roster."""
     members = board.list_members(include_removed=False)
-    running_cards = sorted(_running_cards_from_board(board))
+    progress = _card_progress(board)
+    running_cards = sorted(
+        {
+            str(m.get("card", ""))
+            for m in members
+            if m.get("card") and str(m.get("card", "")) not in progress.finished
+        }
+    )
     return {
         "board": board.status(),
         "swarm": cfg.swarm.as_dict(),
         "tiers": {name: tier.as_dict() for name, tier in cfg.tiers.items()},
         "members": members,
         "running_cards": running_cards,
+        "stopping_cards": sorted(set(running_cards) & progress.stopping),
     }
+
+
+def new_seat_holder() -> dict:
+    """Who is taking seats: this process's pid and host, and a random token.
+
+    The token stays in the caller's memory. The board keeps only its hash, so
+    nothing that reads the roster can prove itself the holder.
+    """
+    return {"pid": os.getpid(), "host": _this_host(), "token": secrets.token_hex(16)}
+
+
+def _token_hash(token: str) -> str:
+    return hashlib.sha256(str(token).encode("utf-8")).hexdigest()
+
+
+def _holder_record(holder: dict) -> dict:
+    """What the member keeps about its holder: never the token itself."""
+    return {
+        "pid": int(holder["pid"]),
+        "host": str(holder["host"]),
+        "since": utc_now(),
+        "token_sha256": _token_hash(holder["token"]),
+    }
+
+
+def holds_seat(member: dict | None, holder: dict | None) -> bool:
+    """True when `holder` (from `new_seat_holder`) is the one `member` records."""
+    if not member or not holder or not holder.get("token"):
+        return False
+    rec = member.get("holder")
+    if not isinstance(rec, dict) or not rec.get("token_sha256"):
+        return False
+    return hmac.compare_digest(str(rec["token_sha256"]), _token_hash(holder["token"]))
+
+
+def _holder_gone(rec: dict) -> bool:
+    """True only when the recorded holder was a process on this host that is gone.
+
+    The run lock's rule (`StateDir.stale_lock_holder`): anything less certain,
+    another host or a record that does not say, counts as still there.
+    """
+    pid = rec.get("pid")
+    host = rec.get("host")
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return False
+    if not isinstance(host, str) or not host or host != _this_host():
+        return False
+    return not _pid_alive(pid)
+
+
+def _describe_holder(rec: dict) -> str:
+    since = f", since {rec.get('since')}" if rec.get("since") else ""
+    return f"pid {rec.get('pid')} on {rec.get('host')}{since}"
 
 
 def swarm_join(
@@ -204,8 +348,23 @@ def swarm_join(
     name: str,
     seat: str,
     owner_kind: str = "human",
+    holder: dict | None = None,
 ) -> dict:
-    """Claim an external coordinator or supervisor seat on the board."""
+    """Claim an external coordinator or supervisor seat on the board.
+
+    `holder` (from `new_seat_holder`) is given by a caller that keeps the seat
+    for as long as it runs, as `openfarm drive` does: its pid, host and the
+    hash of its token are recorded on the member. An active member that records
+    a holder is re-joined only by that holder (its token). Anyone else is
+    refused while the holder runs, and may take the seat over, with a note on
+    the board, once the holder is provably gone (its pid is dead on this host).
+    An active member with no holder record (joined by hand, or by an older
+    version) may be re-confirmed by a caller without a holder of the same owner
+    kind, as before. The owner kind of an active member never changes through a
+    re-join. The check and the write are one step under the board's lock.
+
+    The returned member carries `took_over` (the old holder) after a takeover.
+    """
     clean_seat = normalize_role(seat)
     if clean_seat not in SEAT_ROLES:
         raise Refused("bad-seat", f"seat must be 'coordinator' or 'supervisor', got {seat!r}")
@@ -223,15 +382,77 @@ def swarm_join(
             f"{clean_seat} seat is {configured_seat!r}, not 'external'",
         )
 
+    clean_name = str(name or "").strip()
+    if clean_name in CODE_AUTHOR_NAMES:
+        raise Refused(
+            "reserved-name",
+            f"{clean_name!r} is a name only code uses; join under another name",
+        )
+    if holder is not None and not (
+        isinstance(holder, dict) and holder.get("token") and holder.get("host")
+        and isinstance(holder.get("pid"), int)
+    ):
+        raise Refused("bad-holder", "a seat holder needs a pid, a host and a token")
+
     board.ensure()
+    with board.transaction():
+        return _swarm_join_locked(board, cfg, clean_name=clean_name, clean_seat=clean_seat,
+                                  owner_kind=owner_kind, holder=holder)
+
+
+def _swarm_join_locked(
+    board: Board,
+    cfg,
+    *,
+    clean_name: str,
+    clean_seat: str,
+    owner_kind: str,
+    holder: dict | None,
+) -> dict:
+    same_name = board.get_member(clean_name)
+    # A seat holder that left its seat itself (a drive that ended marks its
+    # members `left_seat`) may take it back under the same name, role and owner
+    # kind, if nobody else holds it now. A member removed by anyone else (the
+    # coordinator's `remove`) stays out.
+    rejoin = bool(
+        same_name is not None
+        and same_name.get("state") == "removed"
+        and same_name.get("left_seat")
+        and same_name.get("kind") == "external"
+        and normalize_role(str(same_name.get("role", ""))) == clean_seat
+        and str(same_name.get("owner_kind") or "") == owner_kind
+    )
+    # Otherwise a join may only re-confirm the same outside member in the same
+    # seat. Any other owner of the name (a worker, a code member, a member in the
+    # other seat, a removed member) keeps its record: the join would otherwise
+    # hand that name a seat and overwrite its tier and role.
+    if same_name is not None and not rejoin and (
+        same_name.get("kind") != "external"
+        or normalize_role(str(same_name.get("role", ""))) != clean_seat
+        or same_name.get("state") == "removed"
+    ):
+        raise Refused(
+            "name-taken",
+            f"{clean_name!r} is already a {same_name.get('kind')!r} member "
+            f"({same_name.get('role')!r}, {same_name.get('state')!r}); "
+            "join under another name",
+        )
+    took_over: dict | None = None
+    if same_name is not None and not rejoin:
+        # The name is an active outside member in this seat: a re-join.
+        took_over = _check_rejoin(same_name, clean_name, clean_seat, owner_kind, holder)
     active_members = board.list_members(include_removed=False)
     for existing in active_members:
-        if normalize_role(str(existing.get("role", ""))) == clean_seat and existing["name"] != name:
+        # A code member (the code fallback acting for a silent external
+        # coordinator) never holds a seat against an outside member joining it.
+        if existing.get("kind") == "code":
+            continue
+        if normalize_role(str(existing.get("role", ""))) == clean_seat and existing["name"] != clean_name:
             raise Refused(
                 "seat-occupied",
                 f"{clean_seat} seat is already held by {existing['name']!r}",
             )
-    if not any(m["name"] == name for m in active_members):
+    if not any(m["name"] == clean_name for m in active_members):
         if len(active_members) >= cfg.swarm.max_members:
             raise Refused(
                 "max-members",
@@ -239,30 +460,110 @@ def swarm_join(
             )
 
     member = board.upsert_member(
-        name,
+        clean_name,
         kind="external",
         role=clean_seat,
         state="active",
         added_by="cli",
         owner_kind=owner_kind,
     )
-    board.post(
-        author="system",
-        to=["all"],
-        kind="roster",
-        body=f"{name} joined seat {clean_seat} ({owner_kind})",
-        trusted=True,
-    )
+    if holder is not None:
+        # The same holder re-joining keeps its first `since`.
+        record = _holder_record(holder)
+        if same_name is not None and not rejoin and took_over is None:
+            old = same_name.get("holder")
+            if isinstance(old, dict) and old.get("since"):
+                record["since"] = old["since"]
+        member = board.update_member(clean_name, holder=record)
+    if took_over is not None:
+        body = (f"{clean_name} took over seat {clean_seat} ({owner_kind}) from its holder "
+                f"({_describe_holder(took_over)}), which is no longer running")
+    elif rejoin:
+        body = f"{clean_name} rejoined seat {clean_seat} ({owner_kind})"
+    else:
+        body = f"{clean_name} joined seat {clean_seat} ({owner_kind})"
+    board.post(author="system", to=["all"], kind="roster", body=body, trusted=True)
+    if took_over is not None:
+        member = {**member, "took_over": dict(took_over)}
     return member
 
 
+def _check_rejoin(
+    member: dict,
+    clean_name: str,
+    clean_seat: str,
+    owner_kind: str,
+    holder: dict | None,
+) -> dict | None:
+    """Whether a join may re-take the active seat member `member`.
+
+    Returns the old holder record when the seat is taken over from a holder
+    that is gone, None for a plain re-confirm, and raises `seat-occupied`
+    otherwise.
+    """
+    held_kind = str(member.get("owner_kind") or "")
+    rec = member.get("holder")
+    rec = rec if isinstance(rec, dict) and rec.get("token_sha256") else None
+    if rec is not None and holds_seat(member, holder):
+        if owner_kind != held_kind:
+            raise Refused(
+                "seat-occupied",
+                f"{clean_name!r} holds the {clean_seat} seat as {held_kind!r}; "
+                f"a re-join cannot make it {owner_kind!r}",
+            )
+        return None
+    if rec is not None:
+        if not _holder_gone(rec):
+            raise Refused(
+                "seat-occupied",
+                f"{clean_seat} seat {clean_name!r} is held by a running process "
+                f"({_describe_holder(rec)}); join under another name, or wait for it to end",
+            )
+        if owner_kind != held_kind:
+            raise Refused(
+                "seat-occupied",
+                f"{clean_name!r} holds the {clean_seat} seat as {held_kind!r} (its holder, "
+                f"{_describe_holder(rec)}, is no longer running); only an {held_kind!r} "
+                "join may take it over",
+            )
+        return dict(rec)
+    # No holder record: joined by hand, or by an older version.
+    if owner_kind != held_kind:
+        raise Refused(
+            "seat-occupied",
+            f"{clean_name!r} holds the {clean_seat} seat as {held_kind!r}; "
+            f"a {owner_kind!r} join cannot take it",
+        )
+    if holder is not None:
+        # A caller that keeps the seat cannot prove a member that records no
+        # holder is its own: someone may be steering it by hand.
+        raise Refused(
+            "seat-occupied",
+            f"{clean_seat} seat {clean_name!r} was joined without a holder record (by hand, "
+            "or by an older openfarm), so it may be in use; join under another name",
+        )
+    return None
+
+
 def _resolve_role_assignment(cfg, role: str, spec: dict | None) -> tuple[str, str, str]:
+    """`(tier, model, effort)` for one role of a started card.
+
+    A tier named in the team spec gives its model. Otherwise the role keeps
+    its configured model (`Config.member_defaults`), as with the swarm off.
+    """
     spec_dict = dict(spec or {})
     raw_tier = spec_dict.get("tier")
-    tier_name = str(raw_tier).strip() if raw_tier else cfg.swarm.default_tier
-    if tier_name not in cfg.tiers:
-        raise Refused("unknown-tier", f"unknown tier {tier_name!r}")
-    tier_cfg = cfg.tiers[tier_name]
+    if raw_tier:
+        tier_name = str(raw_tier).strip()
+        if tier_name not in cfg.tiers:
+            raise Refused("unknown-tier", f"unknown tier {tier_name!r}")
+        tier_cfg = cfg.tiers[tier_name]
+        model_name = tier_cfg.model
+    else:
+        tier_name, model_name = cfg.member_defaults(role)
+        if tier_name not in cfg.tiers:
+            raise Refused("unknown-tier", f"unknown tier {tier_name!r}")
+        tier_cfg = cfg.tiers[tier_name]
 
     if "effort" in spec_dict and spec_dict["effort"] is not None:
         effort = str(spec_dict["effort"])
@@ -286,7 +587,7 @@ def _resolve_role_assignment(cfg, role: str, spec: dict | None) -> tuple[str, st
                 f"default effort {effort!r} for {role} is not in tier {tier_cfg.name!r} "
                 f"efforts {list(tier_cfg.efforts)!r}",
             )
-    return tier_cfg.name, tier_cfg.model, effort
+    return tier_cfg.name, model_name, effort
 
 
 def swarm_start(
@@ -302,9 +603,10 @@ def swarm_start(
     tokens_used: int = 0,
     spend_used: float = 0.0,
     member_kind: str | None = None,
+    outside: bool = False,
 ) -> dict:
     """Validate and start a ready card with a team of worker members."""
-    _require_coordinator(board, caller, card=card_id)
+    _require_coordinator(board, caller, card=card_id, outside=outside)
 
     cards_map = _load_cards_map(source, cards_by_id)
     card = cards_map.get(card_id)
@@ -448,12 +750,13 @@ def swarm_start(
         f"{role}={resolved[role][0]}:{resolved[role][2] or 'default'}"
         for role in WORKER_ROLES
     )
+    models = ", ".join(f"{role}={resolved[role][1]}" for role in WORKER_ROLES)
     board.post(
         author=caller,
         to=["all"],
         kind="action",
         card=card_id,
-        body=f"start {card_id} ({summary})",
+        body=f"start {card_id} ({summary}; models: {models})",
     )
     return {"action": "start", "card": card_id, "team": created}
 
@@ -467,9 +770,10 @@ def swarm_set(
     tier: str | None = None,
     effort: str | None = None,
     reason: str = "",
+    outside: bool = False,
 ) -> dict:
     """Change a member's tier and/or effort from its next call."""
-    _require_coordinator(board, caller)
+    _require_coordinator(board, caller, outside=outside)
     if tier is None and effort is None:
         raise _refuse(board, caller, "empty-set", "set requires tier and/or effort")
 
@@ -539,10 +843,17 @@ def swarm_set(
         else:
             target_effort = current_effort
 
+    # Naming a tier gives the tier's model; changing only the effort keeps the
+    # model the member is really called with (a role's own model, say).
+    target_model = (
+        tier_cfg.model
+        if tier is not None
+        else str(member.get("model", "") or "") or tier_cfg.model
+    )
     updated = board.update_member(
         member_name,
         tier=tier_cfg.name,
-        model=tier_cfg.model,
+        model=target_model,
         effort=target_effort,
     )
     msg = f"set {member_name}: tier={tier_cfg.name}, effort={target_effort or 'none'}"
@@ -565,9 +876,10 @@ def swarm_hint(
     caller: str,
     member_name: str,
     body: str,
+    outside: bool = False,
 ) -> dict:
     """Post a short note addressed to a member."""
-    _require_coordinator(board, caller)
+    _require_coordinator(board, caller, outside=outside)
     member = board.get_member(member_name)
     if member is None:
         raise _refuse(board, caller, "unknown-member", f"unknown member {member_name!r}")
@@ -608,9 +920,10 @@ def swarm_ask(
     attempt: int = 0,
     expects: dict | None = None,
     evidence: list[str] | None = None,
+    outside: bool = False,
 ) -> dict:
     """Post a question to the supervisor seat."""
-    _require_coordinator(board, caller, card=card)
+    _require_coordinator(board, caller, card=card, outside=outside)
     if cfg.swarm.supervisor == "off":
         raise _refuse(
             board, caller, "supervisor-off", "supervisor seat is 'off'", card=card
@@ -648,9 +961,10 @@ def swarm_block(
     reason: str,
     source=None,
     cards_by_id: dict[str, Card] | None = None,
+    outside: bool = False,
 ) -> dict:
     """Stop a card with a reason for the owner."""
-    _require_coordinator(board, caller, card=card_id)
+    _require_coordinator(board, caller, card=card_id, outside=outside)
     text = str(reason or "").strip()
     if not text:
         raise _refuse(
@@ -678,14 +992,52 @@ def swarm_block(
             f"card {card_id!r} is already in state {card.state!r}",
             card=card_id,
         )
+    progress = _card_progress(board)
+    if card_id in progress.finished:
+        raise _refuse(
+            board,
+            caller,
+            "already-finished",
+            f"card {card_id!r} has already finished on the board",
+            card=card_id,
+        )
+    if card_id in progress.stopping:
+        raise _refuse(
+            board,
+            caller,
+            "already-stopping",
+            f"card {card_id!r} was already asked to stop; it is still running until it ends",
+            card=card_id,
+        )
+    running = card_id in progress.started
+    if running:
+        # A stop request: the card's thread sees it before its next model call
+        # and ends with its own final post. Until then it still counts as
+        # running for collision and slot checks.
+        body = f"stop requested for {card_id} (it keeps running until it ends): {text}"
+        message = (
+            f"asked {card_id} to stop; it is still running until it ends "
+            "and stays in its slot until then"
+        )
+    else:
+        body = text
+        message = f"blocked {card_id} before it started"
     post = board.post(
         author=caller,
         to=["all"],
         kind="blocked",
         card=card_id,
-        body=text,
+        body=body,
     )
-    return {"action": "block", "card": card_id, "reason": text, "post": post}
+    return {
+        "action": "block",
+        "card": card_id,
+        "reason": text,
+        "running": running,
+        "stop_requested": running,
+        "message": message,
+        "post": post,
+    }
 
 
 def swarm_remove(
@@ -697,9 +1049,17 @@ def swarm_remove(
     finished_cards: Iterable[str] | None = None,
     cards_by_id: dict[str, Card] | None = None,
     source=None,
+    outside: bool = False,
 ) -> dict:
-    """Remove a member whose card is finished."""
-    _require_coordinator(board, caller)
+    """Remove a member whose card is finished.
+
+    Finished is the board's say alone (`_finished_cards_from_board`: the card's
+    own final post, or blocked before it started), so a caller can never have
+    the members of a card whose thread is still running removed. A
+    `finished_cards` argument is accepted for older callers and not used.
+    """
+    del finished_cards
+    _require_coordinator(board, caller, outside=outside)
     member = board.get_member(member_name)
     if member is None:
         raise _refuse(board, caller, "unknown-member", f"unknown member {member_name!r}")
@@ -721,8 +1081,7 @@ def swarm_remove(
 
     card_id = str(member.get("card", "") or "")
     if card_id:
-        finished = set(finished_cards or ()) | _finished_cards_from_board(board)
-        if card_id not in finished:
+        if card_id not in _finished_cards_from_board(board):
             cards_map = _load_cards_map(source, cards_by_id)
             card = cards_map.get(card_id)
             if card is None and source is not None and hasattr(source, "read"):
@@ -756,9 +1115,10 @@ def swarm_wait(
     *,
     caller: str,
     reason: str = "",
+    outside: bool = False,
 ) -> dict:
     """Validate and record a coordinator wait action without waking the caller."""
-    _require_coordinator(board, caller)
+    _require_coordinator(board, caller, outside=outside)
     board.post(
         author=caller,
         to=[],
@@ -775,9 +1135,9 @@ class StallMonitor:
     """Periodic stall detector (`role = "monitor"`, `kind = "code"`).
 
     Triggers when the run has not ended, no card thread is actively executing,
-    every non-removed non-infra member is waiting or idle on external input,
-    unfinished work remains, and nothing non-`stall` has been posted within
-    `[swarm] stall_after`. Emits at most one `kind = "stall"` post per board
+    no worker of an unfinished card is active (seats only act when asked and
+    never count), unfinished work remains, and nothing non-`stall` has been
+    posted within `[swarm] stall_after`. Emits at most one `kind = "stall"` post per board
     activity sequence until non-`stall` activity advances the board.
     """
 
@@ -809,7 +1169,10 @@ class StallMonitor:
         self._last_non_stall_seq: int = 0
         self._last_activity_at: float | None = None
         self._stalled_for_seq: int = -1
-        self._all_posts: list[dict] = []
+        # Bounded state: unanswered questions by seq and what the board says
+        # about each card, not every post of the run.
+        self._open_questions: dict[int, dict] = {}
+        self._progress = CardProgress()
         self._seed_initial_activity()
 
     def _seed_initial_activity(self) -> None:
@@ -840,15 +1203,36 @@ class StallMonitor:
             self._sync_posts_unlocked(cur_now)
             self._last_activity_at = cur_now
 
+    def _track_post_unlocked(self, post: dict, members: dict[str, dict] | None) -> None:
+        seq = int(post.get("seq", 0) or 0)
+        kind = post.get("kind")
+        if kind == "question":
+            self._open_questions[seq] = post
+        elif kind == "answer" and post.get("ref"):
+            self._open_questions.pop(int(post.get("ref", 0) or 0), None)
+        if post.get("card") and kind in ("done", "blocked", "action"):
+            if members is None:
+                members = {
+                    str(m.get("name", "")): m
+                    for m in self.board.list_members(include_removed=True)
+                }
+            self._progress.feed([post], members)
+
     def _sync_posts_unlocked(self, cur_now: float) -> None:
         new_posts = self.board.read(
             as_name="*", since=self._scan_seq, limit=None, for_model=False
         )
+        members: dict[str, dict] | None = None
+        if any(p.get("card") and p.get("kind") in ("done", "blocked", "action") for p in new_posts):
+            members = {
+                str(m.get("name", "")): m
+                for m in self.board.list_members(include_removed=True)
+            }
         for post in new_posts:
             seq = int(post.get("seq", 0) or 0)
             if seq > self._scan_seq:
                 self._scan_seq = seq
-            self._all_posts.append(post)
+            self._track_post_unlocked(post, members)
             if post.get("kind") != "stall":
                 if seq > self._last_non_stall_seq:
                     self._last_non_stall_seq = seq
@@ -857,40 +1241,48 @@ class StallMonitor:
         if self._last_activity_at is None:
             self._last_activity_at = cur_now
 
+    def _finished_cards_unlocked(self, roster: list[dict]) -> set[str]:
+        self._progress.note_members(roster)
+        return self._progress.finished
+
     def _every_member_waiting_or_idle_unlocked(self) -> bool:
-        for member in self.board.list_members(include_removed=False):
+        """True when no member is doing work of its own.
+
+        A seat (coordinator, supervisor) only acts when asked, whatever fills
+        it (code, a tier, a config supervisor, an outside member), so it never
+        counts as working: whether a card thread is really busy is answered by
+        `active_work_fn`. A worker of a finished card is done working.
+        """
+        roster = self.board.list_members(include_removed=False)
+        finished = self._finished_cards_unlocked(roster)
+        for member in roster:
             name = str(member.get("name", "") or "")
             role = normalize_role(str(member.get("role", "") or ""))
             if name in _INFRA_ROLES or role in _INFRA_ROLES:
+                continue
+            if role in SEAT_ROLES:
                 continue
             if member.get("state") == "waiting":
                 continue
             if member.get("kind") == "external":
                 continue
+            cid = str(member.get("card", "") or "")
+            if cid and cid in finished:
+                continue
             return False
         return True
 
     def _oldest_unanswered_question_unlocked(self) -> dict | None:
-        answered = {
-            int(post.get("ref", 0) or 0)
-            for post in self._all_posts
-            if post.get("kind") == "answer" and post.get("ref")
-        }
-        for post in self._all_posts:
-            seq = int(post.get("seq", 0) or 0)
-            if post.get("kind") == "question" and seq not in answered:
-                return post
-        return None
+        if not self._open_questions:
+            return None
+        return self._open_questions[min(self._open_questions)]
 
     def _has_unfinished_work_unlocked(self) -> bool:
         if self._unfinished_fn is not None:
             return bool(self._unfinished_fn())
-        finished_cards = {
-            str(post.get("card", "") or "")
-            for post in self._all_posts
-            if post.get("kind") in ("done", "blocked") and post.get("card")
-        }
-        for member in self.board.list_members(include_removed=False):
+        roster = self.board.list_members(include_removed=False)
+        finished_cards = self._finished_cards_unlocked(roster)
+        for member in roster:
             cid = str(member.get("card", "") or "")
             if cid and cid not in finished_cards:
                 return True
@@ -954,7 +1346,6 @@ class StallMonitor:
                 trusted=True,
             )
             self._scan_seq = max(self._scan_seq, int(post.get("seq", 0) or 0))
-            self._all_posts.append(post)
             self._stalled_for_seq = stalled_seq
             return post
 

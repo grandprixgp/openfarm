@@ -454,7 +454,7 @@ class BoardTests(unittest.TestCase):
 
         # Code post stays completely intact even when read by a model
         code_text = "=== search_replace info ===\n```text\n/var/log/gate\n```\n"
-        p2 = self.board.post("gates", "test_writer", "gate", code_text)
+        p2 = self.board.post("gates", "test_writer", "gate", code_text, trusted=True)
         self.assertEqual(p2["to"], ["test-writer"])
         self.assertEqual(p2["body"], code_text)
 
@@ -514,8 +514,11 @@ class BoardTests(unittest.TestCase):
         self.assertEqual(note_post["kind"], "note")
         self.assertEqual(self.board.is_ended(), False)
 
-        # Code member or trusted=True succeeds
-        gate_post = self.board.post("gates", "impl", "gate", "clippy pass")
+        # Being a code member is not enough: only trusted=True posts a code kind
+        with self.assertRaises(Refused) as caught_named:
+            self.board.post("gates", "impl", "gate", "clippy pass")
+        self.assertEqual(caught_named.exception.code, "reserved-kind")
+        gate_post = self.board.post("gates", "impl", "gate", "clippy pass", trusted=True)
         self.assertEqual(gate_post["kind"], "gate")
         done_post = self.board.post("system", "all", "done", "CARD-1 done", trusted=True)
         self.assertEqual(done_post["kind"], "done")
@@ -536,14 +539,16 @@ class BoardTests(unittest.TestCase):
         card_brief.parent.mkdir(parents=True, exist_ok=True)
         card_brief.write_text("brief\n", encoding="utf-8")
         p2 = self.board.post(
-            "gates", "impl", "brief", "see brief", evidence=[str(card_brief)]
+            "gates", "impl", "brief", "see brief", evidence=[str(card_brief)], trusted=True
         )
         self.assertEqual(p2["evidence"], [str(card_brief)])
 
         # Evidence escaping state_dir/board_dir is refused without posting
         for bad_path in ("../secret.txt", "/etc/passwd", str(self.tmp / "outside.txt")):
             with self.assertRaises(Refused) as caught:
-                self.board.post("gates", "impl", "brief", "bad", evidence=[bad_path])
+                self.board.post(
+                    "gates", "impl", "brief", "bad", evidence=[bad_path], trusted=True
+                )
             self.assertEqual(caught.exception.code, "evidence-escape")
         self.assertEqual(self.board.status()["posts"], 2)
 
@@ -779,10 +784,19 @@ class BoardCliTests(unittest.TestCase):
         board.ensure()
         board.upsert_member("coord", kind="code", role="coordinator")
         board.upsert_member("alice", kind="external", role="supervisor", owner_kind="human")
+        board.upsert_member("bob", kind="external", role="coordinator", owner_kind="agent")
+
+        # A code member is not an outside voice
+        code, out, _ = self._run_cli(
+            "board", "post", "--as", "coord", "--to", "alice",
+            "--kind", "note", "--body", "hello from lock", "--json",
+        )
+        self.assertEqual(code, EXIT_REFUSED)
+        self.assertEqual(board.status()["posts"], 0)
 
         # Post via --body and --file using active lock holder
         code, out, _ = self._run_cli(
-            "board", "post", "--as", "coord", "--to", "alice",
+            "board", "post", "--as", "bob", "--to", "alice",
             "--kind", "note", "--body", "hello from lock", "--json",
         )
         self.assertEqual(code, EXIT_OK)
@@ -821,7 +835,7 @@ class BoardCliTests(unittest.TestCase):
         status_payload = json.loads(out)
         self.assertEqual(status_payload["run_id"], "run-1")
         self.assertEqual(status_payload["posts"], 2)
-        self.assertEqual(len(status_payload["roster"]), 2)
+        self.assertEqual(len(status_payload["roster"]), 3)
 
         # Invalid --seqs rejected with usage error
         code, out, _ = self._run_cli("board", "read", "--seqs", "abc", "--json")

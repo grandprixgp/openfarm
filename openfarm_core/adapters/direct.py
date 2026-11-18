@@ -31,12 +31,15 @@ INFRA = "infra"
 #: error is deliberately absent, because that is the model's edit being wrong.
 INFRA_PATTERNS = (
     r"error: could not compile `[^`]+` \(signal",
+    # What cargo 1.100 really prints when the compiler itself is killed (seen live):
+    # the signal is in the "Caused by" block under the "could not compile" line.
+    r"error: could not compile `[^`]+`[^\n]*\n\s*\nCaused by:\n\s+process didn't exit "
+    r"successfully: [^\n]*\(signal: \d+",
     r"No space left on device",
     r"Out of memory",
     r"Cannot allocate memory",
     r"error: failed to download",
     r"failed to clone into",
-    r"Blocking waiting for file lock",
     r"internal compiler error",
     r"network failure",
     r"connection refused",
@@ -47,6 +50,19 @@ INFRA_PATTERNS = (
     r"error: toolchain .* is not installed",
     r"Permission denied \(os error 13\).*cargo",
 )
+
+#: cargo prints this while another cargo holds a lock, then carries on. Parallel
+#: cards make it routine, so on its own it says nothing about the machine. It is
+#: infra only when cargo never got past it: the wait is the last thing it said.
+_LOCK_WAIT = re.compile(r"Blocking waiting for file lock")
+
+
+def _stuck_on_lock(stdout: str, stderr: str) -> bool:
+    for text in (stderr, stdout):
+        lines = [line for line in text.splitlines() if line.strip()]
+        if lines and _LOCK_WAIT.search(lines[-1]):
+            return True
+    return False
 
 
 class RunResult:
@@ -210,6 +226,8 @@ class DirectRunner:
         for pattern in INFRA_PATTERNS:
             if re.search(pattern, combined):
                 return INFRA
+        if _stuck_on_lock(stdout, stderr):
+            return INFRA
         if exit_code in (-6, -11):
             return FAIL if kind == "test" else INFRA
         return FAIL

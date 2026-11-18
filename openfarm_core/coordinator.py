@@ -16,14 +16,19 @@ import time
 from pathlib import Path
 from typing import Callable
 
+from .adapters.acp import acp_adapter_for_provider, is_acp_adapter, normalize_acp_provider
+from .adapters.claude_worker import ClaudeAcpWorkerBackend, open_acp_worker
 from .board import Board, normalize_role
 from .briefs import _sanitize_text
 from .cards import Card
+from .config import TierConfig
 from .errors import AdapterError, GateFailure, Infra, Invalid, Refused, StopCode
-from .micromanager import _call_tier_complete
+from .micromanager import SEAT_TIMEOUT_PREFIX, _call_tier_complete
 from .swarm import (
+    WORKER_ROLES,
     StallMonitor,
     cards_collide,
+    collision_reason,
     swarm_ask,
     swarm_block,
     swarm_hint,
@@ -57,8 +62,46 @@ _COORDINATOR_SYSTEM_PROMPT = (
     "- {\"action\": \"block\", \"card\": \"CARD-1\", \"reason\": \"...\"}\n"
     "- {\"action\": \"remove\", \"member\": \"CARD-1-implementer\"}\n"
     "- {\"action\": \"wait\", \"reason\": \"...\"}\n"
+    "Code removes a finished card's workers from the roster by itself, so you never "
+    "need `remove` for them. The roster holds at most `max_members` active members; "
+    "each `start` adds four.\n"
     "Return valid JSON only."
 )
+
+
+def retire_card_members(board: Board, card_id: str, *, reason: str = "card finished") -> list[str]:
+    """Remove a finished card's worker members from the roster, as code.
+
+    Called by the run loop as soon as a card's outcome is recorded, whatever kind of
+    coordinator holds the seat, so finished cards never fill `max_members`. Seat and
+    code members are left alone. Idempotent: members already removed are skipped.
+    """
+    clean = str(card_id or "").strip()
+    if not clean or not board.board_dir.exists():
+        return []
+    removed: list[str] = []
+    for member in board.list_members(include_removed=False):
+        if str(member.get("card", "") or "") != clean:
+            continue
+        if member.get("kind") in ("code", "external"):
+            continue
+        if normalize_role(str(member.get("role", "") or "")) not in WORKER_ROLES:
+            continue
+        try:
+            board.update_member(str(member["name"]), state="removed")
+        except Refused:
+            continue
+        removed.append(str(member["name"]))
+    if removed:
+        board.post(
+            author="gates",
+            to=[],
+            kind="roster",
+            card=clean,
+            body=f"removed {', '.join(removed)} ({reason})",
+            trusted=True,
+        )
+    return removed
 
 
 class CoordinatorRuntime:
@@ -126,11 +169,10 @@ class CoordinatorRuntime:
 
     @contextlib.contextmanager
     def coordinator_waiting(self):
+        # The seat stays "waiting" after the wait until the coordinator next works
+        # (`coord_busy` marks it active), so an idle poll loop does not flip it.
         self._set_member_state("coordinator", "waiting", skip_external=True)
-        try:
-            yield
-        finally:
-            self._set_member_state("coordinator", "active", skip_external=True)
+        yield
 
     def active_work_count(self) -> int:
         with self.lock:
@@ -184,11 +226,19 @@ class CoordinatorRuntime:
             self.launched.add(card_id)
         self._launch_fn(card_id)
 
-    def mark_blocked(self, card_id: str, stop_code: str, detail: str) -> None:
+    def mark_blocked(self, card_id: str, stop_code: str, detail: str) -> bool:
+        """Record a blocked outcome for a card that never started. True if recorded.
+
+        A launched card is never recorded here: a block on it is a stop request, the
+        card stays in flight, and its own thread's outcome is the one recorded.
+        """
         with self.lock:
+            if card_id in self.launched or card_id in self.finished:
+                return False
             if card_id in self.pending:
                 self.pending.remove(card_id)
         self._block_unstarted_fn(card_id, stop_code, detail)
+        return True
 
     def ready_cards_snapshot(self) -> list[dict]:
         with self.lock:
@@ -253,6 +303,60 @@ def _post_event(
     )
 
 
+#: Effort names that turn reasoning down or off: never a step up from anything.
+_NO_REASONING_EFFORTS = frozenset({"off", "none", "minimal", "disabled", "0", "false"})
+#: The usual effort names, lowest first, for telling a raise from a drop.
+_KNOWN_EFFORT_RANK = {
+    name: i for i, name in enumerate(
+        ("off", "none", "minimal", "low", "medium", "high", "xhigh", "max")
+    )
+}
+#: Where an OpenAI-style `reasoning_effort` endpoint sits when none is sent.
+_ASSUMED_ENDPOINT_DEFAULT = "medium"
+
+
+def escalation_step(efforts, current: str) -> str | None:
+    """The effort one step above `current` on a tier's ladder, or None to do nothing.
+
+    Escalation never lowers effort. With `current` set, the next entry up that is a
+    real raise. With `current` empty no effort parameter is sent and the endpoint's
+    own default applies, so where it sits on the ladder is unknown:
+
+    - when every entry is a usual name (`off` ... `max`), step to the first entry
+      above `medium` (the usual endpoint default), or do nothing if none is;
+    - otherwise drop the reasoning-off entries and take the middle of the rest,
+      rounded up, never the lowest rung; with fewer than two rungs do nothing.
+    """
+    ladder = [str(e) for e in (efforts or ()) if str(e)]
+    if not ladder:
+        return None
+    cur = str(current or "")
+    if cur:
+        if cur not in ladder:
+            return None
+        cur_rank = _KNOWN_EFFORT_RANK.get(cur.lower())
+        for cand in ladder[ladder.index(cur) + 1:]:
+            if cand.lower() in _NO_REASONING_EFFORTS:
+                continue
+            cand_rank = _KNOWN_EFFORT_RANK.get(cand.lower())
+            if cur_rank is not None and cand_rank is not None and cand_rank <= cur_rank:
+                continue
+            return cand
+        return None
+
+    rungs = [e for e in ladder if e.lower() not in _NO_REASONING_EFFORTS]
+    if len(rungs) < 2:
+        return None
+    if all(e.lower() in _KNOWN_EFFORT_RANK for e in rungs):
+        floor = _KNOWN_EFFORT_RANK[_ASSUMED_ENDPOINT_DEFAULT]
+        above = [e for e in rungs if _KNOWN_EFFORT_RANK[e.lower()] > floor]
+        if not above:
+            return None
+        return min(above, key=lambda e: _KNOWN_EFFORT_RANK[e.lower()])
+    idx = len(rungs) // 2  # ceil((n - 1) / 2): the middle, rounded up
+    return rungs[idx] if idx > 0 else None
+
+
 class CodeCoordinator:
     """Deterministic built-in coordinator policy (`[swarm] coordinator = "code"`)."""
 
@@ -302,27 +406,25 @@ class CodeCoordinator:
         if tier_cfg is None or not tier_cfg.efforts:
             return None
         current_effort = str(member.get("effort", "") or "")
-        efforts = tuple(tier_cfg.efforts)
-        if not current_effort:
-            next_effort = efforts[0]
-        elif current_effort in efforts:
-            idx = efforts.index(current_effort)
-            if idx + 1 >= len(efforts):
-                return None
-            next_effort = efforts[idx + 1]
-        else:
+        next_effort = escalation_step(tier_cfg.efforts, current_effort)
+        if next_effort is None:
             return None
 
+        failures = info.get("failed_at_effort", 1)
+        if current_effort:
+            reason = f"escalate {current_effort} -> {next_effort} after {failures} failures"
+        else:
+            reason = (
+                f"escalate from the endpoint's default effort (none sent) to "
+                f"{next_effort} after {failures} failures"
+            )
         swarm_set(
             rt.board,
             rt.cfg,
             caller="coordinator",
             member_name=member_name,
             effort=next_effort,
-            reason=(
-                f"escalate after {info.get('failed_at_effort', 1)} failures "
-                f"at {current_effort or 'default'}"
-            ),
+            reason=reason,
         )
         return {"action": "set", "effort": next_effort}
 
@@ -344,49 +446,150 @@ class CodeCoordinator:
 
         if sup_filled and rt.ask_supervisor_fn is not None:
             res = rt.ask_supervisor_fn(info)
-            if isinstance(res, dict) and res.get("action") in ("hint", "set"):
+            if isinstance(res, dict) and res.get("action") in ("hint", "set", "block"):
                 return res
 
         return {"action": "block", "reason": str(info.get("reason", "") or "handed back")}
 
     def on_finished(self, rt: CoordinatorRuntime, card_id: str, _outcome: dict) -> None:
         self.ensure_member(rt.board)
-        for member in rt.board.list_members(include_removed=False):
-            if member.get("card") == card_id and member.get("kind") != "code":
-                try:
-                    swarm_remove(
-                        rt.board,
-                        rt.cfg,
-                        caller="coordinator",
-                        member_name=member["name"],
-                        finished_cards={card_id},
-                        cards_by_id=rt.card_map,
-                        source=rt.source,
-                    )
-                except Refused:
-                    continue
+        # The run loop has already retired the card's workers; this covers direct callers.
+        retire_card_members(rt.board, card_id)
         self.on_plan(rt)
 
-    def on_stall(self, rt: CoordinatorRuntime, _info: dict) -> None:
+    def on_stall(self, rt: CoordinatorRuntime, info: dict) -> None:
+        """Apply the timeout rule (`on_external_timeout`) to a stalled run.
+
+        A stall means no card thread is working: every running card is parked on a
+        silent seat (an external supervisor's question or an external coordinator's
+        hand-back answer). Each parked card's wait is timed out now rather than at
+        the end of `external_wait`, and goes the way a timeout goes: `fallback`
+        skips the supervisor's op or hands the decision to this policy, `block`
+        blocks the card `seat-silent`. With nothing running, the cards waiting to
+        start are the ones stuck: `block` blocks them `seat-silent`, `fallback`
+        lets this policy start them.
+        """
         self.ensure_member(rt.board)
         timeout_policy = str(
             getattr(rt.cfg.swarm, "on_external_timeout", "fallback") or "fallback"
         )
+        stall_post = (info or {}).get("post") or {}
+        stall_seq = int(stall_post.get("seq", 0) or 0) or None
+        parked = sorted(rt.running_ids())
+        for cid in parked:
+            rt.board.post(
+                author="gates",
+                to=["gates"],  # wakes an external supervisor wait, which listens as gates
+                kind="action",
+                card=cid,
+                ref=stall_seq,
+                body=(
+                    f"{SEAT_TIMEOUT_PREFIX}{cid} is waiting on a silent seat and the run "
+                    f"stalled; applying on_external_timeout = {timeout_policy}"
+                ),
+                trusted=True,
+            )
+        if parked:
+            if timeout_policy != "block":
+                self.on_plan(rt)
+            return
         if timeout_policy == "block":
             with rt.lock:
-                for cid in list(rt.pending):
+                waiting = list(rt.pending)
+                for cid in waiting:
                     rt.mark_blocked(
                         cid,
                         StopCode.SEAT_SILENT.value,
                         "stalled with silent seat",
                     )
                 rt.stop_launching = True
+            if waiting:
+                _post_event(
+                    rt.board,
+                    "stall",
+                    "stall: on_external_timeout = block, so cards waiting to start are "
+                    f"blocked seat-silent: {', '.join(waiting)}",
+                    kind="action",
+                )
             return
         self.on_plan(rt)
 
 
+class AcpCoordinatorBackend:
+    """Wrap an ACP worker backend for `ModelCoordinator` when coordinator is ACP."""
+
+    is_acp = True
+
+    def __init__(
+        self,
+        cfg,
+        *,
+        provider: str = "",
+        effort: str = "",
+        worker: ClaudeAcpWorkerBackend | None = None,
+    ) -> None:
+        self.cfg = cfg
+        coord_spec = str(getattr(getattr(cfg, "swarm", None), "coordinator", "claude-acp") or "claude-acp")
+        self.provider = normalize_acp_provider(provider or coord_spec)
+        self.name = acp_adapter_for_provider(self.provider)
+        self.effort = str(effort or "")
+        mm_cfg = getattr(cfg, "micromanager", None)
+        self.model = str(getattr(mm_cfg, "model", "") or "")
+        self.worker = worker if worker is not None else open_acp_worker(cfg, provider=self.provider)
+
+    @property
+    def prices_spend(self) -> bool:
+        return bool(getattr(self.worker, "prices_spend", True))
+
+    def hello(self) -> dict:
+        return {"name": self.name, "versions": [1], "ops": ["hello", "complete"]}
+
+    def complete(
+        self,
+        role: str,
+        model: str,
+        temperature: float,
+        messages: list[dict],
+        seed: int | None = None,
+        max_tokens: int = 4096,
+        response_format: str | None = None,
+        effort: str = "",
+        effort_param: str = "",
+    ):
+        sys_parts: list[str] = []
+        user_messages: list[dict] = []
+        for msg in messages:
+            if str(msg.get("role", "")).lower() == "system":
+                content = str(msg.get("content", "") or "").strip()
+                if content:
+                    sys_parts.append(content)
+            else:
+                user_messages.append(msg)
+        sys_prompt = "\n\n".join(sys_parts) if sys_parts else _COORDINATOR_SYSTEM_PROMPT
+        resolved_model = (
+            self.model
+            if model in ("", self.provider, self.name)
+            else str(model)
+        )
+        return self.worker.complete(
+            role=role,
+            model=resolved_model,
+            temperature=temperature,
+            messages=user_messages or messages,
+            seed=seed,
+            max_tokens=max_tokens,
+            response_format=response_format,
+            effort=effort or self.effort,
+            effort_param=effort_param,
+            system_prompt=sys_prompt,
+        )
+
+    def close(self) -> None:
+        self.worker.close()
+
+
 class ModelCoordinator:
-    """Coordinator seat backed by a configured model tier (`tier:<name>`)."""
+    """Coordinator seat backed by a configured model tier (`tier:<name>`) or ACP provider."""
 
     def __init__(self, cfg, backend, tier, *, effort: str = "") -> None:
         self.cfg = cfg
@@ -402,7 +605,14 @@ class ModelCoordinator:
 
     def ensure_member(self, board: Board) -> None:
         board.ensure()
-        kind = "scripted" if getattr(self.backend, "name", "") == "scripted" else "api"
+        if getattr(self.backend, "name", "") == "scripted":
+            kind = "scripted"
+        elif getattr(self.backend, "is_acp", False) or isinstance(
+            self.backend, (AcpCoordinatorBackend, ClaudeAcpWorkerBackend)
+        ):
+            kind = "acp"
+        else:
+            kind = "api"
         if board.get_member("coordinator") is None:
             board.upsert_member(
                 "coordinator",
@@ -491,6 +701,7 @@ class ModelCoordinator:
             "ready_cards": rt.ready_cards_snapshot(),
             "tiers": tiers_info,
             "roster": roster,
+            "max_members": int(getattr(self.cfg.swarm, "max_members", 24) or 24),
             "free_slots": rt.free_slots(),
             "unread_posts": sanitized_posts,
         }
@@ -523,6 +734,8 @@ class ModelCoordinator:
         *,
         target_card: str = "",
         target_member: str = "",
+        event_name: str = "",
+        event_info: dict | None = None,
     ) -> tuple[bool, dict | None]:
         """Validate & execute coordinator actions. Returns (had_error, card_resolution)."""
         had_error = False
@@ -602,26 +815,33 @@ class ModelCoordinator:
                 elif name == "ask":
                     body = str(act.get("body") or act.get("text") or "").strip()
                     cid = str(act.get("card") or act.get("card_id") or target_card or "")
-                    res_ask = swarm_ask(
-                        rt.board,
-                        rt.cfg,
-                        caller="coordinator",
-                        body=body,
-                        card=cid,
-                    )
                     if target_card and rt.ask_supervisor_fn is not None:
-                        sup_res = rt.ask_supervisor_fn({
+                        # About the card this event is for: the supervisor's own
+                        # handback_triage op is the question (one question, answered
+                        # the same way by every kind of supervisor), carrying the
+                        # coordinator's text as data.
+                        if str(getattr(rt.cfg.swarm, "supervisor", "off") or "off") == "off":
+                            raise Refused("supervisor-off", "supervisor seat is 'off'")
+                        sup_info = dict(event_info or {})
+                        sup_info.update({
                             "card_id": target_card,
-                            "member": target_member,
-                            "reason": body,
-                            "question_post": res_ask.get("post"),
+                            "member": target_member or str(sup_info.get("member", "") or ""),
+                            "event": event_name,
+                            "coordinator_question": body,
                         })
-                        if isinstance(sup_res, dict) and sup_res.get("action") in (
-                            "hint",
-                            "set",
-                            "block",
-                        ):
-                            resolution = sup_res
+                        if not sup_info.get("reason"):
+                            sup_info["reason"] = body or str(sup_info.get("detail", "") or "")
+                        # Asked by `_decide` once the lock is released: the seat may
+                        # take up to `external_wait` to answer.
+                        resolution = {"action": "ask", "_info": sup_info}
+                    else:
+                        swarm_ask(
+                            rt.board,
+                            rt.cfg,
+                            caller="coordinator",
+                            body=body,
+                            card=cid,
+                        )
                 elif name == "block":
                     cid = str(act.get("card") or act.get("card_id") or target_card or "").strip()
                     reason = str(act.get("reason") or act.get("body") or "").strip()
@@ -640,16 +860,27 @@ class ModelCoordinator:
                     )
                     if target_card and cid == target_card:
                         resolution = {"action": "block", "reason": reason}
+                    elif cid in rt.launched:
+                        # A running card: the post is a stop request. Its thread notices
+                        # it and ends; the run loop records that one outcome.
+                        pass
                     else:
                         rt.mark_blocked(cid, StopCode.REFUSED.value, reason)
                 elif name == "remove":
                     mname = str(act.get("member") or act.get("member_name") or "").strip()
+                    existing = rt.board.get_member(mname) if mname else None
+                    if (
+                        existing is not None
+                        and existing.get("state") == "removed"
+                        and str(existing.get("card", "") or "") in rt.finished
+                    ):
+                        # Code already retired this finished card's worker: nothing to do.
+                        continue
                     swarm_remove(
                         rt.board,
                         rt.cfg,
                         caller="coordinator",
                         member_name=mname,
-                        finished_cards=set(rt.finished.keys()),
                         cards_by_id=rt.card_map,
                         source=rt.source,
                     )
@@ -677,78 +908,127 @@ class ModelCoordinator:
         fallback_fn: Callable[[], dict | None],
         target_card: str = "",
         target_member: str = "",
+        defer_fallback: bool = False,
     ) -> dict | None:
+        """Decide one event: serialised under `self._lock`, waits outside it.
+
+        The lock covers the coordinator's own counters, the model call and the
+        execution of that answer's actions, so two events' decisions never
+        interleave their actions. A wait on the supervisor's seat (the `ask`
+        action, or the code policy's hand-back triage when `defer_fallback`) can
+        last up to `external_wait`, so it runs after the lock is released and
+        other cards' events are not queued behind it.
+        """
         with self._lock:
-            self.ensure_member(rt.board)
+            kind, value = self._decide_locked(
+                rt,
+                event,
+                event_details=event_details,
+                fallback_fn=None if defer_fallback else fallback_fn,
+                target_card=target_card,
+                target_member=target_member,
+            )
+        if kind == "fallback":
+            return fallback_fn()
+        if isinstance(value, dict) and value.get("action") == "ask" and "_info" in value:
+            if rt.ask_supervisor_fn is None:
+                return None
+            sup_res = rt.ask_supervisor_fn(value["_info"])
+            if isinstance(sup_res, dict) and sup_res.get("action") in ("hint", "set", "block"):
+                return sup_res
+            return None
+        return value
+
+    def _decide_locked(
+        self,
+        rt: CoordinatorRuntime,
+        event: str,
+        *,
+        event_details: dict,
+        fallback_fn: Callable[[], dict | None] | None,
+        target_card: str = "",
+        target_member: str = "",
+    ) -> tuple[str, dict | None]:
+        """Returns ("resolution", value) or ("fallback", None) when the caller must
+        run the code policy after releasing the lock."""
+
+        def _fallback() -> tuple[str, dict | None]:
+            if fallback_fn is None:
+                return ("fallback", None)
+            return ("resolution", fallback_fn())
+
+        self.ensure_member(rt.board)
+        if self._cap_exceeded():
+            return _fallback()
+
+        while True:
             if self._cap_exceeded():
-                return fallback_fn()
+                return _fallback()
 
-            while True:
-                if self._cap_exceeded():
-                    return fallback_fn()
+            prompt_text = self._build_state_prompt(rt, event, event_details)
+            effort_param = self.tier.effort_param if self.effort else ""
+            max_tokens = int(getattr(self.cfg, "model_max_tokens", 4096) or 4096)
+            attempt_num = self.calls + 1
+            messages = [
+                {"role": "system", "content": _COORDINATOR_SYSTEM_PROMPT},
+                {"role": "user", "content": prompt_text},
+            ]
+            try:
+                comp = _call_tier_complete(
+                    self.backend,
+                    role="coordinator",
+                    model=self.tier.model,
+                    temperature=0.2,
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    response_format="json",
+                    card_id=target_card,
+                    attempt=attempt_num,
+                    effort=self.effort,
+                    effort_param=effort_param,
+                )
+                tok_in = int(getattr(comp, "tokens_in", 0) or 0)
+                tok_out = int(getattr(comp, "tokens_out", 0) or 0)
+                self.calls += 1
+                self.tokens += tok_in + tok_out
+                rt.board.add_member_usage(
+                    "coordinator",
+                    tokens_in=tok_in,
+                    tokens_out=tok_out,
+                    calls=1,
+                    effort=self.effort,
+                )
+                raw_text = str(getattr(comp, "content", "") or "")
+                actions = self._parse_actions(raw_text)
+                had_error, resolution = self._execute_actions(
+                    rt,
+                    actions,
+                    target_card=target_card,
+                    target_member=target_member,
+                    event_name=event,
+                    event_info=event_details,
+                )
+            except (Invalid, ValueError, TypeError, Infra) as exc:
+                if isinstance(exc, Infra) and exc.code not in ("empty-output", "bad-json"):
+                    had_error = True
+                else:
+                    had_error = True
+                msg = getattr(exc, "message", str(exc))
+                code = getattr(exc, "code", "bad-coordinator-answer")
+                self._post_refusal(rt.board, code, msg, card=target_card)
+                resolution = None
 
-                prompt_text = self._build_state_prompt(rt, event, event_details)
-                effort_param = self.tier.effort_param if self.effort else ""
-                max_tokens = int(getattr(self.cfg, "model_max_tokens", 4096) or 4096)
-                attempt_num = self.calls + 1
-                messages = [
-                    {"role": "system", "content": _COORDINATOR_SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt_text},
-                ]
-                try:
-                    comp = _call_tier_complete(
-                        self.backend,
-                        role="coordinator",
-                        model=self.tier.model,
-                        temperature=0.2,
-                        messages=messages,
-                        max_tokens=max_tokens,
-                        response_format="json",
-                        card_id=target_card,
-                        attempt=attempt_num,
-                        effort=self.effort,
-                        effort_param=effort_param,
-                    )
-                    tok_in = int(getattr(comp, "tokens_in", 0) or 0)
-                    tok_out = int(getattr(comp, "tokens_out", 0) or 0)
-                    self.calls += 1
-                    self.tokens += tok_in + tok_out
-                    rt.board.add_member_usage(
-                        "coordinator",
-                        tokens_in=tok_in,
-                        tokens_out=tok_out,
-                        calls=1,
-                        effort=self.effort,
-                    )
-                    raw_text = str(getattr(comp, "content", "") or "")
-                    actions = self._parse_actions(raw_text)
-                    had_error, resolution = self._execute_actions(
-                        rt,
-                        actions,
-                        target_card=target_card,
-                        target_member=target_member,
-                    )
-                except (Invalid, ValueError, TypeError, Infra) as exc:
-                    if isinstance(exc, Infra) and exc.code not in ("empty-output", "bad-json"):
-                        had_error = True
-                    else:
-                        had_error = True
-                    msg = getattr(exc, "message", str(exc))
-                    code = getattr(exc, "code", "bad-coordinator-answer")
-                    self._post_refusal(rt.board, code, msg, card=target_card)
-                    resolution = None
+            if not had_error:
+                self.consecutive_bad = 0
+                self._cap_exceeded()
+                return ("resolution", resolution)
 
-                if not had_error:
-                    self.consecutive_bad = 0
-                    self._cap_exceeded()
-                    return resolution
-
-                self.consecutive_bad += 1
-                if self.consecutive_bad >= 2:
-                    self.consecutive_bad = 0
-                    return fallback_fn()
-                if self._cap_exceeded():
-                    return fallback_fn()
+            self.consecutive_bad += 1
+            if self.consecutive_bad >= 2:
+                self.consecutive_bad = 0
+                return _fallback()
+            if self._cap_exceeded():
+                return _fallback()
 
     def on_plan(self, rt: CoordinatorRuntime, *, post_event: bool = False) -> None:
         if post_event:
@@ -781,6 +1061,7 @@ class ModelCoordinator:
             fallback_fn=lambda: self._code.on_handback(rt, info),
             target_card=str(info.get("card_id", "") or ""),
             target_member=str(info.get("member", "") or ""),
+            defer_fallback=True,
         )
         if res is None:
             return {"action": "block", "reason": str(info.get("reason", "") or "handed back")}
@@ -843,6 +1124,7 @@ class ExternalCoordinator:
             else contextlib.nullcontext()
         )
 
+        timed_out = False
         with pause_cm, rt.board.external_wait(card_id=card_id, member_name=member_name):
             while True:
                 if (
@@ -860,13 +1142,28 @@ class ExternalCoordinator:
                     author = str(item.get("from", "") or "")
                     to_list = item.get("to") or []
                     body = str(item.get("body", "") or "")
+                    if (
+                        kind == "action"
+                        and item.get("card") == card_id
+                        and body.startswith(SEAT_TIMEOUT_PREFIX)
+                        and (rt.board.get_member(author) or {}).get("kind") == "code"
+                    ):
+                        # The stall rule timed this silent seat out early.
+                        timed_out = True
+                        break
+                    # Only the coordinator's seat steers: a post from anyone else is
+                    # data, whatever its kind or addressee.
+                    if rt.board.seat_of(author) != "coordinator":
+                        continue
                     if kind == "note" and member_name in to_list:
                         return {"action": "hint"}
                     if kind == "action" and member_name in to_list and body.startswith("set "):
                         return {"action": "set"}
-                    if kind == "blocked" and item.get("card") == card_id and author != "gates":
+                    if kind == "blocked" and item.get("card") == card_id:
                         return {"action": "block", "reason": body or str(info.get("reason", ""))}
 
+                if timed_out:
+                    break
                 if callable(heartbeat_fn):
                     heartbeat_fn()
                 remaining = deadline - time.monotonic()
@@ -897,7 +1194,15 @@ class ExternalCoordinator:
             _post_event(rt.board, "plan", f"event: plan; ready: {ready}")
 
     def scan_external_actions(self, rt: CoordinatorRuntime) -> bool:
-        """Scan new board posts for `swarm start` / `swarm block`. Return True if acted."""
+        """Act on new checked `swarm start` / `swarm block` posts. Return True if acted.
+
+        Only posts by the current holder of the coordinator seat count; anything
+        else on the board is data. A `start` must have gone through `swarm_start`
+        (its worker members exist, added by that holder), and is re-checked against
+        what is really in flight before the card is launched; a failed check is
+        refused with a board post. A `blocked` post stops a card that never started;
+        on a running card it is a stop request the card's own thread acts on.
+        """
         acted = False
         posts = rt.board.read(
             as_name="*", since=self._scan_seq, limit=None, for_model=False
@@ -909,20 +1214,213 @@ class ExternalCoordinator:
             cid = str(item.get("card", "") or "")
             body = str(item.get("body", "") or "")
             if kind == "action" and body.startswith("start ") and cid:
-                if cid in rt.pending and cid not in rt.launched and cid not in rt.finished:
+                if rt.board.seat_of(author) != "coordinator":
+                    continue
+                with rt.lock:
+                    if cid in rt.launched or cid in rt.finished:
+                        continue
+                    if not self._started_through_swarm_start(rt, cid, author):
+                        self._refuse_start(
+                            rt, author, cid, "not-checked",
+                            f"start {cid} did not go through `swarm start`",
+                        )
+                        continue
+                    why = self._launch_refusal(rt, cid)
+                    if why:
+                        code, message = why
+                        self._refuse_start(rt, author, cid, code, message)
+                        continue
                     rt.launch_card(cid)
-                    acted = True
-            elif kind == "blocked" and cid and author != "gates":
-                if cid in rt.pending and cid not in rt.launched and cid not in rt.finished:
-                    rt.mark_blocked(cid, StopCode.REFUSED.value, body or "blocked by coordinator")
+                acted = True
+            elif kind == "blocked" and cid:
+                if rt.board.seat_of(author) != "coordinator":
+                    continue
+                if rt.mark_blocked(cid, StopCode.REFUSED.value, body or "blocked by coordinator"):
                     acted = True
         return acted
+
+    @staticmethod
+    def _started_through_swarm_start(rt: CoordinatorRuntime, cid: str, author: str) -> bool:
+        for role in WORKER_ROLES:
+            member = rt.board.get_member(f"{cid}-{role}")
+            if (
+                member is None
+                or member.get("state") == "removed"
+                or str(member.get("card", "") or "") != cid
+                or str(member.get("added_by", "") or "") != author
+            ):
+                return False
+        return True
+
+    @staticmethod
+    def _launch_refusal(rt: CoordinatorRuntime, cid: str) -> tuple[str, str] | None:
+        """Why `cid` cannot launch now against what is really in flight, or None."""
+        if rt.can_launch(cid):
+            return None
+        if cid not in rt.pending:
+            return ("not-pending", f"card {cid!r} is not waiting to start in this run")
+        if rt.free_slots() <= 0:
+            return ("slot-limit", f"{len(rt.in_flight)} cards running, no free card slot")
+        cand = rt.card_map.get(cid)
+        if cand is None or cand.state != "ready":
+            return ("not-ready", f"card {cid!r} is not ready")
+        for active_id in sorted(rt.in_flight.values()):
+            active = rt.card_map.get(active_id)
+            if active is not None:
+                reason = collision_reason(cand, active)
+                if reason:
+                    return (
+                        "card-collision",
+                        f"card {cid!r} collides with running card {active_id!r}: {reason}",
+                    )
+        return ("cannot-launch", f"card {cid!r} cannot start now")
+
+    @staticmethod
+    def _refuse_start(rt: CoordinatorRuntime, author: str, cid: str, code: str, message: str) -> None:
+        to = [author] if author and rt.board.get_member(author) is not None else []
+        rt.board.post(
+            author="gates",
+            to=to,
+            kind="action",
+            card=cid,
+            body=f"refused ({code}): {message}",
+            trusted=True,
+        )
+        # The refused start's workers must not make the board count the card as running.
+        retire_card_members(rt.board, cid, reason="start refused")
 
     def on_finished(self, _rt: CoordinatorRuntime, _card_id: str, _outcome: dict) -> None:
         return
 
     def on_stall(self, rt: CoordinatorRuntime, info: dict) -> None:
         self._code_fallback.on_stall(rt, info)
+
+
+def _recent_failing_gates(board: Board, card_id: str, *, limit: int = 3) -> list[str]:
+    """The last few failing gate or defect posts for a card, as plain text."""
+    if not card_id or not board.board_dir.exists():
+        return []
+    out: list[str] = []
+    for post in board.read(as_name="*", since=0, limit=None, for_model=False):
+        if str(post.get("card", "") or "") != card_id:
+            continue
+        kind = post.get("kind")
+        body = str(post.get("body", "") or "")
+        if kind == "defect" or (
+            kind == "gate" and post.get("from") == "gates"
+            and body.split(":", 1)[-1].strip().startswith("fail")
+        ):
+            out.append(_sanitize_text(body))
+    return out[-limit:]
+
+
+def _handback_triage_payload(board: Board, cfg, card: Card | None, info: dict) -> dict:
+    """What the supervisor needs to resolve a hand-back: card, member, reason, failures."""
+    cid = str(info.get("card_id", "") or "")
+    mname = str(info.get("member", "") or "")
+    member = board.get_member(mname) if mname else None
+    worker_reason = str(info.get("reason", "") or "")
+    detail = str(info.get("detail", "") or "")
+    failing = _recent_failing_gates(board, cid)
+    if not detail and failing:
+        detail = failing[-1]
+    card_view: dict = {"id": cid}
+    if card is not None:
+        card_view.update({
+            "title": _sanitize_text(card.title),
+            "category": card.category,
+            "done_text": _sanitize_text(card.done_text),
+            "touches": list(card.touches),
+            "tests": list(getattr(card, "test_names", []) or []),
+        })
+    payload = {
+        "event": str(info.get("event", "") or "handback"),
+        "card": card_view,
+        "member": mname,
+        "role": str(info.get("board_role", "") or info.get("role", "") or (member or {}).get("role", "")),
+        "tier": str((member or {}).get("tier", "") or info.get("tier", "") or ""),
+        "effort": str((member or {}).get("effort", "") or info.get("effort", "") or ""),
+        "handback_reason": _sanitize_text(worker_reason),
+        "failing_detail": _sanitize_text(detail) or "no gate has failed on this card yet",
+        "recent_failures": failing,
+        "attempt": int(info.get("attempt", 0) or 0),
+        "handback_index": int(info.get("handback_index", 0) or 0),
+        "tiers": {
+            name: {"efforts": list(t.efforts)}
+            for name, t in (getattr(cfg, "tiers", {}) or {}).items()
+        },
+        "allowed_actions": ["hint", "set", "block"],
+    }
+    question = str(info.get("coordinator_question", "") or "")
+    if question:
+        payload["coordinator_question"] = _sanitize_text(question)
+    return payload
+
+
+def ask_supervisor_handback(board: Board, cfg, card_map: dict[str, Card], info: dict) -> dict | None:
+    """Ask the supervisor's seat to resolve a hand-back through its `handback_triage` op.
+
+    Asked the same way for every kind of supervisor (config, tier, ACP, external)
+    through the card's micromanager, so an external answer is read from its evidence
+    file and the call's tokens are counted like the supervisor's other calls.
+    Returns a `hint` (the worker tries again with it), a `set` already applied through
+    the checked `swarm_set` (the worker tries again), a `block` carrying the worker's
+    reason, or None when there is no usable answer (the caller then blocks with the
+    worker's reason). An unusable answer never raises; a seat-silent timeout with
+    `on_external_timeout = "block"` and the kill switch still do.
+    """
+    sup_mode = str(getattr(cfg.swarm, "supervisor", "off") or "off")
+    if sup_mode == "off":
+        return None
+    mm = info.get("micromanager")
+    if mm is None or not getattr(mm, "enabled", False) or not hasattr(mm, "handback_triage"):
+        return None
+    cid = str(info.get("card_id", "") or "")
+    mname = str(info.get("member", "") or "")
+    worker_reason = str(info.get("reason", "") or "") or "handed back"
+    payload = _handback_triage_payload(board, cfg, card_map.get(cid), info)
+    try:
+        ans = mm.handback_triage(cid, payload)
+    except (Invalid, Refused, Infra, ValueError, TypeError) as exc:
+        msg = getattr(exc, "message", str(exc))
+        _post_event(
+            board,
+            "handback",
+            f"supervisor handback triage for {mname or cid} gave no usable answer: {msg}",
+            card=cid,
+        )
+        return None
+    if not isinstance(ans, dict) or not ans:
+        return None
+    action = ans.get("action")
+    if action == "hint":
+        if not ans.get("body"):
+            return None
+        return {"action": "hint", "body": str(ans["body"])}
+    if action == "set":
+        if not mname:
+            return None
+        tier = str(ans.get("tier", "") or "") or None
+        effort = str(ans.get("effort", "") or "") or None
+        why = str(ans.get("reason", "") or "")
+        try:
+            swarm_set(
+                board,
+                cfg,
+                caller="coordinator",
+                member_name=mname,
+                tier=tier,
+                effort=effort,
+                reason=("supervisor handback triage" + (f": {why}" if why else ""))[:200],
+            )
+        except Refused:
+            return None  # refusal already posted; block with the worker's reason
+        return {"action": "set", "tier": tier, "effort": effort}
+    if action == "block":
+        why = str(ans.get("reason", "") or "")
+        reason = worker_reason + (f" (supervisor: {why})" if why and why != worker_reason else "")
+        return {"action": "block", "reason": reason}
+    return None
 
 
 class SwarmRunner:
@@ -952,6 +1450,7 @@ class SwarmRunner:
         self.deadline = deadline
         self.run_card_fn = run_card_fn
         self.record_outcome_fn = record_outcome_fn
+        self._stall_scan_seq = 0
 
         if coordinator is not None:
             self.coordinator = coordinator
@@ -972,8 +1471,65 @@ class SwarmRunner:
                     tier_cfg,
                     effort=str(getattr(cfg.swarm, "coordinator_effort", "") or ""),
                 )
+            elif is_acp_adapter(spec):
+                provider = normalize_acp_provider(spec)
+                coord_effort = str(getattr(cfg.swarm, "coordinator_effort", "") or "")
+                if backend is None:
+                    backend = AcpCoordinatorBackend(
+                        cfg, provider=provider, effort=coord_effort
+                    )
+                elif isinstance(backend, ClaudeAcpWorkerBackend):
+                    backend = AcpCoordinatorBackend(
+                        cfg, provider=provider, effort=coord_effort, worker=backend
+                    )
+                mm_cfg = getattr(cfg, "micromanager", None)
+                coord_model = str(getattr(mm_cfg, "model", "") or "")
+                coord_tier = TierConfig(
+                    name=acp_adapter_for_provider(provider),
+                    model=coord_model or provider,
+                    efforts=("low", "medium", "high", "xhigh", "max"),
+                    effort_param="effort",
+                )
+                self.coordinator = ModelCoordinator(
+                    cfg,
+                    backend,
+                    coord_tier,
+                    effort=coord_effort,
+                )
             else:
                 raise Invalid("bad-coordinator", f"unknown coordinator mode {spec!r}")
+
+    def _dispatch_stalls(self, rt: CoordinatorRuntime) -> int:
+        """Call the seated coordinator's `on_stall` once for each new `stall` post.
+
+        Only stall posts written by a code member (the monitor) count. Returns how
+        many were handled.
+        """
+        handled = 0
+        posts = self.board.read(
+            as_name="*", since=self._stall_scan_seq, limit=None, for_model=False
+        )
+        for post in posts:
+            self._stall_scan_seq = max(self._stall_scan_seq, int(post.get("seq", 0) or 0))
+            if post.get("kind") != "stall":
+                continue
+            author = self.board.get_member(str(post.get("from", "") or ""))
+            if author is None or author.get("kind") != "code":
+                continue
+            info = {
+                "post": post,
+                "seq": int(post.get("seq", 0) or 0),
+                "card_id": str(post.get("card", "") or ""),
+                "ref": post.get("ref"),
+                "to": list(post.get("to") or []),
+                "detail": str(post.get("body", "") or ""),
+                "running": sorted(rt.running_ids()),
+                "pending": list(rt.pending),
+            }
+            with rt.coord_busy():
+                self.coordinator.on_stall(rt, info)
+            handled += 1
+        return handled
 
     def run(self) -> list[dict]:
         card_map: dict[str, Card] = {}
@@ -990,102 +1546,7 @@ class SwarmRunner:
 
         def _make_ask_supervisor_fn():
             def _ask(info: dict) -> dict | None:
-                cid = str(info.get("card_id", "") or "")
-                mname = str(info.get("member", "") or "")
-                reason = str(info.get("reason", "") or "")
-                sup_mode = str(getattr(self.cfg.swarm, "supervisor", "off") or "off")
-                if sup_mode == "off":
-                    return None
-                q_post = info.get("question_post")
-                if q_post is None:
-                    try:
-                        ask_res = swarm_ask(
-                            self.board,
-                            self.cfg,
-                            caller="coordinator",
-                            body=f"handback triage for {mname or cid}: {reason}",
-                            card=cid,
-                            attempt=int(info.get("attempt", 0) or 0),
-                            expects={
-                                "op": "handback_triage",
-                                "required": ["action"],
-                                "properties": {
-                                    "action": {"type": "str", "enum": ["hint", "set", "block"]},
-                                    "body": {"type": "str"},
-                                    "tier": {"type": "str"},
-                                    "effort": {"type": "str"},
-                                    "reason": {"type": "str"},
-                                },
-                            },
-                        )
-                        q_post = ask_res.get("post") or {}
-                    except Refused:
-                        return None
-                q_seq = int(q_post.get("seq", 0) or 0)
-
-                if sup_mode == "external":
-                    card_budget = info.get("budget")
-                    hb_fn = info.get("heartbeat_fn")
-                    ext_wait = float(getattr(self.cfg.swarm, "external_wait_s", 1800.0) or 1800.0)
-                    on_to = str(getattr(self.cfg.swarm, "on_external_timeout", "fallback") or "fallback")
-                    dl = time.monotonic() + max(0.0, ext_wait)
-                    pause_cm = (
-                        card_budget.pause_clock()
-                        if card_budget is not None and hasattr(card_budget, "pause_clock")
-                        else contextlib.nullcontext()
-                    )
-                    since_q = q_seq
-                    with pause_cm, self.board.external_wait(card_id=cid, member_name=mname):
-                        while True:
-                            if self.state.kill_requested(self.cfg.kill_switch):
-                                raise GateFailure(StopCode.KILLED, "run cancelled by kill switch")
-                            for item in self.board.read(
-                                as_name="*", since=since_q, limit=None, for_model=False
-                            ):
-                                since_q = max(since_q, int(item.get("seq", 0) or 0))
-                                if item.get("kind") == "answer" and item.get("ref") == q_seq:
-                                    try:
-                                        ans_data = json.loads(str(item.get("body", "") or ""))
-                                    except ValueError:
-                                        ans_data = {}
-                                    act = str(ans_data.get("action", "") or "").lower()
-                                    if act == "hint" and ans_data.get("body") and mname:
-                                        swarm_hint(self.board, self.cfg, caller="coordinator", member_name=mname, body=str(ans_data["body"]))
-                                        return {"action": "hint", "body": str(ans_data["body"])}
-                                    if act == "set" and mname:
-                                        swarm_set(self.board, self.cfg, caller="coordinator", member_name=mname, tier=ans_data.get("tier"), effort=ans_data.get("effort"), reason="supervisor handback triage")
-                                        return {"action": "set", "tier": ans_data.get("tier"), "effort": ans_data.get("effort")}
-                                    if act == "block":
-                                        return {"action": "block", "reason": str(ans_data.get("reason", "") or reason)}
-                            if callable(hb_fn):
-                                hb_fn()
-                            rem = dl - time.monotonic()
-                            if rem <= 0:
-                                break
-                            self.board.wait_after(since_q, min(0.5, rem))
-                    if on_to == "block":
-                        raise GateFailure(StopCode.SEAT_SILENT, f"external supervisor did not answer handback #{q_seq}")
-                    return None
-
-                mm = info.get("micromanager")
-                if mm is None or not getattr(mm, "enabled", False):
-                    return None
-                try:
-                    ans = mm.backend.assist(
-                        "triage_blocked",
-                        {"card_id": cid, "reason": reason, "cards": [{"id": cid, "reason": reason}]},
-                    )
-                    if isinstance(ans, dict):
-                        act = str(ans.get("action", "") or "").lower()
-                        if act == "hint" and ans.get("body") and mname:
-                            swarm_hint(self.board, self.cfg, caller="coordinator", member_name=mname, body=str(ans["body"]))
-                            return {"action": "hint", "body": str(ans["body"])}
-                        if act == "set" and mname:
-                            swarm_set(self.board, self.cfg, caller="coordinator", member_name=mname, tier=ans.get("tier"), effort=ans.get("effort"), reason="supervisor handback triage")
-                            return {"action": "set", "tier": ans.get("tier"), "effort": ans.get("effort")}
-                except (Invalid, Refused, Infra, ValueError):
-                    return None
-                return None
+                return ask_supervisor_handback(self.board, self.cfg, card_map, info)
 
             return _ask
 
@@ -1119,6 +1580,7 @@ class SwarmRunner:
                 rt.finished[cid] = rec
             self.night.note_card()
             self.record_outcome_fn(cid, rec)
+            retire_card_members(self.board, cid, reason="card blocked")
 
         rt = CoordinatorRuntime(
             board=self.board,
@@ -1151,10 +1613,14 @@ class SwarmRunner:
 
                 is_ext = isinstance(self.coordinator, ExternalCoordinator)
                 ext_idle_since: float | None = None
+                # Card threads parked on a silent seat finish no future, so the loop
+                # polls to notice the monitor's stall posts.
+                loop_poll_s = min(1.0, max(0.05, float(monitor.poll_interval_s)))
 
                 while True:
                     if is_ext:
                         self.coordinator.scan_external_actions(rt)
+                    self._dispatch_stalls(rt)
 
                     with rt.lock:
                         if rt.stop_launching or self.state.kill_requested(self.cfg.kill_switch):
@@ -1210,9 +1676,9 @@ class SwarmRunner:
                     if active_futs:
                         ext_idle_since = None
                         wait_timeout = (
-                            self.coordinator.poll_interval_s
+                            min(self.coordinator.poll_interval_s, loop_poll_s)
                             if is_ext
-                            else None
+                            else loop_poll_s
                         )
                         with rt.coordinator_waiting():
                             done_futs, _ = concurrent.futures.wait(
@@ -1239,6 +1705,9 @@ class SwarmRunner:
                             if self.record_outcome_fn(cid, outcome):
                                 with rt.lock:
                                     rt.stop_launching = True
+                            # Code retires the finished card's workers at once, whatever
+                            # coordinator is seated, so the roster never fills with them.
+                            retire_card_members(self.board, cid)
                             if not rt.stop_launching:
                                 with rt.coord_busy():
                                     self.coordinator.on_finished(rt, cid, outcome)
@@ -1285,7 +1754,8 @@ class SwarmRunner:
                     head_now = self.coordinator._scan_seq
                     with rt.coordinator_waiting():
                         self.board.wait_after(
-                            head_now, min(self.coordinator.poll_interval_s, remaining_ext)
+                            head_now,
+                            min(self.coordinator.poll_interval_s, remaining_ext, loop_poll_s),
                         )
         finally:
             monitor.stop()

@@ -18,6 +18,7 @@ import concurrent.futures
 import contextlib
 import datetime as _dt
 import difflib
+import functools
 import inspect
 import io
 import json
@@ -38,6 +39,12 @@ from .acp_setup import (
 from .adopt import adopt_project
 from .bench import load_task
 from .board import Board, VALID_POST_KINDS, board_dir_for
+from .adapters.acp import (
+    ClaudeAcpAdapter,
+    acp_adapter_for_provider,
+    is_acp_adapter,
+    normalize_acp_provider,
+)
 from .adapters.files import FileCardSource, open_card_source
 from .adapters.jsonl import TelemetrySink, open_telemetry
 from .adapters.openai_compat import open_backend
@@ -58,7 +65,7 @@ from .dossier import build_dossier, render_markdown
 from .errors import (AdapterError, ConfigError, GateFailure, Infra, Invalid,
                      Refused, StopCode, UsageError)
 from .flow import CardRun
-from .gates.checks import suite_green
+from .gates.checks import combined_status, rows_for_test, suite_green
 from .gates.eligibility import check_eligibility, derive_cargo_unit
 from .git import Git, GitRefused
 from .globs import matches_any, normalise, resolves_within
@@ -66,7 +73,7 @@ from .harness_global import GlobalLibrary, global_dir_for
 from .harness_memory import HarnessLibrary
 from .harness_scope import project_markers
 from .human_cli import Style, error_hint, format_human
-from .micromanager import MicromanagerBudget, open_micromanager
+from .micromanager import ClaudeAcpMicromanager, MicromanagerBudget, open_micromanager
 from .packs.base import pack_for
 from .state import (StateDir, _safe_id, baseline_lock_for, read_json, utc_now,
                     utc_after, write_json)
@@ -216,6 +223,17 @@ def cmd_check(ctx: Context, args) -> int:
     payload = {"card": card.id, "eligible": eligibility.ok,
                "card_hash": card.hash(),
                "failures": eligibility.failures}
+    # What the card's gates will run it with: the runner, the checker and
+    # formatter and the pack's notes, decided from the same config as above.
+    payload.update(eligibility.info)
+    try:
+        pack = _configured_pack(ctx.cfg, ctx.repo)
+        summary = getattr(pack, "tooling_summary", None)
+        payload["tooling"] = (summary() if summary is not None else
+                              {"pack": str(getattr(pack, "name", "") or "external"),
+                               "notes": [str(n) for n in getattr(pack, "notes", [])]})
+    except (AdapterError, Invalid, OSError) as exc:
+        payload["tooling"] = {"error": str(getattr(exc, "message", exc))}
 
     if args.baseline and eligibility.ok:
         try:
@@ -231,6 +249,30 @@ def cmd_check(ctx: Context, args) -> int:
                payload)
     _emit_ctx(ctx, payload, "check")
     return EXIT_OK if payload["eligible"] else EXIT_REFUSED
+
+
+def _pack_with_config(cfg, cwd: Path):
+    """The project's pack, given the loaded config's settings.
+
+    Straight after `pack_for`: a pack that reads `[runner]` settings (the
+    TypeScript pack) then decides from the same config eligibility was given
+    (`--config` included), not from the file in the base checkout.
+    """
+    pack = pack_for(cfg.languages[0], cfg.cargo_flags, spec=cfg.pack_adapter,
+                    cwd=cwd, python=cfg.runner_python)
+    apply_settings = getattr(pack, "apply_settings", None)
+    if apply_settings is not None:
+        apply_settings(cfg)
+    return pack
+
+
+def _configured_pack(cfg, worktree: Path):
+    """`_pack_with_config`, then configured for `worktree`."""
+    pack = _pack_with_config(cfg, worktree)
+    configure = getattr(pack, "configure", None)
+    if configure is not None:
+        configure(worktree)
+    return pack
 
 
 def _deps_done(source: FileCardSource, card: Card) -> bool:
@@ -251,12 +293,7 @@ def _baseline_check(ctx: Context, source: FileCardSource, card: Card) -> dict:
         git.worktree_remove(worktree)
     git.worktree_add(worktree, base)
     try:
-        pack = pack_for(
-            ctx.cfg.languages[0], ctx.cfg.cargo_flags,
-            spec=ctx.cfg.pack_adapter, cwd=worktree,
-            python=ctx.cfg.runner_python,
-        )
-        pack.configure(worktree)
+        pack = _configured_pack(ctx.cfg, worktree)
         unit = card.unit or derive_cargo_unit(card.touches, worktree)
         runner = ctx.runner(worktree)
         target = ctx.state.check_dir(card.id) / "target"
@@ -336,18 +373,43 @@ def _baseline_check(ctx: Context, source: FileCardSource, card: Card) -> dict:
                              "would prove nothing",
                     "compile_errors": parsed.get("compile_errors", [])}
 
-        statuses = {entry["name"]: entry["status"]
-                    for entry in parsed.get("results", [])}
-        named = {name: statuses.get(name, "not-run") for name in card.test_names}
+        # The same rule the run's fail-before gate uses: every row reported for a
+        # named test decides (a parametrized test has one row per case), and rows
+        # of a same-named test in another file are left out.
+        files = {test.name: test.file for test in card.tests if test.file}
+        row_file = getattr(pack, "row_file", None)
+        rows = parsed.get("results", [])
+        named = {name: combined_status(rows_for_test(rows, name, files.get(name, ""),
+                                                     row_file))
+                 for name in card.test_names}
         passing = [name for name, status in named.items() if status == "ok"]
-        return {
-            "ok": not passing,
+        mixed = [name for name, status in named.items() if status == "mixed"]
+        # Skipped or expected to fail on base (`ignored`): the fail-before gate
+        # refuses those too, since a test that did not run proves nothing. Only
+        # a test that is not there yet (`not-run`) is left to the test writer.
+        ignored = [name for name, status in named.items()
+                   if status not in ("ok", "mixed", "FAILED", "not-run")]
+        out = {
+            "ok": not passing and not mixed and not ignored,
             "class": result.cls,
             "named": named,
             "failed_on_base": [name for name, status in named.items()
                                if status == "FAILED"],
             "passing_on_base": passing,
         }
+        problems = []
+        if mixed:
+            out["mixed_on_base"] = mixed
+            problems.append("these named tests were reported both failing and not "
+                            "failing on base, so they prove nothing: "
+                            + ", ".join(mixed))
+        if ignored:
+            out["ignored_on_base"] = ignored
+            problems.append("these named tests were skipped or expected to fail on "
+                            "base, so they prove nothing: " + ", ".join(ignored))
+        if problems:
+            out["error"] = "; ".join(problems)
+        return out
     finally:
         if lock_held and cache_lock is not None:
             cache_lock.release()
@@ -386,6 +448,12 @@ def cmd_run(ctx: Context, args) -> int:
         _emit_ctx(ctx, {"refused": True,
                         "reason": f"another run holds the lock: {holder.get('run_id')}"}, "run")
         return EXIT_REFUSED
+    stale = getattr(ctx.state, "last_lock_takeover", None)
+    if stale:
+        print(f"note: took over run.lock from run {stale.get('run_id')!r} "
+              f"(pid {stale.get('pid')} on {stale.get('host')}, started "
+              f"{stale.get('started_at')}), which is no longer running",
+              file=sys.stderr)
 
     try:
         return _do_run(ctx, args, run_id)
@@ -433,8 +501,12 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
                 "and pass a positive --spend to lower it")
         cap = (min(args.spend, cfg.spend_per_night) if cfg.spend_per_night > 0
                else args.spend)
-    night = NightBudget(cap, cards_cap=args.cards)
     night_mm_budget = _build_night_mm_budget(cfg)
+    # `openfarm drive` runs this in its own process and hands in a night budget
+    # its own turns are added to, so one total stops both (see driver.py).
+    make_night = getattr(ctx, "make_night_budget", None)
+    night = (make_night(cap, args.cards, night_mm_budget) if callable(make_night)
+             else NightBudget(cap, cards_cap=args.cards))
     deadline = _deadline(args)
     outcomes: list[dict] = []
     consecutive: list[tuple[str, str, str]] = []
@@ -443,6 +515,87 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
                       if getattr(args, "mm_script", None) else None)
     harness_lib = _open_harness_library(ctx, require_enabled=True)
     swarm_cfg = getattr(cfg, "swarm", None)
+
+    def _acp_children(sup_proto=None) -> list[tuple[str, str, object, BaseException | None]]:
+        """`(child, provider, hold, error)` for each ACP child this run starts.
+
+        The one answer to "which ACP children does this run use", for the
+        refusal before the run and for the run's notes after it. The worker
+        backend, unless `--script` stands in for it; the swarm's ACP
+        coordinator, unless the swarm is off or `--script` stands in; the
+        supervisor as `open_micromanager` picks it, so its seat comes first and
+        `[micromanager] mode = "off"`, `--mm-script` and a seat set to `off`,
+        `external` or `tier:` give none. Each hold is worked out by the
+        adapters' own rule (`_SharedAcpSupervisor.hold_of`) and nothing is
+        started. A hold that could not be worked out carries its error instead.
+        """
+        from .adapters.claude_worker import open_acp_worker
+        run_script = Path(args.script) if getattr(args, "script", None) else None
+        swarm_on = bool(swarm_cfg is not None and swarm_cfg.enabled and not args.dry_run)
+        coord = str(getattr(swarm_cfg, "coordinator", "code") or "") if swarm_cfg else ""
+        wanted: list[tuple[str, str, object]] = []  # (child, provider, opener)
+        if run_script is None and is_acp_adapter(cfg.model_adapter):
+            wanted.append(("worker", normalize_acp_provider(cfg.model_adapter),
+                           lambda: open_acp_worker(cfg)))
+        if swarm_on and run_script is None and is_acp_adapter(coord):
+            wanted.append(("coordinator", normalize_acp_provider(coord),
+                           lambda: open_acp_worker(cfg, provider=normalize_acp_provider(coord))))
+        sup_spec = (swarm_cfg.supervisor if (swarm_cfg is not None and swarm_cfg.enabled)
+                    else "config")
+        if sup_proto is None and mm_script_path is None and (
+            is_acp_adapter(sup_spec)
+            or (sup_spec == "config" and is_acp_adapter(cfg.micromanager_adapter))
+        ):
+            # The lazy probe starts nothing; `open_micromanager` applies `mode`.
+            probe_mm = None
+            try:
+                probe_mm = open_micromanager(cfg, ctx.state.root, ctx.repo, worktree=ctx.repo)
+                if isinstance(getattr(probe_mm, "backend", None), ClaudeAcpMicromanager):
+                    sup_proto = probe_mm.backend
+            except (AdapterError, OSError):
+                sup_proto = None
+            finally:
+                if probe_mm is not None:
+                    with contextlib.suppress(Exception):
+                        probe_mm.close()
+        out: list[tuple[str, str, object, BaseException | None]] = []
+        for child, provider, opener in wanted:
+            backend = None
+            try:
+                backend = opener()  # only its settings are wanted
+                _transport, hold = _SharedAcpSupervisor.hold_of(
+                    backend.command, backend.provider, "none", backend.confine)
+                out.append((child, backend.provider, hold, None))
+            except Exception as exc:  # said by the caller, never lost
+                out.append((child, provider, None, exc))
+            finally:
+                if backend is not None:
+                    with contextlib.suppress(Exception):
+                        backend.close()  # it may have made a temp folder
+        if sup_proto is not None:
+            try:
+                _transport, hold = _SharedAcpSupervisor.hold_of(
+                    sup_proto.command, sup_proto.provider, sup_proto.tool_policy,
+                    getattr(sup_proto, "confine", None))
+                out.append(("supervisor", sup_proto.provider, hold, None))
+            except Exception as exc:  # said by the caller, never lost
+                out.append(("supervisor", sup_proto.provider, None, exc))
+        return out
+
+    if not args.dry_run:
+        # An ACP child the confinement rules refuse would fail every op of every
+        # card (a supervisor's ops degrade one by one): the run is refused here,
+        # before a board or a card is touched, as `openfarm drive` refuses its
+        # own child. A hold that cannot be worked out here is left to the
+        # adapter, which applies the same rule when it starts.
+        for child, provider, hold, _err in _acp_children():
+            if hold is not None and hold.refused:
+                _emit_ctx(ctx, {"refused": True, "reason": hold.refused,
+                                "code": "acp-confine-unavailable",
+                                "child": child, "provider": provider,
+                                "confine": hold.as_dict()}, "run")
+                return EXIT_REFUSED
+
     board: Board | None = None
     if swarm_cfg is not None and swarm_cfg.enabled and not args.dry_run:
         board = Board(board_dir_for(ctx.state, run_id), state_dir=ctx.state)
@@ -465,26 +618,59 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
                 effort=swarm_cfg.supervisor_effort,
                 added_by="system",
             )
+        elif is_acp_adapter(swarm_cfg.supervisor):
+            sup_prov = normalize_acp_provider(swarm_cfg.supervisor)
+            board.upsert_member(
+                "supervisor",
+                kind="acp",
+                role="supervisor",
+                tier=acp_adapter_for_provider(sup_prov),
+                model=str(getattr(getattr(cfg, "micromanager", None), "model", "") or sup_prov),
+                effort=swarm_cfg.supervisor_effort,
+                added_by="system",
+            )
 
     swarm_parallel = bool(
         swarm_cfg is not None and swarm_cfg.enabled and not args.dry_run
     )
     shared_mm_backend = None
+    mm_seat: _SharedAcpSupervisor | None = None
     coord_backend = None
+    swarm_sup = swarm_cfg.supervisor if swarm_cfg is not None else "config"
+    uses_acp_sup = is_acp_adapter(swarm_sup) or (
+        swarm_sup == "config"
+        and is_acp_adapter(cfg.micromanager_adapter)
+        and getattr(getattr(cfg, "micromanager", None), "mode", "active") != "off"
+    )
     if (
         swarm_parallel
         and mm_script_path is None
         and getattr(cfg, "concurrent_cards", 1) > 1
-        and swarm_cfg.supervisor == "config"
-        and cfg.micromanager_adapter.lower() in ("claude-acp", "acp", "claude")
-        and getattr(getattr(cfg, "micromanager", None), "mode", "active") != "off"
+        and uses_acp_sup
     ):
         shared_mm = open_micromanager(
             cfg, ctx.state.root, ctx.repo, worktree=ctx.repo, budget=night_mm_budget
         )
         shared_mm_backend = getattr(shared_mm, "backend", None)
-    if swarm_parallel and str(getattr(swarm_cfg, "coordinator", "code") or "").startswith("tier:"):
+        if isinstance(shared_mm_backend, ClaudeAcpMicromanager):
+            # Share the process, not the conversation: see _SharedAcpSupervisor.
+            mm_seat = _SharedAcpSupervisor(shared_mm_backend)
+            shared_mm_backend = None
+    coord_spec = str(getattr(swarm_cfg, "coordinator", "code") or "")
+    if swarm_parallel and coord_spec.startswith("tier:"):
         coord_backend = open_backend(cfg, script_path)
+    elif swarm_parallel and is_acp_adapter(coord_spec):
+        if script_path is not None:
+            coord_backend = open_backend(cfg, script_path)
+        else:
+            from .coordinator import AcpCoordinatorBackend
+            coord_backend = AcpCoordinatorBackend(
+                cfg,
+                provider=normalize_acp_provider(coord_spec),
+                effort=str(getattr(swarm_cfg, "coordinator_effort", "") or ""),
+            )
+    if coord_backend is not None:
+        coord_backend = _MeteredCoordinatorBackend(coord_backend, night)
     build_limiter = (
         BuildLimiter(getattr(cfg, "concurrent_builds", 2))
         if swarm_parallel
@@ -550,23 +736,36 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
             rec_lock = threading.Lock()
 
             def _run_swarm_card(cid: str, *, on_handback=None, on_struggling=None) -> dict:
-                return _run_card(
-                    ctx,
-                    source,
-                    cid,
-                    run_id,
-                    telemetry,
-                    run_dir,
-                    script_path,
-                    mm_script=mm_script_path,
-                    harness_library=harness_lib,
-                    mm_budget=night_mm_budget,
-                    board=board,
-                    build_limiter=build_limiter,
-                    mm_backend=shared_mm_backend,
-                    on_handback=on_handback,
-                    on_struggling=on_struggling,
-                )
+                # A night that counts running cards (a driven run's) meters the
+                # card's worker calls as they land; any other night sees the
+                # card's spend when it ends, as before.
+                metered = None
+                if callable(getattr(night, "metered_backend", None)):
+                    metered = night.metered_backend(cid, open_backend(cfg, script_path))
+                try:
+                    return _run_card(
+                        ctx,
+                        source,
+                        cid,
+                        run_id,
+                        telemetry,
+                        run_dir,
+                        script_path,
+                        backend=metered,
+                        mm_script=mm_script_path,
+                        harness_library=harness_lib,
+                        mm_budget=night_mm_budget,
+                        board=board,
+                        build_limiter=build_limiter,
+                        mm_backend=shared_mm_backend,
+                        on_handback=on_handback,
+                        on_struggling=on_struggling,
+                        mm_seat=mm_seat,
+                    )
+                finally:
+                    if metered is not None and hasattr(metered, "close"):
+                        with contextlib.suppress(Exception):
+                            metered.close()
 
             def _record_swarm_outcome(cid: str, outcome: dict) -> bool:
                 nonlocal consecutive
@@ -583,10 +782,15 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
                             infra_stop = True
                     elif final_state != "released":
                         consecutive = []
-                    night.note_spend(outcome.get("spend", 0.0) or 0.0)
-                    night.note_micromanager(
-                        outcome.get("micromanager_spend", 0.0) or 0.0
-                    )
+                    finish = getattr(night, "finish_card", None)
+                    if callable(finish):
+                        finish(cid, outcome.get("spend", 0.0) or 0.0,
+                               outcome.get("micromanager_spend", 0.0) or 0.0)
+                    else:
+                        night.note_spend(outcome.get("spend", 0.0) or 0.0)
+                        night.note_micromanager(
+                            outcome.get("micromanager_spend", 0.0) or 0.0
+                        )
                     _update_breaker(ctx, consecutive)
                     return infra_stop
 
@@ -614,6 +818,11 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
                 shared_mm_backend.close()
             except Exception as exc:
                 print(f"micromanager close error ignored: {exc}", file=sys.stderr)
+        if mm_seat is not None:
+            try:
+                mm_seat.close()
+            except Exception as exc:
+                print(f"micromanager close error ignored: {exc}", file=sys.stderr)
         if board is not None:
             board.end_run("finished")
 
@@ -622,30 +831,68 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
         notes.append(
             "the backend reports no prices, so every spend is zero and the spend "
             "caps cannot fire: set [model] cost_per_1k_in and cost_per_1k_out")
+    unpriced = _unpriced_supervisor_note(
+        cfg, mm_script_path,
+        swarm_supervisor=(swarm_cfg.supervisor
+                          if swarm_cfg is not None and swarm_cfg.enabled else None))
+    if unpriced:
+        notes.append(unpriced)
     if cfg.concurrent_cards > 1 and not swarm_parallel:
         notes.append(
             f"concurrent_cards is {cfg.concurrent_cards} but cards run one at a "
             f"time: the per-card state is ready for a pool, the loop is not")
+
+    # What a language pack could not use (no tsc, so no types were checked; ruff
+    # not configured), once per run. Packs that had nothing to say add nothing.
+    for o in outcomes:
+        tooling = o.get("tooling") if isinstance(o, dict) else None
+        for note in (tooling.get("notes") if isinstance(tooling, dict) else None) or []:
+            if note and note not in notes:
+                notes.append(str(note))
+
+    def _confinement_notes() -> list[str]:
+        """One note per ACP provider this run used whose child is not confined.
+
+        `[micromanager] confine = "off"`, or Codex held by its tool flags alone
+        because bwrap is unusable. Worked out from the same settings and rules
+        the adapters use (`confine.hold_for`), so it holds for every card's
+        adapter, the ones already closed included. Only children the run
+        started are described (`_acp_children`): a supervisor whose mode is
+        `off`, or a role a script stood in for, gives no note.
+        """
+        from . import confine as confine_lib
+        out: list[str] = []
+        children = _acp_children(mm_seat.proto if mm_seat is not None else None)
+        for _child, _provider, hold, err in children:
+            if err is not None:
+                if isinstance(err, (AdapterError, confine_lib.ConfineError)):
+                    continue
+                raise err
+            if hold.note and not hold.refused and hold.note not in out:
+                out.append(hold.note)
+        return out
+
+    if not args.dry_run:
+        # The cards are done by now: a note that cannot be worked out is said, and
+        # never costs the run its record.
+        try:
+            held_notes = _confinement_notes()
+        except Exception as exc:
+            held_notes = [f"could not work out how this run's ACP children were held: "
+                          f"{type(exc).__name__}: {' '.join(str(exc).split())[:200]}"]
+        for note in held_notes:
+            if note not in notes:
+                notes.append(note)
 
     tokens_payload = token_split(
         sum(int(o.get("tokens_in", 0) or 0) + int(o.get("tokens_out", 0) or 0)
             for o in outcomes),
         sum(int(o.get("micromanager_tokens_in", 0) or 0)
             + int(o.get("micromanager_tokens_out", 0) or 0) for o in outcomes),
+        coord_backend.tokens if coord_backend is not None else 0,
     )
     if board is not None:
-        by_member: dict[str, int] = {}
-        by_effort: dict[str, int] = {}
-        for m in board.list_members(include_removed=True):
-            mtokens = int(m.get("tokens_in", 0) or 0) + int(m.get("tokens_out", 0) or 0)
-            if mtokens > 0 or m.get("role") in (
-                "planner", "test-writer", "implementer", "checker"
-            ):
-                by_member[m["name"]] = mtokens
-            for eff_key, eff_tok in (m.get("tokens_by_effort") or {}).items():
-                by_effort[eff_key] = by_effort.get(eff_key, 0) + int(eff_tok or 0)
-        tokens_payload["by_member"] = by_member
-        tokens_payload["by_effort"] = by_effort
+        tokens_payload.update(_member_token_breakdown(board, tokens_payload))
 
     record = {"run_id": run_id, "started_at": utc_now(),
               "finished_at": utc_now(), "caps": {"spend": night.spend_cap,
@@ -653,7 +900,11 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
               "tokens": tokens_payload,
               # Dollars at API list prices: what the spend caps count, not a cost.
               "spend": round(night.total_spend(), 6),
+              "worker_spend": round(night.spend, 6),
               "micromanager_spend": round(night.micromanager_spend, 6),
+              "coordinator_spend": round(night.coordinator_spend, 6),
+              **({"driver_spend": round(float(night.driver_spend), 6)}
+                 if hasattr(night, "driver_spend") else {}),
               "spend_measured": _backend_prices_spend(cfg, script_path),
               "notes": notes,
               "outcomes": outcomes,
@@ -718,6 +969,125 @@ def _load_test_conventions(cfg, worktree: Path) -> str:
     return ""
 
 
+class _SharedAcpSupervisor:
+    """The run's one ACP supervisor process, with one session per card.
+
+    Parallel cards share the ACP process (the spec's "one Claude ACP process
+    when the supervisor is `acp`"), but not a conversation: v0.8 sent every
+    card's supervisor prompts into one session rooted at the repository, so a
+    card's supervisor saw the other cards' prompts and answers. Each card now
+    gets its own session, rooted at its own worktree, and its own artifact
+    numbering; the night's supervisor budget stays shared. The adapter takes one
+    prompt at a time, so the cards' calls take turns on one lock. A process that
+    dies (a timed-out turn kills it) is replaced once for everyone, and every
+    card opens a fresh session on the new one.
+
+    A standalone ACP server held in a boundary (`codex-acp`, `agy acp`, ...)
+    can see only the one folder it was started in, so a session at another
+    card's worktree would be outside it. Then each card gets its own server,
+    started in its own worktree, and nothing is shared but the budget.
+    openfarm's own bridges confine each prompt's child at the session's folder,
+    and Claude under `auto` is not confined, so both keep the one process.
+    """
+
+    def __init__(self, proto: ClaudeAcpMicromanager) -> None:
+        self.proto = proto
+        self.lock = threading.RLock()
+        self.adapter = None
+        self.per_card = self._confined_server()
+
+    def _adapter_for(self, cwd: Path) -> ClaudeAcpAdapter:
+        p = self.proto
+        return ClaudeAcpAdapter(
+            command=p.command, cwd=cwd, provider=p.provider,
+            isolate_home=p.isolate_home, auth_file=p.auth_file, auth_mode=p.auth_mode,
+            never_touch=p.never_touch, forbidden_files=p.forbidden_files,
+            allowed_root=cwd, confine=p.confine,
+        )
+
+    @staticmethod
+    def hold_of(command, provider: str, tool_policy: str, settings):
+        """`(transport, hold)`: how an adapter for `command` would hold its child.
+
+        The adapter's own rule, worked out without building one. A standalone
+        server's process is held as for tool policy `none`.
+        """
+        from . import confine as confine_lib
+        from .adapters.acp import _bridge_provider, resolve_acp_command
+
+        argv = resolve_acp_command(command, provider=provider)
+        transport = "bridge" if _bridge_provider(argv) else "server"
+        if settings is None:
+            settings = getattr(command, "confine", None)
+        return transport, confine_lib.hold_for(
+            normalize_acp_provider(provider), settings, transport=transport,
+            tool_policy=tool_policy if transport == "bridge" else "none")
+
+    def _confined_server(self) -> bool:
+        """Whether the supervisor is a standalone ACP server inside a boundary."""
+        p = self.proto
+        try:
+            transport, hold = self.hold_of(p.command, p.provider, "none", p.confine)
+        except AdapterError:
+            return False
+        return transport == "server" and hold.boundary
+
+    def live_adapter(self):
+        """The one live adapter, started or replaced as needed (call under `lock`)."""
+        proc = getattr(self.adapter, "_proc", None) if self.adapter is not None else None
+        if self.adapter is not None and proc is not None and proc.poll() is not None:
+            with contextlib.suppress(Exception):
+                self.adapter.close()
+            self.adapter = None
+        if self.adapter is None:
+            self.adapter = self._adapter_for(self.proto.cwd)
+        return self.adapter
+
+    def for_card(self, worktree: Path, card_dir: Path) -> ClaudeAcpMicromanager:
+        p = self.proto
+        kwargs = dict(
+            command=p.command, cwd=worktree, provider=p.provider, model=p.model,
+            effort=p.effort, tool_policy=p.tool_policy, timeout_s=p.timeout_s,
+            isolate_home=p.isolate_home, auth_file=p.auth_file, auth_mode=p.auth_mode,
+            never_touch=p.never_touch, forbidden_files=p.forbidden_files,
+            cost_per_1k_in=p.cost_per_1k_in, cost_per_1k_out=p.cost_per_1k_out,
+            state_dir=p.state_dir, card_dir=card_dir, confine=p.confine,
+        )
+        if self.per_card:
+            # Its own confined server, rooted at its worktree; closed with the card.
+            return ClaudeAcpMicromanager(**kwargs)
+        return _CardAcpSupervisor(self, **kwargs)
+
+    def close(self) -> None:
+        with self.lock:
+            if self.adapter is not None:
+                self.adapter.close()
+                self.adapter = None
+
+
+class _CardAcpSupervisor(ClaudeAcpMicromanager):
+    """One card's supervisor: its own session on the run's shared ACP process."""
+
+    def __init__(self, seat: _SharedAcpSupervisor, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._seat = seat
+        # One prompt at a time on the one process, whichever card asks.
+        self._lock = seat.lock
+
+    def _ensure_session(self):
+        adapter = self._seat.live_adapter()
+        if self._adapter is not adapter:
+            self._adapter = adapter
+            self._session_id = None
+        return super()._ensure_session()
+
+    def close(self) -> None:
+        # The card is done with its session; the run closes the shared process.
+        with self._lock:
+            self._session_id = None
+            self._adapter = None
+
+
 def _run_card(ctx: Context, source: FileCardSource, card_id: str, run_id: str,
               telemetry, run_dir: Path, script: Path | None,
               backend=None, mm_script: Path | None = None,
@@ -728,7 +1098,8 @@ def _run_card(ctx: Context, source: FileCardSource, card_id: str, run_id: str,
               build_limiter: BuildLimiter | None = None,
               mm_backend=None,
               on_handback=None,
-              on_struggling=None) -> dict:
+              on_struggling=None,
+              mm_seat: _SharedAcpSupervisor | None = None) -> dict:
     """Claim one card and drive it. `backend` overrides the configured one."""
     cfg = ctx.cfg
     holder = f"openfarm:{run_id}"
@@ -749,10 +1120,7 @@ def _run_card(ctx: Context, source: FileCardSource, card_id: str, run_id: str,
     Git(ctx.repo).worktree_add(worktree, base_ref)
 
     card_dir = ctx.state.create_card(card.id, run_id)
-    pack = pack_for(cfg.languages[0], cfg.cargo_flags,
-                    spec=cfg.pack_adapter, cwd=worktree,
-                    python=cfg.runner_python)
-    pack.configure(worktree)
+    pack = _configured_pack(cfg, worktree)
     owns_backend = backend is None
     backend = backend if backend is not None else open_backend(cfg, script)
     runner = ctx.runner(worktree, output_dir=card_dir / "gates" / "output")
@@ -762,7 +1130,12 @@ def _run_card(ctx: Context, source: FileCardSource, card_id: str, run_id: str,
     book.pack = pack
     conventions = _load_test_conventions(cfg, worktree)
 
-    owns_mm = micromanager is None and mm_backend is None
+    if mm_seat is not None and micromanager is None and mm_backend is None:
+        # Its own session on the run's shared supervisor process, at its worktree.
+        mm_backend = mm_seat.for_card(worktree, card_dir)
+        owns_mm = True  # closing it ends the card's session, not the process
+    else:
+        owns_mm = micromanager is None and mm_backend is None
     mm = (micromanager if micromanager is not None else open_micromanager(
         cfg, card_dir, ctx.repo, script=mm_script,
         worktree=worktree, card_dir=card_dir, budget=mm_budget,
@@ -890,9 +1263,7 @@ def _handshake(ctx: Context, source, args, telemetry_raw=None) -> dict:
                 "adapters": names}
 
     try:
-        pack = pack_for(ctx.cfg.languages[0], ctx.cfg.cargo_flags,
-                        spec=ctx.cfg.pack_adapter, cwd=ctx.repo,
-                        python=ctx.cfg.runner_python)
+        pack = _pack_with_config(ctx.cfg, ctx.repo)
         hello = pack.hello()
         needed = set(REQUIRED_OPS["pack"])
         offered = set(hello.get("ops") or [])
@@ -937,7 +1308,7 @@ def _handshake(ctx: Context, source, args, telemetry_raw=None) -> dict:
         if (swarm_cfg is not None and swarm_cfg.enabled)
         else "config"
     )
-    should_check_mm = bool(mm_script_raw) or (
+    should_check_mm = bool(mm_script_raw) or is_acp_adapter(swarm_sup) or (
         swarm_sup == "config"
         and mm_cfg is not None
         and getattr(mm_cfg, "mode", "off") != "off"
@@ -964,17 +1335,177 @@ def _handshake(ctx: Context, source, args, telemetry_raw=None) -> dict:
     elif swarm_sup != "config":
         names["micromanager"] = swarm_sup
 
+    if (
+        swarm_cfg is not None
+        and swarm_cfg.enabled
+        and is_acp_adapter(str(getattr(swarm_cfg, "coordinator", "") or ""))
+    ):
+        try:
+            if script_path is not None:
+                coord_check = open_backend(ctx.cfg, script_path)
+            else:
+                from .coordinator import AcpCoordinatorBackend
+                coord_check = AcpCoordinatorBackend(
+                    ctx.cfg,
+                    provider=normalize_acp_provider(swarm_cfg.coordinator),
+                )
+            hello = coord_check.hello()
+            check_hello(hello, "model", set(REQUIRED_OPS["model"]))
+            names["coordinator"] = hello.get("name", "")
+        except Invalid as exc:
+            return {"refused": True, "reason": f"coordinator: {exc.message}",
+                    "adapters": names}
+
     return {"refused": False, "reason": "", "adapters": names}
+
+
+def _unpriced_supervisor_note(cfg, mm_script: Path | None,
+                              swarm_supervisor: str | None = None) -> str:
+    """A note when the supervisor's spend cannot be measured, or "".
+
+    Codex and Antigravity report no cost. Without `[micromanager]` per-1k rates
+    their spend reads zero, so `[micromanager] spend_per_night` and the night's
+    cap can never fire on it: the run has to say so, as it does for the workers.
+
+    `swarm_supervisor` is `[swarm] supervisor` when the swarm is on: an ACP
+    adapter named there is the supervisor that runs; `config` means the
+    micromanager's; anything else (`off`, `external`, a tier) is not an ACP child.
+    """
+    mm = getattr(cfg, "micromanager", None)
+    if mm is None or mm_script is not None:
+        return ""
+    if swarm_supervisor is not None and swarm_supervisor != "config":
+        if not is_acp_adapter(swarm_supervisor):
+            return ""
+        adapter = swarm_supervisor
+    else:
+        adapter = cfg.micromanager_adapter
+        if (not is_acp_adapter(adapter)
+                or str(getattr(mm, "mode", "active")) == "off"):
+            return ""
+    from .adapters.acp import provider_prices_spend
+    provider = normalize_acp_provider(adapter)
+    if provider_prices_spend(provider,
+                             float(getattr(mm, "cost_per_1k_in", 0.0) or 0.0),
+                             float(getattr(mm, "cost_per_1k_out", 0.0) or 0.0)):
+        return ""
+    return (f"the {provider} supervisor reports no cost, so its spend reads zero and "
+            f"its spend caps cannot fire: set [micromanager] cost_per_1k_in and "
+            f"cost_per_1k_out")
 
 
 def _backend_prices_spend(cfg, script: Path | None) -> bool:
     """Whether this configuration can report a cost at all."""
     if script is not None or cfg.model_adapter in ("scripted", "stub"):
         return False
-    if cfg.model_adapter == "claude-acp":
-        return True  # Claude reports its own cost per turn.
+    if is_acp_adapter(cfg.model_adapter):
+        # Claude reports a cost per turn; Codex and Antigravity report none, so
+        # their spend is measured only when per-1k rates are configured.
+        from .adapters.acp import provider_prices_spend
+        return provider_prices_spend(
+            normalize_acp_provider(cfg.model_adapter),
+            float(getattr(cfg, "cost_per_1k_in", 0.0) or 0.0),
+            float(getattr(cfg, "cost_per_1k_out", 0.0) or 0.0))
     return bool(getattr(cfg, "cost_per_1k_in", 0.0)
                 or getattr(cfg, "cost_per_1k_out", 0.0))
+
+
+class _MeteredCoordinatorBackend:
+    """The coordinator's backend, counted: its tokens and its spend.
+
+    A model coordinator's calls are the run's spend like any card's, so each
+    call's cost goes to the night budget as it happens (the spend cap sees it
+    before the next card starts), and its tokens become the coordinator's part
+    of the run's token split. Everything else passes through to the backend.
+    """
+
+    def __init__(self, inner, night: NightBudget) -> None:
+        self._inner = inner
+        self._night = night
+        self._lock = threading.Lock()
+        self.calls = 0
+        self.tokens_in = 0
+        self.tokens_out = 0
+        self.spend = 0.0
+        inner_complete = inner.complete
+
+        @functools.wraps(inner_complete)
+        def complete(*args, **kwargs):
+            comp = inner_complete(*args, **kwargs)
+            self._note(comp)
+            return comp
+
+        # `functools.wraps` keeps the inner signature visible to the callers that
+        # inspect it to choose which optional arguments to pass.
+        self.complete = complete
+
+    def _note(self, comp) -> None:
+        tok_in = int(getattr(comp, "tokens_in", 0) or 0)
+        tok_out = int(getattr(comp, "tokens_out", 0) or 0)
+        try:
+            cost = float(getattr(comp, "cost", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            cost = 0.0
+        with self._lock:
+            self.calls += 1
+            self.tokens_in += tok_in
+            self.tokens_out += tok_out
+            self.spend += cost
+        if cost:
+            self._night.note_coordinator(cost)
+
+    @property
+    def tokens(self) -> int:
+        with self._lock:
+            return self.tokens_in + self.tokens_out
+
+    def __getattr__(self, name: str):
+        return getattr(self._inner, name)
+
+
+_WORKER_ROLES = ("planner", "test-writer", "implementer", "checker")
+
+
+def _member_token_breakdown(board: Board, split: dict) -> dict:
+    """`by_member` and `by_effort` for a swarm run, adding up to `split["total"]`.
+
+    The board records usage per member as calls happen, but not every token the
+    run counts lands on a member: a supervisor that is not a tier (the config's
+    micromanager, an ACP supervisor) keeps its usage in the card records only.
+    Such tokens are listed as `<part> (not on the board)` and under the effort
+    `unrecorded`, so both maps still add up to the total. Members held by an
+    outside agent (`kind = "external"`, as `swarm join` and `openfarm drive`
+    make them) spend on their own account, not through this run's backends; any
+    usage they report goes to `external_by_member` and is not in the total.
+    """
+    by_member: dict[str, int] = {}
+    by_effort: dict[str, int] = {}
+    external: dict[str, int] = {}
+    recorded = {"worker": 0, "supervisor": 0, "coordinator": 0}
+    for m in board.list_members(include_removed=True):
+        mtokens = int(m.get("tokens_in", 0) or 0) + int(m.get("tokens_out", 0) or 0)
+        role = str(m.get("role") or "")
+        if str(m.get("kind") or "") == "external":
+            if mtokens > 0:
+                external[m["name"]] = mtokens
+            continue
+        if mtokens > 0 or role in _WORKER_ROLES:
+            by_member[m["name"]] = mtokens
+        part = ("worker" if role in _WORKER_ROLES else
+                role if role in ("supervisor", "coordinator") else "")
+        if part:
+            recorded[part] += mtokens
+        for eff_key, eff_tok in (m.get("tokens_by_effort") or {}).items():
+            by_effort[eff_key] = by_effort.get(eff_key, 0) + int(eff_tok or 0)
+    for part in ("worker", "supervisor", "coordinator"):
+        missing = int(split.get(part, 0) or 0) - recorded[part]
+        if missing > 0:
+            by_member[f"{part} (not on the board)"] = missing
+            by_effort["unrecorded"] = by_effort.get("unrecorded", 0) + missing
+    result = {"by_member": by_member, "by_effort": by_effort}
+    if external:
+        result["external_by_member"] = external
+    return result
 
 
 def _update_breaker(ctx: Context, consecutive: list[tuple[str, str, str]]) -> None:
@@ -996,6 +1527,10 @@ def _update_breaker(ctx: Context, consecutive: list[tuple[str, str, str]]) -> No
 def cmd_status(ctx: Context, args) -> int:
     """Read-only: the live run, the caps, and the farm's own state."""
     holder = ctx.state.lock_holder()
+    if holder and ctx.state.stale_lock_holder() is not None:
+        # The process that took the lock is gone (a crash, a kill -9). Say so
+        # instead of showing a run that is not there; the next run takes it over.
+        holder = {**holder, "stale": True}
     harness_lib = _open_harness_library(ctx, require_enabled=True)
     payload = {
         "run": holder or {},
@@ -1194,10 +1729,12 @@ def cmd_verdict(ctx: Context, args) -> int:
         _emit_ctx(ctx, {"card": card_id, "error": "no run for this card"}, "verdict")
         return EXIT_REFUSED
     card_dir = candidates[-1].parent
+    # `by` tells this apart from a driver's own first look (`driver/<agent>`,
+    # written by `drive --wave --record-verdict`), which this replaces.
     payload = {"card": card_id, "verdict": args.verdict,
                "review_tokens": args.review_tokens,
                "minutes": args.minutes, "note": args.note or "",
-               "at": utc_now()}
+               "at": utc_now(), "by": "reviewer"}
     write_json(card_dir / "verdict.json", payload)
     _emit_ctx(ctx, payload, "verdict")
     return EXIT_OK
@@ -1565,7 +2102,10 @@ def cmd_board(ctx: Context, args) -> int:
                 ) from exc
         else:
             body = args.body if args.body is not None else ""
-        post = board.post(
+        # An outside voice: a registered, non-code member writing a note,
+        # question, defect or result. Steering kinds go through `swarm`,
+        # answers through `board answer`, and code's kinds are code's alone.
+        post = board.outside_post(
             author=args.as_name,
             to=args.to,
             kind=args.kind,
@@ -1662,6 +2202,8 @@ def cmd_swarm(ctx: Context, args) -> int:
         _emit_ctx(ctx, {"run_id": rid, "member": member}, "swarm_join")
         return EXIT_OK
 
+    # A name typed after --as proves nothing: from the command line only a
+    # member that joined the coordinator seat may steer (outside=True).
     if action == "start":
         card_id = _check_id(args.card, "card id")
         team = parse_team_spec(args.team)
@@ -1670,6 +2212,7 @@ def cmd_swarm(ctx: Context, args) -> int:
             board,
             ctx.cfg,
             caller=args.as_name,
+            outside=True,
             card_id=card_id,
             team=team,
             source=source,
@@ -1682,6 +2225,7 @@ def cmd_swarm(ctx: Context, args) -> int:
             board,
             ctx.cfg,
             caller=args.as_name,
+            outside=True,
             member_name=args.member,
             tier=args.tier,
             effort=args.effort,
@@ -1695,6 +2239,7 @@ def cmd_swarm(ctx: Context, args) -> int:
             board,
             ctx.cfg,
             caller=args.as_name,
+            outside=True,
             member_name=args.member,
             body=args.body,
         )
@@ -1708,6 +2253,7 @@ def cmd_swarm(ctx: Context, args) -> int:
             board,
             ctx.cfg,
             caller=args.as_name,
+            outside=True,
             card_id=card_id,
             reason=args.reason,
             source=source,
@@ -1721,6 +2267,7 @@ def cmd_swarm(ctx: Context, args) -> int:
             board,
             ctx.cfg,
             caller=args.as_name,
+            outside=True,
             member_name=args.member,
             source=source,
         )
@@ -1733,11 +2280,11 @@ def cmd_swarm(ctx: Context, args) -> int:
 # -- the parser ----------------------------------------------------------------
 
 _CLI_EPILOG = """\
-Command groups (21 commands):
+Command groups (22 commands):
   Setup & Auth         init, adopt, install-skill, acp
   Run & Monitor        check, run, status, pause, resume, stop, tui
   Review & Harness     dossier, verdict, done, release, escape, supervise, harness
-  Swarm, Board & Bench swarm, board, bench
+  Swarm, Board & Bench swarm, board, drive, bench
 
 Common workflows:
   Bootstrap & auth     openfarm init my-app --idea "track habits"
@@ -1995,16 +2542,18 @@ def build_parser() -> argparse.ArgumentParser:
         "bench",
         help="run the efficacy bench",
         formatter_class=raw_fmt,
-        epilog="Examples:\n  openfarm bench\n  openfarm bench list --dir bench\n  openfarm bench run --dry-run --task py-bounded-full",
+        epilog="Examples:\n  openfarm bench\n  openfarm bench list --tasks bench\n  openfarm bench run --dry-run --task py-bounded-full",
     )
     bench_sub = bench.add_subparsers(dest="bench_command")
     bench_list = bench_sub.add_parser("list", help="list bench tasks")
-    bench_list.add_argument("--dir", default="bench",
-                            help="directory of bench tasks")
+    bench_list.add_argument("--tasks", "--dir", dest="dir", default="bench",
+                            help="folder of bench tasks, one folder per task with a task.toml "
+                            "(default: ./bench; the openfarm checkout ships one)")
     bench_run = bench_sub.add_parser(
         "run", help="run bench tasks in each arm and write a local report")
-    bench_run.add_argument("--dir", default="bench",
-                           help="directory of bench tasks")
+    bench_run.add_argument("--tasks", "--dir", dest="dir", default="bench",
+                           help="folder of bench tasks, one folder per task with a task.toml "
+                           "(default: ./bench; the openfarm checkout ships one)")
     bench_run.add_argument("--task", action="append", default=[],
                            help="task id to run (repeatable; default: all)")
     bench_run.add_argument("--arm", action="append", default=[],
@@ -2029,6 +2578,9 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--idea", default="", help="plain-English project idea")
     init.add_argument("--profile", choices=PROFILES, default="auto",
                       help="micromanager profile (default: auto)")
+    init.add_argument("--acp-provider", choices=("claude", "antigravity", "codex"),
+                      default="claude",
+                      help="Frontier ACP provider for micromanager (default: claude)")
     init.add_argument("--state-dir", default=None, help="external state directory")
     init.add_argument("--secrets-dir", default=None, help="external secrets directory")
     init.add_argument("--endpoint", default="https://api.example.invalid/v1",
@@ -2053,7 +2605,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     adopt.add_argument("--dir", default=None,
                        help="repository directory (default: the current directory)")
-    adopt.add_argument("--lang", choices=("rust", "python"), default=None,
+    adopt.add_argument("--lang", choices=("rust", "python", "typescript"), default=None,
                        help="language pack to use (default: detect from manifests)")
     adopt.add_argument("--state-dir", default=None, help="external state directory")
     adopt.add_argument("--key-file", default=None, help="external API key file path")
@@ -2074,17 +2626,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     acp = sub.add_parser(
         "acp",
-        help="inspect, log in via OAuth, configure, or probe Frontier Claude ACP",
+        help="inspect, log in via OAuth, configure, or probe Frontier ACP providers",
         formatter_class=raw_fmt,
-        epilog="Examples:\n  openfarm acp status\n  openfarm acp login\n  openfarm acp configure --mode active --auth oauth\n  openfarm acp probe",
+        epilog="Examples:\n  openfarm acp status\n  openfarm acp login --provider antigravity\n  openfarm acp configure --provider codex --mode active --auth oauth\n  openfarm acp probe",
     )
     acp.add_argument("action", nargs="?", default="status", choices=ACP_ACTIONS)
+    acp.add_argument("--provider", choices=("claude", "antigravity", "codex", "all"),
+                     default=None,
+                     help="ACP provider (`claude`, `antigravity`, `codex`, or `all`)")
     acp.add_argument("--mode", choices=("active", "advisory", "off"), default=None)
     acp.add_argument("--auth", choices=("oauth", "api-key", "auto"), default=None)
     acp.add_argument("--binary", default=None,
-                     help="ACP binary or resolution mode (`auto`, `claude`, `claude-agent-acp`)")
+                     help="ACP binary or resolution mode (`auto`, `claude`, `claude-agent-acp`, `agy`, `agy-print`, `antigravity-acp`, `codex`, `codex-acp`)")
     acp.add_argument("--model", default=None)
-    acp.add_argument("--effort", choices=("low", "medium", "high"), default=None)
+    acp.add_argument("--effort", choices=("low", "medium", "high", "xhigh", "max"), default=None)
     acp.add_argument("--tool-policy", choices=("none", "read-only"), default=None)
     acp.add_argument("--auth-file", default=None)
     acp.add_argument("--clear-auth-file", action="store_true")
@@ -2113,6 +2668,52 @@ def build_parser() -> argparse.ArgumentParser:
     tui_p.add_argument("--view", choices=TUI_VIEWS, default="overview",
                        help="initial TUI view (default: overview)")
 
+    drive_p = sub.add_parser(
+        "drive",
+        help="drive external coordinator/supervisor seats with claude, agy, or codex",
+        formatter_class=raw_fmt,
+        epilog="Examples:\n  openfarm drive --agent claude --seat both\n  openfarm drive --agent codex --seat both --cards 3 --wave\n  openfarm drive --agent antigravity --run RUN_ID --seat supervisor",
+    )
+    drive_p.add_argument(
+        "--agent",
+        choices=("claude", "antigravity", "agy", "codex"),
+        default="claude",
+        help="external driver CLI provider (default: claude)",
+    )
+    drive_p.add_argument(
+        "--seat",
+        choices=("both", "coordinator", "supervisor"),
+        default="both",
+        help="board seat(s) to drive (default: both)",
+    )
+    drive_p.add_argument("--run", dest="run_id", default=None,
+                         help="attach to an active run id (omit to start a managed run)")
+    drive_p.add_argument("--cards", type=int, default=None,
+                         help="maximum cards to run")
+    drive_p.add_argument("--card", action="append", default=[],
+                         help="specific card id to run (repeatable)")
+    drive_p.add_argument("--spend", type=float, default=None,
+                         help="spend cap for a managed run")
+    drive_p.add_argument("--driver-name", default="driver",
+                         help="board member name prefix (default: driver)")
+    drive_p.add_argument("--driver-bin", default=None,
+                         help="path to driver CLI executable")
+    drive_p.add_argument("--model", default=None,
+                         help="model override for the driver agent")
+    drive_p.add_argument("--effort", choices=("low", "medium", "high", "xhigh", "max"),
+                         default=None, help="reasoning effort for the driver agent")
+    drive_p.add_argument("--max-turns", type=int, default=40,
+                         help="maximum driver turns (default: 40)")
+    drive_p.add_argument("--turn-timeout", type=float, default=180.0, metavar="SECONDS",
+                         help="seconds one driver turn may take before it is ended "
+                              "(default: 180)")
+    drive_p.add_argument("--wave", action="store_true",
+                         help="inspect in-review dossiers and diffs after the run")
+    drive_p.add_argument("--record-verdict", action="store_true",
+                         help="record wave review verdicts on ledger (never merges or pushes)")
+    drive_p.add_argument("--script", default=None,
+                         help="JSON scripted responses for offline tests")
+
     return parser
 
 
@@ -2128,6 +2729,31 @@ def _emit_bench_error(message: str, want_json: bool) -> int:
     return EXIT_TROUBLE
 
 
+BENCH_NEEDS = (
+    "bench needs a folder of bench tasks: one folder per task, each with a task.toml, "
+    "the card, a repo/ to start from and hidden tests (the openfarm checkout ships "
+    "one in bench/). Point it at one with --tasks PATH, for example "
+    "'openfarm bench list --tasks ~/openfarm/bench' or "
+    "'openfarm bench run --dry-run --tasks ~/openfarm/bench'."
+)
+
+
+def _emit_no_tasks_folder(tasks_dir: Path, want_json: bool, *, bare: bool = False) -> int:
+    """No tasks folder: a usage problem, said plainly, with what bench needs."""
+    if bare:
+        message = f"no bench tasks folder here ({tasks_dir}). {BENCH_NEEDS}"
+    elif tasks_dir.exists():
+        message = f"{tasks_dir} is not a folder. {BENCH_NEEDS}"
+    else:
+        message = f"no bench tasks folder at {tasks_dir}. {BENCH_NEEDS}"
+    if want_json:
+        print(json.dumps({"error": message, "kind": "usage error"}, indent=2,
+                         ensure_ascii=False))
+    else:
+        print(f"openfarm: bench: {message}", file=sys.stderr)
+    return EXIT_USAGE
+
+
 def cmd_bench(args) -> int:
     action = getattr(args, "bench_command", None)
     want_json = bool(getattr(args, "json", False))
@@ -2140,17 +2766,17 @@ def cmd_bench(args) -> int:
             repo_arg = getattr(args, "repo", ".") or "."
             repo_bench = Path(repo_arg) / "bench"
             args.dir = str(repo_bench) if repo_arg != "." and repo_bench.is_dir() else "bench"
+        if not Path(args.dir).is_dir():
+            return _emit_no_tasks_folder(Path(args.dir), want_json, bare=True)
         return cmd_bench_list(args)
-    raise UsageError("bench requires a subcommand")
+    raise UsageError("bench requires a subcommand: list or run (" + BENCH_NEEDS + ")")
 
 
 def cmd_bench_list(args) -> int:
     want_json = bool(getattr(args, "json", False))
     tasks_dir = Path(args.dir)
-    if not tasks_dir.exists():
-        return _emit_bench_error(f"{tasks_dir}: no such directory", want_json)
     if not tasks_dir.is_dir():
-        return _emit_bench_error(f"{tasks_dir}: not a directory", want_json)
+        return _emit_no_tasks_folder(tasks_dir, want_json)
 
     tasks: list[dict[str, str]] = []
     for child in sorted(tasks_dir.iterdir(), key=lambda path: path.name):
@@ -2179,7 +2805,7 @@ def cmd_bench_run(args) -> int:
     want_json = bool(getattr(args, "json", False))
     tasks_dir = Path(args.dir)
     if not tasks_dir.is_dir():
-        return _emit_bench_error(f"{tasks_dir}: no such directory", want_json)
+        return _emit_no_tasks_folder(tasks_dir, want_json)
     try:
         tasks = [load_task(child) for child in sorted(tasks_dir.iterdir())
                  if child.is_dir() and (child / "task.toml").is_file()]
@@ -2231,6 +2857,7 @@ def cmd_init(args) -> int:
         repo_base=repo_base,
         idea=args.idea,
         profile=args.profile,
+        acp_provider=args.acp_provider,
         state_dir=Path(args.state_dir) if args.state_dir else None,
         secrets_dir=Path(args.secrets_dir) if args.secrets_dir else None,
         endpoint=args.endpoint,
@@ -2285,11 +2912,13 @@ def cmd_install_skill(args) -> int:
 def cmd_acp(args) -> int:
     repo = Path(args.repo) if getattr(args, "repo", None) else Path.cwd()
     action = args.action
+    provider = getattr(args, "provider", None)
     if action == "status":
-        payload = inspect_acp_status(repo)
+        payload = inspect_acp_status(repo, provider=provider or "all")
     elif action == "login":
         login_mode = "console" if args.console else "claudeai"
         payload = run_acp_login(
+            provider=provider or "claude",
             mode=login_mode,
             sso=bool(args.sso),
             email=args.email,
@@ -2298,6 +2927,7 @@ def cmd_acp(args) -> int:
     elif action == "configure":
         payload = configure_acp_repo(
             repo,
+            provider=provider,
             mode=args.mode,
             auth=args.auth,
             binary=args.binary,
@@ -2310,12 +2940,16 @@ def cmd_acp(args) -> int:
     elif action == "probe":
         payload = probe_acp(
             repo,
+            provider=provider,
             command=args.binary,
             auth_mode=args.auth,
         )
     else:
         raise UsageError(f"unknown acp action: {action}")
-    _emit_standalone(payload, bool(getattr(args, "json", False)), kind=f"acp_{action}")
+    want_json = bool(getattr(args, "json", False))
+    _emit_standalone(payload, want_json, kind=f"acp_{action}")
+    if action == "probe" and payload.get("ok") is False:
+        return EXIT_TROUBLE
     return EXIT_OK
 
 
@@ -2333,6 +2967,36 @@ def cmd_tui(args) -> int:
         view=args.view,
         json_output=bool(getattr(args, "json", False)),
     )
+
+
+def cmd_drive(ctx: Context, args) -> int:
+    """Drive external coordinator/supervisor board seats with a headless agent."""
+    from .driver import drive_run
+
+    payload = drive_run(
+        ctx.repo,
+        ctx.cfg,
+        ctx.state,
+        agent=args.agent,
+        seat=args.seat,
+        run_id=args.run_id,
+        cards=args.cards,
+        card_ids=list(getattr(args, "card", None) or ()),
+        spend=args.spend,
+        driver_name=args.driver_name,
+        driver_bin=args.driver_bin,
+        model=args.model,
+        effort=args.effort,
+        max_turns=args.max_turns,
+        wave=bool(args.wave),
+        record_verdict=bool(args.record_verdict),
+        script=Path(args.script) if getattr(args, "script", None) else None,
+        turn_timeout=getattr(args, "turn_timeout", 180.0),
+    )
+    _emit_ctx(ctx, payload, "drive")
+    if payload.get("refused"):
+        return EXIT_REFUSED
+    return EXIT_OK if payload.get("ok") else EXIT_TROUBLE
 
 
 PRE_CONFIG_COMMANDS = {
@@ -2361,6 +3025,7 @@ COMMANDS = {
     "harness": cmd_harness,
     "board": cmd_board,
     "swarm": cmd_swarm,
+    "drive": cmd_drive,
 }
 
 

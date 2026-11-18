@@ -24,7 +24,7 @@ from pathlib import Path
 from .errors import Invalid
 from .git import Git
 
-_ALLOWED_LANGUAGES = frozenset({"rust", "python"})
+_ALLOWED_LANGUAGES = frozenset({"rust", "python", "typescript"})
 _ALLOWED_CATEGORIES = frozenset(
     {"small-feature", "pinned-bugfix", "pattern", "refactor"}
 )
@@ -131,19 +131,32 @@ _ALLOWED_ARMS = frozenset({"farm", "solo"})
 
 
 def score(records: list[dict]) -> dict:
+    """Pass rates and token shares per arm and category.
+
+    A record with an `error` is a run that never started (openfarm refused or
+    crashed before the card ran): it says nothing about the arm, so it is listed
+    under `errors` with its reason and left out of every count.
+    """
     for record in records:
         _check_record(record)
 
     arm_totals: dict[str, dict] = {}
     category_totals: dict[str, dict] = {}
+    errors: list[dict] = []
 
     for record in records:
+        if record.get("error"):
+            errors.append({"task": record["task"], "arm": record["arm"],
+                           "repeat": record.get("repeat", 0),
+                           "error": str(record["error"])})
+            continue
         arm = record["arm"]
         category = record["category"]
         passed = bool(record["passed"])
 
         arm_stats = arm_totals.setdefault(
-            arm, {"runs": 0, "passed": 0, "spend": 0.0, "tokens": 0, "worker_tokens": 0}
+            arm, {"runs": 0, "passed": 0, "spend": 0.0, "tokens": 0, "worker_tokens": 0,
+                  "coordinator_tokens": 0}
         )
         arm_stats["runs"] += 1
         if passed:
@@ -152,6 +165,7 @@ def score(records: list[dict]) -> dict:
         arm_stats["tokens"] += int(record["tokens"])
         # Older records have no split; count all their tokens as the worker's.
         arm_stats["worker_tokens"] += int(record.get("worker_tokens", record["tokens"]))
+        arm_stats["coordinator_tokens"] += int(record.get("coordinator_tokens", 0) or 0)
 
         category_arms = category_totals.setdefault(category, {})
         category_stats = category_arms.setdefault(arm, {"runs": 0, "passed": 0})
@@ -176,6 +190,12 @@ def score(records: list[dict]) -> dict:
             "spend": spend,
             "cost_per_pass": round(spend / passed, 4) if passed else None,
         }
+        # Only an arm whose coordinator is a model has a coordinator part; other
+        # arms' summaries keep the shape older readers know.
+        if stats["coordinator_tokens"]:
+            arms[arm]["coordinator_tokens"] = stats["coordinator_tokens"]
+            arms[arm]["coordinator_share"] = (
+                round(stats["coordinator_tokens"] / tokens, 4) if tokens else 0.0)
 
     categories: dict[str, dict[str, float]] = {}
     for category, arm_stats_by_arm in category_totals.items():
@@ -184,7 +204,10 @@ def score(records: list[dict]) -> dict:
             for arm, stats in arm_stats_by_arm.items()
         }
 
-    return {"arms": arms, "categories": categories}
+    summary = {"arms": arms, "categories": categories}
+    if errors:
+        summary["errors"] = errors
+    return summary
 
 
 def render_report(summary: dict) -> str:
@@ -196,19 +219,26 @@ def render_report(summary: dict) -> str:
             return "—"
         return f"{value:,}"
 
-    lines = [
-        "# openfarm bench report",
-        "",
-        "| Arm | Runs | Passed | Pass rate | Tokens | Tokens per pass | Worker share |",
-        "| --- | --- | --- | --- | --- | --- | --- |",
-    ]
+    # The coordinator column appears only when some arm's coordinator used
+    # tokens (a swarm arm with a model coordinator), so other reports read as before.
+    with_coord = any(int(stats.get("coordinator_tokens", 0) or 0) > 0
+                     for stats in summary.get("arms", {}).values())
+    header = "| Arm | Runs | Passed | Pass rate | Tokens | Tokens per pass | Worker share |"
+    rule = "| --- | --- | --- | --- | --- | --- | --- |"
+    if with_coord:
+        header += " Coordinator share |"
+        rule += " --- |"
+    lines = ["# openfarm bench report", "", header, rule]
     for arm in sorted(summary.get("arms", {})):
         stats = summary["arms"][arm]
-        lines.append(
+        row = (
             f"| {arm} | {stats['runs']} | {stats['passed']} | "
             f"{percent(stats['pass_rate'])} | {count(stats['tokens'])} | "
             f"{count(stats['tokens_per_pass'])} | {percent(stats['worker_share'])} |"
         )
+        if with_coord:
+            row += f" {percent(float(stats.get('coordinator_share', 0.0) or 0.0))} |"
+        lines.append(row)
 
     lines += [
         "",
@@ -222,6 +252,22 @@ def render_report(summary: dict) -> str:
         farm = percent(arms["farm"]) if "farm" in arms else "—"
         solo = percent(arms["solo"]) if "solo" in arms else "—"
         lines.append(f"| {category} | {farm} | {solo} |")
+
+    errors = summary.get("errors") or []
+    if errors:
+        lines += [
+            "",
+            "## Runs that did not start",
+            "",
+            "Not counted above: openfarm stopped before the card ran.",
+            "",
+            "| Task | Arm | Repeat | Reason |",
+            "| --- | --- | --- | --- |",
+        ]
+        for entry in errors:
+            reason = " ".join(str(entry.get("error", "")).split()).replace("|", "\\|")
+            lines.append(f"| {entry.get('task', '')} | {entry.get('arm', '')} | "
+                         f"{entry.get('repeat', '')} | {reason} |")
 
     return "\n".join(lines)
 
@@ -398,6 +444,10 @@ def _openfarm_env(global_dir: Path | None = None) -> dict:
 def _suite_cmd(language: str) -> list[str]:
     if language == "rust":
         return ["cargo", "test", "--quiet"]
+    if language == "typescript":
+        raise Invalid("bad-bench-task",
+                      "a TypeScript task is scored by the pack's own run "
+                      "(_score_typescript), never by a bare node --test")
     return [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-t", "."]
 
 
@@ -423,6 +473,9 @@ def run_once(task: BenchTask, arm: str, arm_text: str | None, repeat: int,
     if dry_run and task.script is None:
         raise Invalid("bad-bench-task", f"{task.id}: a dry run needs script.json")
 
+    # Every path below is handed to a child openfarm that runs in the repo, so a
+    # relative one would be read from the wrong folder.
+    work = Path(work).expanduser().resolve()
     run_dir = work / task.id / f"{arm}-{repeat}"
     if run_dir.exists():
         shutil.rmtree(run_dir)
@@ -470,20 +523,33 @@ def run_once(task: BenchTask, arm: str, arm_text: str | None, repeat: int,
               "diff_lines": 0, "final_state": "", "stop_code": "",
               "run_dir": str(run_dir)}
     try:
-        outcome = (json.loads(done.stdout).get("outcomes") or [{}])[0]
+        run_payload = json.loads(done.stdout)
     except ValueError:
+        run_payload = None
+    outcomes = run_payload.get("outcomes") if isinstance(run_payload, dict) else None
+    if not outcomes or not isinstance(outcomes[0], dict) \
+            or not outcomes[0].get("final_state"):
+        # The card never ran: an error with its reason, not a failed task.
         record["stop_code"] = f"openfarm-exit-{done.returncode}"
+        record["error"] = _not_started_reason(run_payload, done)
         return record
+    outcome = outcomes[0]
+    run_tokens = run_payload.get("tokens") or {}
 
     record["final_state"] = str(outcome.get("final_state", ""))
     record["stop_code"] = str(outcome.get("stop_code", "") or "")
+    # A model coordinator's calls belong to the run, not to the card, so they
+    # come from the run's own token split and spend (zero without one).
     record["spend"] = round(float(outcome.get("spend", 0.0) or 0.0)
-                            + float(outcome.get("micromanager_spend", 0.0) or 0.0), 6)
+                            + float(outcome.get("micromanager_spend", 0.0) or 0.0)
+                            + float(run_payload.get("coordinator_spend", 0.0) or 0.0), 6)
     record["worker_tokens"] = sum(int(outcome.get(k, 0) or 0)
                                   for k in ("tokens_in", "tokens_out"))
     record["supervisor_tokens"] = sum(int(outcome.get(k, 0) or 0) for k in (
         "micromanager_tokens_in", "micromanager_tokens_out"))
-    record["tokens"] = record["worker_tokens"] + record["supervisor_tokens"]
+    record["coordinator_tokens"] = int(run_tokens.get("coordinator", 0) or 0)
+    record["tokens"] = (record["worker_tokens"] + record["supervisor_tokens"]
+                        + record["coordinator_tokens"])
     record["diff_lines"] = (int(outcome.get("lines_added", 0) or 0)
                             + int(outcome.get("lines_removed", 0) or 0))
     if record["final_state"] != "in-review":
@@ -498,6 +564,13 @@ def run_once(task: BenchTask, arm: str, arm_text: str | None, repeat: int,
         target = repo / _hidden_target(task, hidden)
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(hidden, target)
+    if task.language == "typescript":
+        passed, log, why = _score_typescript(task, repo)
+        (run_dir / "hidden.log").write_text(log, encoding="utf-8")
+        record["passed"] = passed
+        if why:
+            record["hidden_detail"] = why
+        return record
     scored = subprocess.run(_suite_cmd(task.language), cwd=repo, capture_output=True,
                             text=True, timeout=1800, check=False)
     (run_dir / "hidden.log").write_text(scored.stdout + scored.stderr, encoding="utf-8")
@@ -505,10 +578,62 @@ def run_once(task: BenchTask, arm: str, arm_text: str | None, repeat: int,
     return record
 
 
+def _not_started_reason(payload, done) -> str:
+    """Why a child openfarm produced no outcome for the card, in its own words."""
+    if isinstance(payload, dict):
+        message = payload.get("error") or payload.get("message")
+        if message:
+            kind = payload.get("kind")
+            return f"{kind}: {message}" if kind else str(message)
+        if payload.get("outcomes") == []:
+            return "openfarm ran no card (the card was not ready or not found)"
+    tail = (done.stderr or done.stdout or "").strip().splitlines()[-3:]
+    if tail:
+        return f"openfarm exited {done.returncode}: " + " | ".join(tail)
+    return f"openfarm exited {done.returncode} with no output"
+
+
+def _score_typescript(task: BenchTask, repo: Path) -> tuple[bool, str, str]:
+    """The whole suite plus the hidden test files, named explicitly, read by the
+    pack's parser: passed only when every hidden file really ran and reported
+    tests, all of them passing, and nothing else is red.
+
+    Bare `node --test` would skip `*.spec.ts` and `__tests__/` files and pass
+    with nothing run.
+    """
+    from .gates.checks import suite_green
+    from .packs.typescript import TypeScriptPack
+
+    pack = TypeScriptPack()
+    pack.configure(repo)
+    hidden = [_hidden_target(task, path).as_posix() for path in task.hidden_tests]
+    files = sorted(set(pack.test_files()) | set(hidden))
+    argv = pack.commands("test", files=files)["argv"]
+    done = subprocess.run(argv, cwd=repo, capture_output=True, text=True,
+                          timeout=1800, check=False)
+    log = done.stdout + done.stderr
+    parsed = pack.parse_tests(done.stdout, done.stderr)
+    gate = suite_green(parsed, [], run_cls="pass" if done.returncode == 0 else "fail",
+                       exit_code=done.returncode)
+    if not gate.ok:
+        return False, log, gate.detail
+    if done.returncode != 0:
+        return False, log, f"node --test exited {done.returncode}"
+    counts = parsed.get("file_status") or {}
+    for path in hidden:
+        seen = counts.get(path) or {}
+        if not seen.get("ok"):
+            return False, log, f"hidden test file {path} reported no passing test"
+        if seen.get("failed") or seen.get("ignored"):
+            return False, log, f"hidden test file {path} has tests that did not pass"
+    return True, log, ""
+
+
 def run_bench(tasks: list[BenchTask], arms: dict[str, str | None], repeats: int,
               out: Path, *, dry_run: bool = False,
               log=lambda message: None) -> dict:
     """Every task in every arm `repeats` times; writes the report into `out`."""
+    out = Path(out).expanduser().resolve()
     out.mkdir(parents=True, exist_ok=True)
     work = out / "runs"
     records: list[dict] = []
@@ -519,9 +644,13 @@ def run_bench(tasks: list[BenchTask], arms: dict[str, str | None], repeats: int,
                     log(f"bench: {task.id} {arm} #{repeat}")
                     record = run_once(task, arm, arm_text, repeat, work,
                                       dry_run=dry_run)
-                    log(f"bench: {task.id} {arm} #{repeat} -> "
-                        f"{'pass' if record['passed'] else 'fail'} "
-                        f"({record['final_state'] or record['stop_code']})")
+                    if record.get("error"):
+                        log(f"bench: {task.id} {arm} #{repeat} -> error, the run "
+                            f"never started: {record['error']}")
+                    else:
+                        log(f"bench: {task.id} {arm} #{repeat} -> "
+                            f"{'pass' if record['passed'] else 'fail'} "
+                            f"({record['final_state'] or record['stop_code']})")
                     records.append(record)
                     sink.write(json.dumps(record) + "\n")
                     sink.flush()

@@ -15,6 +15,7 @@ import re
 import tomllib
 from pathlib import Path
 
+from .adapters.acp import ACP_ADAPTER_NAMES, is_acp_adapter
 from .errors import ConfigError
 from .globs import escapes, resolves_within
 
@@ -28,6 +29,7 @@ KNOWN_TABLES = {
 }
 
 DEFAULT_EFFORTS = ("off", "low", "medium", "high", "xhigh", "max")
+_ACP_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 _TIER_KEYS = {"model", "efforts", "effort_param"}
 _FORBIDDEN_TIER_KEYS = ("endpoint", "allowed_endpoints", "key_file", "headers")
 _RESERVED_EFFORT_PARAMS = frozenset({
@@ -49,7 +51,8 @@ _TABLE_KEYS = {
                     "python_tests_in_test_files",
                     "allow_type_changes", "max_context_files"},
     "brief": {"test_conventions"},
-    "runner": {"env", "cargo_flags", "python"},
+    "runner": {"env", "cargo_flags", "python", "typescript", "typescript_typecheck",
+               "typescript_format", "link_node_modules"},
     "budget": {"implementer_attempts", "test_writer_attempts",
                "model_build_calls_per_card", "mutation_build_calls_per_card",
                "tokens_per_card", "wall_clock_per_card", "frontier_cost_ratio",
@@ -66,7 +69,8 @@ _TABLE_KEYS = {
                      "spend_per_night", "cost_per_1k_in", "cost_per_1k_out",
                      "auth", "auth_file", "isolate_home", "shape_cards",
                      "scaffold_contracts", "coach_on_stall",
-                     "adjudicate_counter_tests", "pre_review"},
+                     "adjudicate_counter_tests", "pre_review",
+                     "confine", "confine_read_roots"},
     "state": {"min_free_mb"},
     "harness": {"enabled", "dir", "capture_on", "max_cues_per_brief",
                 "max_active_adaptations", "min_confidence", "probe_window",
@@ -155,6 +159,10 @@ def _as_bool(value, what: str, default: bool) -> bool:
     if not isinstance(value, bool):
         raise ConfigError(f"{what}: expected true or false")
     return value
+
+
+def _uses_typescript(languages) -> bool:
+    return any(lang in ("typescript", "ts", "javascript", "js") for lang in languages)
 
 
 def _as_choice(value, what: str, default: str, choices: tuple[str, ...]) -> str:
@@ -300,6 +308,7 @@ class MicromanagerConfig:
         "auth", "auth_file", "isolate_home", "shape_cards",
         "scaffold_contracts", "coach_on_stall",
         "adjudicate_counter_tests", "pre_review",
+        "confine", "confine_read_roots",
     )
 
     def __init__(self, **kwargs) -> None:
@@ -416,7 +425,7 @@ class Config:
         self.model_adapter = str(adapters.get("model", "openai-compatible"))
         self.micromanager_adapter = _as_adapter(
             adapters.get("micromanager"), "[adapters] micromanager",
-            "off", ("off", "claude-acp", "scripted"))
+            "off", ("off", *ACP_ADAPTER_NAMES, "scripted"))
         self.telemetry_adapter = _as_adapter(
             adapters.get("telemetry"), "[adapters] telemetry",
             "jsonl", ("jsonl",))
@@ -524,6 +533,21 @@ class Config:
             raise ConfigError("[runner] python must be one interpreter path or name")
         #: The interpreter the Python pack runs under; openfarm's own when empty.
         self.runner_python = python.strip()
+        # The TypeScript pack's runner and tools, recorded by adopt.
+        if runner.get("typescript") not in (None, "node"):
+            raise ConfigError(
+                f"[runner] typescript: {runner.get('typescript')!r} is not supported; this "
+                "version runs TypeScript tests only with node --test, so the value is "
+                '"node"')
+        self.runner_typescript = "node"
+        self.typescript_typecheck = _as_choice(
+            runner.get("typescript_typecheck"), "[runner] typescript_typecheck", "auto",
+            ("auto", "tsc", "syntax"))
+        self.typescript_format = _as_choice(
+            runner.get("typescript_format"), "[runner] typescript_format", "auto",
+            ("auto", "prettier", "off"))
+        self.link_node_modules = _as_bool(
+            runner.get("link_node_modules"), "[runner] link_node_modules", True)
         env_table = runner.get("env") or {}
         if not isinstance(env_table, dict):
             raise ConfigError("[runner.env] must be a table")
@@ -573,6 +597,11 @@ class Config:
         self.mutation_required_for = _as_str_list(
             gates.get("mutation_required_for", ["test-backfill"]),
             "[gates] mutation_required_for")
+        if self.mutation == "required" and _uses_typescript(self.languages):
+            raise ConfigError(
+                '[gates] mutation = "required" cannot be served: the TypeScript pack '
+                'has no mutation tool, so every card would be blocked at its end. Set '
+                '[gates] mutation = "off" (or "report", with mutation_required_for = [])')
         self.mutation_min_kill_rate = _as_float(
             gates.get("mutation_min_kill_rate"),
             "[gates] mutation_min_kill_rate", 0.8)
@@ -618,12 +647,19 @@ class Config:
         self.swarm = self._parse_swarm(self._table("swarm"))
         for role_name, role_model in self.role_models.items():
             if role_model.effort:
-                tier = self.tier_for_model(role_model.model)
-                if role_model.effort not in tier.efforts:
-                    raise ConfigError(
-                        f"[model] {role_name}.effort {role_model.effort!r} is not "
-                        f"in tier {tier.name!r} efforts {list(tier.efforts)!r}"
-                    )
+                if is_acp_adapter(self.model_adapter):
+                    if role_model.effort not in _ACP_EFFORTS:
+                        raise ConfigError(
+                            f"[model] {role_name}.effort {role_model.effort!r} is not "
+                            f"one of {list(_ACP_EFFORTS)!r}"
+                        )
+                else:
+                    tier = self.tier_for_model(role_model.model)
+                    if role_model.effort not in tier.efforts:
+                        raise ConfigError(
+                            f"[model] {role_name}.effort {role_model.effort!r} is not "
+                            f"in tier {tier.name!r} efforts {list(tier.efforts)!r}"
+                        )
 
     def _parse_harness(self, h: dict) -> HarnessConfig:
         enabled = _as_bool(h.get("enabled"), "[harness] enabled", True)
@@ -745,7 +781,7 @@ class Config:
             args=_as_str_list(mm.get("args", []), "[micromanager] args"),
             model=str(mm.get("model", "")),
             effort=_as_choice(mm.get("effort"), "[micromanager] effort",
-                              "medium", ("low", "medium", "high")),
+                              "medium", _ACP_EFFORTS),
             tool_policy=_as_choice(mm.get("tool_policy"),
                                    "[micromanager] tool_policy",
                                    "none", ("none", "read-only")),
@@ -775,7 +811,22 @@ class Config:
                 "[micromanager] adjudicate_counter_tests", True),
             pre_review=_as_bool(mm.get("pre_review"),
                                 "[micromanager] pre_review", True),
+            # How provider children are held (see confine.py): auto, bwrap or off.
+            confine=_as_choice(mm.get("confine"), "[micromanager] confine",
+                               "auto", ("auto", "bwrap", "off")),
+            confine_read_roots=self._confine_read_roots(mm.get("confine_read_roots")),
         )
+
+    def _confine_read_roots(self, value) -> list[str]:
+        roots = _as_str_list(value, "[micromanager] confine_read_roots")
+        out: list[str] = []
+        for raw in roots:
+            path = Path(os.path.expanduser(raw))
+            if "\x00" in raw or not path.is_absolute():
+                raise ConfigError(
+                    f"[micromanager] confine_read_roots: {raw!r} must be an absolute path")
+            out.append(str(path))
+        return out
 
     def _parse_extra_gates(self, value) -> list[ExtraGate]:
         if value is None:
@@ -932,7 +983,8 @@ class Config:
         if not isinstance(coordinator, str):
             raise ConfigError("[swarm] coordinator must be a string")
         coord_tier: TierConfig | None = None
-        if coordinator in ("code", "external"):
+        coord_acp = coordinator in ACP_ADAPTER_NAMES
+        if coordinator in ("code", "external") or coord_acp:
             pass
         elif coordinator.startswith("tier:"):
             tname = coordinator[5:]
@@ -942,8 +994,9 @@ class Config:
                 )
             coord_tier = self.tiers[tname]
         else:
+            acp_list = ", ".join(repr(n) for n in ACP_ADAPTER_NAMES)
             raise ConfigError(
-                f"[swarm] coordinator {coordinator!r} must be 'code', 'external', or 'tier:<name>'"
+                f"[swarm] coordinator {coordinator!r} must be 'code', 'external', 'tier:<name>', or {acp_list}"
             )
 
         raw_sup = sw.get("supervisor")
@@ -951,7 +1004,8 @@ class Config:
         if not isinstance(supervisor, str):
             raise ConfigError("[swarm] supervisor must be a string")
         sup_tier: TierConfig | None = None
-        if supervisor in ("config", "external", "off"):
+        sup_acp = supervisor in ACP_ADAPTER_NAMES
+        if supervisor in ("config", "external", "off") or sup_acp:
             pass
         elif supervisor.startswith("tier:"):
             tname = supervisor[5:]
@@ -961,15 +1015,16 @@ class Config:
                 )
             sup_tier = self.tiers[tname]
         else:
+            acp_list = ", ".join(repr(n) for n in ACP_ADAPTER_NAMES)
             raise ConfigError(
-                f"[swarm] supervisor {supervisor!r} must be 'config', 'external', 'off', or 'tier:<name>'"
+                f"[swarm] supervisor {supervisor!r} must be 'config', 'external', 'off', 'tier:<name>', or {acp_list}"
             )
 
         coordinator_effort = self._seat_effort(
-            sw, "coordinator_effort", coord_tier, default_tier_obj
+            sw, "coordinator_effort", coord_tier, default_tier_obj, is_acp=coord_acp
         )
         supervisor_effort = self._seat_effort(
-            sw, "supervisor_effort", sup_tier, default_tier_obj
+            sw, "supervisor_effort", sup_tier, default_tier_obj, is_acp=sup_acp
         )
 
         escalate_after = _as_int(sw.get("escalate_after"), "[swarm] escalate_after", 2)
@@ -1038,6 +1093,8 @@ class Config:
         key: str,
         seat_tier: TierConfig | None,
         default_tier: TierConfig,
+        *,
+        is_acp: bool = False,
     ) -> str:
         explicit = key in sw and sw[key] is not None
         if explicit:
@@ -1051,6 +1108,13 @@ class Config:
             effort = ""
         else:
             effort = "max"
+
+        if is_acp:
+            if explicit and effort and effort not in _ACP_EFFORTS:
+                raise ConfigError(
+                    f"[swarm] {key} {effort!r} is not one of {list(_ACP_EFFORTS)!r}"
+                )
+            return effort
 
         if seat_tier is not None or explicit:
             target = seat_tier if seat_tier is not None else default_tier
@@ -1087,6 +1151,35 @@ class Config:
                     return tier
         return default
 
+    def member_defaults(self, role: str) -> tuple[str, str]:
+        """`(tier name, model)` for a swarm member nobody named a tier for.
+
+        A role with its own model in `[model]` (one that differs from
+        `[model] implementer`, such as an independent checker) keeps that
+        model, exactly as with the swarm off; its tier is the one that serves
+        that model, else `[swarm] default_tier`, which also gives the
+        `effort_param`. Every other role takes `[swarm] default_tier`. A tier
+        named by the coordinator (`--team`, `swarm set`) replaces both.
+        """
+        aliases = {
+            "checker_pass1": "checker",
+            "checker_pass2": "checker",
+            "test-writer": "test_writer",
+        }
+        key = aliases.get(role, role)
+        default = self.tiers[self.swarm.default_tier]
+        role_model = self.role_models.get(key)
+        implementer = self.role_models.get("implementer")
+        base_model = implementer.model if implementer is not None else ""
+        if (
+            key != "implementer"
+            and role_model is not None
+            and role_model.model
+            and role_model.model != base_model
+        ):
+            return (self.tier_for_model(role_model.model).name, role_model.model)
+        return (default.name, default.model)
+
     def effort_for_role(self, role: str) -> tuple[str, str]:
         """Return `(effort, effort_param)` for a configured role, or `("", "")`."""
         aliases = {
@@ -1099,6 +1192,8 @@ class Config:
             role_model = self.role_models.get("implementer")
         if role_model is None or not role_model.effort:
             return ("", "")
+        if is_acp_adapter(self.model_adapter):
+            return (role_model.effort, "effort")
         tier = self.tier_for_model(role_model.model)
         if not tier.effort_param:
             return ("", "")
@@ -1115,6 +1210,9 @@ class Config:
                    "cargo_flags": self.cargo_flags, "languages": self.languages}
         if self.runner_python:
             payload["python"] = self.runner_python
+        if _uses_typescript(self.languages):
+            payload["typescript"] = (self.runner_typescript, self.typescript_typecheck,
+                                     self.typescript_format)
         return hashlib.sha256(
             str(sorted(payload.items())).encode("utf-8")).hexdigest()[:16]
 

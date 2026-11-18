@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1280" height="206" viewBox="0 0 1280 206" role="img" aria-labelledby="qs-t qs-d">
 <title id="qs-t">openfarm quickstart flow</title>
-<desc id="qs-d">Five steps from an empty folder or existing repository to reviewed branches: New or existing repo (Rust or Python via init or adopt), 1. Install (Read and install this skill), 2. Initialize (/openfarm-initialize or openfarm adopt), Checked queue (invariants, golden slice, and baseline-checked cards), and Swarm + TUI (parallel gated branches, inspect in openfarm tui, and merge locally).</desc>
+<desc id="qs-d">Five steps from an empty folder or existing repository to reviewed branches: New or existing repo (Rust, Python, or TypeScript via init or adopt), 1. Install (Read and install this skill), 2. Initialize (/openfarm-initialize or openfarm adopt), Checked queue (invariants, golden slice, and baseline-checked cards), and Swarm + TUI (parallel gated branches, inspect in openfarm tui or drive, and merge locally).</desc>
 <defs>
   <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
     <stop offset="0" stop-color="#0b1220"/><stop offset="1" stop-color="#17233d"/>
@@ -25,7 +25,7 @@
 
 <rect x="32" y="68" width="224" height="112" rx="14" fill="#38bdf8" fill-opacity="0.10" stroke="#38bdf8" stroke-opacity="0.75" stroke-width="1.5"/>
 <text x="144" y="104" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="16.5" font-weight="700" fill="#f1f5f9" text-anchor="middle">New or existing repo</text>
-<text x="144" y="129" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="400" fill="#9fb0c8" text-anchor="middle">idea, or Rust / Python</text>
+<text x="144" y="129" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#9fb0c8" text-anchor="middle">Rust, Python, or TypeScript</text>
 <text x="144" y="151" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#5b6b85" text-anchor="middle">init or openfarm adopt</text>
 
 <rect x="280" y="68" width="224" height="112" rx="12" fill="#a78bfa" fill-opacity="0.12" stroke="#a78bfa" stroke-opacity="0.75" stroke-width="1.5"/>

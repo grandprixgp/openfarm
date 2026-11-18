@@ -56,12 +56,37 @@ VALID_POST_KINDS: tuple[str, ...] = (
 MAX_POST_BODY_LEN = 8000
 _MODEL_KINDS = frozenset({"api", "acp", "scripted"})
 _RESERVED_POST_KINDS = frozenset({"done", "gate"})
+# Names only code writes under. A post from one of these is always code's own
+# (posted with `trusted=True`), so readers can rely on `from == "gates"`.
+CODE_AUTHOR_NAMES: frozenset[str] = frozenset({"gates", "monitor", "system"})
+# Kinds an outside member may write by hand with `openfarm board post`.
+OUTSIDE_POST_KINDS: tuple[str, ...] = ("note", "question", "defect", "result")
+# Where every other kind comes from, for the refusal message.
+_OUTSIDE_REFUSALS: dict[str, tuple[str, str]] = {
+    "action": ("use-swarm-command", "is written by the checked swarm commands (openfarm swarm start/set/hint)"),
+    "blocked": ("use-swarm-command", "is written by `openfarm swarm block`"),
+    "roster": ("use-swarm-command", "is written by `openfarm swarm join` and `openfarm swarm remove`"),
+    "answer": ("use-board-answer", "is written by `openfarm board answer`"),
+    "brief": ("reserved-kind", "is reserved for code"),
+    "gate": ("reserved-kind", "is reserved for code"),
+    "done": ("reserved-kind", "is reserved for code"),
+    "handback": ("reserved-kind", "is reserved for code"),
+    "stall": ("reserved-kind", "is reserved for code"),
+}
+# Body of a coordinator's stop request on a running card (see `swarm_block`).
+STOP_REQUEST_RE = re.compile(
+    r"^stop requested for \S+ \(it keeps running until it ends\):\s*"
+)
+# C0 and C1 control characters other than tab and newline.
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 _ROLE_ALIASES: dict[str, str] = {
     "test_writer": "test-writer",
     "micromanager": "supervisor",
 }
 _MENTION_RE = re.compile(r"(?<![A-Za-z0-9_.-])@([A-Za-z0-9_-]+)")
 _MEMBER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+
+_USAGE_KEYS: tuple[str, ...] = ("calls", "tokens", "tokens_by_effort")
 
 _REGISTRY_LOCK = threading.Lock()
 _PROCESS_LOCKS: dict[Path, tuple[threading.RLock, threading.Condition]] = {}
@@ -105,13 +130,28 @@ def normalize_role(role: str) -> str:
     return dashed
 
 
+def _strip_controls(text: str) -> str:
+    return _CONTROL_RE.sub("", text)
+
+
 def clean_post_body(body: str, *, max_len: int = MAX_POST_BODY_LEN) -> str:
-    """Clean untrusted post text using ``harness_memory.sanitize_lesson_text``."""
+    """Clean untrusted post text using ``harness_memory.sanitize_lesson_text``.
+
+    Also drops C0/C1 control characters other than tab and newline (BEL, CR,
+    backspace, ...), which the lesson cleaner leaves in. When dropping them
+    changes the text, it is cleaned again, so a control character cannot hide
+    a directive from the first pass.
+    """
     text = str(body or "")
-    if 0 < max_len < 3:
-        cleaned = sanitize_lesson_text(text, max_len=0)
-        return cleaned[:max_len]
-    return sanitize_lesson_text(text, max_len=max_len)
+    cleaned = sanitize_lesson_text(text, max_len=0)
+    stripped = _strip_controls(cleaned)
+    if stripped != cleaned:
+        stripped = _strip_controls(sanitize_lesson_text(stripped, max_len=0))
+    if max_len > 0 and len(stripped) > max_len:
+        if max_len < 3:
+            return stripped[:max_len]
+        return stripped[: max_len - 3].rstrip() + "..."
+    return stripped
 
 
 def board_dir_for(state_dir: StateDir | Path | str, run_id: str) -> Path:
@@ -355,6 +395,49 @@ def _post_addresses_member(post: dict, member: dict) -> bool:
     return False
 
 
+def post_is_code(post: dict, members: dict[str, dict] | None = None) -> bool:
+    """True when `post` was written as code (`Board.post(..., trusted=True)`).
+
+    Posts record it in `trusted`. Boards written before that field existed
+    fall back to the old reading: a fixed code name, or an author whose roster
+    entry is a code member.
+    """
+    if "trusted" in post:
+        return post.get("trusted") is True
+    author = str(post.get("from", "") or "")
+    if author in CODE_AUTHOR_NAMES:
+        return True
+    member = (members or {}).get(author)
+    return bool(member and member.get("kind") == "code")
+
+
+def is_stop_request(post: dict, members: dict[str, dict]) -> bool:
+    """True for a `blocked` post written by a holder of the coordinator seat.
+
+    Code's own posts (`gates`, `monitor`, `system`) are never requests: the
+    card's final `blocked` is written by `gates`.
+    """
+    if post.get("kind") != "blocked" or not str(post.get("card", "") or ""):
+        return False
+    author = str(post.get("from", "") or "")
+    if not author or author in CODE_AUTHOR_NAMES:
+        return False
+    member = members.get(author)
+    if member is None:
+        return False
+    return normalize_role(str(member.get("role", "") or "")) == "coordinator"
+
+
+def stop_request_reason(posts: list[dict], members: dict[str, dict], card_id: str) -> str:
+    """Reason of the latest coordinator stop request for `card_id`, or ''."""
+    for post in reversed(posts):
+        if str(post.get("card", "") or "") != card_id or not is_stop_request(post, members):
+            continue
+        body = STOP_REQUEST_RE.sub("", str(post.get("body", "") or "").strip(), count=1)
+        return body.strip() or "blocked by coordinator"
+    return ""
+
+
 class Board:
     """Thread- and process-safe append-only board under ``<run_dir>/board/``."""
 
@@ -406,6 +489,14 @@ class Board:
         finally:
             handle.close()
             rlock.release()
+
+    @contextlib.contextmanager
+    def transaction(self):
+        """Hold the board's lock across several calls, so a check and the write it
+        decides are one step for every thread and process. Re-entrant: the
+        board's own methods may be called inside it."""
+        with self._locked():
+            yield
 
     def _ensure_unlocked(self) -> None:
         self.board_dir.mkdir(parents=True, exist_ok=True)
@@ -552,6 +643,16 @@ class Board:
                 "tokens_out": int(existing.get("tokens_out", 0) or 0),
                 "attempts": int(existing.get("attempts", 0) or 0),
             }
+            # Usage counters survive a re-register (a re-join, a fresh start
+            # of the same member), so the token report never loses calls.
+            if existing:
+                for key in _USAGE_KEYS:
+                    if key in existing:
+                        record[key] = (
+                            dict(existing[key] or {})
+                            if key == "tokens_by_effort"
+                            else int(existing[key] or 0)
+                        )
             members[clean_name] = record
             self._save_members_unlocked(members)
             return dict(record)
@@ -644,18 +745,23 @@ class Board:
             return out
 
     def _load_posts_unlocked(self) -> list[dict]:
+        """Every readable post, in file order.
+
+        A torn or unparseable line (a crash mid-write, a stray byte) is skipped
+        on its own; the posts after it are still read.
+        """
         if not self.posts_path.is_file():
             return []
         posts: list[dict] = []
-        for line in self.posts_path.read_text(encoding="utf-8").splitlines():
-            stripped = line.strip()
+        for raw_line in self.posts_path.read_bytes().split(b"\n"):
+            stripped = raw_line.strip()
             if not stripped:
                 continue
             try:
-                item = json.loads(stripped)
-            except json.JSONDecodeError:
+                item = json.loads(stripped.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
                 continue
-            if isinstance(item, dict):
+            if isinstance(item, dict) and isinstance(item.get("seq"), int):
                 posts.append(item)
         return posts
 
@@ -670,9 +776,23 @@ class Board:
         try:
             record = json.loads(last_line.decode("utf-8"))
         except (UnicodeDecodeError, ValueError):
-            posts = self._load_posts_unlocked()
-            return int(posts[-1]["seq"]) if posts else 0
-        return int(record.get("seq", 0) or 0) if isinstance(record, dict) else 0
+            record = None
+        if isinstance(record, dict) and isinstance(record.get("seq"), int):
+            return int(record["seq"])
+        posts = self._load_posts_unlocked()
+        return max((int(p["seq"]) for p in posts), default=0)
+
+    def _append_record_unlocked(self, record: dict) -> None:
+        """Append one post line, never gluing it onto a torn last line."""
+        line = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
+        if self.posts_path.is_file() and self.posts_path.stat().st_size > 0:
+            with self.posts_path.open("rb") as check:
+                check.seek(-1, os.SEEK_END)
+                if check.read(1) != b"\n":
+                    line = b"\n" + line
+        with self.posts_path.open("ab") as handle:
+            handle.write(line)
+            handle.flush()
 
     def _validate_evidence_paths(self, evidence: list[str] | None) -> list[str]:
         if not evidence:
@@ -768,15 +888,18 @@ class Board:
             raise Refused("bad-ref", f"post ref must be a positive integer, got {ref!r}")
 
         author_member = members.get(clean_author)
-        author_is_code = (trusted is True) or (
-            trusted is None
-            and author_member is not None
-            and author_member.get("kind") == "code"
-        )
+        # Only the caller says a post is code's own. Being named like a code
+        # member (or registered as one) is never enough.
+        author_is_code = trusted is True
         if kind in _RESERVED_POST_KINDS and not author_is_code:
             raise Refused(
                 "reserved-kind",
                 f"post kind {kind!r} is reserved for code members",
+            )
+        if clean_author in CODE_AUTHOR_NAMES and not author_is_code:
+            raise Refused(
+                "code-author",
+                f"only code posts as {clean_author!r}",
             )
 
         evidence_list = self._validate_evidence_paths(evidence)
@@ -812,11 +935,10 @@ class Board:
             "body": final_body,
             "evidence": evidence_list,
             "expects": dict(expects) if isinstance(expects, dict) else expects,
+            "trusted": author_is_code,
         }
 
-        with self.posts_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-            handle.flush()
+        self._append_record_unlocked(record)
 
         if advance_author_cursor and author_member is not None:
             current_cursor = int(author_member.get("last_read_seq", 0) or 0)
@@ -860,6 +982,76 @@ class Board:
                 advance_author_cursor=advance_author_cursor,
             )
 
+    def outside_post(
+        self,
+        author: str,
+        to: list[str] | str,
+        kind: str,
+        body: str,
+        *,
+        card: str = "",
+        attempt: int = 0,
+        ref: int | None = None,
+        evidence: list[str] | None = None,
+    ) -> dict:
+        """Post typed by an outside member (`openfarm board post`).
+
+        The author must be a registered, not-removed, non-code member, and the
+        kind one an outside member writes by hand (`OUTSIDE_POST_KINDS`). Every
+        other kind has its own checked path: `action`, `blocked` and `roster`
+        the `swarm` commands, `answer` `board answer`, the rest code only.
+        The post is never trusted.
+        """
+        clean_author = str(author or "").strip()
+        if kind not in VALID_POST_KINDS:
+            raise Refused("bad-post-kind", f"invalid post kind {kind!r}")
+        if kind not in OUTSIDE_POST_KINDS:
+            code, where = _OUTSIDE_REFUSALS.get(
+                kind, ("reserved-kind", "cannot be posted by hand")
+            )
+            raise Refused(
+                code,
+                f"post kind {kind!r} {where}; `board post` writes only "
+                f"{', '.join(OUTSIDE_POST_KINDS)}",
+            )
+        if not clean_author:
+            raise Refused("bad-author", "post author (--as) must not be empty")
+        with self._locked() as cond:
+            members = self._load_members_unlocked()
+            member = members.get(clean_author)
+            if clean_author in CODE_AUTHOR_NAMES or (
+                member is not None and member.get("kind") == "code"
+            ):
+                raise Refused(
+                    "code-author",
+                    f"{clean_author!r} is a code member; only code posts as it",
+                )
+            if member is None:
+                raise Refused(
+                    "unknown-member",
+                    f"{clean_author!r} is not a member of this run's board; "
+                    "join a seat first (openfarm swarm join --name NAME --seat ...)",
+                )
+            if member.get("state") == "removed":
+                raise Refused(
+                    "removed-member", f"board member {clean_author!r} was removed"
+                )
+            return self._post_unlocked(
+                cond=cond,
+                members=members,
+                author=clean_author,
+                to=to,
+                kind=kind,
+                body=body,
+                card=card,
+                attempt=attempt,
+                ref=ref,
+                evidence=evidence,
+                expects=None,
+                trusted=False,
+                advance_author_cursor=False,
+            )
+
     def _clean_posts_for_viewer(
         self,
         posts: list[dict],
@@ -880,11 +1072,8 @@ class Board:
         out: list[dict] = []
         for post in posts:
             item = dict(post)
-            if should_clean:
-                author_member = members.get(str(item.get("from", "")))
-                author_kind = author_member.get("kind", "") if author_member else ""
-                if author_kind != "code":
-                    item["body"] = clean_post_body(item.get("body", ""))
+            if should_clean and not post_is_code(item, members):
+                item["body"] = clean_post_body(item.get("body", ""))
             out.append(item)
         return out
 
@@ -897,6 +1086,7 @@ class Board:
         limit: int | None,
         for_model: bool | None,
         viewer_kind: str,
+        newest: bool = False,
     ) -> list[dict]:
         posts = self._load_posts_unlocked()
         matched: list[dict] = []
@@ -907,7 +1097,10 @@ class Board:
                 continue
             matched.append(post)
         if limit is not None:
-            matched = matched[:limit]
+            if newest:
+                matched = matched[-limit:] if limit > 0 else []
+            else:
+                matched = matched[:limit]
         return self._clean_posts_for_viewer(
             matched,
             members,
@@ -966,6 +1159,10 @@ class Board:
                 )
             else:
                 effective_since = 0 if since is None else int(since)
+            # No cursor and no --since: someone looking at the board wants the
+            # latest posts. Paging forward from a cursor or --since still gives
+            # the oldest unread first.
+            newest = viewer_member is None and since is None
 
             result = self._matching_posts_unlocked(
                 members,
@@ -974,6 +1171,7 @@ class Board:
                 limit=limit,
                 for_model=for_model,
                 viewer_kind=viewer_kind,
+                newest=newest,
             )
             if viewer_member is not None and advance_cursor and result:
                 new_cursor = max(
@@ -1228,6 +1426,44 @@ class Board:
     def external_wait_count(self) -> int:
         with self._ext_wait_lock:
             return self._ext_wait_count
+
+    def is_code_post(self, post: dict) -> bool:
+        """True when `post` was written as code (see `post_is_code`)."""
+        if "trusted" in post:
+            return post.get("trusted") is True
+        members = {}
+        if self.board_dir.exists():
+            with self._locked():
+                members = self._load_members_unlocked()
+        return post_is_code(post, members)
+
+    def seat_of(self, name: str) -> str:
+        """Seat a board name holds: 'coordinator', 'supervisor', or ''.
+
+        A removed or unknown name holds no seat. Callers use this to decide
+        whose posts may steer a run (start or stop a card, hint a worker).
+        """
+        member = self.get_member(str(name or "").strip())
+        if member is None or member.get("state") == "removed":
+            return ""
+        role = normalize_role(str(member.get("role", "") or ""))
+        return role if role in ("coordinator", "supervisor") else ""
+
+    def stop_requested(self, card_id: str) -> str:
+        """Reason the coordinator asked for `card_id` to stop, or ''.
+
+        A stop request is a `blocked` post for the card written by the
+        coordinator's seat (through `swarm block`). The card's own final
+        `done` / `blocked` post is written by code as `gates` and is not a
+        request. A running card checks this before each model call.
+        """
+        clean = str(card_id or "").strip()
+        if not clean or not self.board_dir.exists():
+            return ""
+        with self._locked():
+            posts = self._load_posts_unlocked()
+            members = self._load_members_unlocked()
+        return stop_request_reason(posts, members, clean)
 
     def status(self) -> dict:
         if not self.board_dir.exists():

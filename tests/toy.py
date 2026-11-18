@@ -241,10 +241,9 @@ class ToyRepo:
                 continue
             shutil.rmtree(path, ignore_errors=True)
         if self.base is not None and self.base.name.startswith("openfarm-toy-"):
-            try:
-                self.base.rmdir()
-            except OSError:
-                pass
+            # The toy's own folder: a run also leaves worktrees, scripts and
+            # copies beside the repo, and they are the toy's too.
+            shutil.rmtree(self.base, ignore_errors=True)
 
     @property
     def config(self) -> Path:

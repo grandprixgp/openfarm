@@ -16,11 +16,16 @@ from .git import Git
 
 
 def detect_language(root: Path) -> str:
-    """Return "rust" or "python" from the manifests at the top level of `root`.
+    """Return `"rust"`, `"python"`, or `"typescript"` from top-level manifests.
 
-    Raises `openfarm_core.errors.Refused` with code "ambiguous-language" when both
-    kinds of manifest are present, or "unsupported-language" when neither is.
-    Only the top level of `root` is looked at; nothing is written.
+    A Cargo or Python manifest decides it, as in v0.8: a `package.json` or
+    `tsconfig.json` beside one (web assets, docs tooling) does not make the repo
+    ambiguous, and adopt says it saw them (`typescript_manifests`). TypeScript is
+    chosen only when it is the one kind of manifest; `--lang typescript` adopts a
+    repo that is really both. Raises `openfarm_core.errors.Refused` with code
+    "ambiguous-language" when both a Rust and a Python manifest are present, or
+    "unsupported-language" when none is. Only the top level of `root` is looked
+    at; nothing is written.
     """
     root = Path(root)
     has_cargo = (root / "Cargo.toml").is_file()
@@ -37,16 +42,19 @@ def detect_language(root: Path) -> str:
         return "rust"
     if has_python:
         return "python"
-    if (root / "package.json").is_file():
-        raise Refused(
-            "unsupported-language",
-            "no supported language manifest found; TypeScript has no pack yet",
-        )
+    if typescript_manifests(root):
+        return "typescript"
     raise Refused(
         "unsupported-language",
         "no supported language manifest found: expected Cargo.toml, pyproject.toml, "
-        "or setup.py",
+        "setup.py, package.json, or tsconfig.json",
     )
+
+
+def typescript_manifests(root: Path) -> list[str]:
+    """The top-level TypeScript/Node manifests present in `root`."""
+    return [name for name in ("package.json", "tsconfig.json")
+            if (Path(root) / name).is_file()]
 
 
 def baseline_known_failing(root: Path, language: str, *, target_dir: Path,
@@ -101,6 +109,7 @@ def adopt_config_text(
     state_dir: Path,
     key_file: Path,
     proposed_known_failing: list[str] | None = None,
+    typescript_tools: dict | None = None,
 ) -> str:
     """Return the text of `.openfarm/config.toml` for adopting `root` as `language`.
 
@@ -108,10 +117,10 @@ def adopt_config_text(
     `state_dir` or `key_file` is inside `root`, or "unsupported-language" when
     `language` is not "rust" or "python". Nothing is written.
     """
-    if language not in ("rust", "python"):
+    if language not in ("rust", "python", "typescript"):
         raise Refused(
             "unsupported-language",
-            f"unsupported language {language!r}: expected 'rust' or 'python'",
+            f"unsupported language {language!r}: expected 'rust', 'python', or 'typescript'",
         )
 
     resolved_root = Path(root).expanduser().resolve()
@@ -133,7 +142,8 @@ def adopt_config_text(
     return render_config(
         name=resolved_root.name, language=language, base_branch=base_branch,
         state_dir=resolved_state, key_file=resolved_key, cargo_flags=cargo_flags,
-        proposed_known_failing=proposed_known_failing)
+        proposed_known_failing=proposed_known_failing,
+        typescript_tools=typescript_tools)
 
 
 def adopt_project(
@@ -197,6 +207,16 @@ def adopt_project(
     else:
         resolved_key = Path(key_file).expanduser().resolve()
 
+    typescript_tools = None
+    adopt_notes: list[str] = []
+    if resolved_language == "typescript":
+        typescript_tools, adopt_notes = typescript_adopt_checks(root)
+    elif language is None and typescript_manifests(root):
+        adopt_notes.append(
+            f"{' and '.join(typescript_manifests(root))} found too; adopted as "
+            f"{resolved_language} from its manifest, as before. To work on the "
+            "TypeScript side instead, adopt with --lang typescript")
+
     baseline = None
     if run_suite:
         # Before anything is written: a suite that does not build refuses adoption.
@@ -211,6 +231,7 @@ def adopt_project(
         state_dir=resolved_state,
         key_file=resolved_key,
         proposed_known_failing=baseline["known_failing"] if baseline else None,
+        typescript_tools=typescript_tools,
     )
 
     resolved_state.mkdir(parents=True, exist_ok=True)
@@ -237,11 +258,42 @@ def adopt_project(
             "cards/.gitkeep",
         ],
     }
+    if typescript_tools is not None:
+        result["typescript"] = {key: typescript_tools[key]
+                                for key in ("runner", "typecheck", "format")}
+    if adopt_notes:
+        result["notes"] = adopt_notes
     if baseline is not None:
         result["suite_ran"] = baseline["ran"]
         result["known_failing_proposed"] = baseline["known_failing"]
         result["suite_notes"] = baseline["notes"]
     return result
+
+
+def typescript_adopt_checks(root: Path) -> tuple[dict, list[str]]:
+    """The runner and tools a TypeScript repo is adopted with, and what to tell.
+
+    Decided here, in the checkout being adopted, and recorded in the config so
+    that `check` and every card use the same. Raises `Refused`
+    "unsupported-test-runner" when the test script is not a `node --test` one.
+    """
+    import shutil
+
+    from .packs.typescript import adopt_findings, resolve_tooling
+
+    tooling = resolve_tooling(root, {})
+    if tooling["test_script"]:
+        raise Refused("unsupported-test-runner", tooling["test_script"])
+    notes = [f"tests run with {tooling['runner']}; typecheck: {tooling['typecheck']}; "
+             f"format: {tooling['format']}"]
+    notes += tooling["notes"]
+    node = shutil.which("node")
+    if node:
+        notes += adopt_findings(root, node)
+    else:
+        notes.append("node was not found, so adopt could not check what node --test "
+                     "can run")
+    return tooling, notes
 
 
 def propose_known_failing(parsed: dict) -> list[str]:

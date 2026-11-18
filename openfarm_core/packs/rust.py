@@ -12,7 +12,10 @@ Everything here is shaped by two facts:
 
 from __future__ import annotations
 
+import json
 import re
+import shutil
+import tempfile
 from pathlib import Path
 
 from ..errors import Invalid, Refused
@@ -48,6 +51,35 @@ _LIST_RE = re.compile(r"^(?P<name>.+):\s+(?P<kind>test|bench)\s*$")
 _COMPILE_FAIL_RE = re.compile(
     r"^error: could not compile `(?P<pkg>[^`]+)`"
     r"(?:\s+\((?P<target>[^)]+)\))?", re.MULTILINE)
+
+#: What follows a `could not compile` line when rustc was killed rather than
+#: reporting an error (cargo 1.100, seen live): no "due to N previous errors",
+#: and a "Caused by" block naming the signal.
+_KILLED_COMPILER_RE = re.compile(
+    r"[^\n]*\n\s*\nCaused by:\n\s+process didn't exit successfully: [^\n]*"
+    r"\(signal: \d+")
+
+#: cargo-mutants' closing line: `13 mutants tested: 6 missed, 7 caught`, with
+#: ` in 3s` after `tested` when times are shown (`--no-times` drops them).
+_MUTANTS_SUMMARY_RE = re.compile(
+    r"^(?P<total>\d+) mutants? tested(?: in [^:]*)?:\s*(?P<parts>.*?)\s*$")
+_MUTANTS_PART_RE = re.compile(
+    r"(?P<n>\d+) (?P<kind>missed|caught|unviable|timeouts?|succeeded)\b")
+#: The summary words, as `outcomes.json` names the same counts.
+_MUTANTS_KINDS = {"missed": "missed", "caught": "caught", "unviable": "unviable",
+                  "timeout": "timeout", "timeouts": "timeout", "succeeded": "success"}
+
+#: cargo-mutants' exit codes (its `src/exit_code.rs` and README). These three are
+#: results: the mutants were tested and the counts say how it went.
+MUTANTS_RESULT_EXITS = {0: "every mutant was caught",
+                        2: "some mutants were missed",
+                        3: "some mutants timed out"}
+#: These mean the tool did not test the mutants, so there is no result at all.
+MUTANTS_ERROR_EXITS = {1: "a usage error",
+                       4: "the tests fail on the unmutated tree (baseline failed)",
+                       5: "the --in-diff diff does not match the source",
+                       6: "the --in-diff diff could not be parsed",
+                       70: "an internal error in cargo-mutants"}
 
 #: Suppressions and leftovers that fail a card wherever they appear.
 BANNED_ANYWHERE = (
@@ -96,6 +128,14 @@ class RustPack(Pack):
         #: "use the lock as it is" and cargo refuses to make one under it.
         self.has_lockfile = True
         self.notes: list[str] = []
+        #: Where cargo-mutants writes its `mutants.out`; never the worktree. The
+        #: flow points it into the card's state folder, so the logs and the diffs
+        #: of missed mutants stay with the card. Unset, each run gets a temporary
+        #: folder that is removed once the result is read.
+        self.mutation_output: Path | None = None
+        self._mutation_out: Path | None = None
+        self._mutation_out_owned = False
+        self._mutation_runs = 0
 
     def configure(self, worktree: Path) -> None:
         """Adapt the flags to this worktree.
@@ -173,12 +213,104 @@ class RustPack(Pack):
             return {"argv": ["cargo", "check", "--all-targets"] + flags + extra}
 
         if purpose == "mutation":
-            return {"argv": ["cargo", "mutants", "--no-times", "--json",
-                             "--file", *[str(f) for f in (files or [])]] + extra}
+            # `--json` applies to `--list` only; a run prints text and writes its
+            # machine-readable result to `mutants.out/outcomes.json`, which goes
+            # to a folder outside the worktree. `--file` takes one glob each.
+            out_dir = self._next_mutation_dir()
+            argv = ["cargo", "mutants", "--no-times", "--colors", "never",
+                    "--output", str(out_dir)]
+            for path in files or []:
+                argv += ["--file", str(path)]
+            return {"argv": argv + extra}
 
         return {"argv": list(extra)}
 
     # -- listing and parsing --------------------------------------------------
+
+    def test_writer_note(self, worktree: Path, test_paths: list[str]) -> str:
+        """How an integration test reaches the library, by the crate's real name.
+
+        A test writer shown only signatures does not know what the crate is
+        called, and falls back on `#[path = "../src/x.rs"] mod x;`. That builds a
+        second copy of the file inside the test, whose unused items then fail
+        the lint gate, which the implementer cannot fix: tests are frozen and
+        `#[allow]` is banned.
+        """
+        crates: dict[str, list[str]] = {}
+        for raw in test_paths:
+            path = str(raw).replace("\\", "/")
+            parts = path.split("/")
+            if "tests" not in parts[:-1]:
+                continue                      # a unit test inside `src/` is in the crate
+            root = Path(worktree).resolve()
+            package_dir = (root / "/".join(parts[:parts.index("tests")])).resolve()
+            if not package_dir.is_relative_to(root):
+                continue
+            name = _lib_crate_name(package_dir)
+            if name:
+                crates.setdefault(name, []).append(path)
+        if not crates:
+            return ""
+        lines = []
+        for name, paths in crates.items():
+            package_dir = Path(worktree) / "/".join(
+                paths[0].split("/")[:paths[0].split("/").index("tests")])
+            modules = _lib_public_modules(package_dir)
+            where = ""
+            if modules:
+                first = modules[0]
+                where = (
+                    f" Its root declares the public module{'s' if len(modules) > 1 else ''} "
+                    f"{', '.join(f'`{m}`' for m in modules)}: an item in module `{first}` is "
+                    f"`{name}::{first}::<item>`, not `{name}::<item>`, unless the root "
+                    f"re-exports it with `pub use`. The same holds for a symbol you stub there.")
+            lines.append(
+                f"\nRust integration tests ({', '.join(paths)}): each file under `tests/` is "
+                f"its own crate. Reach the code under test through the library crate, "
+                f"which is named `{name}`: `use {name}::...;`.{where} Never pull a source file in "
+                f"with `#[path = \"...\"] mod ...;` or `include!`: that compiles a second "
+                f"copy inside the test, and its unused items fail the lint gate.")
+        return "\n".join(lines)
+
+    def build_errors(self, stdout: str, stderr: str) -> str:
+        """rustc's own `error` lines with where each one is, the first few."""
+        found: list[str] = []
+        lines = (stderr or "").splitlines()
+        for index, line in enumerate(lines):
+            text = line.strip()
+            if not re.match(r"error(\[E\d{4}\])?:", text):
+                continue
+            if text.startswith(("error: could not compile", "error: aborting due to")):
+                continue
+            where = ""
+            for after in lines[index + 1:index + 4]:
+                spot = re.match(r"\s*--> (\S+)", after)
+                if spot:
+                    where = f" ({spot.group(1)})"
+                    break
+            # rustc's own label under the code and its suggestion, when it has
+            # one: "no `x` in the root", "help: ... `+ use a::b::x;`".
+            extra: list[str] = []
+            for after in lines[index + 1:index + 25]:
+                bare = after.strip()
+                if re.match(r"(error|warning)(\[E\d{4}\])?:", bare):
+                    break
+                label = re.match(r"\|\s*(?:[\^-]+\s+)?([A-Za-z`].*)$", bare)
+                fix = re.match(r"\d+\s*\+\s+(\S.*)$", bare)
+                if label:
+                    extra.append(label.group(1))
+                elif bare.startswith(("help:", "= help:", "= note:")):
+                    extra.append(bare.lstrip("= "))
+                elif fix:
+                    extra.append(f"`{fix.group(1)}`")
+                if len(extra) >= 4:
+                    break
+            entry = (text + where + ("; " + " ".join(extra) if extra else ""))[:500]
+            if entry not in found:
+                found.append(entry)
+            if len(found) >= 4:
+                break
+        return " | ".join(found)
 
     def parse_list(self, stdout: str) -> dict:
         tests = []
@@ -281,7 +413,12 @@ class RustPack(Pack):
             if rem_bin not in missing:
                 missing.append(rem_bin)
 
-        for match in _COMPILE_FAIL_RE.finditer(f"{stdout}\n{stderr}"):
+        combined = f"{stdout}\n{stderr}"
+        for match in _COMPILE_FAIL_RE.finditer(combined):
+            if _KILLED_COMPILER_RE.match(combined, match.end()):
+                # The compiler itself was killed (out of memory, say). That is the
+                # machine, not the edit: the runner classes the run infra.
+                continue
             target = _target_name(match.group("target") or "")
             compile_errors.append({
                 "pkg": match.group("pkg"),
@@ -295,48 +432,100 @@ class RustPack(Pack):
         return {"results": results, "footers": footers,
                 "missing_footers": missing, "compile_errors": compile_errors}
 
-    def parse_mutation(self, stdout: str) -> dict:
-        """cargo-mutants answers one JSON object, or one per line.
+    def _next_mutation_dir(self) -> Path:
+        """A fresh folder for one mutation run, so no older result is ever read."""
+        self._drop_mutation_dir()
+        self._mutation_runs += 1
+        if self.mutation_output is not None:
+            out = Path(self.mutation_output) / str(self._mutation_runs)
+            if out.exists():
+                shutil.rmtree(out, ignore_errors=True)
+            out.mkdir(parents=True, exist_ok=True)
+            self._mutation_out_owned = False
+        else:
+            out = Path(tempfile.mkdtemp(prefix="openfarm-mutants-"))
+            self._mutation_out_owned = True
+        self._mutation_out = out
+        return out
 
-        The exact shape is not verified on a real tool yet; the pilot measures it.
+    def _drop_mutation_dir(self) -> None:
+        if self._mutation_out is not None and self._mutation_out_owned:
+            shutil.rmtree(self._mutation_out, ignore_errors=True)
+        self._mutation_out = None
+        self._mutation_out_owned = False
+
+    def read_mutation(self, stdout: str, stderr: str = "",
+                      exit_code: int | None = None) -> dict:
+        """One `cargo mutants` run's result, judged by its exit code first.
+
+        0, 2 and 3 are results (all caught, some missed, some timed out). 1 is a
+        usage error and 4 a failing baseline: the mutants were never tested, so
+        there is nothing to count, and that is `Invalid`, never a kill rate.
         """
-        import json
+        try:
+            if exit_code is not None and exit_code not in MUTANTS_RESULT_EXITS:
+                meaning = MUTANTS_ERROR_EXITS.get(
+                    exit_code, "an exit code cargo-mutants does not document")
+                tail = (stderr or stdout or "").strip()[-300:]
+                raise Invalid("mutation-not-run",
+                              f"cargo-mutants exited {exit_code}, {meaning}"
+                              + (f": {tail}" if tail else ""))
+            return self.parse_mutation(stdout)
+        finally:
+            self._drop_mutation_dir()
 
-        killed = survived = total = 0
-        capped = False
-        text = stdout.strip()
-        if not text:
-            raise Invalid("empty-mutation", "the mutation tool printed nothing")
+    def parse_mutation(self, stdout: str) -> dict:
+        """The counts of one run: `outcomes.json` first, the summary line second.
 
-        if text.startswith("{"):
-            try:
-                payload = json.loads(text)
-            except ValueError:
-                payload = None
-            if isinstance(payload, dict):
-                total = int(payload.get("total", 0))
-                killed = int(payload.get("killed", payload.get("caught", 0)))
-                survived = int(payload.get("survived", payload.get("missed", 0)))
-                capped = bool(payload.get("capped", False))
-                if not total:
-                    total = killed + survived
-                return {"killed": killed, "survived": survived,
-                        "total": total, "capped": capped}
+        cargo-mutants 27 prints text whatever `--json` says (that flag is for
+        `--list`), and its text lists only the missed mutants one per line, so
+        lines are never counted. The truth is `mutants.out/outcomes.json` in the
+        `--output` folder; when the runner ran elsewhere and that file is not
+        here, the closing `N mutants tested: ...` line has the same counts.
 
-        for line in text.splitlines():
-            lowered = line.lower()
-            if "killed" in lowered or "caught" in lowered:
-                killed += 1
-            elif "survived" in lowered or "missed" in lowered:
-                survived += 1
-            elif "mutant" in lowered and "total" in lowered:
-                digits = re.findall(r"\d+", line)
-                if digits:
-                    total = int(digits[-1])
-            if "timeout" in lowered and "mutant" in lowered:
-                capped = True
-        return {"killed": killed, "survived": survived,
-                "total": total or (killed + survived), "capped": capped}
+        `killed` is caught and `survived` is missed. Timed out and unviable
+        mutants are neither: `judged` (caught plus missed) is what a kill rate
+        divides by.
+        """
+        counts = self._outcomes_counts()
+        if counts is None:
+            counts = _summary_counts(stdout or "")
+        if counts is None:
+            text = (stdout or "").strip()
+            if not text:
+                raise Invalid("empty-mutation", "the mutation tool printed nothing")
+            raise Invalid("unreadable-mutation",
+                          "no outcomes.json and no `N mutants tested` line: "
+                          + text[-200:])
+        caught = counts.get("caught", 0)
+        missed = counts.get("missed", 0)
+        return {"killed": caught, "survived": missed,
+                "timeout": counts.get("timeout", 0),
+                "unviable": counts.get("unviable", 0),
+                "total": counts.get("total", 0),
+                "judged": caught + missed,
+                "capped": False,
+                "source": counts.get("source", "")}
+
+    def _outcomes_counts(self) -> dict | None:
+        if self._mutation_out is None:
+            return None
+        path = self._mutation_out / "mutants.out" / "outcomes.json"
+        try:
+            payload = json.loads(path.read_text())
+        except (OSError, ValueError):
+            return None
+        if not isinstance(payload, dict) or "total_mutants" not in payload:
+            return None
+        try:
+            counts = {key: int(payload.get(key, 0) or 0)
+                      for key in ("caught", "missed", "timeout", "unviable",
+                                  "success")}
+            counts["total"] = int(payload["total_mutants"])
+        except (TypeError, ValueError):
+            return None
+        counts["source"] = "outcomes.json"
+        return counts
 
     # -- files ----------------------------------------------------------------
 
@@ -697,6 +886,60 @@ class RustPack(Pack):
 
     def mutation(self, files: list[str], tests: list[str] | None = None) -> dict:
         return self.commands("mutation", files=files)
+
+
+def _lib_crate_name(package_dir: Path) -> str:
+    """The name a package's library crate is imported by, or "" when it has none."""
+    import tomllib
+    try:
+        manifest = tomllib.loads((package_dir / "Cargo.toml").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    package = manifest.get("package")
+    lib = manifest.get("lib")
+    lib = lib if isinstance(lib, dict) else {}
+    lib_path = str(lib.get("path") or "src/lib.rs")
+    if not (package_dir / lib_path).is_file():
+        return ""                              # a binary-only package: nothing to import
+    name = str(lib.get("name") or (package.get("name") if isinstance(package, dict) else "") or "")
+    name = name.replace("-", "_")
+    return name if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) else ""
+
+
+def _lib_public_modules(package_dir: Path) -> list[str]:
+    """The `pub mod` names in a package's library root, in the order written."""
+    import tomllib
+    try:
+        manifest = tomllib.loads((package_dir / "Cargo.toml").read_text(encoding="utf-8"))
+        lib = manifest.get("lib")
+        lib_path = str((lib if isinstance(lib, dict) else {}).get("path") or "src/lib.rs")
+        root = (package_dir / lib_path).resolve()
+        if not root.is_relative_to(package_dir.resolve()):
+            return []
+        text = root.read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return []
+    found: list[str] = []
+    for match in re.finditer(r"^pub\s+mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*[;{]", text, re.MULTILINE):
+        if match.group(1) not in found:
+            found.append(match.group(1))
+    return found[:8]
+
+
+def _summary_counts(text: str) -> dict | None:
+    """The counts on cargo-mutants' last `N mutants tested: ...` line."""
+    found = None
+    for line in text.splitlines():
+        match = _MUTANTS_SUMMARY_RE.match(line.strip())
+        if match:
+            found = match
+    if found is None:
+        return None
+    counts = {"total": int(found.group("total")), "source": "summary line"}
+    for part in _MUTANTS_PART_RE.finditer(found.group("parts")):
+        kind = _MUTANTS_KINDS[part.group("kind")]
+        counts[kind] = counts.get(kind, 0) + int(part.group("n"))
+    return counts
 
 
 def _target_name(spec: str) -> str:

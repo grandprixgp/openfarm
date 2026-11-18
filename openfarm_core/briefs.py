@@ -121,11 +121,13 @@ ROLE_HEADERS = {
         "Return edit blocks only. You cannot edit tests."),
     "checker_pass1": (
         "You review tests alone, without seeing the implementation.\n"
-        "Say whether these tests would catch a bad implementation, and restate the\n"
-        "done text in your own words."),
+        "Answer in the form given at the end of this brief: restate the done text in\n"
+        "your own words, then say whether these tests would catch a bad\n"
+        "implementation, and what they miss."),
     "checker_pass2": (
-        "You review the whole diff. Return a traceability table, at least two traced\n"
-        "edge cases, and up to two counter-tests you expect to fail."),
+        "You review the whole diff against the done text. Answer in the form given\n"
+        "at the end of this brief: your verdict and reasons, a traceability table,\n"
+        "traced edge cases, and counter-tests you expect to fail."),
 }
 
 
@@ -166,6 +168,18 @@ false, hand back instead of trying a third way (in place of edits or JSON):
 <reason explaining what failed twice or which assumption is false>
 >>>"""
 
+#: The planner answers in JSON mode, where a `<<<HANDBACK` block cannot be sent, so
+#: its hand-back is a JSON object. The flow reads this shape (and the block form).
+PLANNER_HANDBACK_INSTRUCTIONS = """When to hand a card back:
+When something the card assumes is false, so no honest plan can be written, hand
+back instead of returning steps. Return this JSON object in place of the plan:
+
+{"handback": "<reason explaining which assumption is false>"}"""
+
+# Hand-back text goes into a brief only when the swarm is on (`handback=True`). With
+# the swarm off a run is v0.7's, so its briefs are v0.7's: no hand-back invitation
+# and no `replan_if` signs.
+
 
 class Brief:
     """One built brief, ready to send."""
@@ -178,13 +192,13 @@ class Brief:
         return self.body
 
 
-def _card_section(card: Card) -> str:
+def _card_section(card: Card, handback: bool = False) -> str:
     tests = "\n".join(
         f"  - {t.name}"
         + (f" in {t.file}" if t.file else "")
         + (f"\n    Asserts (data):\n{fence(t.asserts, 'asserts')}" if t.asserts else "")
         for t in card.tests) or "  (none)"
-    replan_signs = list(getattr(card, "replan_if", ()) or ())
+    replan_signs = list(getattr(card, "replan_if", ()) or ()) if handback else []
     return (
         f"Card: {card.id}\n"
         f"Title (data):\n{fence(card.title, 'title')}\n"
@@ -240,8 +254,9 @@ def _merged_context_files(card: Card, extra: list[str] | None) -> list[str]:
     return list(dict.fromkeys(normalise(p) for p in merged if p))
 
 
-def planner_brief(card: Card, book: BriefBook, harness_guidance: str = "") -> Brief:
-    parts = [ROLE_HEADERS["planner"], "", _card_section(card), "",
+def planner_brief(card: Card, book: BriefBook, harness_guidance: str = "",
+                  handback: bool = False) -> Brief:
+    parts = [ROLE_HEADERS["planner"], "", _card_section(card, handback), "",
              "Files in your touches, by signature:"]
     for path in _expand_touch_paths(book, card.touches):
         if book.is_hidden(path):
@@ -257,7 +272,8 @@ def planner_brief(card: Card, book: BriefBook, harness_guidance: str = "") -> Br
     if harness_guidance and harness_guidance.strip():
         parts.append("\nHarness adaptations (data):\n"
                      + fence(harness_guidance, "harness adaptations"))
-    parts.append("\n" + HANDBACK_INSTRUCTIONS)
+    if handback:
+        parts.append("\n" + PLANNER_HANDBACK_INSTRUCTIONS)
     return Brief("planner", "\n".join(parts))
 
 
@@ -266,8 +282,9 @@ def test_writer_brief(card: Card, book: BriefBook, pack,
                       previous_failure: str = "",
                       guidance: str = "",
                       context_files: list[str] | None = None,
-                      harness_guidance: str = "") -> Brief:
-    parts = [ROLE_HEADERS["test_writer"], "", _card_section(card), ""]
+                      harness_guidance: str = "",
+                      handback: bool = False) -> Brief:
+    parts = [ROLE_HEADERS["test_writer"], "", _card_section(card, handback), ""]
 
     classified = pack.classify_paths(card.touches) if hasattr(pack, "classify_paths") else {}
     touch_test_paths = [
@@ -337,6 +354,41 @@ def test_writer_brief(card: Card, book: BriefBook, pack,
             if target is not None:
                 parts.append(f"\n### Reference tests: {reference}\n{target.read_text()}")
 
+    pack_name = str(getattr(pack, "name", "") or "")
+    pack_runner = str(getattr(pack, "runner", "") or "")
+    if not pack_runner and getattr(book, "root", None) is not None:
+        if pack_name == "typescript":
+            from .packs.typescript import detect_runner as _detect_ts_runner
+            pack_runner = _detect_ts_runner(book.root)
+        elif pack_name == "python":
+            from .packs.python import detect_runner as _detect_py_runner
+            pack_runner = _detect_py_runner(book.root)
+    if pack_name == "typescript" and pack_runner == "node":
+        parts.append(
+            "\nTest runner: Node built-in `node:test` (`import test from \"node:test\"; "
+            "import assert from \"node:assert/strict\";` with explicit `.ts` extensions on "
+            "relative imports; do not import `vitest` or `jest`)."
+        )
+    elif pack_name == "python" and pack_runner == "unittest":
+        # What the project is set up for, never what is installed: the runner is
+        # unittest because nothing configures pytest, which says nothing about
+        # whether pytest happens to be on the machine.
+        parts.append(
+            "\nTest runner: this project is set up for Python's stdlib `unittest` "
+            "(it does not configure pytest). Write the tests for `unittest`: "
+            "`unittest.TestCase` subclasses, no pytest imports or fixtures."
+        )
+    elif pack_name == "python" and pack_runner == "pytest":
+        parts.append(
+            "\nTest runner: this project is set up for `pytest` (its configuration "
+            "names it). Write the tests for pytest."
+        )
+
+    if hasattr(pack, "test_writer_note") and getattr(book, "worktree", None) is not None:
+        note = pack.test_writer_note(book.worktree, test_paths)
+        if note:
+            parts.append(note)
+
     if conventions:
         parts.append("\nTest conventions (authoritative):\n" + conventions)
 
@@ -354,12 +406,20 @@ def test_writer_brief(card: Card, book: BriefBook, pack,
     if card.new_symbols:
         parts.append(
             "\nThis card declares new symbols. You may append stubs that fail when\n"
-            "called (Rust: `todo!()`; Python: `raise NotImplementedError`) with\n"
-            "`append_stub` in files in your touches, additions only.")
+            "called (Rust: `todo!()`; Python: `raise NotImplementedError`; "
+            "TypeScript: `throw new Error(\"not implemented\")`) with\n"
+            "`append_stub` in files in your touches, additions only."
+            "\nA symbol whose signature is already shown above is declared: do not "
+            "stub it again, a second declaration does not compile."
+            "\nA stub lands at the end of the file, at the top level. It cannot add a "
+            "method inside an existing Python or TypeScript class: leave such a method "
+            "unstubbed, the test failing on base because it is missing is the proof. "
+            "(In Rust, a new `impl` block at the top level can carry the method.)")
         parts.append("\n" + STUB_FORMAT)
 
     parts.append("\n" + EDIT_FORMAT)
-    parts.append("\n" + HANDBACK_INSTRUCTIONS)
+    if handback:
+        parts.append("\n" + HANDBACK_INSTRUCTIONS)
     return Brief("test_writer", "\n".join(parts))
 
 
@@ -375,8 +435,9 @@ def implementer_brief(card: Card, book: BriefBook, frozen_tests: dict[str, str],
                       guidance: str = "",
                       step_context: str = "",
                       context_files: list[str] | None = None,
-                      harness_guidance: str = "") -> Brief:
-    parts = [ROLE_HEADERS["implementer"], "", _card_section(card), ""]
+                      harness_guidance: str = "",
+                      handback: bool = False) -> Brief:
+    parts = [ROLE_HEADERS["implementer"], "", _card_section(card, handback), ""]
 
     if attempt == 1:
         parts.append("Full text of files in your touches:")
@@ -453,20 +514,42 @@ def implementer_brief(card: Card, book: BriefBook, frozen_tests: dict[str, str],
                      f"Tests this step turns green: {', '.join(step.get('tests', []))}")
 
     parts.append("\n" + EDIT_FORMAT)
-    parts.append("\n" + HANDBACK_INSTRUCTIONS)
+    if handback:
+        parts.append("\n" + HANDBACK_INSTRUCTIONS)
     return Brief("implementer", "\n".join(parts))
 
 
-def checker_pass1_brief(card: Card, test_diff: str) -> Brief:
-    parts = [ROLE_HEADERS["checker_pass1"], "", _card_section(card), "",
-             "The test diff, and nothing else:\n" + fence(test_diff, "test diff"),
-             "", HANDBACK_INSTRUCTIONS]
+def checker_pass1_brief(card: Card, test_diff: str, handback: bool = False,
+                        answer_form: str = "", retry_problem: str = "") -> Brief:
+    """The first pass's brief. `answer_form` is `roles.pass1_answer_form()`, the
+    form `roles.parse_pass1` reads. `retry_problem` says why the last answer
+    could not be read, for the one time the pass is asked again."""
+    if not answer_form:
+        from .roles import pass1_answer_form
+        answer_form = pass1_answer_form()
+    parts = [ROLE_HEADERS["checker_pass1"], "", _card_section(card, handback), "",
+             "The test diff, and nothing else:\n" + fence(test_diff, "test diff")]
+    if retry_problem:
+        parts.append(
+            "\nYour last answer to this brief could not be read: "
+            f"{_sanitize_text(retry_problem).strip()}. Answer again, in exactly the "
+            "form below, from the `RESTATEMENT:` line on.")
+    parts.extend(["", answer_form])
+    if handback:
+        parts.extend(["", HANDBACK_INSTRUCTIONS])
     return Brief("checker_pass1", "\n".join(parts))
 
 
 def checker_pass2_brief(card: Card, full_diff: str, gate_results: list[dict],
-                        modified_files: dict[str, str]) -> Brief:
-    parts = [ROLE_HEADERS["checker_pass2"], "", _card_section(card), "",
+                        modified_files: dict[str, str], handback: bool = False,
+                        answer_form: str = "", retry_problem: str = "") -> Brief:
+    """The second pass's brief. `answer_form` is `roles.pass2_answer_form(...)`
+    for this project; the parser reads that same form. `retry_problem` says why
+    the last answer could not be read, for the one time the pass is asked again."""
+    if not answer_form:
+        from .roles import pass2_answer_form
+        answer_form = pass2_answer_form()
+    parts = [ROLE_HEADERS["checker_pass2"], "", _card_section(card, handback), "",
              "The full diff:\n" + fence(full_diff, "diff")]
     parts.append("\nGate results:")
     for gate in gate_results:
@@ -474,7 +557,14 @@ def checker_pass2_brief(card: Card, full_diff: str, gate_results: list[dict],
     parts.append("\nModified files:")
     for path, text in modified_files.items():
         parts.append(f"\n### {path}\n{text}")
-    parts.append("\n" + HANDBACK_INSTRUCTIONS)
+    if retry_problem:
+        parts.append(
+            "\nYour last answer to this brief could not be read: "
+            f"{_sanitize_text(retry_problem).strip()}. Answer again, in exactly the "
+            "form below, from the `VERDICT:` line on.")
+    parts.append("\n" + answer_form)
+    if handback:
+        parts.append("\n" + HANDBACK_INSTRUCTIONS)
     return Brief("checker_pass2", "\n".join(parts))
 
 

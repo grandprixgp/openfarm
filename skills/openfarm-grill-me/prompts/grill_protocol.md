@@ -18,8 +18,9 @@ Advance through branches sequentially, skipping any branch already settled by re
    - Should v1 use zero external crates (faster offline builds, zero lockfile churn) or specific upfront dependencies?
    - Do generated files or extra tools require a `[[gates.extra]]` command?
 
-4. **Frontier (Claude ACP OAuth) & Workers (ZDR API Key)**
-   - Frontier micromanager defaults to `claude-acp` + `auth = "oauth"` + `binary = "auto"`. Confirm `active` vs `advisory` vs `solo`, and verify `oauth_ready: true` (`openfarm acp status` / `openfarm acp login`).
+4. **Frontier (Claude / Antigravity / Codex ACP or Driver Mode) & Workers (ZDR API Key)**
+   - Frontier micromanager supports `claude-acp`, `antigravity-acp`/`agy-acp`, and `codex-acp` with `auth = "oauth"`, `binary = "auto"` (or external Driver mode via `openfarm drive --agent claude|antigravity|codex`). Confirm `active` vs `advisory` vs `solo`, and verify `oauth_ready: true` (`openfarm acp status --provider all` / `openfarm acp login --provider ...`).
+   - Recommended: Claude with `tool_policy = "none"`; Codex with `binary = "codex-exec"` and `tool_policy = "none"`. Antigravity only after the owner confirms their plan's terms allow openfarm to start `agy` unattended on OAuth, or with an API key. Codex and Antigravity run inside a bubblewrap boundary; `confine = "off"` lets the child read whatever the owner's user can.
    - Confirm Worker ZDR OpenAI-compatible endpoint, model ID, card spend cap, and whether mutation testing is enabled (`cargo-mutants` present vs `off`).
 
 5. **Wave 1–3 Card Plan & Concrete Assertions**
@@ -36,7 +37,7 @@ Persist settled decisions cleanly (no API keys or credentials):
 # <project_slug> Design Decisions (openfarm-grill-me)
 
 - **Idea:** <plain-English idea>
-- **Execution Setup:** Frontier = Claude ACP (`auth = "oauth"`, `mode = "<active|advisory|off>"`) | Workers = `<endpoint>` / `<model>` (key outside repo)
+- **Execution Setup:** Frontier = <Claude|Codex|Antigravity> ACP (`auth = "<oauth|api-key>"`, `mode = "<active|advisory|off>"`, `binary = "<auto|codex-exec|...>"`) | Workers = `<endpoint>` / `<model>` (key outside repo)
 
 ## 1. Protected Seam (`src/invariants.rs` — `never_touch`)
 - ...

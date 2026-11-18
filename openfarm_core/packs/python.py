@@ -8,9 +8,11 @@ Shaped by the same two facts as the Rust pack:
 - **Never judge a run by its exit code.** Per-test lines decide, as they do for cargo.
 
 The runner is `unittest` unless the repository configures pytest (`[tool.pytest...]`
-in `pyproject.toml`, a `pytest.ini`, or `[tool:pytest]` in `setup.cfg`). openfarm
-itself has no dependencies, so `ruff` is used only where it is already installed;
-without it formatting is not checked, and the dossier says so.
+in `pyproject.toml`, a `pytest.ini`, or `[tool:pytest]` in `setup.cfg`). `ruff` follows
+the same rule: it is used only when the repository configures it (`[tool.ruff]` in
+`pyproject.toml`, a `ruff.toml` or a `.ruff.toml`) and it is installed. Anywhere else
+ruff's defaults would judge code nobody wrote for them, so lint is the syntax check
+and formatting is not checked, and the dossier says why.
 
 A module that fails to import is Python's compile error: unittest reports it as a
 `unittest.loader._FailedTest`, pytest as `ERROR collecting`. Either way the card goes
@@ -39,7 +41,8 @@ _SKIP_DIRS = (".git", ".hg", ".venv", "venv", "env", ".env", "node_modules",
               ".ruff_cache", ".pytest_cache", "site-packages", "target")
 
 #: Parses every `.py` file under a root without writing any `.pyc`, then runs
-#: `ruff check` when ruff is on PATH. Exit 1 on any finding.
+#: `ruff check` when asked to (the project configures ruff and the pack saw it
+#: installed) and ruff is on the runner's PATH. Exit 1 on any finding.
 _CHECK_SCRIPT = (
     "import ast, os, shutil, subprocess, sys\n"
     "root = sys.argv[1] if len(sys.argv) > 1 else '.'\n"
@@ -59,7 +62,7 @@ _CHECK_SCRIPT = (
     "            bad += 1\n"
     "            print(f'{path}:{exc.lineno}: SyntaxError: {exc.msg}', file=sys.stderr)\n"
     "if use_ruff and shutil.which('ruff'):\n"
-    "    bad += subprocess.call(['ruff', 'check', '--quiet', root]) != 0\n"
+    "    bad += subprocess.call(['ruff', 'check', '--quiet', '--no-cache', root]) != 0\n"
     "sys.exit(1 if bad else 0)\n"
 )
 
@@ -186,6 +189,34 @@ def detect_runner(worktree: Path) -> str:
     return "unittest"
 
 
+#: The files that configure ruff, in the order ruff itself prefers them.
+RUFF_CONFIG_FILES = (".ruff.toml", "ruff.toml", "pyproject.toml")
+
+
+def detect_ruff_config(worktree: Path) -> Path | None:
+    """The file that configures ruff at the repository root, or None.
+
+    `.ruff.toml` and `ruff.toml` configure ruff by existing; a `pyproject.toml`
+    only with a `[tool.ruff]` table, as ruff itself reads it. A pyproject that does
+    not parse configures nothing, and ruff would refuse it anyway.
+    """
+    root = Path(worktree)
+    for name in RUFF_CONFIG_FILES[:2]:
+        if (root / name).is_file():
+            return root / name
+    pyproject = root / RUFF_CONFIG_FILES[2]
+    if pyproject.is_file():
+        try:
+            import tomllib
+            data = tomllib.loads(pyproject.read_text(errors="replace"))
+        except (OSError, ValueError):
+            return None
+        tool = data.get("tool") if isinstance(data, dict) else None
+        if isinstance(tool, dict) and isinstance(tool.get("ruff"), dict):
+            return pyproject
+    return None
+
+
 class PythonPack(Pack):
     name = "python"
     extension = ".py"
@@ -199,21 +230,50 @@ class PythonPack(Pack):
         #: `unittest` or `pytest`; fixed by `configure` when not given.
         self.runner = runner or "unittest"
         self._runner_fixed = bool(runner)
+        #: Whether ruff is installed. `ruff` overrides the PATH lookup (tests).
         self.has_ruff = shutil.which("ruff") is not None if ruff is None else bool(ruff)
+        #: The file that configures ruff in this repository; set by `configure`.
+        #: Until a repository is known nothing configures ruff, so it is not used.
+        self.ruff_config: Path | None = None
         self.worktree: Path | None = None
         self.notes: list[str] = []
+        self._ruff_note = ""
         self._note_ruff()
 
+    @property
+    def use_ruff(self) -> bool:
+        """ruff runs only where the project configures it and it is installed."""
+        return self.has_ruff and self.ruff_config is not None
+
     def _note_ruff(self) -> None:
-        note = ("ruff is not installed, so formatting is not checked and lint is a "
-                "syntax check only")
-        if not self.has_ruff and note not in self.notes:
+        """One note on why lint and formatting are, or are not, ruff."""
+        if self.ruff_config is not None and self.has_ruff:
+            note = ""
+        elif self.ruff_config is not None:
+            note = (f"ruff is configured in {self.ruff_config.name} but not "
+                    "installed, so formatting is not checked and lint is a syntax "
+                    "check only")
+        elif self.worktree is None:
+            note = ("" if self.has_ruff else
+                    "ruff is not installed, so formatting is not checked and lint "
+                    "is a syntax check only")
+        else:
+            note = ("ruff is not configured here (no [tool.ruff] in pyproject.toml, "
+                    "no ruff.toml or .ruff.toml), so it is not used"
+                    + (" although it is installed" if self.has_ruff else "")
+                    + ": formatting is not checked and lint is a syntax check only")
+        if self._ruff_note in self.notes:
+            self.notes.remove(self._ruff_note)
+        self._ruff_note = note
+        if note and note not in self.notes:
             self.notes.append(note)
 
     def configure(self, worktree: Path) -> None:
         self.worktree = Path(worktree)
         if not self._runner_fixed:
             self.runner = detect_runner(Path(worktree))
+        self.ruff_config = detect_ruff_config(Path(worktree))
+        self._note_ruff()
         if self.runner == "unittest" and not (Path(worktree) / self.test_dir).is_dir():
             note = f"no {self.test_dir}/ folder: unittest discovery finds nothing"
             if note not in self.notes:
@@ -276,7 +336,7 @@ class PythonPack(Pack):
         if purpose in ("lint", "ws-lint", "typecheck"):
             root = "." if purpose == "ws-lint" else top
             argv = [py, "-c", _CHECK_SCRIPT, root]
-            if self.has_ruff and purpose != "typecheck":
+            if self.use_ruff and purpose != "typecheck":
                 argv.append("ruff")
             return {"argv": argv + extra}
 
@@ -284,13 +344,14 @@ class PythonPack(Pack):
             return {"argv": [py, "-c", _CHECK_SCRIPT, top] + extra}
 
         if purpose in ("format", "fmt-check"):
-            if not self.has_ruff:
+            if not self.use_ruff:
                 # Nothing to format with: an honest no-op, named in the dossier.
                 return {"argv": [py, "-c", "pass"]}
-            argv = ["ruff", "format"]
+            names = [str(f) for f in (files or [])]
+            argv = ["ruff", "format", "--no-cache", *self._ruff_config_args(names)]
             if purpose == "fmt-check":
                 argv.append("--check")
-            return {"argv": argv + [str(f) for f in (files or [])]}
+            return {"argv": argv + names}
 
         if purpose == "mutation":
             raise Invalid("no-python-mutation",
@@ -298,6 +359,26 @@ class PythonPack(Pack):
                           "[gates] mutation = \"off\"")
 
         return {"argv": list(extra)}
+
+    def _ruff_config_args(self, files: list[str]) -> list[str]:
+        """`--config <file>` when a file sits outside the worktree.
+
+        The format check at base copies the base blob to a scratch folder, where
+        ruff would find no configuration and judge it by its defaults. Files inside
+        the worktree keep ruff's own discovery, nested configurations included.
+        """
+        if self.ruff_config is None or self.worktree is None:
+            return []
+        root = Path(self.worktree).resolve()
+        for name in files:
+            path = Path(name)
+            if not path.is_absolute():
+                continue
+            try:
+                path.resolve().relative_to(root)
+            except ValueError:
+                return ["--config", str(self.ruff_config)]
+        return []
 
     # -- listing and parsing --------------------------------------------------
 
@@ -333,6 +414,24 @@ class PythonPack(Pack):
         if self.runner == "pytest":
             return _parse_pytest(text)
         return _parse_unittest(text)
+
+    def row_file(self, row: dict) -> str | None:
+        """The test file of a row, from its binary.
+
+        pytest rows carry the node id's file (`tests/test_x.py::TestA`), unittest
+        rows the module and class (`tests.test_x.TestA`, so the module is all but
+        the last part).
+        """
+        binary = str(row.get("binary", "") or "")
+        if not binary:
+            return None
+        head = binary.split("::", 1)[0]
+        if head.endswith(".py"):
+            return head
+        if "::" in binary or "/" in head:
+            return None
+        module = head.rpartition(".")[0]
+        return module.replace(".", "/") + ".py" if module else None
 
     def parse_mutation(self, stdout: str) -> dict:
         raise Invalid("no-python-mutation",
@@ -399,8 +498,14 @@ class PythonPack(Pack):
         try:
             parsed = ast.parse(stub)
         except SyntaxError as exc:
+            hint = ""
+            if "indent" in str(exc.msg):
+                hint = (". A stub is appended at the end of the file, at the top level, "
+                        "so it cannot be a method inside an existing class: leave that "
+                        "method unstubbed (a test that fails on base because the method "
+                        "is missing is proof enough)")
             raise Refused("non-panicking-stub",
-                          f"a stub must be valid Python: {exc.msg}") from exc
+                          f"a stub must be valid Python: {exc.msg}{hint}") from exc
         raises = any(
             isinstance(node, ast.Raise) and node.exc is not None
             and "NotImplementedError" in ast.unparse(node.exc)
@@ -619,7 +724,10 @@ def _parse_pytest(text: str) -> dict:
                 compile_errors.append({"pkg": path, "target": path, "binary": path})
             continue
         footer = _PT_FOOTER_RE.match(line.strip())
-        if footer and _PT_COUNT_RE.search(footer.group("summary")):
+        # `no tests ran` (exit 5) is a finished run with nothing in it, as
+        # unittest's `NO TESTS RAN` is; a run that died prints no footer at all.
+        if footer and (_PT_COUNT_RE.search(footer.group("summary"))
+                       or footer.group("summary").strip() == "no tests ran"):
             counts: dict[str, int] = {}
             for count in _PT_COUNT_RE.finditer(footer.group("summary")):
                 kind = count.group("kind")

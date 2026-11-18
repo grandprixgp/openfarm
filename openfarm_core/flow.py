@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import json
 import shutil
 from pathlib import Path
 
 from .board import normalize_role
-from .briefs import Brief, BriefBook, fence
+from .briefs import (Brief, BriefBook, checker_pass1_brief, checker_pass2_brief,
+                     fence, implementer_brief, planner_brief, test_writer_brief)
 from .budget import Budget, BudgetExceeded, NightBudget
 from .cards import Card
 from .edits import (apply_edits, diff_text, line_counts, parse_edits,
@@ -22,7 +24,8 @@ from .errors import (AdapterError, GateFailure, Infra, Invalid, Refused,
 from .gates.checks import (PASS, FAIL, INFRA, GateResult, banned_patterns,
                            diff_within_touches, extra_gate_result, frozen_check,
                            _code_of,
-                           ignored_or_filtered, mutation_gate,
+                           combined_status, ignored_or_filtered, mutation_gate,
+                           rows_for_test,
                            paths_touched_by_extra_gate, revert_check,
                            suite_green, test_loss)
 from .gates.eligibility import (check_eligibility, derive_cargo_unit,
@@ -34,11 +37,8 @@ from .harness_scope import project_markers
 from .harness_memory import (GuidanceSelection, HarnessLibrary, _classify_failure,
                              _is_unsafe_path)
 from .micromanager import open_micromanager
-from .roles import (Plan, Roles, parse_answer_edits, build_checker_pass1_brief,
-                    build_checker_pass2_brief, build_implementer_brief,
-                    build_planner_brief, build_test_writer_brief,
-                    parse_counter_tests, parse_handback, parse_plan,
-                    parse_restatement, wants_planner)
+from .roles import (Plan, Roles, parse_answer_edits, parse_handback, parse_pass1,
+                    parse_plan, pass1_answer_form, wants_planner)
 from .state import append_jsonl, baseline_lock_for, utc_now, utc_after, write_json
 from .swarm import WORKER_ROLES, swarm_set, worker_kind_for_config, worker_member_name
 
@@ -119,6 +119,9 @@ class CardRun:
 
         self.board = board
         self.swarm = swarm if swarm is not None else getattr(cfg, "swarm", None)
+        #: With the swarm off a run is v0.7's: briefs carry no hand-back text and no
+        #: answer is read as a hand-back. A run gets a board only with the swarm on.
+        self.swarm_on = board is not None or bool(getattr(self.swarm, "enabled", False))
         self.on_handback = on_handback
         self.on_struggling = on_struggling
         self.team_sets: list[dict] = []
@@ -129,6 +132,10 @@ class CardRun:
         self._role_overrides: dict[str, tuple[str | None, str | None, str | None]] = {}
         self._effort_failures: dict[str, tuple[str, int]] = {}
         self._board_members_ready = False
+        #: The coordinator's reason when it stopped this card while it ran.
+        self.coordinator_stop = ""
+        #: Board seqs of the hints this card posted itself as code.
+        self._own_hint_seqs: set[int] = set()
 
         self._owns_micromanager = micromanager is None
         cancel_fn = lambda: bool(
@@ -219,6 +226,9 @@ class CardRun:
         self.current_diff = ""
         self.started_at = utc_now()
         self.checker_restatement = None
+        #: What the checker's first pass said: its form, whether the tests
+        #: would catch a bad implementation, what they miss (an opinion).
+        self.checker_pass1: dict = {}
         self.checker_adjudication: dict = {}
         self.reviewer_brief = ""
         self.clarified_notes = ""
@@ -649,7 +659,11 @@ class CardRun:
             if self.board.get_member(mname) is None:
                 tier_cfg = tiers.get(default_tier_name) or next(iter(tiers.values()), None)
                 tier_name = tier_cfg.name if tier_cfg is not None else default_tier_name
-                if tier_cfg is not None and tier_cfg.model:
+                if hasattr(self.cfg, "member_defaults"):
+                    # Same rule `swarm start` uses: a role's own [model] entry
+                    # wins until the coordinator names a tier.
+                    tier_name, model_name = self.cfg.member_defaults(role)
+                elif tier_cfg is not None and tier_cfg.model:
                     model_name = tier_cfg.model
                 else:
                     rm = (getattr(self.cfg, "role_models", {}) or {}).get(
@@ -700,16 +714,63 @@ class CardRun:
             trusted=trusted,
         )
 
+    def _may_steer(self, author: str) -> bool:
+        """Code, or a name that holds the coordinator's or supervisor's seat now.
+
+        A name typed after `--as` proves nothing by itself: only those may hint a
+        worker or answer for the coordinator.
+        """
+        if self.board is None:
+            return False
+        member = self.board.get_member(str(author or "").strip())
+        if member is None or member.get("state") == "removed":
+            return False
+        if member.get("kind") == "code":
+            return True
+        return self.board.seat_of(author) in ("coordinator", "supervisor")
+
+    def _is_steering_post(self, post: dict, member_name: str) -> bool:
+        """A post addressed to `member_name` by name, from code or a seat holder.
+
+        A note to `all` or to a role is an announcement for people, not a hint.
+        """
+        if member_name not in (post.get("to") or ()):
+            return False
+        if int(post.get("seq", 0) or 0) in self._own_hint_seqs:
+            return True
+        return self._may_steer(str(post.get("from", "") or ""))
+
+    def _steering_posts(self, member_name: str, kind: str,
+                        since: int | None = None) -> list[dict]:
+        """Posts of `kind` that may steer `member_name`: unread ones, or after `since`."""
+        if self.board is None:
+            return []
+        return [
+            post
+            for post in self.board.read(
+                as_name=member_name,
+                since=since,
+                limit=None,
+                for_model=False,
+                advance_cursor=False,
+            )
+            if post.get("kind") == kind and self._is_steering_post(post, member_name)
+        ]
+
     def _consume_member_hints(self, member_name: str) -> list[str]:
         if self.board is None:
             return []
+        # Reading advances the member's cursor past every unread post, so a note
+        # that is skipped here is marked read and not looked at again.
         unread = self.board.read(
             as_name=member_name, limit=None, for_model=True, advance_cursor=True
         )
         return [
             str(post.get("body", "")).strip()
             for post in unread
-            if post.get("kind") == "note" and str(post.get("body", "")).strip()
+            if post.get("kind") == "note"
+            and str(post.get("body", "")).strip()
+            and self._is_steering_post(post, member_name)
         ]
 
     def _refund_member_attempt(self, board_role: str) -> None:
@@ -788,6 +849,7 @@ class CardRun:
         unread_notes_before: int,
         reason: str,
         context_label: str,
+        since_seq: int = 0,
     ) -> tuple[str | None, str]:
         """Interpret coordinator hint/set/retry/block action or board mutation."""
         action = ""
@@ -801,18 +863,14 @@ class CardRun:
         if action == "hint":
             hint_body = str(res_dict.get("body", "") or "").strip()
             if self.board is not None and hint_body:
+                # The coordinator may have posted the hint itself; only a note that
+                # will reach the worker's brief counts as that.
                 existing_notes = [
                     str(post.get("body", "")).strip()
-                    for post in self.board.read(
-                        as_name=member_name,
-                        limit=None,
-                        for_model=False,
-                        advance_cursor=False,
-                    )
-                    if post.get("kind") == "note"
+                    for post in self._steering_posts(member_name, "note")
                 ]
                 if hint_body not in existing_notes:
-                    self.board.post(
+                    posted = self.board.post(
                         author="coordinator",
                         to=[member_name],
                         kind="note",
@@ -820,6 +878,7 @@ class CardRun:
                         body=hint_body,
                         trusted=True,
                     )
+                    self._own_hint_seqs.add(int(posted.get("seq", 0) or 0))
             elif hint_body:
                 self._pending_hints.setdefault(board_role, []).append(hint_body)
             return "hint", ""
@@ -878,17 +937,10 @@ class CardRun:
             return "block", str(res_dict.get("reason", "") or reason)
 
         if not action and self.board is not None:
+            # No answer from the callback: look at what was written while it
+            # waited, counting only what code or a seat holder wrote.
             current = self.board.get_member(member_name) or {}
-            unread_notes_after = sum(
-                1
-                for post in self.board.read(
-                    as_name=member_name,
-                    limit=None,
-                    for_model=False,
-                    advance_cursor=False,
-                )
-                if post.get("kind") == "note"
-            )
+            unread_notes_after = len(self._steering_posts(member_name, "note"))
             tier_or_effort_changed = (
                 member_before is not None
                 and (
@@ -896,9 +948,13 @@ class CardRun:
                     or current.get("effort") != member_before.get("effort")
                 )
             )
+            set_posted = any(
+                str(post.get("body", "") or "").startswith("set ")
+                for post in self._steering_posts(member_name, "action", since=since_seq)
+            )
             if unread_notes_after > unread_notes_before:
                 return "hint", ""
-            if tier_or_effort_changed:
+            if tier_or_effort_changed and set_posted:
                 return "set", ""
 
         return None, str(res_dict.get("reason", "") or reason)
@@ -942,16 +998,7 @@ class CardRun:
         unread_notes_before = 0
         post_rec = None
         if self.board is not None:
-            unread_notes_before = sum(
-                1
-                for post in self.board.read(
-                    as_name=member_name,
-                    limit=None,
-                    for_model=False,
-                    advance_cursor=False,
-                )
-                if post.get("kind") == "note"
-            )
+            unread_notes_before = len(self._steering_posts(member_name, "note"))
             post_rec = self._post_board(
                 author="gates",
                 to=["coordinator"],
@@ -966,6 +1013,7 @@ class CardRun:
 
         tier_cur = str((member_before or {}).get("tier", "") or "")
         effort_cur = str((member_before or {}).get("effort", "") or "")
+        self._check_stop_requested()
         cancel_fn = lambda: bool(
             self.state.kill_requested(getattr(self.cfg, "kill_switch", None))
         )
@@ -997,6 +1045,7 @@ class CardRun:
             unread_notes_before=unread_notes_before,
             reason=detail[:300],
             context_label="struggling",
+            since_seq=int((post_rec or {}).get("seq", 0) or 0),
         )
         if outcome in ("hint", "set", "retry"):
             self.diff_hashes.clear()
@@ -1057,16 +1106,7 @@ class CardRun:
         unread_notes_before = 0
         post_rec = None
         if self.board is not None:
-            unread_notes_before = sum(
-                1
-                for post in self.board.read(
-                    as_name=member_name,
-                    limit=None,
-                    for_model=False,
-                    advance_cursor=False,
-                )
-                if post.get("kind") == "note"
-            )
+            unread_notes_before = len(self._steering_posts(member_name, "note"))
             post_rec = self._post_board(
                 author=member_name,
                 to=["coordinator"],
@@ -1113,10 +1153,18 @@ class CardRun:
             self.budget.implementer_attempts = max(
                 0, self.budget.implementer_attempts - 1
             )
-        self._refund_member_attempt(board_role)
+        if role != "checker_pass2":
+            # `_call_board_role` counts no member attempt for pass 2, so there is
+            # nothing to give back.
+            self._refund_member_attempt(board_role)
 
         resolution = None
         if self.on_handback is not None:
+            try:
+                self._check_stop_requested()
+            except GateFailure:
+                hb_entry["outcome"] = "stopped"
+                raise
             cancel_fn = lambda: bool(
                 self.state.kill_requested(getattr(self.cfg, "kill_switch", None))
             )
@@ -1147,6 +1195,7 @@ class CardRun:
             unread_notes_before=unread_notes_before,
             reason=reason,
             context_label="handback",
+            since_seq=int((post_rec or {}).get("seq", 0) or 0),
         )
         if outcome in ("hint", "set", "retry"):
             hb_entry["outcome"] = outcome
@@ -1154,6 +1203,73 @@ class CardRun:
 
         hb_entry["outcome"] = "blocked"
         raise GateFailure(StopCode.HANDED_BACK, block_reason)
+
+    def _handback_reason(self, call, *, json_form: bool = False) -> str | None:
+        """The hand-back reason in a worker's answer, or None.
+
+        Only with the swarm on. With it off no brief invites a hand-back, so the
+        answer goes down v0.7's path like any other answer without usable edits.
+        A cut-off answer is never a hand-back. `json_form` also reads the planner's
+        JSON-mode shape, `{"handback": "<reason>"}`.
+        """
+        if not self.swarm_on or call.cut_off:
+            return None
+        reason = parse_handback(call.content)
+        if reason is None and json_form:
+            reason = _json_handback(call.content)
+        return reason
+
+    def _call_role_with_handbacks(
+        self,
+        role: str,
+        brief: Brief,
+        *,
+        first_attempt: int,
+        response_name: str,
+        response_format: str | None = None,
+        json_handback: bool = False,
+        unavailable: tuple = (),
+    ):
+        """Call the planner or a checker pass, giving a hand-back the spec's handling.
+
+        These roles have no attempt budget of their own. A hand-back goes through
+        `_handle_handback` like the implementer's: a hint or set within
+        `handbacks_per_card` sends the brief again (`_call_board_role` adds the
+        hint), a block raises `handed-back`. Returns `(answer, None)` for an answer
+        that is not a hand-back, `(hand-back answer, detail)` once a hand-back went
+        past the limit, and `(None, None)` when the call raised one of `unavailable`.
+        """
+        call_seq = 0
+        while True:
+            call_seq += 1
+            try:
+                call = self._call_board_role(
+                    role,
+                    brief,
+                    attempt=first_attempt + call_seq - 1,
+                    response_format=response_format,
+                    response_path=self.card_layout / "responses" / (
+                        f"{response_name}.json" if call_seq == 1
+                        else f"{response_name}-{call_seq}.json"
+                    ),
+                )
+            except unavailable:
+                return None, None
+            self.budget.note_tokens(call.tokens_in, call.tokens_out, call.spend)
+            reason = self._handback_reason(call, json_form=json_handback)
+            if reason is None:
+                return call, None
+            # Every pass through here records a hand-back, so the loop ends at the
+            # limit at the latest.
+            limit_err = self._handle_handback(
+                role=role,
+                call=call,
+                attempt_no=1,
+                call_seq=call_seq,
+                reason=reason,
+            )
+            if limit_err is not None:
+                return call, limit_err
 
     def _member_call_settings(self, role: str, member: dict) -> tuple[str, str | None, str, str]:
         tiers = getattr(self.cfg, "tiers", {}) or {}
@@ -1213,6 +1329,7 @@ class CardRun:
                 write_json(response_path, call.as_dict())
             return call
 
+        self._check_stop_requested()
         self._ensure_board_members()
         board_role = (
             "checker" if role in ("checker_pass1", "checker_pass2") else normalize_role(role)
@@ -1400,6 +1517,22 @@ class CardRun:
             raise GateFailure(
                 StopCode.KILLED,
                 "the kill switch was set while this card was in progress")
+        self._check_stop_requested()
+
+    def _check_stop_requested(self) -> None:
+        """A coordinator's stop request ends the card before its next call or build.
+
+        `swarm block` (or a tier coordinator's `block`) on a running card only posts
+        to the board, so the card asks before each model call and wherever the kill
+        switch is checked. A stopped card ends blocked with `refused` through the
+        normal finish path. With the swarm off there is no board and nothing to ask.
+        """
+        if self.board is None:
+            return
+        reason = self.board.stop_requested(self.card.id)
+        if reason:
+            self.coordinator_stop = reason
+            raise GateFailure(StopCode.REFUSED, f"stopped by coordinator: {reason}")
 
     def _run(self, kind: str, argv: list[str], counted: str = "model",
              unit: str = "", timeout_s: float | None = None):
@@ -1636,15 +1769,53 @@ class CardRun:
         # The worktree was made by the controller and entered here; one target
         # folder per card, never shared between branches.
         self.git.checkout(self.branch, detach=False)
+        # The pack decides from this run's config (as eligibility did), not from
+        # the base checkout's config file, which `--config` may not be.
+        if hasattr(self.pack, "apply_settings"):
+            self.pack.apply_settings(self.cfg)
         if hasattr(self.pack, "configure"):
             self.pack.configure(self.worktree)
         self.effective_unit = self.card.unit or derive_cargo_unit(
             self.card.touches, self.worktree
         )
 
+    def _pack_gate_evidence(self, gate: str) -> dict:
+        """What the pack says a gate's record should carry (see `Pack.gate_evidence`)."""
+        evidence = getattr(self.pack, "gate_evidence", None)
+        if evidence is None:
+            return {}
+        try:
+            found = evidence(gate)
+        except Exception:  # noqa: BLE001 - a pack's extra words never stop a gate
+            return {}
+        return dict(found) if isinstance(found, dict) else {}
+
+    def _prepare_checkout(self, path: Path) -> None:
+        """A checkout gets what the pack gives the card's own worktree.
+
+        A TypeScript project's linked `node_modules`, for one: without it a run in
+        a revert-check or catch-up checkout could not import what the card's runs
+        import. Also used to set the card's worktree up again after a
+        counter-test removed part of it.
+        """
+        prepare = getattr(self.pack, "prepare_worktree", None)
+        if prepare is None:
+            return
+        note = prepare(path)
+        if note:
+            self.log(f"{self.card.id}: {note}")
+
     def _base_ref(self) -> str:
         name = f"refs/heads/{self.cfg.base_branch}"
         return name if self.git.ref_exists(name) else "HEAD"
+
+    def _named_test_files(self) -> dict[str, str]:
+        """The card's file for each named test, so rows of a same-named test in
+        another file are not counted for it."""
+        return {test.name: test.file for test in self.card.tests if test.file}
+
+    def _row_file(self):
+        return getattr(self.pack, "row_file", None)
 
     # -- step 3: baseline green ----------------------------------------------
 
@@ -1793,6 +1964,7 @@ class CardRun:
                 if t.get("name")
             ]
             self._refresh_micromanager_harness_context("planner")
+            self._check_stop_requested()
             try:
                 decision = self.micromanager.shape_and_plan(
                     self.card, sigs, ctx_contents, known_tests=known_tests, cfg=self.cfg
@@ -1852,44 +2024,23 @@ class CardRun:
             self.depth = 1
             return
         planner_harness = self._select_harness_guidance("planner")
-        brief = build_planner_brief(
-            self.card, self.book, harness_guidance=planner_harness
+        brief = planner_brief(
+            self.card, self.book, harness_guidance=planner_harness,
+            handback=self.swarm_on,
         )
-        max_hb = int(
-            getattr(self.swarm, "handbacks_per_card", 2)
-            if self.swarm is not None
-            else 2
-        )
-        call = None
-        for call_seq in range(1, max_hb + 2):
-            try:
-                call = self._call_board_role(
-                    "planner",
-                    brief,
-                    attempt=call_seq,
-                    response_format="json",
-                    response_path=self.card_layout / "responses" / (
-                        "planner.json" if call_seq == 1 else f"planner-{call_seq}.json"
-                    ),
-                )
-            except (Infra, Invalid):
-                self.planner_used = False
-                self.log(f"{self.card.id}: planner unavailable, running unsplit")
-                return
-            self.budget.note_tokens(call.tokens_in, call.tokens_out, call.spend)
-            hb_reason = None if call.cut_off else parse_handback(call.content)
-            if hb_reason is None:
-                break
-            limit_err = self._handle_handback(
-                role="planner",
-                call=call,
-                attempt_no=1,
-                call_seq=call_seq,
-                reason=hb_reason,
-            )
-            if limit_err is not None:
-                raise GateFailure(StopCode.HANDED_BACK, limit_err)
+        call, limit_err = self._call_role_with_handbacks(
+            "planner", brief, first_attempt=1, response_name="planner",
+            response_format="json", json_handback=True,
+            unavailable=(Infra, Invalid))
+        if call is None:
+            self.planner_used = False
+            self.log(f"{self.card.id}: planner unavailable, running unsplit")
+            return
         try:
+            if limit_err is not None:
+                # Past `handbacks_per_card` a hand-back counts as a failed attempt,
+                # and a planner's failed attempt is an unusable plan.
+                raise Invalid("planner-handback-limit", limit_err)
             plan = parse_plan(call.content, card=self.card)
         except Invalid as exc:
             if getattr(self.cfg, "planner", "auto") == "on":
@@ -1959,11 +2110,11 @@ class CardRun:
             tw_harness = self._select_harness_guidance(
                 "test_writer", failure_class=tw_fc
             )
-            brief = build_test_writer_brief(
+            brief = test_writer_brief(
                 self.card, self.book, self.pack, self.conventions,
                 attempt=attempt, previous_failure=last_failure,
                 guidance=tw_guidance, context_files=self.extra_context_files,
-                harness_guidance=tw_harness)
+                harness_guidance=tw_harness, handback=self.swarm_on)
             call = self._call_board_role(
                 "test_writer",
                 brief,
@@ -1972,7 +2123,7 @@ class CardRun:
             )
             self.budget.note_tokens(call.tokens_in, call.tokens_out, call.spend)
 
-            hb_reason = None if call.cut_off else parse_handback(call.content)
+            hb_reason = self._handback_reason(call)
             if hb_reason is not None:
                 limit_err = self._handle_handback(
                     role="test_writer",
@@ -2053,7 +2204,10 @@ class CardRun:
                         "the test writer left the allowed paths: "
                         + ", ".join(report.outside_touches or report.not_additions_only))
                 retryable = {entry["code"] for entry in report.refused}
-                if not retryable <= {"no-unique-match"}:
+                # Asked again with the reason: a search block that did not match,
+                # or a stub the pack could not take (malformed, or one that does
+                # not fail when called). Nothing of a refused answer is on disk.
+                if not retryable <= {"no-unique-match", "non-panicking-stub"}:
                     raise GateFailure(
                         StopCode.REFUSED,
                         "the test writer's answer was refused: "
@@ -2061,6 +2215,11 @@ class CardRun:
                 self.budget.test_writer_attempts -= 1
                 free_retries -= 1
                 if free_retries <= 0:
+                    if "non-panicking-stub" in retryable:
+                        raise GateFailure(
+                            StopCode.REFUSED,
+                            "the test writer's answer was refused: "
+                            + _report_detail(report))
                     raise GateFailure(
                         StopCode.TESTS_UNPROVABLE,
                         "the test writer's search blocks kept failing to match "
@@ -2096,6 +2255,7 @@ class CardRun:
                         "test_writer",
                         failure_class=_classify_failure(failure=last_failure),
                     )
+                    self._check_stop_requested()
                     try:
                         advice = self.micromanager.coach(
                             self.card, "test-writer", attempt,
@@ -2160,6 +2320,7 @@ class CardRun:
                     sigs[norm] = self.book.signatures(norm, self.pack)
                 except (OSError, Refused):
                     pass
+        self._check_stop_requested()
         try:
             scaffold_edits = self.micromanager.scaffold_contract(
                 self.card, base_files, sigs,
@@ -2230,20 +2391,32 @@ class CardRun:
         listing = self.pack.parse_list(out)
         write_json(self.card_layout / "gates" / "named-tests-list.json", listing)
 
-        listed = {t["name"] for t in listing.get("tests", [])}
         if not self.card.test_names:
             self._record_gate(GateResult(
                 "named-tests-exist", PASS,
                 f"skipped: a {self.card.category} card names no new tests"))
             return
-        missing = [name for name in self.card.test_names if name not in listed]
+        # A parametrized test is listed once per case (`test_param[1-2]`); those
+        # rows are the named test's, as they are in every run below.
+        listed_rows = _named_rows({"results": listing.get("tests", [])},
+                                  self.card.test_names, self._named_test_files(),
+                                  self._row_file())
+        missing = [name for name in self.card.test_names if not listed_rows[name]]
         if missing:
             load_errors = [str(e) for e in listing.get("errors", []) or []][:5]
             why = ("; could not load: " + " | ".join(load_errors)) if load_errors else ""
+            # A build that failed lists nothing: say what the compiler said, so
+            # the test writer's next try is not a guess.
+            build_errors = ""
+            if list_result.cls != PASS and hasattr(self.pack, "build_errors"):
+                build_errors = str(self.pack.build_errors(out, err) or "")
+            if build_errors:
+                why += "; the test build failed: " + build_errors
             self._record_gate(GateResult(
                 "named-tests-exist", FAIL,
                 "not reported by the test binary: " + ", ".join(missing[:10]) + why,
-                {"missing": missing, "load_errors": load_errors}))
+                {"missing": missing, "load_errors": load_errors,
+                 "build_errors": build_errors}))
             raise GateFailure(StopCode.TESTS_UNPROVABLE,
                               "the test binary does not list: "
                               + ", ".join(missing[:10]) + why)
@@ -2267,7 +2440,11 @@ class CardRun:
                                              tests=self.card.test_names)["argv"], counted="fixed")
         out, err = self._output(rerun)
         parsed = self.pack.parse_tests(out, err)
-        failures = _named_failures(parsed, self.card.test_names)
+        named_files = self._named_test_files()
+        failures = _named_failures(parsed, self.card.test_names, named_files,
+                                   self._row_file())
+        named_rows = _named_rows(parsed, self.card.test_names, named_files,
+                                 self._row_file())
         compile_errors = parsed.get("compile_errors", [])
 
         if rerun.cls == INFRA:
@@ -2301,6 +2478,21 @@ class CardRun:
                 "the fail-before run did not finish", parsed))
             raise Infra("fail-before-infra", "the fail-before run did not finish")
 
+        # A test whose rows disagree (one parameter case or binary failing, another
+        # passing) proves nothing about the change: every row must fail on base.
+        mixed = [name for name, status in failures.items() if status == "mixed"]
+        if mixed:
+            self._record_gate(GateResult(
+                "fail-before", FAIL,
+                "these named tests were reported both failing and not failing on "
+                "base, so they prove nothing: " + ", ".join(mixed[:10]),
+                {"mixed_on_base": mixed,
+                 "rows": {name: named_rows[name] for name in mixed}}))
+            raise GateFailure(
+                StopCode.TESTS_UNPROVABLE,
+                "named tests are not failing in every row on base: "
+                + ", ".join(mixed[:10]))
+
         # `ignored` is not proof: an ignored test never ran on base, so it proves
         # nothing about what the code does.
         wrong = [name for name, status in failures.items()
@@ -2309,7 +2501,9 @@ class CardRun:
             self._record_gate(GateResult(
                 "fail-before", FAIL,
                 "these named tests do not fail at runtime on base, so they assert "
-                "nothing: " + ", ".join(wrong[:10]), {"passing_on_base": wrong}))
+                "nothing: " + ", ".join(wrong[:10]),
+                {"passing_on_base": wrong,
+                 "rows": {name: named_rows[name] for name in wrong}}))
             raise GateFailure(
                 StopCode.TESTS_UNPROVABLE,
                 "named tests do not fail on base: " + ", ".join(wrong[:10]))
@@ -2318,7 +2512,7 @@ class CardRun:
         self._record_gate(GateResult(
             "fail-before", PASS,
             f"{len(self.card.test_names)} named test(s) failed at runtime on base",
-            {"failures": failures}))
+            {"failures": failures, "rows": named_rows}))
 
     # -- step 7: phase B, the implementer ------------------------------------
 
@@ -2370,7 +2564,7 @@ class CardRun:
             impl_harness = self._select_harness_guidance(
                 "implementer", failure_class=impl_fc
             )
-            brief = build_implementer_brief(
+            brief = implementer_brief(
                 self.card, self.book, self._frozen_texts(),
                 attempt=max(2, attempt_no) if showing_diff else 1,
                 diff=last_failed_diff,
@@ -2379,7 +2573,8 @@ class CardRun:
                 guidance=guidance,
                 step_context="\n".join(self.step_summaries),
                 context_files=self.extra_context_files,
-                harness_guidance=impl_harness)
+                harness_guidance=impl_harness,
+                handback=self.swarm_on)
             call = self._call_board_role(
                 "implementer",
                 brief,
@@ -2390,7 +2585,7 @@ class CardRun:
             )
             self.budget.note_tokens(call.tokens_in, call.tokens_out, call.spend)
 
-            hb_reason = None if call.cut_off else parse_handback(call.content)
+            hb_reason = self._handback_reason(call)
             if hb_reason is not None:
                 limit_err = self._handle_handback(
                     role="implementer",
@@ -2715,11 +2910,12 @@ class CardRun:
         lint_result = self._run(runner_kind("lint"),
                                 self.pack.commands("lint", unit=unit)["argv"])
         lint_out, lint_err = self._output(lint_result)
+        lint_evidence = self._pack_gate_evidence("lint")
         lint_gate = self._record_gate(
             GateResult("lint", PASS if lint_result.cls == PASS else
                        (INFRA if lint_result.cls == INFRA else FAIL),
                        "" if lint_result.cls == PASS else
-                       (lint_err or lint_out).strip()[-800:]))
+                       (lint_err or lint_out).strip()[-800:], lint_evidence))
         if lint_result.cls == INFRA or suite.result == INFRA:
             raise Infra("attempt-infra",
                         "a gate did not finish, so the attempt is not judged")
@@ -2851,6 +3047,7 @@ class CardRun:
                         failure=detail,
                     ),
                 )
+                self._check_stop_requested()
                 try:
                     advice = self.micromanager.coach(
                         self.card, "implementer", attempt_no,
@@ -2961,10 +3158,18 @@ class CardRun:
                                                       tests=self.card.test_names)["argv"], counted="fixed")
                 out, err = self._output(result)
                 parsed = self.pack.parse_tests(out, err)
-                self.head_status_by_test = _named_failures(parsed, self.card.test_names)
+                self.head_status_by_test = _named_failures(
+                    parsed, self.card.test_names, self._named_test_files(),
+                    self._row_file())
                 gate = self._record_gate(
-                    ignored_or_filtered(parsed, self.card.test_names))
+                    ignored_or_filtered(parsed, self.card.test_names,
+                                        run_cls=result.cls,
+                                        exit_code=result.exit_code,
+                                        files=self._named_test_files(),
+                                        row_file=self._row_file()))
                 named_ok = named_ok and gate.ok
+                if gate.result == INFRA:
+                    raise Infra("pass-after-infra", gate.detail)
                 if not gate.ok:
                     raise GateFailure(
                         StopCode.ATTEMPTS,
@@ -3002,10 +3207,12 @@ class CardRun:
             ws = self._run(runner_kind("ws-lint"),
                            self.pack.commands("ws-lint")["argv"], counted="fixed")
             ws_out, ws_err = self._output(ws)
+            ws_evidence = self._pack_gate_evidence("workspace-lint")
             ws_gate = self._record_gate(GateResult(
                 "workspace-lint", PASS if ws.cls == PASS else
                 (INFRA if ws.cls == INFRA else FAIL),
-                "" if ws.cls == PASS else (ws_err or ws_out).strip()[-800:]))
+                "" if ws.cls == PASS else (ws_err or ws_out).strip()[-800:],
+                ws_evidence))
             if ws_gate.result == INFRA:
                 raise Infra("workspace-lint-infra", "the workspace lint did not finish")
             if not ws_gate.ok:
@@ -3065,6 +3272,7 @@ class CardRun:
                 shutil.rmtree(revert_target, ignore_errors=True)
                 base_ref = self.scaffold_commit or self.base_commit or "HEAD"
                 self.git.worktree_add(trial_wt, base_ref)
+                self._prepare_checkout(trial_wt)
                 try:
                     overlay = sorted(set(self.frozen_tests) | set(self.phase_a_stub_files))
                     for rel in overlay:
@@ -3088,7 +3296,9 @@ class CardRun:
                     self.budget.note_fixed_build()
                     r_out, r_err = self._output(rev_result)
                     r_parsed = self.pack.parse_tests(r_out, r_err)
-                    r_failures = _named_failures(r_parsed, self.card.test_names)
+                    r_failures = _named_failures(r_parsed, self.card.test_names,
+                                                 self._named_test_files(),
+                                                 self._row_file())
                     r_compile = r_parsed.get("compile_errors", [])
                     if (rev_result.cls == INFRA
                             or (r_parsed.get("missing_footers") and not r_compile
@@ -3110,7 +3320,8 @@ class CardRun:
                         )
                         self._record_gate(GateResult(
                             "revert-check", FAIL, detail,
-                            {"compile_errors": r_compile, "not_failing": wrong}))
+                            {"compile_errors": r_compile, "not_failing": wrong,
+                             "failures": r_failures}))
                         raise GateFailure(StopCode.TESTS_UNPROVABLE, detail)
                     self._record_gate(GateResult(
                         "revert-check", PASS,
@@ -3131,6 +3342,7 @@ class CardRun:
 
         if self.micromanager.enabled:
             self._refresh_micromanager_harness_context("micromanager")
+            self._check_stop_requested()
             try:
                 report = self.micromanager.triage_and_review("pre_review", {
                     "card_id": self.card.id,
@@ -3317,6 +3529,10 @@ class CardRun:
                 "mutation", PASS, "no production lines changed"))
             return
 
+        if hasattr(self.pack, "mutation_output"):
+            # The tool's own output folder goes with the card's evidence, never into
+            # the worktree, where it would be an untracked folder on the branch.
+            self.pack.mutation_output = self.card_layout / "gates" / "mutation"
         try:
             argv = self.pack.commands(
                 "mutation", files=production, tests=self.card.test_names)["argv"]
@@ -3346,19 +3562,29 @@ class CardRun:
             return
 
         try:
-            parsed = self.pack.parse_mutation(out)
+            # A pack that knows its tool's exit codes reads them first: a failing
+            # baseline or a usage error is the tool not having run, not a result.
+            reader = getattr(self.pack, "read_mutation", None)
+            if reader is not None:
+                parsed = reader(out, err, result.exit_code)
+            else:
+                parsed = self.pack.parse_mutation(out)
         except Invalid as exc:
             # A tool that is not installed, or prints nothing, is not a finding
             # about the code. In report mode that is recorded and the card carries
             # on; when mutation is this card's only proof, it blocks.
+            not_run = exc.code == "mutation-not-run"
             self._record_gate(GateResult(
                 "mutation", FAIL if breaking else PASS,
-                f"the mutation tool's output could not be read: {exc.message}"))
+                (f"the mutation tool did not run: {exc.message}" if not_run else
+                 f"the mutation tool's output could not be read: {exc.message}"),
+                {"exit_code": result.exit_code}))
             if breaking:
                 raise GateFailure(
                     StopCode.MUTATION_CAP,
-                    "mutation is this card's only proof and its output could not "
-                    "be read") from exc
+                    "mutation is this card's only proof and "
+                    + ("the tool did not run" if not_run else
+                       "its output could not be read")) from exc
             return
         # One mutation run is many builds: `cargo mutants` compiles every mutant, so
         # the cap counts the mutants it set out to test, not the one command. The cap
@@ -3369,6 +3595,9 @@ class CardRun:
             "survived": parsed.get("survived", 0),
             "total": parsed.get("total", 0),
             "capped": parsed.get("capped", False) or self.budget.mutation_capped()}
+        for key in ("timeout", "unviable", "judged"):
+            if key in parsed:
+                self.mutation_summary[key] = parsed.get(key, 0)
         gate = self._record_gate(mutation_gate(
             parsed, self.cfg.mutation_min_kill_rate, mode, self.card.category,
             required_for=self.cfg.mutation_required_for))
@@ -3406,48 +3635,133 @@ class CardRun:
             self.worktree,
             [path for path in changed if self._is_test_path(path)],
             ref=self.base_commit or "HEAD")
-        brief1 = build_checker_pass1_brief(self.card, test_diff)
-        call1 = self._call_board_role(
-            "checker_pass1",
-            brief1,
-            attempt=1,
-            response_path=self.card_layout / "responses" / "checker-pass1.json",
-        )
-        self.budget.note_tokens(call1.tokens_in, call1.tokens_out, call1.spend)
-        restatement = parse_restatement(call1.content, self.card)
+        form1 = pass1_answer_form()
+        brief1 = checker_pass1_brief(self.card, test_diff, handback=self.swarm_on,
+                                     answer_form=form1)
+        # A checker's answer is checked for a hand-back before anything reads it: a
+        # hand-back is never a restatement and never a passing checker gate.
+        call1, limit_err = self._call_role_with_handbacks(
+            "checker_pass1", brief1, first_attempt=1, response_name="checker-pass1")
+        if limit_err is not None:
+            self._checker_handback_limit("checker-pass1", limit_err)
+        first = parse_pass1(call1.content, self.card, cut_off=call1.cut_off)
+        first_problem1 = ""
+        if not first.readable:
+            # Never taken as the restatement: ask once more with the form
+            # restated. A hand-back is still read first.
+            first_problem1 = first.problem
+            retry1 = checker_pass1_brief(self.card, test_diff, handback=self.swarm_on,
+                                         answer_form=form1,
+                                         retry_problem=first.problem)
+            asked1 = sum(1 for c in getattr(self.roles, "calls", []) or []
+                         if getattr(c, "role", "") == "checker_pass1")
+            call1, limit_err = self._call_role_with_handbacks(
+                "checker_pass1", retry1, first_attempt=1 + max(1, asked1),
+                response_name="checker-pass1-again")
+            if limit_err is not None:
+                self._checker_handback_limit("checker-pass1", limit_err)
+            first = parse_pass1(call1.content, self.card, cut_off=call1.cut_off)
+        restatement = first.restatement
         self.checker_restatement = restatement
+        self.checker_pass1 = {**first.as_dict(), "asked_again": bool(first_problem1),
+                              "first_problem": first_problem1}
+        if not first.readable:
+            detail1 = ("the first pass could not be read, even when asked again "
+                       f"({first.problem}): no restatement to compare with the tests")
+        else:
+            detail1 = ("restatement flagged as drifting" if restatement.mismatch
+                       else "restatement matches the named tests")
+            said1 = {"yes": "would catch a bad implementation",
+                     "partly": "would partly catch a bad implementation",
+                     "no": "would not catch a bad implementation"}.get(first.catches)
+            if said1:
+                detail1 += f"; the checker says the tests {said1}"
         gate1 = self._record_gate(GateResult(
-            "checker-pass1", PASS,
-            "restatement flagged as drifting" if restatement.mismatch
-            else "restatement matches the named tests",
-            {"restatement": restatement.as_dict()}))
+            "checker-pass1", PASS, detail1,
+            {"restatement": restatement.as_dict(), "checker": self.checker_pass1}))
+
+        from .roles import MAX_COUNTER_TESTS, parse_pass2, pass2_answer_form
 
         modified = {}
         for path in changed[:8]:
             full = self.worktree / path
             if full.exists():
                 modified[path] = full.read_text()[:8000]
-        brief2 = build_checker_pass2_brief(
-            self.card, full_diff, [g.as_dict() for g in self.gates], modified)
-        call2 = self._call_board_role(
-            "checker_pass2",
-            brief2,
-            attempt=2,
-            response_path=self.card_layout / "responses" / "checker-pass2.json",
-        )
-        self.budget.note_tokens(call2.tokens_in, call2.tokens_out, call2.spend)
+        # The brief names the language, the runner and the files the counter-tests
+        # are saved as, in the same form `parse_pass2` reads.
+        language = str(getattr(self.pack, "name", "") or "")
+        crate = ""
+        if language == "rust":
+            import tomllib
+            unit = self._effective_unit()
+            manifests = ([self.worktree / unit / "Cargo.toml"]
+                         if unit and unit != "." else []) + [self.worktree / "Cargo.toml"]
+            for manifest in manifests:
+                try:
+                    data = tomllib.loads(manifest.read_text())
+                except (OSError, ValueError):
+                    continue
+                name = str((data.get("lib") or {}).get("name")
+                           or (data.get("package") or {}).get("name") or "")
+                if name:
+                    crate = name.replace("-", "_")
+                    break
+            if not crate and unit and unit != "." and "/" not in unit:
+                crate = unit.replace("-", "_")
+        answer_form = pass2_answer_form(
+            language, str(getattr(self.pack, "runner", "") or ""),
+            [self._counter_fallback_path(i) for i in range(1, MAX_COUNTER_TESTS + 1)],
+            crate)
+        gate_list = [g.as_dict() for g in self.gates]
+        brief2 = checker_pass2_brief(
+            self.card, full_diff, gate_list, modified,
+            handback=self.swarm_on, answer_form=answer_form)
+        call2, limit_err = self._call_role_with_handbacks(
+            "checker_pass2", brief2, first_attempt=2, response_name="checker-pass2")
+        if limit_err is not None:
+            self._checker_handback_limit("checker-pass2", limit_err)
+        answer = parse_pass2(call2.content, cut_off=call2.cut_off)
+        first_problem = ""
+        if not answer.readable:
+            # An answer that cannot be read is never "no counter-tests": ask once
+            # more with the form restated. A hand-back is still read first.
+            first_problem = answer.problem
+            retry = checker_pass2_brief(
+                self.card, full_diff, gate_list, modified,
+                handback=self.swarm_on, answer_form=answer_form,
+                retry_problem=answer.problem)
+            asked = sum(1 for c in getattr(self.roles, "calls", []) or []
+                        if getattr(c, "role", "") == "checker_pass2")
+            call2, limit_err = self._call_role_with_handbacks(
+                "checker_pass2", retry, first_attempt=2 + max(1, asked),
+                response_name="checker-pass2-again")
+            if limit_err is not None:
+                self._checker_handback_limit("checker-pass2", limit_err)
+            answer = parse_pass2(call2.content, cut_off=call2.cut_off)
 
-        counters = parse_counter_tests(call2.content)
+        counted_drops = [d for d in answer.dropped if not d.get("over_limit")]
         self.counter_summary = {
-            "written": len(counters.tests),
-            "dropped_uncompiled": 0,
+            "written": len(answer.counter_tests) + len(counted_drops),
+            "dropped_uncompiled": len(counted_drops),
             "passed": 0,
             "failed": 0,
             "not_run": 0,
+            "unreadable": 0 if answer.readable else 1,
         }
         self._last_failing_counters = []
-        if counters.tests:
-            self._run_counter_tests(counters.tests)
+        self.counter_results = []
+        if answer.counter_tests:
+            self._run_counter_tests(answer.counter_tests)
+        self.counter_results += [
+            {"name": d.get("name", ""), "file": "", "outcome": "dropped",
+             "why": d.get("why", ""), "output_head": ""}
+            for d in answer.dropped]
+        self.checker_pass2 = {
+            **answer.as_dict(),
+            "asked_again": bool(first_problem),
+            "first_problem": first_problem,
+            "counter_results": list(self.counter_results),
+        }
 
         if self.board is not None and self._last_failing_counters:
             names = ", ".join(
@@ -3455,7 +3769,7 @@ class CardRun:
             )
             evidence = [
                 str(p)
-                for idx in range(1, len(counters.tests) + 1)
+                for idx in range(1, len(answer.counter_tests) + 1)
                 for p in [self.card_layout / "gates" / f"counter-test-{idx}.json"]
                 if p.exists()
             ]
@@ -3468,11 +3782,31 @@ class CardRun:
                 evidence=evidence,
             )
 
-        self._record_gate(GateResult(
-            "checker-pass2", PASS,
-            f"traceability returned; {len(counters.tests)} counter-test(s), "
-            f"{self.counter_summary['failed']} failing",
-            {"counter_tests": self.counter_summary}))
+        gate_evidence = {"counter_tests": self.counter_summary,
+                         "checker": self.checker_pass2}
+        if not answer.readable:
+            detail = ("the second pass could not be read, even when asked again "
+                      f"({answer.problem}): no counter-test ran, nothing was checked")
+            if self.cfg.counter_tests == "reject":
+                # The person asked for the checker to gate, and no check happened.
+                self._record_gate(GateResult("checker-pass2", FAIL, detail,
+                                             gate_evidence))
+                raise GateFailure(StopCode.CHECKER_REJECT, detail)
+            self._record_gate(GateResult(
+                "checker-pass2", PASS,
+                detail + " (counter-tests are report-only)", gate_evidence))
+        else:
+            said = {"accept": "checker accepts the diff",
+                    "changes-requested": "checker asks for changes"}.get(
+                        answer.verdict, "checker stated no verdict (old answer form)")
+            summary = self.counter_summary
+            detail = (f"{said}; {summary['written']} counter-test(s): "
+                      f"{summary['failed']} failed, {summary['passed']} passed, "
+                      f"{summary['dropped_uncompiled'] + summary['not_run']} dropped")
+            if answer.verdict == "changes-requested" and not summary["failed"]:
+                detail += "; no counter-test fails on the diff"
+            self._record_gate(GateResult("checker-pass2", PASS, detail,
+                                         gate_evidence))
         self._record_attempt("checker", "passed-gates", role="checker_pass2")
 
         if (self.cfg.counter_tests == "reject"
@@ -3482,6 +3816,7 @@ class CardRun:
                 self._refresh_micromanager_harness_context(
                     "checker", failure_class="counter-test"
                 )
+                self._check_stop_requested()
                 try:
                     verdict = self.micromanager.adjudicate_checker(
                         self.card, full_diff, restatement,
@@ -3530,87 +3865,253 @@ class CardRun:
                 f"{self.counter_summary['failed']} counter-test(s) fail on the diff")
         return None
 
+    def _checker_handback_limit(self, gate_name: str, detail: str) -> None:
+        """A checker hand-back past `handbacks_per_card` is a failed checker gate.
+
+        The checker has no attempts to spend, so the failed attempt fails the gate:
+        the card blocks with `checker-reject`, never passing on a hand-back.
+        """
+        self._record_gate(GateResult(gate_name, FAIL, detail))
+        raise GateFailure(StopCode.CHECKER_REJECT, detail)
+
     def _extension(self) -> str:
         """The pack's source extension; `.rs` for packs that predate the field."""
         return str(getattr(self.pack, "extension", "") or ".rs")
 
+    def _counter_stays_inside(self, path: str) -> bool:
+        """Whether a counter-test written at `path` lands inside the worktree."""
+        return resolves_within(self.worktree, path) is not None
+
     def _counter_fallback_path(self, index: int) -> str:
         unit = self._effective_unit()
         ext = self._extension()
-        # Python test files are found by their `test_` prefix.
+        # Python test files are found by their `test_` prefix, TypeScript ones by
+        # their `.test` suffix (the pack's own test-file rule).
         stem = (f"test_openfarm_counter_{index}" if ext == ".py"
+                else f"openfarm_counter_{index}.test" if ext == ".ts"
                 else f"openfarm_counter_{index}")
         if unit and unit != "." and (self.worktree / unit).is_dir() and any(
                 (self.worktree / unit / manifest).is_file()
-                for manifest in ("Cargo.toml", "pyproject.toml", "setup.py")):
+                for manifest in ("Cargo.toml", "pyproject.toml", "setup.py",
+                                 "package.json")):
             return f"{unit.strip('/')}/tests/{stem}{ext}"
         return f"tests/{stem}{ext}"
 
     def _run_counter_tests(self, tests: list[dict]) -> None:
         """Run the checker's counter-tests in this card's own worktree and target.
 
-        Never committed. One that doesn't compile is dropped and counted, because
-        a counter-test can itself be wrong.
+        Each is saved as a new file, run alone, and taken away again: the worktree
+        is left exactly as it was, nothing new, nothing changed, nothing committed.
+        One that doesn't compile is dropped and counted, because a counter-test can
+        itself be wrong. Every outcome goes to `self.counter_results`.
         """
+        import os
+        import re
+
+        if not hasattr(self, "counter_results"):
+            self.counter_results = []
         unit = self._effective_unit()
+
+        def listing(*args: str) -> list[str]:
+            out = self.git._run(["ls-files", "-z", *args]).stdout
+            return [p for p in out.split("\0") if p]
+
+        def snapshot() -> dict:
+            dirty = listing("--modified", "--deleted") + listing(
+                "--others", "--exclude-standard")
+            dirty += [p for p in self.git.staged_changes() if p not in dirty]
+            files: dict[str, bytes | None] = {}
+            for rel in dirty:
+                full = self.worktree / rel
+                files[rel] = (full.read_bytes()
+                              if full.is_file() and not full.is_symlink() else None)
+            ignored = set(listing("--others", "--ignored", "--exclude-standard"))
+            # Ignored links (a TypeScript worktree's linked `node_modules`): git
+            # never restores them, and a run can remove or re-point one.
+            links = {}
+            for rel in ignored:
+                full = self.worktree / rel
+                if full.is_symlink():
+                    with contextlib.suppress(OSError):
+                        links[rel] = os.readlink(full)
+            dirs = {""}
+            for rel in list(ignored) + listing() + list(files):
+                parent = Path(rel).parent
+                while str(parent) not in dirs and str(parent) != ".":
+                    dirs.add(str(parent))
+                    parent = parent.parent
+            return {"head": self.git.head(), "branch": self.git.current_branch(),
+                    "files": files, "ignored": ignored, "dirs": dirs,
+                    "links": links, "status": self.git.status_lines()}
+
+        def restore(before: dict) -> None:
+            if self.git.current_branch() != before["branch"] and before["branch"]:
+                self.git._run(["checkout", "-f", before["branch"]])
+            # Tracked changes and new files go; a commit a test made goes too.
+            self.git.reset_hard(before["head"])
+            for rel, data in before["files"].items():
+                full = self.worktree / rel
+                if data is None:
+                    continue
+                full.parent.mkdir(parents=True, exist_ok=True)
+                full.write_bytes(data)
+            # Ignored files the run left behind (`__pycache__`, `Cargo.lock`, ...).
+            for rel in sorted(set(listing("--others", "--ignored", "--exclude-standard"))
+                              - before["ignored"]):
+                full = self.worktree / rel
+                with contextlib.suppress(OSError):
+                    os.unlink(full)
+                parent = Path(rel).parent
+                while str(parent) not in before["dirs"] and str(parent) != ".":
+                    with contextlib.suppress(OSError):
+                        (self.worktree / parent).rmdir()
+                    parent = parent.parent
+            # Ignored entries the run removed: the pack sets its own up again
+            # (a removed `node_modules` comes back with its marker and links).
+            if any(not os.path.lexists(self.worktree / rel)
+                   for rel in before["ignored"]):
+                self._prepare_checkout(self.worktree)
+            # Every ignored link exactly as it was, never followed: a link
+            # removed, re-pointed or replaced is made again.
+            for rel, link_to in sorted(before["links"].items()):
+                full = self.worktree / rel
+                with contextlib.suppress(OSError):
+                    if full.is_symlink() and os.readlink(full) == link_to:
+                        continue
+                    if full.is_symlink() or full.is_file():
+                        full.unlink()
+                    elif full.is_dir():
+                        shutil.rmtree(full)
+                    full.parent.mkdir(parents=True, exist_ok=True)
+                    os.symlink(link_to, full)
+            after_ignored = set(listing("--others", "--ignored", "--exclude-standard"))
+            if (self.git.head() != before["head"]
+                    or self.git.status_lines() != before["status"]
+                    or after_ignored != before["ignored"]):
+                self.log(f"{self.card.id}: the worktree did not come back exactly "
+                         "as it was after a counter-test")
+
+        def head_of(text: str) -> str:
+            lines = text.strip("\n").splitlines()
+            for at, line in enumerate(lines):
+                if re.search(r"^(FAIL|ERROR):|panicked at|AssertionError|"
+                             r"assert(ion)?\b.*(fail|left|right)|^not ok\b|"
+                             r"error(\[E\d+\])?:", line):
+                    return "\n".join(lines[at:at + 12])
+            return "\n".join(lines[:12])
+
+        def status_of(parsed: dict, name: str) -> str:
+            status = _status_of(parsed, name)
+            if status != "not-run":
+                return status
+            for entry in parsed.get("results", []):
+                got = str(entry.get("name", ""))
+                if got and (got.endswith(("::" + name, "." + name))
+                            or name.endswith(("::" + got, "." + got))):
+                    return entry.get("status", "")
+            # `test_x checks the start`: a header with words after a one-word
+            # name, from a language whose test names have no spaces.
+            first = name.split(" ", 1)[0]
+            if first != name:
+                return status_of(parsed, first)
+            return "not-run"
+
         for index, counter in enumerate(tests, start=1):
+            name = str(counter.get("name", "") or "")
             raw_path = str(counter.get("file", "") or "").strip()
             path = self._counter_fallback_path(index)
             if raw_path and resolves_within(self.worktree, raw_path):
                 candidate = normalise(raw_path)
+                # Never over an existing file: a counter-test is a new file.
                 if (candidate
                         and not matches_any(candidate, self.cfg.never_touch)
                         and not matches_any(candidate, self.cfg.forbidden_files)
-                        and self._is_test_path(candidate)):
+                        and self._is_test_path(candidate)
+                        and not (self.worktree / candidate).exists()):
                     path = candidate
             target = self.worktree / path
-            content = counter.get("content", "")
-            if not content:
+            content = str(counter.get("content", "") or "")
+            entry = {"name": name, "file": path, "content": content,
+                     "outcome": "", "why": "", "status": "", "output": "",
+                     "output_head": ""}
+            if not content.strip():
                 self.counter_summary["dropped_uncompiled"] += 1
-                continue
-            existed = target.exists()
-            previous = target.read_text() if existed else ""
-            try:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(content)
-                result = self._run(
-                    runner_kind("test"),
-                    self.pack.commands("test", unit=unit, files=[path])["argv"],
-                    counted="model")
-                out, err = self._output(result)
-                parsed = self.pack.parse_tests(out, err)
-                if parsed.get("compile_errors") or result.cls == INFRA:
-                    self.counter_summary["dropped_uncompiled"] += 1
-                    continue
-                status = _status_of(parsed, counter.get("name", ""))
-                if status == "ok":
-                    self.counter_summary["passed"] += 1
-                elif status == "FAILED":
-                    self.counter_summary["failed"] += 1
-                    detail_entry = {
-                        "name": counter.get("name"),
-                        "file": path,
-                        "status": status,
-                        "content": content,
-                        "output": (out + err)[-4000:],
-                    }
-                    self._last_failing_counters.append(detail_entry)
-                    write_json(self.card_layout / "gates"
-                               / f"counter-test-{index}.json",
-                               detail_entry)
-                else:
-                    self.counter_summary["not_run"] += 1
-                    write_json(self.card_layout / "gates"
-                               / f"counter-test-{index}.json",
-                               {"name": counter.get("name"), "file": path,
-                                "status": status,
-                                "output": (out + err)[-4000:]})
-            finally:
-                if existed:
-                    target.write_text(previous)
-                elif target.exists():
-                    target.unlink()
-                self.git.reset_hard("HEAD")
+                entry.update(outcome="dropped", why="the counter-test is empty")
+            elif not self._counter_stays_inside(path):
+                # The harness's own fallback name, like a name the checker gave,
+                # is never written through a linked folder to outside the worktree.
+                self.counter_summary["dropped_uncompiled"] += 1
+                entry.update(outcome="dropped",
+                             why="its file would land outside the worktree")
+            else:
+                before = snapshot()
+                existed = target.exists()
+                previous = target.read_bytes() if existed else b""
+                try:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(content)
+                    result = self._run(
+                        runner_kind("test"),
+                        self.pack.commands("test", unit=unit, files=[path])["argv"],
+                        counted="model")
+                    out, err = self._output(result)
+                    parsed = self.pack.parse_tests(out, err)
+                    text = out + ("\n" + err if err else "")
+                    entry["output"] = text[-4000:]
+                    entry["output_head"] = head_of(text)
+                    # No results and no footer: the runner could not even load it
+                    # (a syntax error in a module run by name, for one).
+                    unloaded = (not parsed.get("results")
+                                and bool(parsed.get("missing_footers"))
+                                and result.cls != PASS)
+                    if parsed.get("compile_errors") or result.cls == INFRA or unloaded:
+                        self.counter_summary["dropped_uncompiled"] += 1
+                        entry.update(
+                            outcome="dropped",
+                            why=("the run did not finish" if result.cls == INFRA
+                                 else "it did not compile or could not be collected"))
+                    else:
+                        status = status_of(parsed, name)
+                        died = bool(parsed.get("missing_footers"))
+                        if died:
+                            # The run died partway: a row it printed is not a pass.
+                            status = "not-run"
+                        elif status == "mixed":
+                            # Any failing row of a counter-test is the finding it
+                            # exists for.
+                            status = ("FAILED" if any(
+                                row.get("status") == "FAILED" for row in rows_for_test(
+                                    parsed.get("results", []), name))
+                                else "not-run")
+                        entry["status"] = status
+                        if status == "ok":
+                            self.counter_summary["passed"] += 1
+                            entry["outcome"] = "passed"
+                        elif status == "FAILED":
+                            self.counter_summary["failed"] += 1
+                            entry["outcome"] = "failed"
+                            self._last_failing_counters.append(
+                                {k: entry[k] for k in
+                                 ("name", "file", "status", "content", "output")})
+                        else:
+                            self.counter_summary["not_run"] += 1
+                            entry.update(
+                                outcome="not-run",
+                                why=("the run died before it finished" if died
+                                     else f"the runner reported no test named {name!r}"
+                                     if status == "not-run"
+                                     else f"the runner reported it as {status}"))
+                finally:
+                    if existed:
+                        target.write_bytes(previous)
+                    elif target.exists() or target.is_symlink():
+                        target.unlink()
+                    restore(before)
+            write_json(self.card_layout / "gates" / f"counter-test-{index}.json",
+                       entry)
+            self.counter_results.append(
+                {k: entry[k] for k in ("name", "file", "outcome", "why", "status",
+                                       "output_head")})
 
     # -- step 9: catch-up -----------------------------------------------------
 
@@ -3633,6 +4134,7 @@ class CardRun:
         if trial.exists():
             shutil.rmtree(trial, ignore_errors=True)
         self.git.worktree_add(trial, self.branch)
+        self._prepare_checkout(trial)
         trial_git = Git(trial)
         try:
             merged, output = trial_git.merge_no_commit(current_base)
@@ -3704,6 +4206,9 @@ class CardRun:
             isolated = (
                 self.stop_code in _HARNESS_ISOLATED_STOP_CODES
                 or (self.stop_code == StopCode.REFUSED and model_calls == 0)
+                # The coordinator's decision, not the card's failure; and no
+                # reflection call is made for a stopped card.
+                or (self.stop_code == StopCode.REFUSED and bool(self.coordinator_stop))
                 or final_state == "released"
             )
             if isolated:
@@ -3909,8 +4414,17 @@ class CardRun:
             return (f"{self.card.id}: {self.stop_code.value if self.stop_code else 'blocked'}"
                     f" — {self.detail}\n\nGates: {_gate_line(counts)}")
 
+        # The header says what the gates said: a gate that degraded (a refused
+        # or silent supervisor's pre-review, say) is counted, never read as a pass.
+        not_passed = [gate for gate in self.gates if gate.result != "pass"]
+        if not_passed:
+            gate_summary = (f"{len(self.gates)} gates: {len(self.gates) - len(not_passed)} "
+                            f"passed, {len(not_passed)} did not "
+                            f"({', '.join(f'{g.name}={g.result}' for g in not_passed)}). ")
+        else:
+            gate_summary = f"{len(self.gates)} gates, all passed. "
         header = (f"{self.card.id}: in review\n\n"
-                  f"{len(self.gates)} gates, all passed. "
+                  f"{gate_summary}"
                   f"Attempts: {self.budget.implementer_attempts}. "
                   f"Named tests: {self.named_passing}. "
                   f"Builds: {self.budget.model_builds} model, "
@@ -3979,12 +4493,38 @@ class CardRun:
             "team": self.team_summary(),
             "handbacks": list(self.handbacks),
         }
+        summary = getattr(self.pack, "tooling_summary", None)
+        if summary is not None:
+            # The runner, tools and the pack's notes this card was judged with.
+            with contextlib.suppress(Exception):
+                record["tooling"] = summary()
         if self.board is not None:
             record["by_effort"] = dict(self.effort_tokens)
         return complete_record(record, CARD_FIELDS)
 
 
 # -- helpers -------------------------------------------------------------------
+
+def _json_handback(content: str) -> str | None:
+    """A planner's JSON-mode hand-back, `{"handback": "<reason>"}`, or None.
+
+    An object that also carries `steps` is a plan, not a hand-back.
+    """
+    text = str(content or "").strip()
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end <= start:
+        return None
+    try:
+        payload = json.loads(text[start:end + 1])
+    except ValueError:
+        return None
+    if not isinstance(payload, dict) or "steps" in payload:
+        return None
+    reason = payload.get("handback")
+    if not isinstance(reason, str) or not reason.strip():
+        return None
+    return reason.strip()
+
 
 def _tests_hash(hashes: dict[str, str]) -> str:
     """One hash for a whole set of frozen test files, so two can be compared."""
@@ -4007,17 +4547,32 @@ def _red(parsed: dict, known: list[str]) -> list[str]:
             if entry.get("status") == "FAILED" and entry.get("name") not in known_set]
 
 
-def _named_failures(parsed: dict, named: list[str]) -> dict[str, str]:
-    by_name = {entry["name"]: entry["status"]
-               for entry in parsed.get("results", [])}
-    return {name: by_name.get(name, "not-run") for name in named}
+def _named_rows(parsed: dict, named: list[str], files: dict[str, str] | None = None,
+                row_file=None) -> dict[str, list[dict]]:
+    """Every row each named test was reported with (`rows_for_test`)."""
+    results = parsed.get("results", [])
+    files = files or {}
+    return {name: rows_for_test(results, name, files.get(name, ""), row_file)
+            for name in named}
+
+
+def _named_failures(parsed: dict, named: list[str],
+                    files: dict[str, str] | None = None,
+                    row_file=None) -> dict[str, str]:
+    """One status per named test, from every row reported for it.
+
+    `FAILED` only when every row failed and `ok` only when every row passed; rows
+    that disagree (a parameter case passing while another fails, or the same test
+    in two binaries) are `mixed`, which proves nothing either way. Keeping the last
+    row instead let a planted or duplicate row decide the proof.
+    """
+    rows = _named_rows(parsed, named, files, row_file)
+    return {name: combined_status(rows[name]) for name in named}
 
 
 def _status_of(parsed: dict, name: str) -> str:
-    for entry in parsed.get("results", []):
-        if entry.get("name") == name:
-            return entry.get("status", "")
-    return "not-run"
+    """A named test's status over all its rows, as `_named_failures` reads it."""
+    return combined_status(rows_for_test(parsed.get("results", []), name))
 
 
 def _report_detail(report) -> str:
