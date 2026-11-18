@@ -32,7 +32,7 @@ v0.8.5 makes the supervisor cheaper in tokens, makes `openfarm drive` behave the
   - Standalone `codex-acp` with `read-only` is refused where it can't run.
   - JSON error codes.
   - A test for parallel supervisor spend.
-- **Tests.** TESTS_PLACEHOLDER
+- **Tests.** 1524 offline tests on the final tree with no failures (93 skipped with no optional tools on `PATH`; 5 with `OPENFARM_E2E=1` and ruff, pytest, tsc, prettier and cargo-mutants installed).
 
 ### Tested live in v0.8.5
 

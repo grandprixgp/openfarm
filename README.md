@@ -30,11 +30,11 @@
 </p>
 
 <p align="center">
-  <img src="docs/assets/openfarm-stats.svg" alt="TESTCOUNT offline tests with 0 failures, 22 CLI subcommands, 6 adapter interfaces, 0 runtime dependencies" width="100%">
+  <img src="docs/assets/openfarm-stats.svg" alt="1524 offline tests with 0 failures, 22 CLI subcommands, 6 adapter interfaces, 0 runtime dependencies" width="100%">
 </p>
 
 > [!IMPORTANT]
-> **Pre-release (v0.8.5).** v0.8.5 makes the frontier supervisor cheaper, makes `openfarm drive` behave the same as ACP mode, and fixes the v0.8.1 known limits that code can fix. On the 12 bench tasks with scripted workers, the supervisor is sent 62% fewer prompt characters in 45% fewer calls. One live call through openfarm's own lean prompts takes 58% (Claude) and 57% (Codex) fewer input tokens. Python and TypeScript cards now get a mutation gate, and builds and tests can run in a bubblewrap boundary. The offline suite has TESTCOUNT tests with no failures. What ran live, and what has not run at all, is in [What's verified](#whats-verified) and [Not yet tested](#not-yet-tested). v0.8.1 brought Codex and Antigravity providers, `openfarm drive` and the TypeScript pack; its notes follow v0.8.5's below. With `[swarm] enabled = false` a run behaves as in v0.7.
+> **Pre-release (v0.8.5).** v0.8.5 makes the frontier supervisor cheaper, makes `openfarm drive` behave the same as ACP mode, and fixes the v0.8.1 known limits that code can fix. On the 12 bench tasks with scripted workers, the supervisor is sent 62% fewer prompt characters in 45% fewer calls. One live call through openfarm's own lean prompts takes 58% (Claude) and 57% (Codex) fewer input tokens. Python and TypeScript cards now get a mutation gate, and builds and tests can run in a bubblewrap boundary. The offline suite has 1524 tests with no failures. What ran live, and what has not run at all, is in [What's verified](#whats-verified) and [Not yet tested](#not-yet-tested). v0.8.1 brought Codex and Antigravity providers, `openfarm drive` and the TypeScript pack; its notes follow v0.8.5's below. With `[swarm] enabled = false` a run behaves as in v0.7.
 
 ---
 
@@ -409,8 +409,8 @@ On the final v0.8.5 tree, Python 3.14 on Linux:
 
 | Run | Result |
 | --- | --- |
-| Default, no optional tools on `PATH` | **TESTCOUNT tests**, SKIPPLAIN skipped, **0 failures** |
-| `OPENFARM_E2E=1` with ruff 0.17.5, tsc 7.0.2, prettier 3.10.1, cargo-mutants 27.1.0 and pytest 9.2.0 on `PATH` | **TESTCOUNT tests**, SKIPTOOLS skipped, **0 failures** |
+| Default, no optional tools on `PATH` | **1524 tests**, 93 skipped, **0 failures** |
+| `OPENFARM_E2E=1` with ruff 0.17.5, tsc 7.0.2, prettier 3.10.1, cargo-mutants 27.1.0 and pytest 9.2.0 on `PATH` | **1524 tests**, 5 skipped, **0 failures** |
 
 A test that needs a real tool skips itself when the tool is missing, so the default run's skip count depends on what you have installed. The ones skipped in the second run are stand-in tests that step aside when the real tool is there. Each test process keeps its temp files in one folder of its own and removes it at exit.
 
