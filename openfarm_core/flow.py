@@ -4414,8 +4414,17 @@ class CardRun:
             return (f"{self.card.id}: {self.stop_code.value if self.stop_code else 'blocked'}"
                     f" — {self.detail}\n\nGates: {_gate_line(counts)}")
 
+        # The header says what the gates said: a gate that degraded (a refused
+        # or silent supervisor's pre-review, say) is counted, never read as a pass.
+        not_passed = [gate for gate in self.gates if gate.result != "pass"]
+        if not_passed:
+            gate_summary = (f"{len(self.gates)} gates: {len(self.gates) - len(not_passed)} "
+                            f"passed, {len(not_passed)} did not "
+                            f"({', '.join(f'{g.name}={g.result}' for g in not_passed)}). ")
+        else:
+            gate_summary = f"{len(self.gates)} gates, all passed. "
         header = (f"{self.card.id}: in review\n\n"
-                  f"{len(self.gates)} gates, all passed. "
+                  f"{gate_summary}"
                   f"Attempts: {self.budget.implementer_attempts}. "
                   f"Named tests: {self.named_passing}. "
                   f"Builds: {self.budget.model_builds} model, "

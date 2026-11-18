@@ -515,6 +515,87 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
                       if getattr(args, "mm_script", None) else None)
     harness_lib = _open_harness_library(ctx, require_enabled=True)
     swarm_cfg = getattr(cfg, "swarm", None)
+
+    def _acp_children(sup_proto=None) -> list[tuple[str, str, object, BaseException | None]]:
+        """`(child, provider, hold, error)` for each ACP child this run starts.
+
+        The one answer to "which ACP children does this run use", for the
+        refusal before the run and for the run's notes after it. The worker
+        backend, unless `--script` stands in for it; the swarm's ACP
+        coordinator, unless the swarm is off or `--script` stands in; the
+        supervisor as `open_micromanager` picks it, so its seat comes first and
+        `[micromanager] mode = "off"`, `--mm-script` and a seat set to `off`,
+        `external` or `tier:` give none. Each hold is worked out by the
+        adapters' own rule (`_SharedAcpSupervisor.hold_of`) and nothing is
+        started. A hold that could not be worked out carries its error instead.
+        """
+        from .adapters.claude_worker import open_acp_worker
+        run_script = Path(args.script) if getattr(args, "script", None) else None
+        swarm_on = bool(swarm_cfg is not None and swarm_cfg.enabled and not args.dry_run)
+        coord = str(getattr(swarm_cfg, "coordinator", "code") or "") if swarm_cfg else ""
+        wanted: list[tuple[str, str, object]] = []  # (child, provider, opener)
+        if run_script is None and is_acp_adapter(cfg.model_adapter):
+            wanted.append(("worker", normalize_acp_provider(cfg.model_adapter),
+                           lambda: open_acp_worker(cfg)))
+        if swarm_on and run_script is None and is_acp_adapter(coord):
+            wanted.append(("coordinator", normalize_acp_provider(coord),
+                           lambda: open_acp_worker(cfg, provider=normalize_acp_provider(coord))))
+        sup_spec = (swarm_cfg.supervisor if (swarm_cfg is not None and swarm_cfg.enabled)
+                    else "config")
+        if sup_proto is None and mm_script_path is None and (
+            is_acp_adapter(sup_spec)
+            or (sup_spec == "config" and is_acp_adapter(cfg.micromanager_adapter))
+        ):
+            # The lazy probe starts nothing; `open_micromanager` applies `mode`.
+            probe_mm = None
+            try:
+                probe_mm = open_micromanager(cfg, ctx.state.root, ctx.repo, worktree=ctx.repo)
+                if isinstance(getattr(probe_mm, "backend", None), ClaudeAcpMicromanager):
+                    sup_proto = probe_mm.backend
+            except (AdapterError, OSError):
+                sup_proto = None
+            finally:
+                if probe_mm is not None:
+                    with contextlib.suppress(Exception):
+                        probe_mm.close()
+        out: list[tuple[str, str, object, BaseException | None]] = []
+        for child, provider, opener in wanted:
+            backend = None
+            try:
+                backend = opener()  # only its settings are wanted
+                _transport, hold = _SharedAcpSupervisor.hold_of(
+                    backend.command, backend.provider, "none", backend.confine)
+                out.append((child, backend.provider, hold, None))
+            except Exception as exc:  # said by the caller, never lost
+                out.append((child, provider, None, exc))
+            finally:
+                if backend is not None:
+                    with contextlib.suppress(Exception):
+                        backend.close()  # it may have made a temp folder
+        if sup_proto is not None:
+            try:
+                _transport, hold = _SharedAcpSupervisor.hold_of(
+                    sup_proto.command, sup_proto.provider, sup_proto.tool_policy,
+                    getattr(sup_proto, "confine", None))
+                out.append(("supervisor", sup_proto.provider, hold, None))
+            except Exception as exc:  # said by the caller, never lost
+                out.append(("supervisor", sup_proto.provider, None, exc))
+        return out
+
+    if not args.dry_run:
+        # An ACP child the confinement rules refuse would fail every op of every
+        # card (a supervisor's ops degrade one by one): the run is refused here,
+        # before a board or a card is touched, as `openfarm drive` refuses its
+        # own child. A hold that cannot be worked out here is left to the
+        # adapter, which applies the same rule when it starts.
+        for child, provider, hold, _err in _acp_children():
+            if hold is not None and hold.refused:
+                _emit_ctx(ctx, {"refused": True, "reason": hold.refused,
+                                "code": "acp-confine-unavailable",
+                                "child": child, "provider": provider,
+                                "confine": hold.as_dict()}, "run")
+                return EXIT_REFUSED
+
     board: Board | None = None
     if swarm_cfg is not None and swarm_cfg.enabled and not args.dry_run:
         board = Board(board_dir_for(ctx.state, run_id), state_dir=ctx.state)
@@ -775,49 +856,18 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
         `[micromanager] confine = "off"`, or Codex held by its tool flags alone
         because bwrap is unusable. Worked out from the same settings and rules
         the adapters use (`confine.hold_for`), so it holds for every card's
-        adapter, the ones already closed included.
+        adapter, the ones already closed included. Only children the run
+        started are described (`_acp_children`): a supervisor whose mode is
+        `off`, or a role a script stood in for, gives no note.
         """
         from . import confine as confine_lib
-        seats: list[tuple[str, object, str, object]] = []
-        if script_path is None and is_acp_adapter(cfg.model_adapter):
-            from .adapters.claude_worker import open_acp_worker
-            wb = open_acp_worker(cfg)
-            seats.append((wb.provider, wb.command, "none", wb.confine))
-            with contextlib.suppress(Exception):
-                wb.close()  # only its settings were wanted; it made a temp folder
-        if swarm_parallel and script_path is None and is_acp_adapter(coord_spec):
-            from .adapters.claude_worker import open_acp_worker
-            cb = open_acp_worker(cfg, provider=normalize_acp_provider(coord_spec))
-            seats.append((cb.provider, cb.command, "none", cb.confine))
-            with contextlib.suppress(Exception):
-                cb.close()
-        sup = mm_seat.proto if mm_seat is not None else None
-        sup_spec = swarm_sup if (swarm_cfg is not None and swarm_cfg.enabled) else "config"
-        if sup is None and mm_script_path is None and (
-            is_acp_adapter(sup_spec)
-            or (sup_spec == "config" and is_acp_adapter(cfg.micromanager_adapter))
-        ):
-            probe_mm = None
-            try:
-                probe_mm = open_micromanager(cfg, ctx.state.root, ctx.repo, worktree=ctx.repo)
-                if isinstance(getattr(probe_mm, "backend", None), ClaudeAcpMicromanager):
-                    sup = probe_mm.backend
-            except (AdapterError, OSError):
-                sup = None
-            finally:
-                if probe_mm is not None:
-                    with contextlib.suppress(Exception):
-                        probe_mm.close()
-        if sup is not None:
-            seats.append((sup.provider, sup.command, sup.tool_policy,
-                          getattr(sup, "confine", None)))
         out: list[str] = []
-        for provider, command, policy, settings in seats:
-            try:
-                _transport, hold = _SharedAcpSupervisor.hold_of(
-                    command, provider, policy, settings)
-            except (AdapterError, confine_lib.ConfineError):
-                continue
+        children = _acp_children(mm_seat.proto if mm_seat is not None else None)
+        for _child, _provider, hold, err in children:
+            if err is not None:
+                if isinstance(err, (AdapterError, confine_lib.ConfineError)):
+                    continue
+                raise err
             if hold.note and not hold.refused and hold.note not in out:
                 out.append(hold.note)
         return out
