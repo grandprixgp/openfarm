@@ -11,3 +11,6 @@ __pycache__/
 build/
 dist/
 *.egg-info/
+
+# local archives of work folders (not for the repo)
+data/archives/
