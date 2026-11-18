@@ -94,12 +94,15 @@ class TestLintBeforeFreezeTests(unittest.TestCase):
         outcome = self._run(backend)
         self.assertEqual(outcome.get("final_state"), "in-review", json.dumps(outcome)[:2000])
         self.assertEqual(backend.calls.count("test_writer"), 2)
-        gates = Path(self.toy.state_dir) / "cards" / "CARD-1"
-        records = list(gates.rglob("test-lint.json"))
-        self.assertTrue(records, "a test-lint gate record was written")
-        rec = json.loads(records[0].read_text())
-        self.assertEqual(rec["result"], "fail")
-        self.assertIn("tests/full.rs", rec["evidence"]["files"])
+        card_dir = Path(self.toy.state_dir) / "cards" / "CARD-1"
+        first = sorted(card_dir.rglob("attempts/01-test-writer.json"))
+        self.assertTrue(first, "the first test-writer attempt was recorded")
+        rec = json.loads(first[0].read_text())
+        self.assertEqual(rec["outcome"], "failed-gates")
+        self.assertIn("tests/full.rs", rec["detail"])
+        self.assertIn("bool_assert_comparison", rec["detail"])
+        # Fixed by the retry, so nothing on file says the tests still fail lint.
+        self.assertEqual(list(card_dir.rglob("test-lint*.json")), [])
 
 
 UNFORMATTED_TEST = (

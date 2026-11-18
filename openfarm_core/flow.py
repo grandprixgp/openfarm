@@ -2506,8 +2506,10 @@ class CardRun:
         detail = ("the lint gate flags the tests you wrote, and they cannot change "
                   "once frozen; write them so the lint passes (" + ", ".join(located)
                   + "):\n" + "\n".join(lines[-40:])[-1500:])
-        self._record_gate(GateResult("test-lint", FAIL, detail[:800],
-                                     {"files": located}))
+        # No gate record: the test writer gets this as its retry reason and the
+        # attempt log keeps it. A `fail` record stayed on file after the retry
+        # fixed the tests, and a supervisor read it as a live failure and bounced
+        # a correct card (pilot round 2, card P6, 18 Nov 2026).
         raise GateFailure(StopCode.TESTS_UNPROVABLE, detail)
 
     def _prove_current_tests(self) -> None:
