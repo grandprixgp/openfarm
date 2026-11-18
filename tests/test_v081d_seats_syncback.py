@@ -123,16 +123,16 @@ class FailedTurnSyncBackTests(unittest.TestCase):
                 raise KeyboardInterrupt
             return real(proc, *args, **kwargs)
 
-        with mock.patch.object(subprocess.Popen, "communicate", interrupted):
-            with self.assertRaises(KeyboardInterrupt):
-                agent.complete("hello", turn_key="driver/plan")
+        with mock.patch.object(subprocess.Popen, "communicate", interrupted), \
+                self.assertRaises(KeyboardInterrupt):
+            agent.complete("hello", turn_key="driver/plan")
         self.assertEqual(json.loads(self.real.read_text()), _NEW)
 
     def test_a_failed_copy_after_a_timeout_is_a_note_not_a_second_error(self) -> None:
         agent = self._agent(json.dumps(_NEW), timeout_s=2.0)
-        with mock.patch.object(logins, "sync_back", side_effect=RuntimeError("disk on fire")):
-            with self.assertRaises(Infra) as caught:
-                agent.complete("hello", turn_key="driver/plan")
+        with mock.patch.object(logins, "sync_back", side_effect=RuntimeError("disk on fire")), \
+                self.assertRaises(Infra) as caught:
+            agent.complete("hello", turn_key="driver/plan")
         self.assertEqual(caught.exception.code, "driver-timeout")
         self.assertEqual(json.loads(self.real.read_text()), _OLD)
         self.assertTrue(any("RuntimeError: disk on fire" in n for n in agent.notes), agent.notes)
@@ -141,9 +141,9 @@ class FailedTurnSyncBackTests(unittest.TestCase):
         agent = self._agent(json.dumps(_NEW), timeout_s=2.0)
         with mock.patch.object(logins, "sync_back") as sync, \
                 mock.patch.object(DriverAgent, "child_argv",
-                                  side_effect=Infra("boom", "no argv")):
-            with self.assertRaises(Infra):
-                agent.complete("hello", turn_key="driver/plan")
+                                  side_effect=Infra("boom", "no argv")), \
+                self.assertRaises(Infra):
+            agent.complete("hello", turn_key="driver/plan")
         sync.assert_not_called()
 
 
