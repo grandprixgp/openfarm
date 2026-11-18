@@ -2345,6 +2345,19 @@ def _scaffold_body_to_validate(edit: Edit) -> str:
                 delta = _added(replace[: len(replace) - len(search)])
                 if delta:
                     return delta
+            # Inserted inside the anchor, say above an `impl`'s closing brace: the
+            # replace is the anchor split at one line boundary with a block put in
+            # between, so that block is the only new text. It must be whole blocks
+            # by itself, since the kept lines around it are split.
+            if len(replace) > len(search):
+                grown = len(replace) - len(search)
+                cuts = [i + 1 for i, ch in enumerate(search) if ch == "\n"]
+                for cut in reversed(cuts[:-1] if search.endswith("\n") else cuts):
+                    if (replace.startswith(search[:cut])
+                            and replace.endswith(search[cut:])):
+                        middle = replace[cut:cut + grown].strip()
+                        if middle and middle.count("{") == middle.count("}"):
+                            return middle
     return replace
 
 
