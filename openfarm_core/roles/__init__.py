@@ -204,6 +204,28 @@ class Plan:
         return {"steps": self.steps, "cannot_split": self.cannot_split}
 
 
+def _plan_test_name(raw: str, card: Card | None) -> str:
+    """A step's test as the card names it.
+
+    The planner's brief lists each test as "`name` in file", and a planner may copy
+    that form back. It is read as the bare name only when both the name and the
+    file are the card's own; anything else is left as written, to be refused.
+    """
+    text = raw.strip().strip("`").strip()
+    if card is None:
+        return text
+    if text in set(card.test_names):
+        return text
+    for test in card.tests:
+        if not test.file:
+            continue
+        for form in (f"{test.name} in {test.file}", f"`{test.name}` in {test.file}",
+                     f"{test.name} in `{test.file}`", f"`{test.name}` in `{test.file}`"):
+            if raw.strip() == form or text == form:
+                return test.name
+    return text
+
+
 def parse_plan(content: str, card: Card | None = None) -> Plan:
     text = content.strip()
     payload = _json_block(text)
@@ -219,7 +241,7 @@ def parse_plan(content: str, card: Card | None = None) -> Plan:
     for index, step in enumerate(steps, start=1):
         if not isinstance(step, dict):
             raise Invalid("bad-plan", f"step {index} is not an object")
-        tests = [str(t) for t in step.get("tests", []) or []]
+        tests = [_plan_test_name(str(t), card) for t in step.get("tests", []) or []]
         if allowed_tests is not None and allowed_tests:
             if not tests or any(t not in allowed_tests for t in tests):
                 raise Invalid(
