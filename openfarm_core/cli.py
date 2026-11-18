@@ -3100,10 +3100,14 @@ def main(argv: list[str] | None = None) -> int:
             want_json = True
             break
 
-    def _emit_error(kind: str, message: str, code: int) -> int:
+    def _emit_error(kind: str, message: str, code: int, error_code: str = "") -> int:
         if want_json:
-            print(json.dumps({"error": message, "kind": kind},
-                             indent=2, ensure_ascii=False))
+            payload = {"error": message, "kind": kind}
+            if error_code:
+                # A script can tell one refusal from another (v0.8.5), e.g.
+                # `seat-occupied` from `name-taken` on `swarm join`.
+                payload["code"] = error_code
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
         else:
             print(f"openfarm: {kind}: {message}", file=sys.stderr)
             hint = error_hint(kind, message)
@@ -3153,13 +3157,13 @@ def main(argv: list[str] | None = None) -> int:
         except GitRefused as exc:
             return _emit_error("refused", str(exc), EXIT_REFUSED)
         except Refused as exc:
-            return _emit_error("refused", exc.message, EXIT_REFUSED)
+            return _emit_error("refused", exc.message, EXIT_REFUSED, getattr(exc, "code", "") or "")
         except Invalid as exc:
-            return _emit_error("adapter trouble", exc.message, EXIT_TROUBLE)
+            return _emit_error("adapter trouble", exc.message, EXIT_TROUBLE, getattr(exc, "code", "") or "")
         except Infra as exc:
-            return _emit_error("trouble", exc.message, EXIT_TROUBLE)
+            return _emit_error("trouble", exc.message, EXIT_TROUBLE, getattr(exc, "code", "") or "")
         except AdapterError as exc:
-            return _emit_error("trouble", exc.message, EXIT_TROUBLE)
+            return _emit_error("trouble", exc.message, EXIT_TROUBLE, getattr(exc, "code", "") or "")
         except OSError as exc:
             return _emit_error("trouble", str(exc), EXIT_TROUBLE)
 
@@ -3178,13 +3182,13 @@ def main(argv: list[str] | None = None) -> int:
     except GitRefused as exc:
         return _emit_error("refused", str(exc), EXIT_REFUSED)
     except Refused as exc:
-        return _emit_error("refused", exc.message, EXIT_REFUSED)
+        return _emit_error("refused", exc.message, EXIT_REFUSED, getattr(exc, "code", "") or "")
     except Invalid as exc:
-        return _emit_error("adapter trouble", exc.message, EXIT_TROUBLE)
+        return _emit_error("adapter trouble", exc.message, EXIT_TROUBLE, getattr(exc, "code", "") or "")
     except Infra as exc:
-        return _emit_error("trouble", exc.message, EXIT_TROUBLE)
+        return _emit_error("trouble", exc.message, EXIT_TROUBLE, getattr(exc, "code", "") or "")
     except AdapterError as exc:
-        return _emit_error("trouble", exc.message, EXIT_TROUBLE)
+        return _emit_error("trouble", exc.message, EXIT_TROUBLE, getattr(exc, "code", "") or "")
     except KeyboardInterrupt:
         return _emit_error("interrupted", "interrupted", EXIT_TROUBLE)
 
