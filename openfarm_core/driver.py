@@ -1872,6 +1872,9 @@ def _review_wave(
                             f"the reviewer's answer could not be used ({parse_err}) and no "
                             f"driver turn was left to ask again (--max-turns {max_turns})"
                         )
+                    elif spend_stop is not None and (spend_reason := spend_stop()):
+                        # The correction turn passes the same spend stop first.
+                        reason = f"no review: {spend_reason}"
                     else:
                         corr_prompt = (
                             f"Invalid wave review response ({parse_err}). "
@@ -2710,7 +2713,15 @@ def drive_run(
                         )
 
                     if all_errs:
-                        if counters["turns"] < max_turns:
+                        # A correction turn costs like any other: the same spend
+                        # stop is checked first, and when it fires the turn is not
+                        # sent and the work goes the way it does for a first turn.
+                        corr_spend = _spend_stop() if counters["turns"] < max_turns else ""
+                        if corr_spend and not spend_stopped:
+                            spend_stopped.append(corr_spend)
+                        if spend_stopped:
+                            all_errs = [spend_stopped[0]]
+                        elif counters["turns"] < max_turns:
                             corr_prompt = (
                                 "Previous JSON turn had issue(s): "
                                 + "; ".join(all_errs)
