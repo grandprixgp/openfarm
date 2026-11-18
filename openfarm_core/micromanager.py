@@ -1995,8 +1995,14 @@ _RUST_CHAR_RE = re.compile(
 )
 _RUST_RAW_STR_RE = re.compile(r"(?:[bc])?r(#*)\"")
 _FN_DEF_RE = re.compile(r"\bfn\s+(?:r#)?[A-Za-z_][A-Za-z0-9_]*\b")
+# A stub body: `todo!()` or `unimplemented!()`, after any number of
+# `let _ = (a, b);` lines. Those keep the parameters used, so the stub passes a
+# lint run that treats warnings as errors; they name parameters and call nothing.
+_UNUSED_ARG = r"&?\s*(?:mut\s+)?[A-Za-z_][A-Za-z0-9_]*"
 _TODO_ONLY_RE = re.compile(
-    r"^(?:todo|unimplemented)!\s*\(\s*(?:\"\"\s*(?:,\s*\"\")*\s*)?\)\s*;?$"
+    r"^(?:let\s+_\s*=\s*(?:" + _UNUSED_ARG + r"|\(\s*" + _UNUSED_ARG
+    + r"(?:\s*,\s*" + _UNUSED_ARG + r")*\s*,?\s*\))\s*;\s*)*"
+    r"(?:todo|unimplemented)!\s*\(\s*(?:\"\"\s*(?:,\s*\"\")*\s*)?\)\s*;?$"
 )
 
 
@@ -2104,13 +2110,23 @@ def _scaffold_body_to_validate(edit: Edit) -> str:
     search = edit.search or ""
     if search:
         s_stripped = search.strip("\n")
-        if s_stripped and s_stripped.count("{") == s_stripped.count("}"):
+        search_whole = bool(s_stripped) and s_stripped.count("{") == s_stripped.count("}")
+
+        def _added(delta: str) -> str:
+            # The anchor is either whole blocks itself, or (the end of an `impl`,
+            # say) the added text is: the kept lines are not the scaffold.
+            delta = delta.strip()
+            if delta and (search_whole or delta.count("{") == delta.count("}")):
+                return delta
+            return ""
+
+        if s_stripped:
             if replace.startswith(search) and (
                 len(replace) == len(search)
                 or replace[len(search)] == "\n"
                 or search.endswith("\n")
             ):
-                delta = replace[len(search) :].strip()
+                delta = _added(replace[len(search) :])
                 if delta:
                     return delta
             if replace.endswith(search) and (
@@ -2118,7 +2134,7 @@ def _scaffold_body_to_validate(edit: Edit) -> str:
                 or replace[-len(search) - 1] == "\n"
                 or search.startswith("\n")
             ):
-                delta = replace[: len(replace) - len(search)].strip()
+                delta = _added(replace[: len(replace) - len(search)])
                 if delta:
                     return delta
     return replace
