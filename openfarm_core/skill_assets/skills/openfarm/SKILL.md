@@ -1,7 +1,7 @@
 ---
 name: openfarm
 description: >-
-  Operate an initialized Openfarm v0.8.5 project across card waves: manage
+  Operate an initialized Openfarm v0.8.6 project across card waves: manage
   multi-provider Frontier ACP OAuth setup (Claude, Antigravity agy, Codex via
   openfarm acp), run automated Driver mode (openfarm drive), clarify feature
   waves with openfarm-grill-me, prepare queues with openfarm supervise, execute
@@ -10,7 +10,7 @@ description: >-
   <state_dir>/harness/ recursive memory.
 ---
 
-# Openfarm Wave Operations Skill (`v0.8.5`)
+# Openfarm Wave Operations Skill (`v0.8.6`)
 
 Use this skill after `/openfarm-initialize` (or `openfarm adopt --lang rust|python|typescript` on an existing repository) has set up `.openfarm/config.toml`, committed the baseline on the base branch, and verified `cards/` via `openfarm check`.
 
