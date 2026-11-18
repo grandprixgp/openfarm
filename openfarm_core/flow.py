@@ -235,6 +235,8 @@ class CardRun:
         self.checker_adjudication: dict = {}
         self.reviewer_brief = ""
         self.clarified_notes = ""
+        # A scaffold the shape call already returned (shape_and_scaffold, v0.8.5).
+        self._early_scaffold = None
         self.extra_context_files: list[str] = [
             normalise(p) for p in (getattr(self.card, "context_files", ()) or ())
         ]
@@ -1968,10 +1970,17 @@ class CardRun:
             ]
             self._refresh_micromanager_harness_context("planner")
             self._check_stop_requested()
+            combined = self._wants_shape_and_scaffold()
             try:
-                decision = self.micromanager.shape_and_plan(
-                    self.card, sigs, ctx_contents, known_tests=known_tests, cfg=self.cfg
-                )
+                if combined:
+                    base_files, _scaffold_sigs = self._scaffold_inputs()
+                    decision, self._early_scaffold = self.micromanager.shape_and_scaffold(
+                        self.card, sigs, ctx_contents, base_files,
+                        known_tests=known_tests, cfg=self.cfg)
+                else:
+                    decision = self.micromanager.shape_and_plan(
+                        self.card, sigs, ctx_contents, known_tests=known_tests, cfg=self.cfg
+                    )
             except (Refused, Invalid, ValueError, Infra) as exc:
                 # Planning is help, not a gate: a supervisor that is slow to answer
                 # costs the card its plan, not its run. Other infra still stops it.
@@ -2310,7 +2319,11 @@ class CardRun:
                           "the test writer produced no usable edit in "
                           f"{self.cfg.test_writer_attempts} attempts: {last_failure}")
 
-    def _run_scaffold_contract(self) -> None:
+    def _wants_shape_and_scaffold(self) -> bool:
+        wants = getattr(self.micromanager, "wants_shape_and_scaffold", None)
+        return bool(callable(wants) and wants(self.card))
+
+    def _scaffold_inputs(self) -> tuple[dict[str, str], dict[str, str]]:
         base_files: dict[str, str] = {}
         sigs: dict[str, str] = {}
         for path in self.card.touches:
@@ -2323,13 +2336,25 @@ class CardRun:
                     sigs[norm] = self.book.signatures(norm, self.pack)
                 except (OSError, Refused):
                     pass
+        return base_files, sigs
+
+    def _run_scaffold_contract(self) -> None:
+        early = getattr(self, "_early_scaffold", None)
+        self._early_scaffold = None
         self._check_stop_requested()
         try:
-            scaffold_edits = self.micromanager.scaffold_contract(
-                self.card, base_files, sigs,
-                never_touch=self.cfg.never_touch,
-                forbidden=self.cfg.forbidden_files,
-            )
+            if early is not None:
+                # The shape call already declared the contract (shape_and_scaffold).
+                if isinstance(early, BaseException):
+                    raise early
+                scaffold_edits = early
+            else:
+                base_files, sigs = self._scaffold_inputs()
+                scaffold_edits = self.micromanager.scaffold_contract(
+                    self.card, base_files, sigs,
+                    never_touch=self.cfg.never_touch,
+                    forbidden=self.cfg.forbidden_files,
+                )
         except (Refused, Invalid, ValueError, Infra) as exc:
             if isinstance(exc, Infra) and exc.code != "acp-timeout":
                 raise

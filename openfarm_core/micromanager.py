@@ -46,7 +46,7 @@ from .edits import (
     FORMAT_WHOLE_FILE,
     parse_edits,
 )
-from .errors import GateFailure, Infra, Invalid, Refused, StopCode, Unsupported
+from .errors import AdapterError, GateFailure, Infra, Invalid, Refused, StopCode, Unsupported
 from .globs import escapes, matches_any, normalise
 from .harness_memory import (
     EDITABLE_SURFACES,
@@ -452,6 +452,10 @@ class ScriptedMicromanager(_ThreadLocalUsageMixin):
     def hello(self) -> dict:
         return {"name": self.name, "versions": [1], "ops": ["hello", "assist"]}
 
+    def supports_op(self, op: str) -> bool:
+        """A script takes a combined op only when it has an answer for it."""
+        return any(key == op or key.endswith(f"/{op}") for key in self.script)
+
     def assist(self, op: str, payload: dict) -> dict:
         self.last_usage = {"tokens_in": 0, "tokens_out": 0, "spend": 0.0}
         clean_payload = {k: v for k, v in payload.items() if k != "_card_dir"}
@@ -526,9 +530,22 @@ class CmdMicromanager(_ThreadLocalUsageMixin):
     def __init__(self, spec: str, repo: Path, timeout_s: float = 180.0) -> None:
         self._init_usage()
         self._adapter = CmdAdapter(spec, repo, timeout_s=timeout_s)
+        self._hello: dict | None = None
 
     def hello(self) -> dict:
-        return self._adapter.hello("micromanager", {"hello", "assist"})
+        self._hello = self._adapter.hello("micromanager", {"hello", "assist"})
+        return self._hello
+
+    def supports_op(self, op: str) -> bool:
+        """An external adapter takes a combined op only when its `hello` lists it
+        under `supervisor_ops` (v0.8.5); one written for the older ops never sees it."""
+        if self._hello is None:
+            try:
+                self.hello()
+            except AdapterError:
+                return False
+        listed = (self._hello or {}).get("supervisor_ops") or ()
+        return isinstance(listed, (list, tuple)) and op in listed
 
     def assist(self, op: str, payload: dict) -> dict:
         self.last_usage = {"tokens_in": 0, "tokens_out": 0, "spend": 0.0}
@@ -570,6 +587,19 @@ _OP_RULES = {
         "`throw new Error(\"not implemented\")`. Imports, types, "
         "classes and typed fields are fine; no other logic, no default values "
         "computed from input. Return {\"edits\": []} if nothing is needed."
+    ),
+    "shape_and_scaffold": (
+        "Two jobs in one answer. First shape the card: `verdict`, `clarified_notes`, "
+        "`extra_context_files`, `steps`, `findings`. Set `steps` to `[]` unless the "
+        "card genuinely needs sequential steps; every entry in a step's `tests` must "
+        "be an exact name from `card.test_names` and every `touches` entry must belong "
+        "to `card.touches`. Then, in `edits`, declare the new symbols' contracts so "
+        "the frozen tests can import them, and nothing else. Edit only production "
+        "files listed in card.touches (their text is in `base_files`), never a test "
+        "file. Every new function's body is only a stub that fails when called: Rust "
+        "`todo!()` or `unimplemented!()`, Python `raise NotImplementedError`, "
+        "TypeScript `throw new Error(\"not implemented\")`. Imports, types, classes "
+        "and typed fields are fine; no other logic. `edits` is `[]` if nothing is needed."
     ),
     "reflect_harness": (
         "Give every lesson a scope. \"general\" means it would help on any project "
@@ -682,6 +712,14 @@ def _build_op_prompt(op: str, payload: dict) -> str:
             '{"edits": [{"format": "search_replace|whole_file", "path": "...", '
             '"search": "...", "replace": "...", "content": "..."}]}'
         ),
+        "shape_and_scaffold": (
+            '{"verdict": "ready|split|ineligible", "clarified_notes": "...", '
+            '"extra_context_files": ["..."], '
+            '"steps": [{"n": 1, "does": "...", "tests": ["..."], "touches": ["..."]}], '
+            '"findings": [{"title": "...", "body": "..."}], '
+            '"edits": [{"format": "search_replace|whole_file", "path": "...", '
+            '"search": "...", "replace": "...", "content": "..."}]}'
+        ),
         "coach": (
             '{"root_cause": "...", "guidance": "...", "abort": false, "abort_reason": ""}'
         ),
@@ -734,6 +772,8 @@ class ClaudeAcpMicromanager(_ThreadLocalUsageMixin):
 
     name = "claude-acp"
     enabled = True
+    #: Answers with a model, so it takes the combined ops (v0.8.5).
+    combined_ops = True
 
     def __init__(
         self,
@@ -946,6 +986,19 @@ SUPERVISOR_OP_EXPECTS: dict[str, dict] = {
             "edit_blocks": {"type": "str"},
         },
     },
+    "shape_and_scaffold": {
+        "op": "shape_and_scaffold",
+        "required": ["verdict"],
+        "verdict": ["ready", "split", "ineligible"],
+        "properties": {
+            "verdict": {"type": "str", "enum": ["ready", "split", "ineligible"]},
+            "clarified_notes": {"type": "str"},
+            "extra_context_files": {"type": "list", "items": "str"},
+            "steps": {"type": "list", "items": "dict"},
+            "findings": {"type": "list", "items": "dict"},
+            "edits": {"type": "list", "items": "dict"},
+        },
+    },
     "coach": {
         "op": "coach",
         "required": ["root_cause", "guidance"],
@@ -1104,6 +1157,7 @@ class TierMicromanagerBackend(_ThreadLocalUsageMixin):
     """Supervisor seat backed by a configured model tier on the worker backend."""
 
     enabled = True
+    combined_ops = True
 
     def __init__(
         self,
@@ -1291,6 +1345,7 @@ class ExternalMicromanagerBackend(_ThreadLocalUsageMixin):
 
     name = "external"
     enabled = True
+    combined_ops = True
 
     def __init__(
         self,
@@ -1544,12 +1599,15 @@ class Micromanager:
         if self.harness_context:
             payload["harness_context"] = dict(self.harness_context)
         raw = self._call_backend("shape_and_plan", card.id, payload)
+        return self._shape_from_answer(card, raw, nt, fb)
 
+    def _shape_from_answer(self, card: Card, raw: dict, nt, fb,
+                           op: str = "shape_and_plan") -> ShapeDecision:
         verdict = str(raw.get("verdict", "")).strip()
         if verdict not in ("ready", "split", "ineligible"):
             raise Invalid(
                 "bad-micromanager-verdict",
-                f"shape_and_plan returned invalid verdict {verdict!r}",
+                f"{op} returned invalid verdict {verdict!r}",
             )
 
         clarified_notes = _strip_edit_blocks(str(raw.get("clarified_notes", "")))
@@ -1642,7 +1700,10 @@ class Micromanager:
             "signatures_by_path": signatures_by_path,
         }
         raw = self._call_backend("scaffold_contract", card.id, payload)
+        return self._scaffold_from_answer(card, raw, nt, fb)
 
+    def _scaffold_from_answer(self, card: Card, raw: dict, nt, fb,
+                              *, missing_ok: bool = False) -> list[Edit]:
         parsed_edits: list[Edit] = []
         raw_blocks = raw.get("edit_blocks")
         raw_list = raw.get("edits")
@@ -1694,6 +1755,8 @@ class Micromanager:
                         test_name=str(entry.get("test_name", "")),
                     )
                 )
+        elif missing_ok and raw_blocks is None and raw_list is None:
+            return []
         else:
             raise Invalid(
                 "bad-micromanager-edits",
@@ -1746,6 +1809,63 @@ class Micromanager:
                 )
 
         return parsed_edits
+
+    # -- 1+2. shape_and_scaffold (v0.8.5) -------------------------------------
+
+    def wants_shape_and_scaffold(self, card: Card) -> bool:
+        """True when one call can do both the shape and the scaffold for `card`.
+
+        That is when both would run anyway (the card declares new symbols or a
+        type change, both features are on, the mode is active) and the backend
+        answers with a model: a scripted or `cmd:` backend keeps the two ops it
+        was written for unless it says otherwise.
+        """
+        if not (self._feature_enabled("combine_calls")
+                and self._feature_enabled("shape_cards")
+                and self._feature_enabled("scaffold_contracts")
+                and self.mode == "active"):
+            return False
+        if not (card.new_symbols or getattr(card, "type_changes", False)):
+            return False
+        supports = getattr(self.backend, "supports_op", None)
+        if callable(supports):
+            return bool(supports("shape_and_scaffold"))
+        return bool(getattr(self.backend, "combined_ops", False))
+
+    def shape_and_scaffold(
+        self,
+        card: Card,
+        signatures_by_path: dict,
+        context_contents: dict,
+        base_files: dict,
+        known_tests=None,
+        cfg=None,
+    ) -> tuple[ShapeDecision, list[Edit] | AdapterError | ValueError]:
+        """Shape the card and declare its contract in one supervisor call.
+
+        The scaffold half comes back as the edits, or as the error the separate
+        `scaffold_contract` would have raised, so the test-writer step handles it
+        exactly as before. A bad shape answer raises, as `shape_and_plan` does.
+        """
+        nt, fb = self._effective_lists(cfg=cfg)
+        payload = {
+            "card_id": card.id,
+            "card": card.as_dict(),
+            "signatures_by_path": signatures_by_path,
+            "context_contents": context_contents,
+            "known_tests": list(known_tests) if known_tests is not None else [],
+            "base_files": base_files,
+        }
+        if self.harness_context:
+            payload["harness_context"] = dict(self.harness_context)
+        raw = self._call_backend("shape_and_scaffold", card.id, payload)
+        decision = self._shape_from_answer(card, raw, nt, fb, op="shape_and_scaffold")
+        try:
+            edits: list[Edit] | AdapterError | ValueError = self._scaffold_from_answer(
+                card, raw, nt, fb, missing_ok=True)
+        except (AdapterError, ValueError) as exc:
+            edits = exc
+        return decision, edits
 
     # -- 3. coach -------------------------------------------------------------
 
@@ -2382,6 +2502,7 @@ def open_micromanager(
             "coach_on_stall",
             "adjudicate_counter_tests",
             "pre_review",
+            "combine_calls",
         )
     }
 

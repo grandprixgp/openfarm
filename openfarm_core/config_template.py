@@ -192,6 +192,8 @@ def render_config(*, name: str, language: str, base_branch: str, state_dir: Path
         "pre_review = true",
         "# openfarm's own bridges replace the provider CLI's built-in system prompt.",
         "lean_prompt = true",
+        "# One supervisor call shapes a card and declares its contract when it needs both.",
+        "combine_calls = true",
         "",
         "[state]",
         "min_free_mb = 256",

@@ -70,7 +70,8 @@ _TABLE_KEYS = {
                      "auth", "auth_file", "isolate_home", "shape_cards",
                      "scaffold_contracts", "coach_on_stall",
                      "adjudicate_counter_tests", "pre_review",
-                     "confine", "confine_read_roots", "lean_prompt"},
+                     "confine", "confine_read_roots", "lean_prompt",
+                     "combine_calls"},
     "state": {"min_free_mb"},
     "harness": {"enabled", "dir", "capture_on", "max_cues_per_brief",
                 "max_active_adaptations", "min_confidence", "probe_window",
@@ -309,7 +310,7 @@ class MicromanagerConfig:
         "auth", "auth_file", "isolate_home", "shape_cards",
         "scaffold_contracts", "coach_on_stall",
         "adjudicate_counter_tests", "pre_review",
-        "confine", "confine_read_roots", "lean_prompt",
+        "confine", "confine_read_roots", "lean_prompt", "combine_calls",
     )
 
     def __init__(self, **kwargs) -> None:
@@ -838,6 +839,9 @@ class Config:
             # openfarm's own bridges replace the provider CLI's built-in prompt.
             lean_prompt=_as_bool(mm.get("lean_prompt"),
                                  "[micromanager] lean_prompt", True),
+            # One supervisor call for shape and scaffold when a card needs both.
+            combine_calls=_as_bool(mm.get("combine_calls"),
+                                   "[micromanager] combine_calls", True),
         )
 
     def _confine_read_roots(self, value) -> list[str]:

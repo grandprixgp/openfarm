@@ -188,6 +188,8 @@ if isinstance(req, dict):
             data = {{"lessons": []}}
         elif op == "scaffold_contract":
             data = {{"edits": []}}
+        elif op == "shape_and_scaffold":
+            data = {{"verdict": "ready", "clarified_notes": f"Mock {{provider}} ready", "edits": []}}
         elif op == "coach":
             data = {{"root_cause": "test failure", "guidance": "check implementation"}}
         elif op == "adjudicate_checker":
