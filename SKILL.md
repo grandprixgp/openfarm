@@ -1,14 +1,14 @@
 ---
 name: openfarm-installer
 description: >-
-  Install the Openfarm v0.8.1 CLI package, multi-provider ACP OAuth bridges and
+  Install the Openfarm v0.8.5 CLI package, multi-provider ACP OAuth bridges and
   Driver mode (Claude Code, Antigravity agy, Codex), /openfarm-grill-me design
   interview, and /openfarm-initialize skills into Claude Code, Antigravity,
   Codex, or workspace customization directories from a single repository or
   package target.
 ---
 
-# Openfarm Installer Skill (`v0.8.1`)
+# Openfarm Installer Skill (`v0.8.5`)
 
 Follow these steps when the user asks you to read and install this skill (`"Read and install this skill <github_or_local_link>"`):
 

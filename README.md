@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.8.1-16a34a?style=flat-square" alt="version 0.8.1">
+  <img src="https://img.shields.io/badge/version-0.8.5-16a34a?style=flat-square" alt="version 0.8.5">
   <img src="https://img.shields.io/badge/status-pre--release-d97706?style=flat-square" alt="status: pre-release">
   <img src="https://img.shields.io/badge/python-3.11%2B-7c3aed?style=flat-square" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/runtime%20deps-stdlib%20only-0284c7?style=flat-square" alt="runtime dependencies: standard library only">
@@ -21,7 +21,7 @@
 
 <p align="center">
   <a href="#quickstart"><b>Quickstart</b></a> &nbsp;&bull;&nbsp;
-  <a href="#what-changed-in-v081"><b>What changed in v0.8.1</b></a> &nbsp;&bull;&nbsp;
+  <a href="#what-changed-in-v085"><b>What changed in v0.8.5</b></a> &nbsp;&bull;&nbsp;
   <a href="#how-it-works"><b>How it works</b></a> &nbsp;&bull;&nbsp;
   <a href="#commands"><b>Commands</b></a> &nbsp;&bull;&nbsp;
   <a href="#whats-verified"><b>What's verified</b></a> &nbsp;&bull;&nbsp;
@@ -30,11 +30,11 @@
 </p>
 
 <p align="center">
-  <img src="docs/assets/openfarm-stats.svg" alt="1438 offline tests with 0 failures, 22 CLI subcommands, 6 adapter interfaces, 0 runtime dependencies" width="100%">
+  <img src="docs/assets/openfarm-stats.svg" alt="TESTCOUNT offline tests with 0 failures, 22 CLI subcommands, 6 adapter interfaces, 0 runtime dependencies" width="100%">
 </p>
 
 > [!IMPORTANT]
-> **Pre-release (v0.8.1).** v0.8.1 adds Codex and Antigravity as frontier providers next to Claude, `openfarm drive` to hold the coordinator and supervisor seats with a CLI agent, and a TypeScript pack. After the first build, two reviews and live runs with the real tools found gaps, and the fix work closed them: Codex and Antigravity children now run inside a bubblewrap boundary, the checker's counter-tests are read and run, and ruff, pytest, cargo-mutants, tsc and prettier are called the way the real programs need. An outside review of the fix work then found no blockers, and its larger findings are fixed too. The offline suite has 1438 tests with no failures. What ran live on 17 Nov 2026, and what has not run at all, is in [What's verified](#whats-verified) and [Not yet tested](#not-yet-tested). With `[swarm] enabled = false` a run behaves as in v0.7.
+> **Pre-release (v0.8.5).** v0.8.5 makes the frontier supervisor cheaper, makes `openfarm drive` behave the same as ACP mode, and fixes the v0.8.1 known limits that code can fix. On the 12 bench tasks with scripted workers, the supervisor is sent 62% fewer prompt characters in 45% fewer calls. One live call through openfarm's own lean prompts takes 58% (Claude) and 57% (Codex) fewer input tokens. Python and TypeScript cards now get a mutation gate, and builds and tests can run in a bubblewrap boundary. The offline suite has TESTCOUNT tests with no failures. What ran live, and what has not run at all, is in [What's verified](#whats-verified) and [Not yet tested](#not-yet-tested). v0.8.1 brought Codex and Antigravity providers, `openfarm drive` and the TypeScript pack; its notes follow v0.8.5's below. With `[swarm] enabled = false` a run behaves as in v0.7.
 
 ---
 
@@ -150,7 +150,36 @@ openfarm check CARD-001
 `openfarm check` also shows the tooling the card's gates will use (test runner, type check or lint, formatter) and the language pack's notes.
 
 - **Python** repositories use `unittest` unless they configure pytest (`pytest.ini` or `[tool.pytest.ini_options]`). `ruff` runs (lint and format) only when the project configures it (`[tool.ruff]` in `pyproject.toml`, `ruff.toml` or `.ruff.toml`) and it is installed. Otherwise lint is a syntax check, formatting is not checked, and the run's notes say which case applies.
-- **TypeScript** tests run only with `node --test`. A test script that uses npm, jest, vitest or mocha is refused at adopt and at check. `tsc --noEmit` runs when the project has `tsc` and a `tsconfig.json`; otherwise the type check is a syntax check by node's own type stripping, no types are checked, and the notes and gate records say "syntax only". `prettier` runs only when the project configures it. Adopt records these choices under `[runner]`, and check and every card use the same ones. Card worktrees link the base checkout's git-ignored `node_modules`. There is no mutation tool for TypeScript.
+- **TypeScript** tests run only with `node --test`. A test script that uses npm, jest, vitest or mocha is refused at adopt and at check. `tsc --noEmit` runs when the project has `tsc` and a `tsconfig.json`; otherwise the type check is a syntax check by node's own type stripping, no types are checked, and the notes and gate records say "syntax only". `prettier` runs only when the project configures it. Adopt records these choices under `[runner]`, and check and every card use the same ones. Card worktrees link the base checkout's git-ignored `node_modules`.
+- **Mutation** for Python and TypeScript (v0.8.5) is openfarm's own runner. It mutates only the lines the card changed, runs the card's named tests against each mutant, and reports caught, missed, timed-out and unviable mutants, as cargo-mutants does for Rust. Nothing needs installing in the project.
+
+## What changed in v0.8.5
+
+For a reader upgrading from v0.8.1. Measurements are in [`docs/v0.8.5-build-log.md`](docs/v0.8.5-build-log.md), and every key is in [`docs/USAGE-AND-FIRST-DEPLOYMENT.md`](docs/USAGE-AND-FIRST-DEPLOYMENT.md).
+
+<p align="center">
+  <img src="docs/assets/openfarm-v085-tokens.svg" alt="Supervisor prompt characters over the 12 bench tasks fell from 233,752 in 44 calls (v0.8.1) to 87,814 in 24 calls (v0.8.5). Input tokens of one live shape_and_plan call fell from 4,239 to 1,779 for Claude and from 10,936 to 4,673 for Codex." width="100%">
+</p>
+
+- **Lean supervisor prompts.** openfarm's Claude and Codex bridges replace the CLI's built-in system prompt with a short one of openfarm's (`[micromanager] lean_prompt`, on by default). Skills, MCP servers and plugins you have installed are not touched.
+- **Smaller payloads.** Every backend (ACP, tier, external seat, `drive`) gets the same compact form: no local paths, a repeated gate shown once, and evidence only where a gate did not pass.
+- **Fewer calls.**
+  - A card that needs both a plan and a contract gets one `shape_and_scaffold` call instead of two (`[micromanager] combine_calls`). An answer without the contract falls back to the separate call.
+  - A clean first-try pass is no longer reflected on (`[harness] reflect_on`). A pass after a handback still is.
+- **Drive like ACP.** With no flags, `drive` takes `[micromanager]`'s model, effort and wait. A turn that only has questions carries only the questions.
+- **Effort on retries.** `[roles.<role>] retry_effort` sets the effort for every attempt after the first, and a coordinator's change never goes below it. This repository's own config runs its DeepSeek roles on high first and max on every retry.
+- **Mutation for Python and TypeScript**, and `[gates] mutation = "required"` is allowed for TypeScript again.
+- **A runner boundary.** `[runner] confine = "bwrap"` (off by default) runs builds and tests where only the worktree, its build folder and `confine_write_roots` can be written, with logins under home and the worker key hidden.
+- **Fixes to v0.8.1's known limits:**
+  - Swarm join errors carry their code (`seat-occupied`, `name-taken`).
+  - A named test whose every parametrized case is on `known_failing` is refused, by `check` and by the run.
+  - Counter-tests restore ignored files past 64 MB.
+  - Lock and seat takeover checks the machine, boot and pid namespace.
+  - Bridges and `drive` retry a provider CLI that is updating itself.
+  - `never_touch` paths behind symlinked folders are hidden.
+  - A read root that holds your home folder is refused.
+  - A standalone `codex-acp` with `read-only` is refused up front where it can't work.
+  - A test proves that parallel cards book their own supervisor spend.
 
 ## What changed in v0.8.1
 
@@ -160,7 +189,7 @@ For a reader upgrading from v0.8. Details are in [`docs/USAGE-AND-FIRST-DEPLOYME
 - **New subcommand.** `openfarm drive` holds the external seats with a `claude`, `codex` or `agy` CLI. There are now 22 subcommands.
 - **New language.** `openfarm adopt --lang typescript` (see above).
 - **New config keys.** `[micromanager] confine` (`"auto"`, `"bwrap"` or `"off"`, default `"auto"`) and `confine_read_roots`. `[runner] typescript` (only `"node"`), `typescript_typecheck`, `typescript_format` and `link_node_modules`. `[micromanager] effort` also takes `"xhigh"` and `"max"`.
-- **New refusals.** A Codex or Antigravity child that needs the boundary is refused when `bwrap` cannot run; `openfarm run` checks this for its worker backend, ACP coordinator and supervisor before any card is claimed, and the refusal names the child. Codex with tool policy `read-only` is refused where Codex's own sandbox cannot start inside the boundary, as on Ubuntu with its default AppArmor rule. A `binary` that names another provider than its adapter is refused (`acp-provider-mismatch`). An Antigravity prompt over 131072 bytes is refused before `agy` starts (`agy-prompt-too-large`). `[gates] mutation = "required"` is a config error when TypeScript is in `languages`.
+- **New refusals.** A Codex or Antigravity child that needs the boundary is refused when `bwrap` cannot run; `openfarm run` checks this for its worker backend, ACP coordinator and supervisor before any card is claimed, and the refusal names the child. Codex with tool policy `read-only` is refused where Codex's own sandbox cannot start inside the boundary, as on Ubuntu with its default AppArmor rule. A `binary` that names another provider than its adapter is refused (`acp-provider-mismatch`). An Antigravity prompt over 131072 bytes is refused before `agy` starts (`agy-prompt-too-large`). `[gates] mutation = "required"` was a config error when TypeScript was in `languages` (lifted in v0.8.5).
 - **Changed behaviour for Python.** v0.8 used `ruff` whenever it was installed; v0.8.1 uses it only where the project configures it.
 - **Changed behaviour for every language.** A named test must fail on base in every row and pass after in every row; a parametrized test's rows count as the test's. A test run the runner classes as infra (timed out, killed) is never green, and neither is one that fails without naming a failing test. A provider turn the child ends as cancelled is an error (`acp-turn-cancelled`), never a short answer. `check --baseline` refuses a named test that is skipped or expected to fail on base (`ignored_on_base`).
 - **The checker.** Both checker passes answer in a fixed form and are asked once more when the answer cannot be read. Counter-tests are written as new files, run one at a time, and removed, and the worktree is put back exactly.
@@ -307,7 +336,7 @@ openfarm keeps a small, bounded memory of what helped weaker models recover from
 The core reads one config file per repository and talks to the outside world only through six adapter interfaces. Each has built-in implementations, and any of them can be swapped for an external command that speaks a small JSON protocol (`{"openfarm": 1, ...}`) over stdin and stdout.
 
 <p align="center">
-  <img src="docs/assets/openfarm-adapters.svg" alt="openfarm core (Python 3.11+ stdlib, one config file enforcing gates, budgets, swarm board and TUI) connected to six adapter interfaces: Card source (files: folder on openfarm-cards), Runner (direct cargo, python, node, BuildLimiter), Language pack (rust, python, typescript), Model backend (openai-compatible, claude|antigravity|codex-acp, scripted), Telemetry (jsonl plus run board and dossiers), and Micromanager &amp; seats (claude|antigravity|codex-acp, openfarm drive, tier:<name>, external, off). Every interface also accepts cmd:<argv> over stdio JSON." width="100%">
+  <img src="docs/assets/openfarm-adapters.svg" alt="openfarm core (Python 3.11+ stdlib, one config file enforcing gates, budgets, swarm board and TUI) connected to six adapter interfaces: Card source (files: folder on openfarm-cards), Runner (direct cargo, python, node, BuildLimiter, an opt-in bwrap boundary), Language pack (rust, python, typescript), Model backend (openai-compatible, claude|antigravity|codex-acp, scripted), Telemetry (jsonl plus run board and dossiers), and Micromanager &amp; seats (claude|antigravity|codex-acp, openfarm drive, tier:<name>, external, off). Every interface also accepts cmd:<argv> over stdio JSON." width="100%">
 </p>
 
 Every adapter also accepts `cmd:<argv>`. Card state lives on its own `openfarm-cards` branch so parallel cards never conflict. TypeScript projects run on `node --test`, with `tsc` when the project has it and a `tsconfig.json`, and `prettier` when the project configures it. Git is the one hard dependency, and nothing in the core names a particular project.
@@ -323,7 +352,7 @@ Every adapter also accepts `cmd:<argv>`. Card state lives on its own `openfarm-c
 | **Provider children** | Isolated home and cleaned environment for every provider; Codex and Antigravity inside a bubblewrap boundary under the default `confine = "auto"` (see [Providers](#providers-claude-codex-and-antigravity)). The boundary shares the network |
 | **State stays out of the repo** | Prompts contain repository text, so the state folder lives outside the repo and should stay out of unencrypted synced folders |
 | **Config is farm-proof** | `.openfarm/**` and `.claude/**` are always forbidden to the farm (and `.gemini/**`, `.codex/**`, `.agents/**` to provider children), and unknown config tables or keys are rejected so a typo can never silently disable a gate |
-| **Tests run as you** | The runner has no sandbox: a test, or the code it runs, can do what your user can. In a TypeScript card that includes writing through the linked `node_modules` into the base checkout |
+| **Tests run as you, unless confined** | By default a test, or the code it runs, can do what your user can, which in a TypeScript card includes writing through the linked `node_modules` into the base checkout. `[runner] confine = "bwrap"` (v0.8.5) leaves only the worktree, its build folder and `confine_write_roots` writable and hides logins under home. It shares the network |
 
 ## Commands
 
@@ -366,7 +395,7 @@ Each repository carries `.openfarm/config.toml` on its base branch, and `openfar
 
 **Three hooks** keep a repository's quirks out of the core: `[[gates.extra]]` for named commands that must pass, `[runner.env]` for per-unit environment variables, and `[brief] test_conventions` for a test-writing guide.
 
-**Provider confinement:** `[micromanager] confine` (`"auto"`, `"bwrap"`, `"off"`) and `confine_read_roots` (extra absolute folders shown read-only inside the boundary). **TypeScript tooling:** `[runner] typescript`, `typescript_typecheck` (`"auto"`, `"tsc"`, `"syntax"`), `typescript_format` (`"auto"`, `"prettier"`, `"off"`) and `link_node_modules`.
+**Provider confinement:** `[micromanager] confine` (`"auto"`, `"bwrap"`, `"off"`) and `confine_read_roots` (extra absolute folders shown read-only inside the boundary). **TypeScript tooling:** `[runner] typescript`, `typescript_typecheck` (`"auto"`, `"tsc"`, `"syntax"`), `typescript_format` (`"auto"`, `"prettier"`, `"off"`) and `link_node_modules`. **Runner boundary:** `[runner] confine` (`"off"`, `"bwrap"`) and `confine_write_roots`. **Supervisor cost:** `[micromanager] lean_prompt` and `combine_calls`, `[harness] reflect_on`, and `retry_effort` in each `[roles.<role>]` table.
 
 Every key, gate, stop code (`19` per-card stop codes including `handed-back` and `seat-silent`) and record format is documented in [`docs/openfarm-internals.md`](docs/openfarm-internals.md) (and the owner's local spec `openfarm spec v0.8.md` when present).
 
@@ -376,14 +405,14 @@ Every key, gate, stop code (`19` per-card stop codes including `handed-back` and
 
 ### The offline suite
 
-On the final v0.8.1 tree, Python 3.14 on Linux:
+On the final v0.8.5 tree, Python 3.14 on Linux:
 
 | Run | Result |
 | --- | --- |
-| Default, no optional tools on `PATH` | **1438 tests**, 89 skipped, **0 failures** |
-| `OPENFARM_E2E=1` with ruff 0.17.5, tsc 7.0.2, prettier 3.10.1 and cargo-mutants 27.1.0 on `PATH` | **1438 tests**, 15 skipped, **0 failures** |
+| Default, no optional tools on `PATH` | **TESTCOUNT tests**, SKIPPLAIN skipped, **0 failures** |
+| `OPENFARM_E2E=1` with ruff 0.17.5, tsc 7.0.2, prettier 3.10.1, cargo-mutants 27.1.0 and pytest 9.2.0 on `PATH` | **TESTCOUNT tests**, SKIPTOOLS skipped, **0 failures** |
 
-A test that needs a real tool skips itself when the tool is missing, so the default run's skip count depends on what you have installed. Of the 15 skipped in the second run, 12 need a Python that can import pytest and pass when run under one (pytest 9.2.0); the others are stand-in tests that step aside when the real tool is there. Each test process keeps its temp files in one folder of its own and removes it at exit.
+A test that needs a real tool skips itself when the tool is missing, so the default run's skip count depends on what you have installed. The ones skipped in the second run are stand-in tests that step aside when the real tool is there. Each test process keeps its temp files in one folder of its own and removes it at exit.
 
 The suite includes, among the rest:
 
@@ -398,9 +427,18 @@ The suite includes, among the rest:
 - `openfarm drive` with scripted and stand-in drivers: abort, turn timeout, seat time-outs, spend, rejoin;
 - `openfarm adopt` on Python, Rust and TypeScript repositories, including a red suite proposed in a comment and a crate that does not build refused before anything is written;
 - every one of the 12 bench tasks: its scripted answer passes its hidden tests through a real `openfarm run`, and its untouched starting project fails them;
+- openfarm's mutation runner on a Python and a TypeScript card end to end, and the runner boundary in a real `bwrap` (a test cannot write outside its worktree or read a hidden key);
 - parallel non-colliding Rust `cargo` card execution, the PTY-tested `curses` TUI, and human CLI formatting with `--json` parity.
 
 Model calls in these tests use a scripted backend and local HTTP test servers, and the provider tests use stand-in CLIs. No test calls a real model.
+
+### Tested live in v0.8.5 (18 Nov 2026)
+
+- One `shape_and_plan` call through openfarm's Claude bridge and its Codex bridge, with and without the lean prompt. Input fell from 4,239 to 1,779 tokens on Claude and from 10,936 to 4,673 on Codex.
+- One merged `shape_and_scaffold` call through each bridge: 2,186 input tokens on Claude and 4,939 on Codex, both answering `ready` with a correct stub.
+- Command Code taking `reasoning_effort = "high"` and `"max"` for DeepSeek V4.1 Flash.
+
+There is no live bench on v0.8.5 yet, so no live worker-to-supervisor token share.
 
 ### Tested live in the v0.8.1 fix work (17 and 18 Nov 2026)
 
@@ -419,6 +457,7 @@ The first build's live runs (before the fix work) are kept, with what has change
 ## Not yet tested
 
 > [!WARNING]
+> - A live bench on v0.8.5, a live `drive` since the v0.8.5 drive changes, `[runner] confine = "bwrap"` on a real project's build, and the mutation runner on a large project.
 > - Everything Antigravity since the first agent's runs: the boundary around `agy`, the login copy, the prompt-size refusal, the driver. Nobody may run `agy` unattended here.
 > - A turn through a standalone `codex-acp` server, and so per-card confined servers with it.
 > - Codex `read-only` inside the boundary on a system that allows a nested sandbox.
@@ -438,7 +477,9 @@ The first build's live runs (before the fix work) are kept, with what has change
 - [x] **TypeScript pack:** `openfarm adopt --lang typescript`, `node --test` with a per-file check that every listed test ran, `tsc` and `prettier` when the project has them.
 - [x] **Counter-tests that run:** fixed answer forms for both checker passes, checked live on 24 runs.
 - [x] **Bench on the final code, one repeat:** Codex and Claude, farm and solo ([`docs/bench-v0.8.1.md`](docs/bench-v0.8.1.md)).
-- [ ] **Run the full 3-repeat bench live**, and measure lighter supervision against the solo arm: with a supervisor on every card the farm arm did not use fewer tokens than the frontier model alone.
+- [x] **Lighter supervision (v0.8.5):** lean prompts, compact payloads, one call for shape and scaffold, no reflection on clean passes.
+- [x] **Mutation for every pack and an opt-in runner boundary (v0.8.5).**
+- [ ] **Run the full 3-repeat bench live on v0.8.5**, and measure the lighter supervision against the solo arm: on v0.8.1, with a supervisor on every card, the farm arm used more tokens than the frontier model alone.
 - [ ] **Efficacy pilot & gate calibration:** write and run the 25-card all-Rust pilot with frontier baseline cards, and measure `counter_tests = "reject"` and `cargo-mutants` payback before promoting `reject` / `required` gates.
 
 ## Contributing

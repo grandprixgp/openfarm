@@ -1,14 +1,58 @@
-# Openfarm v0.8.1 Engineering Handoff
+# Openfarm v0.8.5 Engineering Handoff
 
-Concise entry point for engineers reviewing, testing, or extending Openfarm v0.8.1.
+Concise entry point for engineers reviewing, testing, or extending Openfarm v0.8.5.
 
 For greenfield empty-folder initialization (`"Read and install this skill <link>"` -> `/openfarm-grill-me` -> `"/openfarm-initialize calorie-log ..."`), see [docs/FROM-IDEA-TO-SHIPPED-APP.md](FROM-IDEA-TO-SHIPPED-APP.md). For step-by-step operator instructions, config table reference, provider setup, card authoring rules, and the executable `tallybox` first-deployment runbook on existing repos, see [docs/USAGE-AND-FIRST-DEPLOYMENT.md](USAGE-AND-FIRST-DEPLOYMENT.md). Module-level detail is in [docs/openfarm-internals.md](openfarm-internals.md).
 
-## Current State (v0.8.1, 17 Nov 2026)
+## Current State (v0.8.5, 18 Nov 2026)
+
+v0.8.5 makes the supervisor cheaper in tokens, makes `openfarm drive` behave the same as ACP mode, and fixes the v0.8.1 known limits that code can fix. Over the 12 bench tasks with scripted workers, the supervisor gets 62% fewer prompt characters in 45% fewer calls. One live call through the lean prompts takes 58% (Claude) and 57% (Codex) fewer input tokens. The details are in [docs/v0.8.5-build-log.md](v0.8.5-build-log.md).
+
+### Done in v0.8.5
+
+- **Supervisor tokens.**
+  - openfarm's bridges replace Claude's and Codex's built-in system prompts (`[micromanager] lean_prompt`).
+  - Payloads are compact: no local paths, and passing gates are cut down.
+  - One `shape_and_scaffold` call replaces two calls when a card needs both (`[micromanager] combine_calls`).
+  - A clean first-try pass gets no reflection call (`[harness] reflect_on`).
+- **Drive parity.**
+  - With no flags, `drive` uses `[micromanager]`'s model, effort and wait.
+  - A drive turn with only questions carries only the questions.
+  - Drive sees the same compact payloads as every other backend.
+- **Worker effort.** `[roles.<role>] retry_effort` sets the effort for every retry. In this repository's config the DSF roles run high on the first try and max on every retry.
+- **Backlog.**
+  - Mutation for Python and TypeScript, through openfarm's own runner.
+  - An opt-in runner boundary (`[runner] confine = "bwrap"`).
+  - Parametrized `known_failing` rows are refused.
+  - Counter-test restore past 64 MB.
+  - Lock takeover now checks the machine, boot and pid namespace.
+  - Provider CLIs that are updating themselves get retried.
+  - `never_touch` paths behind symlinked folders are hidden.
+  - A read root holding home is refused.
+  - Standalone `codex-acp` with `read-only` is refused where it can't run.
+  - JSON error codes.
+  - A test for parallel supervisor spend.
+- **Tests.** TESTS_PLACEHOLDER
+
+### Tested live in v0.8.5
+
+- One `shape_and_plan` call through the Claude and the Codex bridge, with the built-in system prompt and with the lean one.
+- One merged `shape_and_scaffold` call through each bridge. Both answered `ready` with a correct stub.
+- Command Code taking `reasoning_effort = "high"` and `"max"` for DeepSeek V4.1 Flash.
+
+### Untested in v0.8.5
+
+- A full live bench, so there is no live worker-to-supervisor token share for v0.8.5 yet.
+- A live `openfarm drive` run since the drive changes.
+- `[runner] confine = "bwrap"` on a real project's build (only offline tests in a real bwrap).
+- openfarm's mutation runner on a large project (only the test toys and two small projects).
+- Anything with Antigravity, as before.
+
+## v0.8.1 (17 Nov 2026)
 
 v0.8.1 was built in two rounds. The first agent added Codex and Antigravity as providers, `openfarm drive` and the TypeScript pack. Two reviews and live runs with the real tools then found gaps, and the fix work closed them. Since the first agent's last commit (`3129c0e`): 130 files changed, about 25,900 lines added and 2,900 removed, tests included. The history of both rounds is in [docs/v0.8.1-build-log.md](v0.8.1-build-log.md).
 
-### Done
+### Done in v0.8.1
 
 - **Providers.** Claude, Codex and Antigravity for the micromanager, swarm seats and an ACP worker backend. Codex and Antigravity children run inside a bubblewrap boundary under the default `[micromanager] confine = "auto"` (Codex through openfarm's bridge with tool policy `none` also has its tools turned off by flags, and runs on those flags alone when `bwrap` is missing). Logins are found through `CLAUDE_CONFIG_DIR` / `CODEX_HOME` and copied back only when checked. A binary that names another provider is refused.
 - **Drive.** `openfarm drive` holds the coordinator and supervisor seats with a `claude`, `codex` or `agy` CLI. An aborted drive ends cleanly and frees the lock; there are no made-up answers or verdicts; the driver's spend counts in a managed run; each turn has a timeout and its own process group; a driven run's token split counts the driver.
@@ -37,27 +81,22 @@ Real ruff, pytest, cargo-mutants, tsc and prettier; the checker with a live mode
 
 ### Known Limits
 
-- **The runner has no sandbox.** Tests, and the code they run, can do what your user can. A TypeScript test that writes through the linked `node_modules` into the base checkout is not undone.
-- **Parallel swarm spend.** In a parallel swarm run, a card's `micromanager_spend` may include other cards' supervisor spend from the same moment (unproven, noted by a builder).
-- **Parametrized tests and `known_failing`.** A card whose every pytest parameter row is on `known_failing` passes the eligibility rule's name check, because that rule compares exact names.
 - **Claude under `confine = "auto"`** has no OS boundary from openfarm; Claude Code's own settings hold it. `confine = "bwrap"` puts it in the boundary.
-- **Codex `read-only`** cannot run inside the boundary where Codex's own sandbox cannot start (Ubuntu's default AppArmor rule) and is refused there.
+- **Codex `read-only`** can't run inside the boundary where Codex's own sandbox can't start (Ubuntu's default AppArmor rule), so it is refused there, for the bridge and for a standalone `codex-acp` alike.
 - **Standalone `codex-acp`** (0.16.0) completed no turn on a ChatGPT login; use `binary = "codex-exec"`.
-- **Unpriced providers.** Codex and Antigravity report no cost. Without per-1k rates their spend reads zero and the spend caps cannot fire on it; the run's notes say so.
-- **The boundary shares the network**, because the model call needs it. That includes this machine's loopback services.
-- **What the boundary mounts.** A provider program installed outside a `bin` folder or a `node_modules` tree gets its whole folder mounted read-only. `confine_read_roots` are mounted as given, without the guards the install folders get, and the worker key file is not hidden inside them.
-- **Hidden files and links.** A `never_touch` file reached through a symlinked folder in the worktree is not hidden from a confined child. A standalone server's hidden-file list is fixed when the server starts.
-- **A standalone `codex-acp` with `read-only`** is started although its shell cannot work inside the boundary; only the bridge refuses up front.
-- **Cached input tokens** are added to a server's input count unless its own total shows they are already in it; a server that includes them and reports no total would be counted high, which stops a cap early, never late.
-- **Lock and seat takeover** trust the pid and hostname. Two processes with the same hostname in different pid namespaces (containers), or a state folder shared between machines with the same hostname, can see each other as gone.
-- **Counter-tests on a dirty worktree.** The restore is exact for the clean worktree a card normally has; a difference after the restore is logged, not failed. Ignored files that were already there are put back from a copy kept in memory, up to 64 MB in total; a larger one that a counter-test changes is logged as not put back.
-- **A provider CLI that updates itself during a run** can be missing for a moment (seen with Claude Code's npm auto-update, twice in one bench). Cards that start a child then stop as `infra` ("Failed to spawn"); nothing is retried. For a long run, point `[micromanager] binary` at a fixed copy or turn the CLI's auto-update off.
-- **`openfarm swarm join` errors** carry no code in JSON, so a script cannot tell `seat-occupied` from `name-taken`.
-- **No mutation tool for Python or TypeScript.**
+- **Unpriced providers.** Codex and Antigravity report no cost. Without per-1k rates their spend reads zero and the spend caps can't fire on it; the run's notes say so.
+- **The boundary shares the network**, because the model call needs it. That includes this machine's loopback services. The same holds for `[runner] confine = "bwrap"`.
+- **What the boundary mounts.** A provider program installed outside a `bin` folder or a `node_modules` tree gets its whole folder mounted read-only. `confine_read_roots` are mounted as given, without the guards the install folders get, and the worker key file isn't hidden inside them. A read root that holds your home folder is refused.
+- **A standalone server's hidden-file list** is fixed when the server starts.
+- **Cached input tokens** are added to a server's input count unless its own total shows they are already in it. A server that includes them and reports no total would be counted high, which stops a cap early, never late.
+- **The runner boundary is opt-in** (`[runner] confine = "off"` by default). Without it, tests and the code they run can do whatever your user can. With it, a tool that writes outside the worktree (a download cache, `~/.cargo/registry`) fails unless that folder is listed in `confine_write_roots`.
+- **openfarm's mutation runner** makes a fixed set of small changes: operators, constants, returned values, and for TypeScript token swaps outside strings and comments. It is no full mutation framework. At most 40 mutants run per gate, spread evenly over the changed lines, and the record says when the cap was hit.
+- **A merged `shape_and_scaffold` answer** that gives a contract the gates refuse is handled as a refused `scaffold_contract`. It isn't retried as a separate call; only an answer with no contract at all is.
+- **Counter-tests on a dirty worktree.** The restore is exact for the clean worktree a card normally has. A difference after the restore is logged, not failed.
 
 ### Where the Records Are
 
-- **In this repository:** the [build log](v0.8.1-build-log.md) (both rounds, with trees and token shares), the [bench report](bench-v0.8.1.md), the [README](../README.md) live and untested lists, and the claim-to-test table in [internals](openfarm-internals.md#verification-status--claim-to-test-mapping).
+- **In this repository:** the [v0.8.5 build log](v0.8.5-build-log.md), the [v0.8.1 build log](v0.8.1-build-log.md) (both rounds, with trees and token shares), the [bench report](bench-v0.8.1.md), the [README](../README.md) live and untested lists, and the claim-to-test table in [internals](openfarm-internals.md#verification-status--claim-to-test-mapping).
 - **Per run:** `<state_dir>/runs/<run_id>/run.json` (notes, token split, `tokens.with_driver` in a driven run), `<state_dir>/cards/<card>/<run>/` (briefs, responses, gate records including `gates/counter-test-N.json` and `gates/mutation/N/`, `dossier.md`, `verdict.json`), and the board under `runs/<run_id>/board/`.
 - **Bench:** `bench-report.md`, `bench-report.json` and `records.jsonl` in the `--out` folder.
 - The raw outputs of the 17 Nov live runs are kept outside the repository with the fix work's notes.

@@ -40,8 +40,8 @@
 <circle cx="988" cy="112" r="15" fill="#34d399"/>
 <text x="988" y="117.5" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="15" font-weight="800" fill="#0b1220" text-anchor="middle" >4</text>
 <text x="1014" y="118" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="17" font-weight="700" fill="#f1f5f9" text-anchor="start" >Shape + plan</text>
-<text x="978" y="158" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#9fb0c8" text-anchor="start" >One supervisor call shapes the</text>
-<text x="978" y="179" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#9fb0c8" text-anchor="start" >plan and the contract stubs.</text>
+<text x="978" y="158" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#9fb0c8" text-anchor="start" >Supervisor (in one call) or</text>
+<text x="978" y="179" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#9fb0c8" text-anchor="start" >planner shapes plan + stubs.</text>
 <rect x="958" y="248" width="282" height="128" rx="12" fill="#34d399" fill-opacity="0.08" stroke="#34d399" stroke-opacity="0.75" stroke-width="1.5"/>
 <circle cx="988" cy="280" r="15" fill="#34d399"/>
 <text x="988" y="285.5" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="15" font-weight="800" fill="#0b1220" text-anchor="middle" >5</text>
