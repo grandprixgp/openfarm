@@ -19,7 +19,7 @@ v0.8.1 was built in two rounds. The first agent added Codex and Antigravity as p
 
 ### Tested live (17 Nov 2026)
 
-Real ruff, pytest, cargo-mutants, tsc and prettier; the checker with a live model on 24 runs; Codex through the bridge inside the boundary (and one bench card supervised that way); a standalone `codex-acp` up to handshake and options; Claude through the bridge and the standalone `claude-agent-acp`; `openfarm drive` with real Codex and real Claude. Numbers are in the [README](../README.md#whats-verified), the [build log](v0.8.1-build-log.md) and the [bench report](bench-v0.8.1.md).
+Real ruff, pytest, cargo-mutants, tsc and prettier; the checker with a live model on 24 runs; Codex through the bridge inside the boundary (and one bench card supervised that way); a standalone `codex-acp` up to handshake and options; Claude through the bridge and the standalone `claude-agent-acp`; `openfarm drive` with real Codex and real Claude; the 12-task bench with Codex and with Claude, farm and solo, one repeat, before and after the test-writer fixes. Numbers are in the [README](../README.md#whats-verified), the [build log](v0.8.1-build-log.md) and the [bench report](bench-v0.8.1.md).
 
 ### Explicitly Untested
 
@@ -51,6 +51,7 @@ Real ruff, pytest, cargo-mutants, tsc and prettier; the checker with a live mode
 - **Cached input tokens** are added to a server's input count unless its own total shows they are already in it; a server that includes them and reports no total would be counted high, which stops a cap early, never late.
 - **Lock and seat takeover** trust the pid and hostname. Two processes with the same hostname in different pid namespaces (containers), or a state folder shared between machines with the same hostname, can see each other as gone.
 - **Counter-tests on a dirty worktree.** The restore is exact for the clean worktree a card normally has; a difference after the restore is logged, not failed.
+- **A provider CLI that updates itself during a run** can be missing for a moment (seen with Claude Code's npm auto-update, twice in one bench). Cards that start a child then stop as `infra` ("Failed to spawn"); nothing is retried. For a long run, point `[micromanager] binary` at a fixed copy or turn the CLI's auto-update off.
 - **`openfarm swarm join` errors** carry no code in JSON, so a script cannot tell `seat-occupied` from `name-taken`.
 - **No mutation tool for Python or TypeScript.**
 
