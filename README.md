@@ -402,7 +402,7 @@ The suite includes, among the rest:
 
 Model calls in these tests use a scripted backend and local HTTP test servers, and the provider tests use stand-in CLIs. No test calls a real model.
 
-### Tested live in the v0.8.1 fix work (17 Nov 2026)
+### Tested live in the v0.8.1 fix work (17 and 18 Nov 2026)
 
 Numbers and trees are in [`docs/v0.8.1-build-log.md`](docs/v0.8.1-build-log.md) and [`docs/bench-v0.8.1.md`](docs/bench-v0.8.1.md). Where workers or a live checker ran, they were DeepSeek V4.1 Flash on Command Code with `x-cmd-zdr: 1`.
 
@@ -412,6 +412,7 @@ Numbers and trees are in [`docs/v0.8.1-build-log.md`](docs/v0.8.1-build-log.md) 
 - **A standalone `codex-acp` server** (0.16.0): handshake, new session and option setting work inside the boundary; no turn completed on a ChatGPT login.
 - **Claude** (Haiku 5.5 and Opus 5.5) through openfarm's bridge and through the standalone `claude-agent-acp`, tool policy `none` and `read-only`: all answered, with the login found through `CLAUDE_CONFIG_DIR`.
 - **`openfarm drive`** with real Codex (inside the boundary) and real Claude: each took one card to `in-review` with hidden tests passing, and recorded a wave verdict.
+- **The 12-task bench, one repeat, with Codex and with Claude** (Opus 5.5), farm and solo arms, before and after the test-writer fixes. On the fixed code: Codex farm 12 of 12 and solo 12 of 12; Claude farm 11 of 12 and solo 12 of 12. With a supervisor on every card the farm arms used more tokens in total than the frontier model alone, and moved 13% (Codex) and 21% (Claude) of the frontier model's tokens off it. Tables, token shares and each loss's cause are in the bench report.
 
 The first build's live runs (before the fix work) are kept, with what has changed since, in the build log.
 
@@ -436,7 +437,8 @@ The first build's live runs (before the fix work) are kept, with what has change
 - [x] **Provider lock-down:** Codex tool flags and a bubblewrap boundary for Codex and Antigravity children (`[micromanager] confine`).
 - [x] **TypeScript pack:** `openfarm adopt --lang typescript`, `node --test` with a per-file check that every listed test ran, `tsc` and `prettier` when the project has them.
 - [x] **Counter-tests that run:** fixed answer forms for both checker passes, checked live on 24 runs.
-- [ ] **Run the full 3-repeat bench live** on the final code, across arms including Claude ([`docs/bench-v0.8.1.md`](docs/bench-v0.8.1.md)).
+- [x] **Bench on the final code, one repeat:** Codex and Claude, farm and solo ([`docs/bench-v0.8.1.md`](docs/bench-v0.8.1.md)).
+- [ ] **Run the full 3-repeat bench live**, and measure lighter supervision against the solo arm: with a supervisor on every card the farm arm did not use fewer tokens than the frontier model alone.
 - [ ] **Efficacy pilot & gate calibration:** write and run the 25-card all-Rust pilot with frontier baseline cards, and measure `counter_tests = "reject"` and `cargo-mutants` payback before promoting `reject` / `required` gates.
 
 ## Contributing
