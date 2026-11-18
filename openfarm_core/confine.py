@@ -720,6 +720,30 @@ RUNNER_HIDDEN_HOME = (".ssh", ".gnupg", ".aws", ".config/openfarm", ".claude",
                       ".docker/config.json", ".kube", ".git-credentials", ".pypirc",
                       ".npmrc")
 
+#: Variables that name a login folder kept outside the default places (v0.8.6).
+RUNNER_LOGIN_DIR_ENV = ("CLAUDE_CONFIG_DIR", "CODEX_HOME")
+
+_SECRET_ENV_SUFFIXES = ("_TOKEN", "_API_KEY", "_APIKEY", "_SECRET", "_SECRET_KEY",
+                        "_ACCESS_KEY", "_PASSWORD", "_PASSWD", "_CREDENTIALS")
+
+
+def secret_env_names(environ, keep=()) -> list[str]:
+    """Names in `environ` that look like tokens, keys or passwords (v0.8.6).
+
+    They are unset inside the runner boundary, since the network is shared and a
+    test could send one anywhere. `keep` (what `[runner.env]` sets on purpose)
+    stays.
+    """
+    kept = {str(k) for k in keep}
+    out = []
+    for name in environ:
+        upper = str(name).upper()
+        if name in kept:
+            continue
+        if upper.endswith(_SECRET_ENV_SUFFIXES) or upper in ("GITHUB_TOKEN", "GH_TOKEN"):
+            out.append(str(name))
+    return sorted(out)
+
 
 def runner_argv(
     argv: list[str],
@@ -727,6 +751,8 @@ def runner_argv(
     worktree: Path | str,
     write_roots=(),
     hide_paths=(),
+    unset_env=(),
+    environ=None,
     bwrap: str | None = None,
 ) -> list[str]:
     """Wrap one gate command (a build, a test run) in a boundary (v0.8.5).
@@ -735,7 +761,9 @@ def runner_argv(
     only the card's worktree, the extra `write_roots` (a build target folder, a
     cache) and a private /tmp can be written. A test that writes through a linked
     `node_modules` into the base checkout, or anywhere else, gets an error instead.
-    Logins and keys under home, and `hide_paths`, are hidden. The network is shared.
+    Logins and keys under home, and `hide_paths`, are hidden, and so are the login
+    folders `CLAUDE_CONFIG_DIR` and `CODEX_HOME` name wherever they are (v0.8.6).
+    The variables in `unset_env` are unset. The network is shared.
     """
     exe = bwrap or find_bwrap()
     if not exe:
@@ -763,6 +791,11 @@ def runner_argv(
     hidden: list[Path] = [Path(p) for p in (hide_paths or ()) if str(p)]
     if real_home is not None:
         hidden += [real_home / name for name in RUNNER_HIDDEN_HOME]
+    source = os.environ if environ is None else environ
+    for name in RUNNER_LOGIN_DIR_ENV:
+        raw = str(source.get(name) or "").strip()
+        if raw and os.path.isabs(os.path.expanduser(raw)):
+            hidden.append(Path(os.path.expanduser(raw)))
     for path in _dedupe(hidden):
         if not os.path.lexists(path):
             continue
@@ -773,6 +806,8 @@ def runner_argv(
             args.extend(["--tmpfs", str(real), "--remount-ro", str(real)])
         else:
             args.extend(["--ro-bind", "/dev/null", str(real)])
+    for name in sorted({str(n) for n in unset_env or () if str(n)}):
+        args.extend(["--unsetenv", name])
     args.extend(["--setenv", "TMPDIR", "/tmp", "--chdir", str(tree), "--", *argv])
     return args
 
