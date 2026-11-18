@@ -102,5 +102,42 @@ class TestLintBeforeFreezeTests(unittest.TestCase):
         self.assertIn("tests/full.rs", rec["evidence"]["files"])
 
 
+UNFORMATTED_TEST = (
+    "use toy::fascicle::{Fascicle, FascicleError};\n\n#[test]\n"
+    "fn a_full_fascicle_refuses_a_push() {\n"
+    "  let mut fascicle = Fascicle::new( 1 );\n"
+    "  fascicle.push(7).unwrap();\n"
+    "  assert_eq!(fascicle.push(8), Err(FascicleError::Full));\n}"  # no final newline
+)
+
+
+@unittest.skipUnless(ENABLED and shutil.which("rustfmt"), "set OPENFARM_E2E=1 with rustfmt")
+class TestFormatBeforeFreezeTests(TestLintBeforeFreezeTests):
+    """Pilot, 18 Nov 2026: every Rust test file froze without its final newline."""
+
+    def test_a_lint_finding_in_the_tests_goes_back_to_the_test_writer(self) -> None:
+        self.skipTest("covered by the parent class")
+
+    def test_the_test_writers_files_are_formatted_before_they_freeze(self) -> None:
+        import subprocess
+        backend = QueueBackend({
+            "test_writer": [_write("tests/full.rs", UNFORMATTED_TEST)],
+            "implementer": [FIX],
+            "*": ["{}"],
+        })
+        outcome = self._run(backend)
+        self.assertEqual(outcome.get("final_state"), "in-review", json.dumps(outcome)[:2000])
+        branch = subprocess.run(
+            ["git", "-C", str(self.toy.root), "branch", "--list", "openfarm/CARD-1-*",
+             "--format=%(refname:short)"], capture_output=True, text=True).stdout.split()[0]
+        frozen = subprocess.run(["git", "-C", str(self.toy.root), "show", f"{branch}:tests/full.rs"],
+                                capture_output=True, text=True).stdout
+        self.assertTrue(frozen.endswith("}\n"), repr(frozen[-20:]))
+        self.assertIn("    let mut fascicle = Fascicle::new(1);", frozen)
+        check = subprocess.run(["rustfmt", "--check", "--edition", "2021"], input=frozen,
+                               capture_output=True, text=True)
+        self.assertEqual(check.returncode, 0, check.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

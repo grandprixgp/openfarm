@@ -2274,6 +2274,7 @@ class CardRun:
                 continue
 
             try:
+                self._format_new_tests()
                 self._prove_current_tests()
                 self._lint_new_tests()
             except GateFailure as exc:
@@ -2436,6 +2437,38 @@ class CardRun:
         if self._tests_proven_in_phase_a:
             return
         self._prove_current_tests()
+
+    def _format_new_tests(self) -> None:
+        """Run the pack's formatter over the card's test files before they freeze.
+
+        `_format_touched` leaves frozen files alone, so whatever the test writer
+        wrote was frozen unformatted: every Rust test file in the 18 Nov 2026
+        pilot lacked its final newline and failed `cargo fmt --check`, and a
+        live TypeScript card's test file failed `prettier --check`. Formatting
+        changes no test's meaning, so it happens once here, before the proof
+        and the hashes. A file that was not format-clean at base is left alone,
+        as `_format_touched` does.
+        """
+        paths = [normalise(t.file) for t in self.card.tests if t.file]
+        paths = [p for p in dict.fromkeys(paths) if (self.worktree / p).is_file()]
+        if not paths:
+            return
+        kinds = self.pack.classify_paths(paths)
+        clean = [p for p in paths if kinds.get(p, "other") != "other"
+                 and self._was_format_clean_at_base(p)]
+        if not clean:
+            return
+        try:
+            argv = self.pack.commands("format", files=clean)["argv"]
+        except (Invalid, KeyError):
+            return
+        if not argv:
+            return
+        result = self._run(runner_kind("extra"), argv, counted="fixed")
+        if result.cls != PASS:
+            # A file the formatter cannot parse fails the proof or the lint
+            # with a clearer message; nothing to add here.
+            self.log(f"{self.card.id}: the formatter could not format the new tests")
 
     def _lint_new_tests(self) -> None:
         """Lint once before the tests freeze, and give the test writer its own lint.
