@@ -57,6 +57,8 @@ from .swarm import (
     WORKER_ROLES,
     _card_progress,
     cards_collide,
+    holds_seat,
+    new_seat_holder,
     swarm_ask,
     swarm_block,
     swarm_hint,
@@ -746,7 +748,7 @@ class DriverAgent:
                 # never a second error over the first.
                 try:
                     self._sync_back(isolated_home, cred_source, initial_bytes)
-                except Exception as exc:  # noqa: BLE001 - noted, the turn's own error wins
+                except Exception as exc:  # noted: the turn's own error wins
                     note = (
                         f"the {self.provider} login could not be checked for a refresh "
                         f"after the failed turn: {type(exc).__name__}: "
@@ -2305,6 +2307,11 @@ def drive_run(
     run_exc: list[BaseException] = []
     run_rc: list[int] = []
     joined: list[str] = []
+    # Who holds the seats this drive joins: its pid, host and a token kept here
+    # only. A second drive or a person can then not take them by reusing the
+    # names, and this drive's end removes only what it still holds.
+    seat_holder = new_seat_holder()
+    seat_notes: list[str] = []
     ks_path = Path(active_cfg.kill_switch) if getattr(active_cfg, "kill_switch", None) else None
 
     def _body() -> dict:
@@ -2426,16 +2433,21 @@ def drive_run(
         ) as drv:
             driver_confine = drv.hold.as_dict() if driver_script is None else {}
             if not board.is_ended():
-                if clean_seat in ("both", "coordinator"):
-                    swarm_join(
-                        board, active_cfg, name=coord_name, seat="coordinator", owner_kind="agent"
+                for m_seat, m_name in (("coordinator", coord_name), ("supervisor", sup_name)):
+                    if clean_seat not in ("both", m_seat):
+                        continue
+                    member = swarm_join(
+                        board, active_cfg, name=m_name, seat=m_seat, owner_kind="agent",
+                        holder=seat_holder,
                     )
-                    joined.append(coord_name)
-                if clean_seat in ("both", "supervisor"):
-                    swarm_join(
-                        board, active_cfg, name=sup_name, seat="supervisor", owner_kind="agent"
-                    )
-                    joined.append(sup_name)
+                    joined.append(m_name)
+                    old = member.get("took_over")
+                    if isinstance(old, dict):
+                        seat_notes.append(
+                            f"took over seat {m_seat} as {m_name} from a holder that is no "
+                            f"longer running (pid {old.get('pid')} on {old.get('host')}, "
+                            f"since {old.get('since')})"
+                        )
 
                 sys_prompt = _build_driver_system_prompt(clean_seat, coord_name, sup_name)
                 scan_seq = 0
@@ -2829,6 +2841,7 @@ def drive_run(
             bool(run_rc) and run_rc[0] != 0
         )
         report = _driver_spend_report(counters, provider)
+        report["notes"].extend(n for n in seat_notes if n not in report["notes"])
         # How the CLI child was held (`off`, flags alone) and refused credential
         # copies go with the spend notes, into the payload and `run.json`.
         for note in drv.notes:
@@ -2892,6 +2905,7 @@ def drive_run(
             run_thread=run_thread,
             ks_path=ks_path,
             joined=joined,
+            holder=seat_holder,
         ):
             print(f"openfarm drive: {problem}", file=sys.stderr)
             exc.add_note(problem)
@@ -2901,6 +2915,7 @@ def drive_run(
         run_thread=run_thread,
         ks_path=ks_path,
         joined=joined,
+        holder=seat_holder,
     )
     if problems:
         result["cleanup_problems"] = problems
@@ -2920,6 +2935,7 @@ def _end_drive(
     run_thread: threading.Thread | None,
     ks_path: Path | None,
     joined: list[str],
+    holder: dict | None = None,
 ) -> list[str]:
     """Leave nothing of the drive working. Returns the problems met, never raises them.
 
@@ -2927,7 +2943,9 @@ def _end_drive(
     switch, and the kill switch stays until the run's thread has really ended
     (the run's own `finally` then releases `run.lock`). If that wait is itself
     interrupted, the kill switch is left in place and the problem says how to
-    clear it. The driver's seat members are marked removed either way.
+    clear it. The seat members this drive joined (`joined`) are marked removed
+    either way, but only while they still record this drive as their holder
+    (`holder`): a seat another holder has taken since stays theirs.
     """
     problems: list[str] = []
     if run_thread is not None and run_thread.is_alive():
@@ -2963,19 +2981,24 @@ def _end_drive(
                     )
     for name in joined:
         try:
-            member = board.get_member(name)
-            if member is None or member.get("state") == "removed":
-                continue
-            seat = str(member.get("role") or "")
-            # `left_seat`: it left by itself, so the same driver may join again.
-            board.update_member(name, state="removed", left_seat=True)
-            board.post(
-                author="system",
-                to=["all"],
-                kind="roster",
-                body=f"{name} left seat {seat} (drive ended)",
-                trusted=True,
-            )
+            # The check and the removal are one step, so a takeover cannot land
+            # between them.
+            with board.transaction():
+                member = board.get_member(name)
+                if member is None or member.get("state") == "removed":
+                    continue
+                if not holds_seat(member, holder):
+                    continue  # taken over since: no longer this drive's to leave
+                seat = str(member.get("role") or "")
+                # `left_seat`: it left by itself, so the same driver may join again.
+                board.update_member(name, state="removed", left_seat=True)
+                board.post(
+                    author="system",
+                    to=["all"],
+                    kind="roster",
+                    body=f"{name} left seat {seat} (drive ended)",
+                    trusted=True,
+                )
         except Exception as exc:  # reported, never swallowed
             problems.append(f"could not mark {name} removed: {type(exc).__name__}: {exc}")
     return problems

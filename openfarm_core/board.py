@@ -490,6 +490,14 @@ class Board:
             handle.close()
             rlock.release()
 
+    @contextlib.contextmanager
+    def transaction(self):
+        """Hold the board's lock across several calls, so a check and the write it
+        decides are one step for every thread and process. Re-entrant: the
+        board's own methods may be called inside it."""
+        with self._locked():
+            yield
+
     def _ensure_unlocked(self) -> None:
         self.board_dir.mkdir(parents=True, exist_ok=True)
         self.evidence_dir.mkdir(parents=True, exist_ok=True)

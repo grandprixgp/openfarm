@@ -32,7 +32,7 @@ from openfarm_core.config import load_config
 from openfarm_core.driver import _end_drive, drive_run
 from openfarm_core.errors import Refused
 from openfarm_core.state import StateDir
-from openfarm_core.swarm import swarm_join
+from openfarm_core.swarm import new_seat_holder, swarm_join
 from tests.test_python_e2e import GOOD_IMPLEMENTATION, GOOD_TEST, build_python_toy
 
 
@@ -56,28 +56,36 @@ class SwarmRejoinTests(unittest.TestCase):
         self.board = Board(self.tmp / "board")
         self.board.ensure()
         self.cfg = _cfg()
+        self.holders: dict[str, dict] = {}
+
+    # Each drive holds its seats with its own holder (M4, v0.8.1 seats unit): a
+    # drive's end removes only the members it still holds.
+    def _join(self, name: str, seat: str = "supervisor") -> dict:
+        holder = new_seat_holder()
+        self.holders[name] = holder
+        return swarm_join(self.board, self.cfg, name=name, seat=seat, owner_kind="agent",
+                          holder=holder)
 
     def _leave(self, name: str) -> None:
         self.assertEqual(_end_drive(board=self.board, run_thread=None, ks_path=None,
-                                    joined=[name]), [])
+                                    joined=[name], holder=self.holders[name]), [])
         self.assertEqual(self.board.get_member(name)["state"], "removed")
 
     def test_a_driver_that_left_takes_its_seat_back(self) -> None:
-        swarm_join(self.board, self.cfg, name="d-sup", seat="supervisor", owner_kind="agent")
+        self._join("d-sup")
         self._leave("d-sup")
-        member = swarm_join(self.board, self.cfg, name="d-sup", seat="supervisor",
-                            owner_kind="agent")
+        member = self._join("d-sup")
         self.assertEqual((member["state"], member["role"], member["kind"]),
                          ("active", "supervisor", "external"))
         self.assertFalse(member.get("left_seat"))
         self.assertEqual(_roster(self.board)[-1], "d-sup rejoined seat supervisor (agent)")
         # And again: leaving and coming back works every time.
         self._leave("d-sup")
-        swarm_join(self.board, self.cfg, name="d-sup", seat="supervisor", owner_kind="agent")
+        self._join("d-sup")
         self.assertEqual(self.board.get_member("d-sup")["state"], "active")
 
     def test_a_seat_someone_else_holds_is_still_refused(self) -> None:
-        swarm_join(self.board, self.cfg, name="d-sup", seat="supervisor", owner_kind="agent")
+        self._join("d-sup")
         self._leave("d-sup")
         swarm_join(self.board, self.cfg, name="other", seat="supervisor", owner_kind="human")
         with self.assertRaises(Refused) as caught:
@@ -86,7 +94,7 @@ class SwarmRejoinTests(unittest.TestCase):
         self.assertEqual(self.board.get_member("d-sup")["state"], "removed")
 
     def test_another_role_kind_or_a_member_removed_by_others_stays_out(self) -> None:
-        swarm_join(self.board, self.cfg, name="d-sup", seat="supervisor", owner_kind="agent")
+        self._join("d-sup")
         self._leave("d-sup")
         for seat, kind in (("coordinator", "agent"), ("supervisor", "human")):
             with self.subTest(seat=seat, kind=kind):

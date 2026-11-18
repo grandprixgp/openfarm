@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import os
+import secrets
 import sys
 import threading
 import time
@@ -12,6 +16,7 @@ from .board import CODE_AUTHOR_NAMES, Board, is_stop_request, normalize_role, po
 from .cards import Card
 from .errors import Refused
 from .globs import globs_overlap
+from .state import _pid_alive, _this_host, utc_now
 
 WORKER_ROLES: tuple[str, ...] = ("planner", "test-writer", "implementer", "checker")
 SEAT_ROLES: tuple[str, ...] = ("coordinator", "supervisor")
@@ -283,6 +288,59 @@ def swarm_status(board: Board, cfg) -> dict:
     }
 
 
+def new_seat_holder() -> dict:
+    """Who is taking seats: this process's pid and host, and a random token.
+
+    The token stays in the caller's memory. The board keeps only its hash, so
+    nothing that reads the roster can prove itself the holder.
+    """
+    return {"pid": os.getpid(), "host": _this_host(), "token": secrets.token_hex(16)}
+
+
+def _token_hash(token: str) -> str:
+    return hashlib.sha256(str(token).encode("utf-8")).hexdigest()
+
+
+def _holder_record(holder: dict) -> dict:
+    """What the member keeps about its holder: never the token itself."""
+    return {
+        "pid": int(holder["pid"]),
+        "host": str(holder["host"]),
+        "since": utc_now(),
+        "token_sha256": _token_hash(holder["token"]),
+    }
+
+
+def holds_seat(member: dict | None, holder: dict | None) -> bool:
+    """True when `holder` (from `new_seat_holder`) is the one `member` records."""
+    if not member or not holder or not holder.get("token"):
+        return False
+    rec = member.get("holder")
+    if not isinstance(rec, dict) or not rec.get("token_sha256"):
+        return False
+    return hmac.compare_digest(str(rec["token_sha256"]), _token_hash(holder["token"]))
+
+
+def _holder_gone(rec: dict) -> bool:
+    """True only when the recorded holder was a process on this host that is gone.
+
+    The run lock's rule (`StateDir.stale_lock_holder`): anything less certain,
+    another host or a record that does not say, counts as still there.
+    """
+    pid = rec.get("pid")
+    host = rec.get("host")
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return False
+    if not isinstance(host, str) or not host or host != _this_host():
+        return False
+    return not _pid_alive(pid)
+
+
+def _describe_holder(rec: dict) -> str:
+    since = f", since {rec.get('since')}" if rec.get("since") else ""
+    return f"pid {rec.get('pid')} on {rec.get('host')}{since}"
+
+
 def swarm_join(
     board: Board,
     cfg,
@@ -290,8 +348,23 @@ def swarm_join(
     name: str,
     seat: str,
     owner_kind: str = "human",
+    holder: dict | None = None,
 ) -> dict:
-    """Claim an external coordinator or supervisor seat on the board."""
+    """Claim an external coordinator or supervisor seat on the board.
+
+    `holder` (from `new_seat_holder`) is given by a caller that keeps the seat
+    for as long as it runs, as `openfarm drive` does: its pid, host and the
+    hash of its token are recorded on the member. An active member that records
+    a holder is re-joined only by that holder (its token). Anyone else is
+    refused while the holder runs, and may take the seat over, with a note on
+    the board, once the holder is provably gone (its pid is dead on this host).
+    An active member with no holder record (joined by hand, or by an older
+    version) may be re-confirmed by a caller without a holder of the same owner
+    kind, as before. The owner kind of an active member never changes through a
+    re-join. The check and the write are one step under the board's lock.
+
+    The returned member carries `took_over` (the old holder) after a takeover.
+    """
     clean_seat = normalize_role(seat)
     if clean_seat not in SEAT_ROLES:
         raise Refused("bad-seat", f"seat must be 'coordinator' or 'supervisor', got {seat!r}")
@@ -315,8 +388,27 @@ def swarm_join(
             "reserved-name",
             f"{clean_name!r} is a name only code uses; join under another name",
         )
+    if holder is not None and not (
+        isinstance(holder, dict) and holder.get("token") and holder.get("host")
+        and isinstance(holder.get("pid"), int)
+    ):
+        raise Refused("bad-holder", "a seat holder needs a pid, a host and a token")
 
     board.ensure()
+    with board.transaction():
+        return _swarm_join_locked(board, cfg, clean_name=clean_name, clean_seat=clean_seat,
+                                  owner_kind=owner_kind, holder=holder)
+
+
+def _swarm_join_locked(
+    board: Board,
+    cfg,
+    *,
+    clean_name: str,
+    clean_seat: str,
+    owner_kind: str,
+    holder: dict | None,
+) -> dict:
     same_name = board.get_member(clean_name)
     # A seat holder that left its seat itself (a drive that ended marks its
     # members `left_seat`) may take it back under the same name, role and owner
@@ -345,6 +437,10 @@ def swarm_join(
             f"({same_name.get('role')!r}, {same_name.get('state')!r}); "
             "join under another name",
         )
+    took_over: dict | None = None
+    if same_name is not None and not rejoin:
+        # The name is an active outside member in this seat: a re-join.
+        took_over = _check_rejoin(same_name, clean_name, clean_seat, owner_kind, holder)
     active_members = board.list_members(include_removed=False)
     for existing in active_members:
         # A code member (the code fallback acting for a silent external
@@ -371,15 +467,82 @@ def swarm_join(
         added_by="cli",
         owner_kind=owner_kind,
     )
-    board.post(
-        author="system",
-        to=["all"],
-        kind="roster",
-        body=(f"{clean_name} rejoined seat {clean_seat} ({owner_kind})" if rejoin
-              else f"{clean_name} joined seat {clean_seat} ({owner_kind})"),
-        trusted=True,
-    )
+    if holder is not None:
+        # The same holder re-joining keeps its first `since`.
+        record = _holder_record(holder)
+        if same_name is not None and not rejoin and took_over is None:
+            old = same_name.get("holder")
+            if isinstance(old, dict) and old.get("since"):
+                record["since"] = old["since"]
+        member = board.update_member(clean_name, holder=record)
+    if took_over is not None:
+        body = (f"{clean_name} took over seat {clean_seat} ({owner_kind}) from its holder "
+                f"({_describe_holder(took_over)}), which is no longer running")
+    elif rejoin:
+        body = f"{clean_name} rejoined seat {clean_seat} ({owner_kind})"
+    else:
+        body = f"{clean_name} joined seat {clean_seat} ({owner_kind})"
+    board.post(author="system", to=["all"], kind="roster", body=body, trusted=True)
+    if took_over is not None:
+        member = {**member, "took_over": dict(took_over)}
     return member
+
+
+def _check_rejoin(
+    member: dict,
+    clean_name: str,
+    clean_seat: str,
+    owner_kind: str,
+    holder: dict | None,
+) -> dict | None:
+    """Whether a join may re-take the active seat member `member`.
+
+    Returns the old holder record when the seat is taken over from a holder
+    that is gone, None for a plain re-confirm, and raises `seat-occupied`
+    otherwise.
+    """
+    held_kind = str(member.get("owner_kind") or "")
+    rec = member.get("holder")
+    rec = rec if isinstance(rec, dict) and rec.get("token_sha256") else None
+    if rec is not None and holds_seat(member, holder):
+        if owner_kind != held_kind:
+            raise Refused(
+                "seat-occupied",
+                f"{clean_name!r} holds the {clean_seat} seat as {held_kind!r}; "
+                f"a re-join cannot make it {owner_kind!r}",
+            )
+        return None
+    if rec is not None:
+        if not _holder_gone(rec):
+            raise Refused(
+                "seat-occupied",
+                f"{clean_seat} seat {clean_name!r} is held by a running process "
+                f"({_describe_holder(rec)}); join under another name, or wait for it to end",
+            )
+        if owner_kind != held_kind:
+            raise Refused(
+                "seat-occupied",
+                f"{clean_name!r} holds the {clean_seat} seat as {held_kind!r} (its holder, "
+                f"{_describe_holder(rec)}, is no longer running); only an {held_kind!r} "
+                "join may take it over",
+            )
+        return dict(rec)
+    # No holder record: joined by hand, or by an older version.
+    if owner_kind != held_kind:
+        raise Refused(
+            "seat-occupied",
+            f"{clean_name!r} holds the {clean_seat} seat as {held_kind!r}; "
+            f"a {owner_kind!r} join cannot take it",
+        )
+    if holder is not None:
+        # A caller that keeps the seat cannot prove a member that records no
+        # holder is its own: someone may be steering it by hand.
+        raise Refused(
+            "seat-occupied",
+            f"{clean_seat} seat {clean_name!r} was joined without a holder record (by hand, "
+            "or by an older openfarm), so it may be in use; join under another name",
+        )
+    return None
 
 
 def _resolve_role_assignment(cfg, role: str, spec: dict | None) -> tuple[str, str, str]:

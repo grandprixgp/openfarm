@@ -156,9 +156,14 @@ class SwarmActionsTests(unittest.TestCase):
             swarm_join(self.board, self.cfg, name="bob", seat="coordinator", owner_kind="human")
         self.assertEqual(caught.exception.code, "seat-occupied")
 
-        # Idempotent re-join for same name succeeds
-        again = swarm_join(self.board, self.cfg, name="alice", seat="coordinator", owner_kind="human")
-        self.assertEqual(again["owner_kind"], "human")
+        # Idempotent re-join for same name and owner kind succeeds
+        again = swarm_join(self.board, self.cfg, name="alice", seat="coordinator", owner_kind="agent")
+        self.assertEqual(again["owner_kind"], "agent")
+        # A re-join never changes an active member's owner kind (v0.8.1 seats, M4)
+        with self.assertRaises(Refused) as caught_kind:
+            swarm_join(self.board, self.cfg, name="alice", seat="coordinator", owner_kind="human")
+        self.assertEqual(caught_kind.exception.code, "seat-occupied")
+        self.assertEqual(self.board.get_member("alice")["owner_kind"], "agent")
 
         # Non-external seat refused
         code_cfg = _make_config(
