@@ -134,7 +134,7 @@ class CodexReadOnlyInsideTheBoundaryTests(unittest.TestCase):
     def test_nothing_else_is_refused_for_it(self) -> None:
         d = confine.decide
         for prov, transport, policy, mode in (
-                ("codex", "bridge", "none", "auto"), ("codex", "server", "read-only", "auto"),
+                ("codex", "bridge", "none", "auto"), ("codex", "server", "none", "auto"),
                 ("antigravity", "bridge", "read-only", "auto"),
                 ("claude", "bridge", "read-only", "bwrap"),
                 ("codex", "bridge", "read-only", "off")):
@@ -143,6 +143,11 @@ class CodexReadOnlyInsideTheBoundaryTests(unittest.TestCase):
             self.assertFalse(h.refused, (prov, transport, policy, mode))
             self.assertEqual(confine.needs_nested(prov, transport, policy, mode), False)
         self.assertTrue(confine.needs_nested("codex", "bridge", "read-only", "auto"))
+        # v0.8.5: a standalone server's read-only is refused up front too (it was
+        # started and could read nothing, a known limit of v0.8.1).
+        self.assertTrue(confine.needs_nested("codex", "server", "read-only", "auto"))
+        self.assertTrue(d("codex", transport="server", tool_policy="read-only", mode="auto",
+                          bwrap_usable=True, nested_usable=False).refused)
 
     def test_the_probe_reads_the_inner_sandbox_result(self) -> None:
         tmp = Path(tempfile.mkdtemp(prefix="of-v081-lead-nest-"))

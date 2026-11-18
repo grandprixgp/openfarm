@@ -85,6 +85,9 @@ def runner_kind(purpose: str) -> str:
 
 #: How much ignored-file content a counter-test run keeps to put back (bytes).
 _COUNTER_KEEP_BYTES = 64 * 1024 * 1024
+#: Past the in-memory cap, ignored files are kept as hard links beside the
+#: worktree (no space used); where a link cannot be made, as copies up to this.
+_COUNTER_SPILL_BYTES = 1024 * 1024 * 1024
 
 class CardRun:
     """One card's whole run, from claim to in-review or blocked."""
@@ -235,6 +238,8 @@ class CardRun:
         self.checker_adjudication: dict = {}
         self.reviewer_brief = ""
         self.clarified_notes = ""
+        # A scaffold the shape call already returned (shape_and_scaffold, v0.8.5).
+        self._early_scaffold = None
         self.extra_context_files: list[str] = [
             normalise(p) for p in (getattr(self.card, "context_files", ()) or ())
         ]
@@ -1292,6 +1297,25 @@ class CardRun:
             effort_param = "reasoning_effort"
         return tier_name, model_override, effort, effort_param
 
+    def _retry_effort(self, role: str, effort: str, attempt: int) -> str:
+        """`[model] <role>.retry_effort` from the second attempt on. A coordinator
+        that raised the effort keeps the higher of the two; a retry never runs
+        below `retry_effort` (owner, 18 Nov: retries on max)."""
+        if attempt <= 1 or not hasattr(self.cfg, "effort_for_role"):
+            return effort
+        try:
+            first, _ = self.cfg.effort_for_role(role, 1)
+            later, _ = self.cfg.effort_for_role(role, attempt)
+        except TypeError:
+            return effort
+        if not later:
+            return effort
+        if not effort or effort == first:
+            return later
+        from .coordinator import higher_effort
+
+        return higher_effort(effort, later)
+
     def _call_board_role(
         self,
         role: str,
@@ -1319,6 +1343,8 @@ class CardRun:
             ov_model, ov_eff, ov_ep = self._role_overrides.get(
                 board_role, (None, None, None)
             )
+            if ov_eff is not None:
+                ov_eff = self._retry_effort(role, ov_eff, attempt)
             call = self.roles.call(
                 role,
                 effective_brief,
@@ -1359,6 +1385,14 @@ class CardRun:
         tier_name, model_override, effort_val, effort_param = self._member_call_settings(
             role, member
         )
+        retry_effort = self._retry_effort(role, effort_val, attempt)
+        if retry_effort != effort_val:
+            # The member shows the effort its retries really run at, so the
+            # coordinator's escalation starts from there and never steps down.
+            with contextlib.suppress(Refused):
+                self.board.update_member(member_name, effort=retry_effort)
+            member = self.board.get_member(member_name) or member
+            effort_val = retry_effort
         self._post_board(
             author="gates",
             to=[member_name],
@@ -1968,10 +2002,17 @@ class CardRun:
             ]
             self._refresh_micromanager_harness_context("planner")
             self._check_stop_requested()
+            combined = self._wants_shape_and_scaffold()
             try:
-                decision = self.micromanager.shape_and_plan(
-                    self.card, sigs, ctx_contents, known_tests=known_tests, cfg=self.cfg
-                )
+                if combined:
+                    base_files, _scaffold_sigs = self._scaffold_inputs()
+                    decision, self._early_scaffold = self.micromanager.shape_and_scaffold(
+                        self.card, sigs, ctx_contents, base_files,
+                        known_tests=known_tests, cfg=self.cfg)
+                else:
+                    decision = self.micromanager.shape_and_plan(
+                        self.card, sigs, ctx_contents, known_tests=known_tests, cfg=self.cfg
+                    )
             except (Refused, Invalid, ValueError, Infra) as exc:
                 # Planning is help, not a gate: a supervisor that is slow to answer
                 # costs the card its plan, not its run. Other infra still stops it.
@@ -2310,7 +2351,11 @@ class CardRun:
                           "the test writer produced no usable edit in "
                           f"{self.cfg.test_writer_attempts} attempts: {last_failure}")
 
-    def _run_scaffold_contract(self) -> None:
+    def _wants_shape_and_scaffold(self) -> bool:
+        wants = getattr(self.micromanager, "wants_shape_and_scaffold", None)
+        return bool(callable(wants) and wants(self.card))
+
+    def _scaffold_inputs(self) -> tuple[dict[str, str], dict[str, str]]:
         base_files: dict[str, str] = {}
         sigs: dict[str, str] = {}
         for path in self.card.touches:
@@ -2323,13 +2368,25 @@ class CardRun:
                     sigs[norm] = self.book.signatures(norm, self.pack)
                 except (OSError, Refused):
                     pass
+        return base_files, sigs
+
+    def _run_scaffold_contract(self) -> None:
+        early = getattr(self, "_early_scaffold", None)
+        self._early_scaffold = None
         self._check_stop_requested()
         try:
-            scaffold_edits = self.micromanager.scaffold_contract(
-                self.card, base_files, sigs,
-                never_touch=self.cfg.never_touch,
-                forbidden=self.cfg.forbidden_files,
-            )
+            if early is not None:
+                # The shape call already declared the contract (shape_and_scaffold).
+                if isinstance(early, BaseException):
+                    raise early
+                scaffold_edits = early
+            else:
+                base_files, sigs = self._scaffold_inputs()
+                scaffold_edits = self.micromanager.scaffold_contract(
+                    self.card, base_files, sigs,
+                    never_touch=self.cfg.never_touch,
+                    forbidden=self.cfg.forbidden_files,
+                )
         except (Refused, Invalid, ValueError, Infra) as exc:
             if isinstance(exc, Infra) and exc.code != "acp-timeout":
                 raise
@@ -2423,6 +2480,22 @@ class CardRun:
             raise GateFailure(StopCode.TESTS_UNPROVABLE,
                               "the test binary does not list: "
                               + ", ".join(missing[:10]) + why)
+        # The eligibility rule compares exact names, so a parametrized test whose
+        # every case is on `known_failing` got past it: its rows say so here.
+        known = set(self.cfg.known_failing or ())
+        all_known = [name for name in self.card.test_names
+                     if listed_rows[name]
+                     and all(str(r.get("name", "")) in known for r in listed_rows[name])]
+        if all_known:
+            self._record_gate(GateResult(
+                "named-tests-exist", FAIL,
+                "every case of these named tests is on the known_failing list: "
+                + ", ".join(all_known[:10]),
+                {"known_failing_rows": {n: [r.get("name") for r in listed_rows[n]]
+                                        for n in all_known}}))
+            raise GateFailure(StopCode.INELIGIBLE,
+                              "the card's test(s) " + ", ".join(all_known[:10])
+                              + " are on the known_failing list in every case")
         self._record_gate(GateResult("named-tests-exist", PASS,
                                      f"{len(self.card.test_names)} named test(s) "
                                      f"listed"))
@@ -3536,6 +3609,18 @@ class CardRun:
             # The tool's own output folder goes with the card's evidence, never into
             # the worktree, where it would be an untracked folder on the branch.
             self.pack.mutation_output = self.card_layout / "gates" / "mutation"
+        if hasattr(self.pack, "mutation_lines"):
+            # openfarm's own runner mutates only the lines this card changed.
+            self.pack.mutation_lines = None
+            if self.base_commit:
+                from .mutate import changed_lines_from_diff
+
+                try:
+                    self.pack.mutation_lines = changed_lines_from_diff(
+                        self.git.diff(list(production), ref=self.base_commit))
+                except Exception as exc:  # noqa: BLE001 - whole files then
+                    self.log(f"{self.card.id}: mutation: changed lines unknown ({exc}); "
+                             "mutating the files whole")
         try:
             argv = self.pack.commands(
                 "mutation", files=production, tests=self.card.test_names)["argv"]
@@ -3945,7 +4030,11 @@ class CardRun:
             # not read into memory.
             kept: dict[str, dict] = {}
             budget = _COUNTER_KEEP_BYTES
-            for rel in sorted(ignored):
+            spill_budget = _COUNTER_SPILL_BYTES
+            spill_dir = self.worktree.parent / f".{self.worktree.name}-counter-keep"
+            shutil.rmtree(spill_dir, ignore_errors=True)
+            min_free = int(getattr(self.cfg, "min_free_mb", 0) or 0) * 1024 * 1024
+            for at, rel in enumerate(sorted(ignored)):
                 full = self.worktree / rel
                 try:
                     info = os.lstat(full)
@@ -3954,11 +4043,31 @@ class CardRun:
                 if not stat.S_ISREG(info.st_mode):
                     continue
                 item = {"size": info.st_size, "mtime_ns": info.st_mtime_ns,
-                        "mode": stat.S_IMODE(info.st_mode), "data": None}
+                        "mode": stat.S_IMODE(info.st_mode), "data": None, "copy": None}
                 if info.st_size <= budget:
                     with contextlib.suppress(OSError):
                         item["data"] = full.read_bytes()
                         budget -= info.st_size
+                if item["data"] is None:
+                    # v0.8.5: past the cap, a hard link keeps the old content
+                    # through a delete or a replace; a copy where no link can be made.
+                    target = spill_dir / f"{at}"
+                    try:
+                        spill_dir.mkdir(parents=True, exist_ok=True)
+                        os.link(full, target)
+                        item["copy"] = str(target)
+                        item["linked"] = True
+                    except OSError:
+                        try:
+                            free = shutil.disk_usage(spill_dir).free
+                        except OSError:
+                            free = 0
+                        if info.st_size <= spill_budget and free - info.st_size > min_free:
+                            with contextlib.suppress(OSError):
+                                shutil.copyfile(full, target)
+                                item["copy"] = str(target)
+                                item["linked"] = False
+                                spill_budget -= info.st_size
                 kept[rel] = item
             dirs = {""}
             for rel in list(ignored) + listing() + list(files):
@@ -3968,7 +4077,22 @@ class CardRun:
                     parent = parent.parent
             return {"head": self.git.head(), "branch": self.git.current_branch(),
                     "files": files, "ignored": ignored, "dirs": dirs,
-                    "links": links, "kept": kept, "status": self.git.status_lines()}
+                    "links": links, "kept": kept, "status": self.git.status_lines(),
+                    "spill_dir": str(spill_dir)}
+
+        def kept_copy(item: dict) -> str | None:
+            """The kept copy's path when it still holds the old content."""
+            copy = item.get("copy")
+            if not copy:
+                return None
+            try:
+                info = os.lstat(copy)
+            except OSError:
+                return None
+            if info.st_size != item["size"] or (
+                    item.get("linked") and info.st_mtime_ns != item["mtime_ns"]):
+                return None  # a link to a file the run overwrote in place
+            return copy
 
         def restore(before: dict) -> None:
             if self.git.current_branch() != before["branch"] and before["branch"]:
@@ -4026,7 +4150,8 @@ class CardRun:
                     same = False
                 if same:
                     continue
-                if item["data"] is None:
+                copy = kept_copy(item) if item["data"] is None else None
+                if item["data"] is None and copy is None:
                     lost.append(rel)
                     continue
                 try:
@@ -4036,11 +4161,18 @@ class CardRun:
                         else:
                             full.unlink()
                     full.parent.mkdir(parents=True, exist_ok=True)
-                    full.write_bytes(item["data"])
+                    if copy is not None:
+                        # Never write through the link: a new file from the copy.
+                        with contextlib.suppress(FileNotFoundError):
+                            full.unlink()
+                        shutil.copyfile(copy, full)
+                    else:
+                        full.write_bytes(item["data"])
                     os.chmod(full, item["mode"])
                     os.utime(full, ns=(item["mtime_ns"], item["mtime_ns"]))
                 except OSError:
                     lost.append(rel)
+            shutil.rmtree(before.get("spill_dir") or "", ignore_errors=True)
             if lost:
                 self.log(f"{self.card.id}: a counter-test changed {len(lost)} ignored "
                          f"file(s) that could not be put back: {', '.join(lost[:5])}")
@@ -4309,6 +4441,7 @@ class CardRun:
                 "stop_code": self.stop_code.value if self.stop_code else "",
                 "passed": final_state == "in-review",
                 "attempts": attempts_count,
+                "handbacks": len(getattr(self, "handbacks", ()) or ()),
                 "tokens_in": self.budget.tokens_in,
                 "tokens_out": self.budget.tokens_out,
                 "spend": round(self.budget.spend, 6),

@@ -265,3 +265,52 @@ def pack_for(language: str, cargo_flags: list[str] | None = None,
         from .typescript import TypeScriptPack
         return TypeScriptPack()
     return UnsupportedPack(language)
+
+
+class OwnMutationMixin:
+    """`[gates] mutation` through openfarm's own runner (`openfarm_core/mutate.py`,
+    v0.8.5), for packs whose language has no mutation tool openfarm can call.
+
+    The flow sets `mutation_output` (the card's evidence folder) and
+    `mutation_lines` (`{path: [line, ...]}` changed since the card's base, so only
+    those lines are mutated). The runner's result is read from its `outcomes.json`.
+    """
+
+    mutation_language = ""
+    mutation_output = None
+    mutation_lines = None
+    _mutation_dir = None
+    _mutation_runs = 0
+
+    def _own_mutation_argv(self, files, tests) -> list[str]:
+        import json
+        import shutil
+        import sys
+        import tempfile
+
+        from .. import mutate
+
+        self._mutation_runs = int(self._mutation_runs or 0) + 1
+        if self.mutation_output is not None:
+            out = Path(self.mutation_output) / str(self._mutation_runs)
+            shutil.rmtree(out, ignore_errors=True)
+            out.mkdir(parents=True, exist_ok=True)
+        else:
+            out = Path(tempfile.mkdtemp(prefix="openfarm-mutants-"))
+        self._mutation_dir = out
+        test_argv = self.commands("test", tests=list(tests or []))["argv"]
+        argv = [sys.executable, "-I", str(Path(mutate.__file__)), "--lang", self.mutation_language,
+                "--out", str(out), "--test-argv", json.dumps(test_argv)]
+        if self.mutation_lines is not None:
+            argv += ["--lines", json.dumps({str(k): sorted(v) for k, v in
+                                            self.mutation_lines.items()})]
+        return argv + [str(f) for f in (files or [])]
+
+    def read_mutation(self, stdout: str, stderr: str = "", exit_code=None) -> dict:
+        from ..mutate import read_outcomes
+
+        return read_outcomes(self._mutation_dir, stdout, stderr, exit_code)
+
+    def parse_mutation(self, stdout: str) -> dict:
+        return self.read_mutation(stdout, "", None)
+

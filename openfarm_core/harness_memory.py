@@ -2040,9 +2040,18 @@ class HarnessLibrary:
                 self.harness_cfg.enabled
                 and contrast["outcome_kind"] in self.harness_cfg.capture_on
             )
+            reflect_on = getattr(self.harness_cfg, "reflect_on", None)
+            if reflect_on is None:
+                reflect_on = self.harness_cfg.capture_on
+            reflect_kind = contrast["outcome_kind"]
+            if reflect_kind == "pass" and int(card_meta.get("handbacks", 0) or 0) > 0:
+                # A worker that handed back and passed after a hint was stuck: not a
+                # clean first-try pass, so it is reflected on as a recovery would be.
+                reflect_kind = "retry_recovery"
             if (
                 will_capture
                 and reflect
+                and reflect_kind in reflect_on
                 and self.harness_cfg.allow_micromanager_reflection
                 and micromanager is not None
                 and getattr(micromanager, "enabled", False)

@@ -52,7 +52,7 @@ _TABLE_KEYS = {
                     "allow_type_changes", "max_context_files"},
     "brief": {"test_conventions"},
     "runner": {"env", "cargo_flags", "python", "typescript", "typescript_typecheck",
-               "typescript_format", "link_node_modules"},
+               "typescript_format", "link_node_modules", "confine", "confine_write_roots"},
     "budget": {"implementer_attempts", "test_writer_attempts",
                "model_build_calls_per_card", "mutation_build_calls_per_card",
                "tokens_per_card", "wall_clock_per_card", "frontier_cost_ratio",
@@ -70,12 +70,14 @@ _TABLE_KEYS = {
                      "auth", "auth_file", "isolate_home", "shape_cards",
                      "scaffold_contracts", "coach_on_stall",
                      "adjudicate_counter_tests", "pre_review",
-                     "confine", "confine_read_roots"},
+                     "confine", "confine_read_roots", "lean_prompt",
+                     "combine_calls"},
     "state": {"min_free_mb"},
     "harness": {"enabled", "dir", "capture_on", "max_cues_per_brief",
                 "max_active_adaptations", "min_confidence", "probe_window",
                 "auto_demote", "allow_micromanager_reflection",
-                "editable_surfaces", "global_dir", "learn_from", "share"},
+                "editable_surfaces", "global_dir", "learn_from", "share",
+                "reflect_on"},
     "swarm": {"enabled", "coordinator", "supervisor", "coordinator_effort",
               "supervisor_effort", "default_tier", "escalate_after",
               "handbacks_per_card", "max_members", "coordinator_calls_per_run",
@@ -83,7 +85,7 @@ _TABLE_KEYS = {
               "on_external_timeout", "stall_after"},
     "tiers": set(_TIER_KEYS),
 }
-_ROLE_MODEL_KEYS = {"model", "temperature", "vary_seed", "effort"}
+_ROLE_MODEL_KEYS = {"model", "temperature", "vary_seed", "effort", "retry_effort"}
 _HEADER_NAME = re.compile(r"^[A-Za-z0-9!#$%&'*+.^_`|~-]+$")
 # openfarm sets these itself; a config may not replace the key or the body type.
 _RESERVED_HEADERS = {"authorization", "content-type", "content-length", "host"}
@@ -210,18 +212,27 @@ def _nonneg_float(value, what: str, default: float) -> float:
 class RoleModel:
     """One model role's settings."""
 
-    __slots__ = ("model", "temperature", "vary_seed", "effort")
+    __slots__ = ("model", "temperature", "vary_seed", "effort", "retry_effort")
 
     def __init__(self, model: str = "", temperature: float = 0.2,
-                 vary_seed: bool = False, effort: str = "") -> None:
+                 vary_seed: bool = False, effort: str = "",
+                 retry_effort: str = "") -> None:
         self.model = model
         self.temperature = temperature
         self.vary_seed = vary_seed
         self.effort = effort
+        #: The effort for every attempt after the first (v0.8.5); empty keeps `effort`.
+        self.retry_effort = retry_effort
+
+    def effort_for_attempt(self, attempt: int = 1) -> str:
+        if attempt > 1 and self.retry_effort:
+            return self.retry_effort
+        return self.effort
 
     def as_dict(self) -> dict:
         return {"model": self.model, "temperature": self.temperature,
-                "vary_seed": self.vary_seed, "effort": self.effort}
+                "vary_seed": self.vary_seed, "effort": self.effort,
+                "retry_effort": self.retry_effort}
 
 
 @dataclasses.dataclass
@@ -308,7 +319,7 @@ class MicromanagerConfig:
         "auth", "auth_file", "isolate_home", "shape_cards",
         "scaffold_contracts", "coach_on_stall",
         "adjudicate_counter_tests", "pre_review",
-        "confine", "confine_read_roots",
+        "confine", "confine_read_roots", "lean_prompt", "combine_calls",
     )
 
     def __init__(self, **kwargs) -> None:
@@ -326,6 +337,10 @@ class MicromanagerConfig:
 
 VALID_LEARN_FROM = ("both", "project", "global")
 VALID_HARNESS_CAPTURE_ON = ("retry_recovery", "fail", "counter_fail", "pass")
+#: When the supervisor is asked to reflect on a card (v0.8.5). A clean first-try
+#: pass is left out: across the v0.8.1 bench, 41 of 47 reflection calls were on
+#: such cards and what they proposed was about openfarm's own bookkeeping.
+DEFAULT_HARNESS_REFLECT_ON = ("retry_recovery", "fail", "counter_fail")
 VALID_HARNESS_SURFACES = (
     "test_writer_guidance",
     "implementer_guidance",
@@ -348,6 +363,7 @@ class HarnessConfig:
     probe_window: int = 3
     auto_demote: bool = True
     allow_micromanager_reflection: bool = True
+    reflect_on: tuple[str, ...] = ("retry_recovery", "fail", "counter_fail")
     editable_surfaces: tuple[str, ...] = (
         "test_writer_guidance",
         "implementer_guidance",
@@ -372,6 +388,7 @@ class HarnessConfig:
             "probe_window": self.probe_window,
             "auto_demote": self.auto_demote,
             "allow_micromanager_reflection": self.allow_micromanager_reflection,
+            "reflect_on": list(self.reflect_on),
             "editable_surfaces": list(self.editable_surfaces),
             "global_dir": self.global_dir,
             "learn_from": self.learn_from,
@@ -548,6 +565,11 @@ class Config:
             ("auto", "prettier", "off"))
         self.link_node_modules = _as_bool(
             runner.get("link_node_modules"), "[runner] link_node_modules", True)
+        # v0.8.5: gate commands in a boundary where only the worktree is writable.
+        self.runner_confine = _as_choice(
+            runner.get("confine"), "[runner] confine", "off", ("off", "bwrap"))
+        self.runner_write_roots = _as_str_list(
+            runner.get("confine_write_roots", []), "[runner] confine_write_roots")
         env_table = runner.get("env") or {}
         if not isinstance(env_table, dict):
             raise ConfigError("[runner.env] must be a table")
@@ -597,11 +619,8 @@ class Config:
         self.mutation_required_for = _as_str_list(
             gates.get("mutation_required_for", ["test-backfill"]),
             "[gates] mutation_required_for")
-        if self.mutation == "required" and _uses_typescript(self.languages):
-            raise ConfigError(
-                '[gates] mutation = "required" cannot be served: the TypeScript pack '
-                'has no mutation tool, so every card would be blocked at its end. Set '
-                '[gates] mutation = "off" (or "report", with mutation_required_for = [])')
+        # v0.8.5: TypeScript (and Python) cards are mutated by openfarm's own
+        # runner, so "required" no longer has to be refused for them.
         self.mutation_min_kill_rate = _as_float(
             gates.get("mutation_min_kill_rate"),
             "[gates] mutation_min_kill_rate", 0.8)
@@ -646,18 +665,25 @@ class Config:
         )
         self.swarm = self._parse_swarm(self._table("swarm"))
         for role_name, role_model in self.role_models.items():
-            if role_model.effort:
+            if role_model.retry_effort and not role_model.effort:
+                raise ConfigError(
+                    f"[model] {role_name}.retry_effort needs an effort for the first "
+                    "attempt as well")
+            for key in ("effort", "retry_effort"):
+                value = getattr(role_model, key)
+                if not value:
+                    continue
                 if is_acp_adapter(self.model_adapter):
-                    if role_model.effort not in _ACP_EFFORTS:
+                    if value not in _ACP_EFFORTS:
                         raise ConfigError(
-                            f"[model] {role_name}.effort {role_model.effort!r} is not "
+                            f"[model] {role_name}.{key} {value!r} is not "
                             f"one of {list(_ACP_EFFORTS)!r}"
                         )
                 else:
                     tier = self.tier_for_model(role_model.model)
-                    if role_model.effort not in tier.efforts:
+                    if value not in tier.efforts:
                         raise ConfigError(
-                            f"[model] {role_name}.effort {role_model.effort!r} is not "
+                            f"[model] {role_name}.{key} {value!r} is not "
                             f"in tier {tier.name!r} efforts {list(tier.efforts)!r}"
                         )
 
@@ -707,6 +733,18 @@ class Config:
             True,
         )
 
+        if "reflect_on" in h and h["reflect_on"] is not None:
+            raw_reflect = _as_str_list(h["reflect_on"], "[harness] reflect_on")
+            for item in raw_reflect:
+                if item not in VALID_HARNESS_CAPTURE_ON:
+                    raise ConfigError(
+                        f"[harness] reflect_on: {item!r} is not one of "
+                        f"{', '.join(VALID_HARNESS_CAPTURE_ON)}"
+                    )
+            reflect_on = tuple(dict.fromkeys(raw_reflect))
+        else:
+            reflect_on = DEFAULT_HARNESS_REFLECT_ON
+
         if "editable_surfaces" in h and h["editable_surfaces"] is not None:
             raw_surfaces = _as_str_list(
                 h["editable_surfaces"], "[harness] editable_surfaces"
@@ -743,6 +781,7 @@ class Config:
             probe_window=probe_window,
             auto_demote=auto_demote,
             allow_micromanager_reflection=allow_mm_refl,
+            reflect_on=reflect_on,
             editable_surfaces=editable_surfaces,
             global_dir=global_dir,
             learn_from=learn_from,
@@ -815,6 +854,12 @@ class Config:
             confine=_as_choice(mm.get("confine"), "[micromanager] confine",
                                "auto", ("auto", "bwrap", "off")),
             confine_read_roots=self._confine_read_roots(mm.get("confine_read_roots")),
+            # openfarm's own bridges replace the provider CLI's built-in prompt.
+            lean_prompt=_as_bool(mm.get("lean_prompt"),
+                                 "[micromanager] lean_prompt", True),
+            # One supervisor call for shape and scaffold when a card needs both.
+            combine_calls=_as_bool(mm.get("combine_calls"),
+                                   "[micromanager] combine_calls", True),
         )
 
     def _confine_read_roots(self, value) -> list[str]:
@@ -872,17 +917,20 @@ class Config:
         model_name = str(raw_model) if raw_model is not None else default_model
         if not model_name and default_model:
             model_name = default_model
-        raw_effort = value.get("effort")
-        if raw_effort is None:
-            effort = ""
-        else:
+        efforts = {}
+        for key in ("effort", "retry_effort"):
+            raw_effort = value.get(key)
+            if raw_effort is None:
+                efforts[key] = ""
+                continue
             if not isinstance(raw_effort, str):
-                raise ConfigError(f"[model] {role}.effort must be a string")
+                raise ConfigError(f"[model] {role}.{key} must be a string")
             if any(ch.isspace() for ch in raw_effort) or "\x00" in raw_effort:
                 raise ConfigError(
-                    f"[model] {role}.effort {raw_effort!r} must not contain whitespace"
+                    f"[model] {role}.{key} {raw_effort!r} must not contain whitespace"
                 )
-            effort = raw_effort
+            efforts[key] = raw_effort
+        effort = efforts["effort"]
         return RoleModel(
             model=model_name,
             temperature=_as_float(value.get("temperature"),
@@ -890,6 +938,7 @@ class Config:
             vary_seed=_as_bool(value.get("vary_seed"),
                                f"[model] {role}.vary_seed", default_vary),
             effort=effort,
+            retry_effort=efforts["retry_effort"],
         )
 
     def _parse_tiers(self, raw_tiers, default_model: str) -> dict[str, TierConfig]:
@@ -1180,8 +1229,11 @@ class Config:
             return (self.tier_for_model(role_model.model).name, role_model.model)
         return (default.name, default.model)
 
-    def effort_for_role(self, role: str) -> tuple[str, str]:
-        """Return `(effort, effort_param)` for a configured role, or `("", "")`."""
+    def effort_for_role(self, role: str, attempt: int = 1) -> tuple[str, str]:
+        """Return `(effort, effort_param)` for a configured role, or `("", "")`.
+
+        From the second attempt on, the role's `retry_effort` replaces `effort`.
+        """
         aliases = {
             "checker_pass1": "checker",
             "checker_pass2": "checker",
@@ -1190,14 +1242,15 @@ class Config:
         role_model = self.role_models.get(aliases.get(role, role))
         if role_model is None:
             role_model = self.role_models.get("implementer")
-        if role_model is None or not role_model.effort:
+        effort = role_model.effort_for_attempt(attempt) if role_model is not None else ""
+        if not effort:
             return ("", "")
         if is_acp_adapter(self.model_adapter):
-            return (role_model.effort, "effort")
+            return (effort, "effort")
         tier = self.tier_for_model(role_model.model)
         if not tier.effort_param:
             return ("", "")
-        return (role_model.effort, tier.effort_param)
+        return (effort, tier.effort_param)
 
     def known_failing_hash(self) -> str:
         """The cache key component that changes when `known_failing` changes."""

@@ -33,6 +33,8 @@ from .adapters.acp import (
     strip_control_sequences,
 )
 from .adapters.agy_native_acp import MAX_ARG_BYTES as AGY_MAX_ARG_BYTES
+from .adapters.claude_native_acp import LEAN_SYSTEM_PROMPT
+from .adapters.codex_native_acp import lean_codex_args
 from .adapters.files import FileCardSource
 from .board import (
     Board,
@@ -49,6 +51,7 @@ from .cards import Card
 from .config import Config
 from .coordinator import _clean_json_payload
 from .errors import AdapterError, Infra, Invalid, Refused, UsageError
+from .spawn import popen_with_retry
 from .git import Git
 from .globs import matches_any, normalise
 from .micromanager import SEAT_TIMEOUT_PREFIX
@@ -308,6 +311,35 @@ _POPEN = subprocess.Popen
 DEFAULT_TURN_TIMEOUT_S = 180.0
 
 
+def drive_defaults(cfg, provider: str, model, effort, turn_timeout):
+    """What `openfarm drive` runs with when its flags leave something out (v0.8.5).
+
+    The supervisor answers the same questions as an ACP micromanager, so it gets
+    the same settings: `[micromanager] model` and `effort` when the drive agent is
+    that micromanager's provider, and `[micromanager] timeout_s` for a turn (never
+    under the old 180 s, as a turn can also carry coordinator work).
+    """
+    mm = getattr(cfg, "micromanager", None)
+    same_provider = False
+    try:
+        same_provider = normalize_acp_provider(
+            str(getattr(cfg, "micromanager_adapter", "") or "")) == provider
+    except Invalid:
+        same_provider = False
+    if same_provider and mm is not None:
+        if model is None and str(getattr(mm, "model", "") or ""):
+            model = str(mm.model)
+        if effort is None and str(getattr(mm, "effort", "") or ""):
+            effort = str(mm.effort)
+    if turn_timeout is None:
+        mm_timeout = getattr(mm, "timeout_s", None) if mm is not None else None
+        try:
+            turn_timeout = max(DEFAULT_TURN_TIMEOUT_S, float(mm_timeout))
+        except (TypeError, ValueError):
+            turn_timeout = DEFAULT_TURN_TIMEOUT_S
+    return model, effort, turn_timeout
+
+
 def _end_process_group(proc, *, grace_s: float = 2.0) -> None:
     """End a driver child's whole process group: TERM, a grace, then KILL.
 
@@ -379,8 +411,12 @@ class DriverAgent:
         env: dict[str, str] | None = None,
         script: object = None,
         confine=None,
+        lean_prompt: bool = True,
     ) -> None:
         self.provider = normalize_acp_provider(agent)
+        # Replace the CLI's built-in system prompt with the driver's own, as
+        # openfarm's bridges do (`[micromanager] lean_prompt`, v0.8.5).
+        self.lean_prompt = bool(lean_prompt)
         self.cwd = Path(cwd or Path.cwd()).resolve()
         self.driver_bin = str(driver_bin).strip() if driver_bin else ""
         self.model = str(model).strip() if model else ""
@@ -480,7 +516,9 @@ class DriverAgent:
                 argv.extend(["--model", self.model])
             if self.effort:
                 argv.extend(["--effort", self.effort])
-            if system_prompt:
+            if self.lean_prompt:
+                argv.extend(["--system-prompt", system_prompt or LEAN_SYSTEM_PROMPT])
+            elif system_prompt:
                 argv.extend(["--append-system-prompt", system_prompt])
             return argv
 
@@ -522,6 +560,8 @@ class DriverAgent:
             argv.extend(["-m", self.model])
         if self.effort:
             argv.extend(["-c", f"model_reasoning_effort={json.dumps(self.effort)}"])
+        if self.lean_prompt:
+            argv.extend(lean_codex_args(system_prompt))
         argv.append("-")
         return argv
 
@@ -689,7 +729,8 @@ class DriverAgent:
             if too_large:
                 raise Refused("agy-prompt-too-large", too_large)
         argv = self.build_argv(system_prompt=system_prompt, prompt=prompt)
-        if self.provider == "claude":
+        if self.provider == "claude" or (self.provider == "codex" and self.lean_prompt):
+            # The system prompt went in the argv (Claude's flag, Codex's instructions).
             stdin_text = prompt
             sub_input = stdin_text
         else:
@@ -728,8 +769,9 @@ class DriverAgent:
             try:
                 # Its own session, so the whole group (the CLI and anything it
                 # started) can be ended before the isolated HOME is deleted.
-                proc = _POPEN(
+                proc = popen_with_retry(
                     spawn_argv,
+                    popen=_POPEN,
                     cwd=str(self.child_dir),
                     env=env,
                     stdin=subprocess.PIPE,
@@ -880,6 +922,47 @@ def _open_questions_for_supervisor(
     return open_qs
 
 
+#: The most of one question's request a driver turn carries. Before v0.8.5 this
+#: was 2,400 characters, which cut a pre-review off before its gate results and
+#: most of its diff; an ACP supervisor is sent the whole request.
+QUESTION_PROMPT_MAX_CHARS = 120_000
+
+
+def _cap_question_prompt(text: str) -> str:
+    if len(text) <= QUESTION_PROMPT_MAX_CHARS:
+        return text
+    cut = len(text) - QUESTION_PROMPT_MAX_CHARS
+    return (text[:QUESTION_PROMPT_MAX_CHARS]
+            + f"\n[openfarm cut the last {cut} characters of this request]")
+
+
+def render_driver_turn(prompt_payload: dict) -> str:
+    """One driver turn's prompt: the board state as compact JSON, then each open
+    question's request in full as its own block.
+
+    The requests are the text an ACP supervisor is sent for the same op, kept out
+    of the JSON so they are not escaped a second time.
+    """
+    state = dict(prompt_payload)
+    questions = []
+    blocks = []
+    for q in prompt_payload.get("open_questions") or ():
+        q = dict(q)
+        request = str(q.pop("prompt", "") or "")
+        if request:
+            q["request"] = f"see QUESTION #{q.get('seq')} below"
+            blocks.append(
+                f"=== QUESTION #{q.get('seq')} ({q.get('op') or 'supervisor'}"
+                + (f", {q['card']}" if q.get("card") else "")
+                + f") ===\n{request.rstrip()}\n=== END QUESTION #{q.get('seq')} ===")
+        questions.append(q)
+    state["open_questions"] = questions
+    text = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
+    if blocks:
+        text += "\n\n" + "\n\n".join(blocks)
+    return text
+
+
 def _question_details(board: Board, post: dict) -> dict:
     expects = post.get("expects") if isinstance(post.get("expects"), dict) else {}
     op = str(expects.get("op") or "")
@@ -901,7 +984,7 @@ def _question_details(board: Board, post: dict) -> dict:
             if not op and ev_data.get("op"):
                 op = str(ev_data["op"])
             if ev_data.get("prompt"):
-                q_prompt = _sanitize_text(str(ev_data["prompt"]))[:2400]
+                q_prompt = _cap_question_prompt(_sanitize_text(str(ev_data["prompt"])))
             break
     return {
         "seq": int(post.get("seq", 0) or 0),
@@ -942,7 +1025,8 @@ def _build_driver_system_prompt(seat: str, coord_name: str, sup_name: str) -> st
         lines.append("Keep `actions` as `[]` because you do not hold the coordinator seat.")
     if seat in ("both", "supervisor"):
         lines.extend([
-            "Allowed supervisor answers in `answers` (answer EVERY item in `open_questions`):",
+            "Allowed supervisor answers in `answers` (answer EVERY item in `open_questions`;",
+            "each one's full request follows the JSON, between its QUESTION markers):",
             '- {"seq": <question_seq>, "data": {...matching question.expects...}, "body": "concise note"}',
             "",
         ])
@@ -2266,10 +2350,11 @@ def drive_run(
     wave: bool = False,
     record_verdict: bool = False,
     script: Path | None = None,
-    turn_timeout: float = DEFAULT_TURN_TIMEOUT_S,
+    turn_timeout: float | None = None,
 ) -> dict:
     """Attach to an active run or start a managed external-seat run and drive it."""
     provider = normalize_acp_provider(agent)
+    model, effort, turn_timeout = drive_defaults(cfg, provider, model, effort, turn_timeout)
     clean_seat = str(seat or "both").strip().lower()
     if clean_seat not in DRIVE_SEATS:
         raise UsageError(f"invalid --seat {seat!r}: choose from {', '.join(DRIVE_SEATS)}")
@@ -2481,6 +2566,7 @@ def drive_run(
             timeout_s=turn_timeout,
             script=driver_script,
             confine=confine_settings,
+            lean_prompt=bool(getattr(active_cfg.micromanager, "lean_prompt", True)),
         ) as drv:
             driver_confine = drv.hold.as_dict() if driver_script is None else {}
             if not board.is_ended():
@@ -2723,8 +2809,15 @@ def drive_run(
                         ],
                         "open_questions": [_question_details(board, q) for q in open_qs],
                     }
-                    user_prompt = json.dumps(prompt_payload, indent=2, ensure_ascii=False)
                     has_coord_work = bool(startable or coord_events)
+                    if not has_coord_work:
+                        # A turn with only supervisor questions needs only them:
+                        # an ACP supervisor is sent the request and nothing else.
+                        for key in ("pending_ready_cards", "running_cards",
+                                    "finished_cards_with_active_members",
+                                    "unresolved_events", "tiers", "roster", "recent_posts"):
+                            prompt_payload.pop(key, None)
+                    user_prompt = render_driver_turn(prompt_payload)
 
                     resp = _driver_turn(
                         user_prompt, turn_key, sup_work=bool(open_qs), coord_work=has_coord_work

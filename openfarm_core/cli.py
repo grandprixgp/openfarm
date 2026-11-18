@@ -389,8 +389,16 @@ def _baseline_check(ctx: Context, source: FileCardSource, card: Card) -> dict:
         # a test that is not there yet (`not-run`) is left to the test writer.
         ignored = [name for name, status in named.items()
                    if status not in ("ok", "mixed", "FAILED", "not-run")]
+        # v0.8.5, as the run's named-tests check: a named test whose every row (a
+        # parametrized test's every case) is on known_failing proves nothing.
+        known = set(ctx.cfg.known_failing or ())
+        all_known = []
+        for name in card.test_names:
+            own = rows_for_test(rows, name, files.get(name, ""), row_file)
+            if own and all(str(r.get("name", "")) in known for r in own):
+                all_known.append(name)
         out = {
-            "ok": not passing and not mixed and not ignored,
+            "ok": not passing and not mixed and not ignored and not all_known,
             "class": result.cls,
             "named": named,
             "failed_on_base": [name for name, status in named.items()
@@ -407,6 +415,10 @@ def _baseline_check(ctx: Context, source: FileCardSource, card: Card) -> dict:
             out["ignored_on_base"] = ignored
             problems.append("these named tests were skipped or expected to fail on "
                             "base, so they prove nothing: " + ", ".join(ignored))
+        if all_known:
+            out["known_failing_on_base"] = all_known
+            problems.append("every case of these named tests is on the known_failing "
+                            "list, so they prove nothing: " + ", ".join(all_known))
         if problems:
             out["error"] = "; ".join(problems)
         return out
@@ -2699,14 +2711,17 @@ def build_parser() -> argparse.ArgumentParser:
     drive_p.add_argument("--driver-bin", default=None,
                          help="path to driver CLI executable")
     drive_p.add_argument("--model", default=None,
-                         help="model override for the driver agent")
+                         help="model for the driver agent (default: [micromanager] model "
+                              "when the agent is the micromanager's provider)")
     drive_p.add_argument("--effort", choices=("low", "medium", "high", "xhigh", "max"),
-                         default=None, help="reasoning effort for the driver agent")
+                         default=None, help="reasoning effort for the driver agent "
+                                            "(default: [micromanager] effort, as above)")
     drive_p.add_argument("--max-turns", type=int, default=40,
                          help="maximum driver turns (default: 40)")
-    drive_p.add_argument("--turn-timeout", type=float, default=180.0, metavar="SECONDS",
+    drive_p.add_argument("--turn-timeout", type=float, default=None, metavar="SECONDS",
                          help="seconds one driver turn may take before it is ended "
-                              "(default: 180)")
+                              "(default: [micromanager] timeout_s, the wait an ACP "
+                              "supervisor gets, and never under 180)")
     drive_p.add_argument("--wave", action="store_true",
                          help="inspect in-review dossiers and diffs after the run")
     drive_p.add_argument("--record-verdict", action="store_true",
@@ -2991,7 +3006,7 @@ def cmd_drive(ctx: Context, args) -> int:
         wave=bool(args.wave),
         record_verdict=bool(args.record_verdict),
         script=Path(args.script) if getattr(args, "script", None) else None,
-        turn_timeout=getattr(args, "turn_timeout", 180.0),
+        turn_timeout=getattr(args, "turn_timeout", None),
     )
     _emit_ctx(ctx, payload, "drive")
     if payload.get("refused"):
@@ -3097,10 +3112,14 @@ def main(argv: list[str] | None = None) -> int:
             want_json = True
             break
 
-    def _emit_error(kind: str, message: str, code: int) -> int:
+    def _emit_error(kind: str, message: str, code: int, error_code: str = "") -> int:
         if want_json:
-            print(json.dumps({"error": message, "kind": kind},
-                             indent=2, ensure_ascii=False))
+            payload = {"error": message, "kind": kind}
+            if error_code:
+                # A script can tell one refusal from another (v0.8.5), e.g.
+                # `seat-occupied` from `name-taken` on `swarm join`.
+                payload["code"] = error_code
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
         else:
             print(f"openfarm: {kind}: {message}", file=sys.stderr)
             hint = error_hint(kind, message)
@@ -3150,13 +3169,13 @@ def main(argv: list[str] | None = None) -> int:
         except GitRefused as exc:
             return _emit_error("refused", str(exc), EXIT_REFUSED)
         except Refused as exc:
-            return _emit_error("refused", exc.message, EXIT_REFUSED)
+            return _emit_error("refused", exc.message, EXIT_REFUSED, getattr(exc, "code", "") or "")
         except Invalid as exc:
-            return _emit_error("adapter trouble", exc.message, EXIT_TROUBLE)
+            return _emit_error("adapter trouble", exc.message, EXIT_TROUBLE, getattr(exc, "code", "") or "")
         except Infra as exc:
-            return _emit_error("trouble", exc.message, EXIT_TROUBLE)
+            return _emit_error("trouble", exc.message, EXIT_TROUBLE, getattr(exc, "code", "") or "")
         except AdapterError as exc:
-            return _emit_error("trouble", exc.message, EXIT_TROUBLE)
+            return _emit_error("trouble", exc.message, EXIT_TROUBLE, getattr(exc, "code", "") or "")
         except OSError as exc:
             return _emit_error("trouble", str(exc), EXIT_TROUBLE)
 
@@ -3175,13 +3194,13 @@ def main(argv: list[str] | None = None) -> int:
     except GitRefused as exc:
         return _emit_error("refused", str(exc), EXIT_REFUSED)
     except Refused as exc:
-        return _emit_error("refused", exc.message, EXIT_REFUSED)
+        return _emit_error("refused", exc.message, EXIT_REFUSED, getattr(exc, "code", "") or "")
     except Invalid as exc:
-        return _emit_error("adapter trouble", exc.message, EXIT_TROUBLE)
+        return _emit_error("adapter trouble", exc.message, EXIT_TROUBLE, getattr(exc, "code", "") or "")
     except Infra as exc:
-        return _emit_error("trouble", exc.message, EXIT_TROUBLE)
+        return _emit_error("trouble", exc.message, EXIT_TROUBLE, getattr(exc, "code", "") or "")
     except AdapterError as exc:
-        return _emit_error("trouble", exc.message, EXIT_TROUBLE)
+        return _emit_error("trouble", exc.message, EXIT_TROUBLE, getattr(exc, "code", "") or "")
     except KeyboardInterrupt:
         return _emit_error("interrupted", "interrupted", EXIT_TROUBLE)
 

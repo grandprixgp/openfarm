@@ -208,6 +208,9 @@ class ExternalSupervisorEndToEndTests(unittest.TestCase):
         _write_card_1(self.toy)
 
         cfg = load_config(self.toy.root)
+        # v0.8.5 leaves a clean first-try pass out of reflection by default; this
+        # test is about the reflect call, so it asks for it on a pass too.
+        cfg.harness.reflect_on = (*cfg.harness.reflect_on, "pass")
         state = StateDir(self.toy.state_dir)
         run_id = "run-reflect-silent"
         board = Board(board_dir_for(state, run_id), state_dir=state)

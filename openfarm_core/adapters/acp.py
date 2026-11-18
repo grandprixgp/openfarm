@@ -195,9 +195,12 @@ class AcpCommand(list):
     """
 
     confine: confine_lib.ConfineSettings = confine_lib.ConfineSettings()
+    #: openfarm's own bridges replace the provider CLI's built-in system prompt
+    #: (`[micromanager] lean_prompt`). A standalone server ignores it.
+    lean_prompt: bool = True
 
 
-def acp_command(command: str | list[str], confine) -> AcpCommand:
+def acp_command(command: str | list[str], confine, lean_prompt: bool = True) -> AcpCommand:
     """`command` as an argv list carrying `confine` (settings, a mode string or None)."""
     if isinstance(command, str):
         try:
@@ -208,6 +211,7 @@ def acp_command(command: str | list[str], confine) -> AcpCommand:
         argv = [str(part) for part in command]
     out = AcpCommand(argv)
     out.confine = confine_lib.as_settings(confine)
+    out.lean_prompt = bool(lean_prompt)
     return out
 
 
@@ -829,6 +833,7 @@ class ClaudeAcpAdapter:
         max_line_bytes: int = DEFAULT_MAX_LINE_BYTES,
         stderr_tail_lines: int = 100,
         confine=None,
+        lean_prompt: bool | None = None,
     ) -> None:
         if auth_mode not in ("oauth", "api-key", "auto"):
             raise Invalid(
@@ -847,6 +852,9 @@ class ClaudeAcpAdapter:
         except confine_lib.ConfineError as exc:
             raise Invalid(exc.code, exc.message) from exc
         self.transport = "bridge" if _bridge_provider(self.argv) else "server"
+        if lean_prompt is None:
+            lean_prompt = getattr(command, "lean_prompt", True)
+        self.lean_prompt = bool(lean_prompt)
         self.process_hold: confine_lib.Hold | None = None
         self._boundary_root: Path | None = None
         self.notes: list[str] = []
@@ -1234,6 +1242,7 @@ class ClaudeAcpAdapter:
     def _bridge_meta(self, tool_policy: str, hold: confine_lib.Hold) -> dict:
         return {
             "toolPolicy": tool_policy,
+            "leanPrompt": self.lean_prompt,
             "confine": {
                 "mode": self.confine.mode,
                 "flags": hold.flags,

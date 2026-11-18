@@ -220,8 +220,9 @@ def codex_read_only_refusal(reason: str = "") -> str:
 
 def needs_nested(provider: str, transport: str, tool_policy: str, mode: str) -> bool:
     """Whether `decide` needs `nested_status` for this child."""
-    return (provider == "codex" and transport == "bridge" and tool_policy == "read-only"
-            and mode != "off")
+    # A standalone Codex ACP server runs the same sandboxed shell (v0.8.5).
+    return (provider == "codex" and transport in ("bridge", "server")
+            and tool_policy == "read-only" and mode != "off")
 
 
 def flags_only_note(provider: str, bwrap_reason: str = "") -> str:
@@ -311,6 +312,10 @@ def decide(
     if bwrap_usable:
         if flags and tool_policy == "read-only" and not nested_usable:
             return Hold(provider, mode, flags=True, refused=codex_read_only_refusal(nested_reason))
+        if (provider == "codex" and transport == "server" and tool_policy == "read-only"
+                and not nested_usable):
+            # v0.8.5: refused up front as the bridge is, not started to read nothing.
+            return Hold(provider, mode, refused=codex_read_only_refusal(nested_reason))
         return Hold(provider, mode, flags=flags, boundary=True)
     if mode == "bwrap":
         why = f'{CONFINE_SETTING} = "bwrap" confines every provider'
@@ -558,9 +563,13 @@ def scan_masks(
     if not globs and not hide_git:
         return files, dirs
     seen = 0
-    stack = [root]
+    # Each entry is (the real folder, the path it is reached by inside the session).
+    # A symlinked folder inside the session is walked again under its link's name
+    # (v0.8.5): `never_touch = ["link/secret"]` must hide the file `link/` leads to.
+    stack: list[tuple[Path, str]] = [(root, "")]
+    walked_links: set[Path] = set()
     while stack:
-        current = stack.pop()
+        current, prefix = stack.pop()
         try:
             entries = list(os.scandir(current))
         except OSError:
@@ -574,22 +583,27 @@ def scan_masks(
                     "never_touch / forbidden_files masks; the child is not started",
                 )
             full = Path(entry.path)
-            rel = full.relative_to(root).as_posix()
+            rel = f"{prefix}/{entry.name}" if prefix else full.relative_to(root).as_posix()
             hit = bool(globs) and matches_any(rel, globs)
             if hide_git and entry.name == ".git":
                 hit = True
             try:
                 if entry.is_symlink():
+                    target = full.resolve()
+                    inside = _within(target, root) and target != root
                     if hit:
-                        target = full.resolve()
-                        if _within(target, root) and target != root:
+                        if inside:
                             (dirs if target.is_dir() else files).append(target)
+                    elif (inside and globs and target.is_dir()
+                          and target not in walked_links):
+                        walked_links.add(target)
+                        stack.append((target, rel))
                     continue
                 if entry.is_dir(follow_symlinks=False):
                     if hit:
                         dirs.append(full)
                     elif entry.name != ".git":
-                        stack.append(full)
+                        stack.append((full, rel))
                 elif hit:
                     files.append(full)
             except OSError:
@@ -643,7 +657,16 @@ def boundary_argv(
     for raw in read_roots or ():
         p = Path(os.path.expanduser(str(raw)))
         if p.is_absolute() and p.exists():
-            extra_roots.append(p.resolve())
+            resolved = p.resolve()
+            # v0.8.5: a read root gets the guard an install folder gets: never
+            # the home folder or anything holding it (its keys and logins).
+            if real_home is not None and _within(real_home, resolved):
+                raise ConfineError(
+                    "confine-read-root-holds-home",
+                    f"refusing to mount confine_read_roots entry {raw!r}: it holds your "
+                    "home folder; name the folders inside it the child needs",
+                )
+            extra_roots.append(resolved)
 
     args: list[str] = [exe, *_base_args(), "--tmpfs", "/tmp"]
     bound: list[Path] = []
@@ -688,6 +711,69 @@ def boundary_argv(
     # make it read-only so the child writes only in its home and its /tmp.
     args.extend(["--remount-ro", "/"])
     args.extend(["--setenv", "TMPDIR", "/tmp", "--chdir", str(session), "--", *child_argv])
+    return args
+
+
+#: Folders under home that hold logins and keys: hidden from a confined test run.
+RUNNER_HIDDEN_HOME = (".ssh", ".gnupg", ".aws", ".config/openfarm", ".claude",
+                      ".claude.json", ".codex", ".gemini", ".config/gh", ".netrc",
+                      ".docker/config.json", ".kube", ".git-credentials", ".pypirc",
+                      ".npmrc")
+
+
+def runner_argv(
+    argv: list[str],
+    *,
+    worktree: Path | str,
+    write_roots=(),
+    hide_paths=(),
+    bwrap: str | None = None,
+) -> list[str]:
+    """Wrap one gate command (a build, a test run) in a boundary (v0.8.5).
+
+    The whole system is read-only, so toolchains installed anywhere still work;
+    only the card's worktree, the extra `write_roots` (a build target folder, a
+    cache) and a private /tmp can be written. A test that writes through a linked
+    `node_modules` into the base checkout, or anywhere else, gets an error instead.
+    Logins and keys under home, and `hide_paths`, are hidden. The network is shared.
+    """
+    exe = bwrap or find_bwrap()
+    if not exe:
+        raise ConfineError("confine-no-bwrap", "bwrap is not installed (not found on PATH)")
+    tree = Path(worktree).resolve()
+    real_home = _real_home()
+    if real_home is not None and _within(real_home, tree):
+        raise ConfineError("confine-session-is-home",
+                           f"refusing to make {tree} writable: it holds your home folder")
+    args = [exe, "--die-with-parent", "--unshare-all", "--share-net", "--new-session",
+            "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp"]
+    writable = [tree]
+    for raw in write_roots or ():
+        if not str(raw):
+            continue
+        path = Path(os.path.expanduser(str(raw)))
+        path.mkdir(parents=True, exist_ok=True)
+        resolved = path.resolve()
+        if real_home is not None and _within(real_home, resolved):
+            raise ConfineError("confine-write-root-holds-home",
+                               f"refusing to make {raw!r} writable: it holds your home folder")
+        writable.append(resolved)
+    for path in _dedupe(writable):
+        args.extend(["--bind", str(path), str(path)])
+    hidden: list[Path] = [Path(p) for p in (hide_paths or ()) if str(p)]
+    if real_home is not None:
+        hidden += [real_home / name for name in RUNNER_HIDDEN_HOME]
+    for path in _dedupe(hidden):
+        if not os.path.lexists(path):
+            continue
+        real = path.resolve()
+        if any(_within(real, w) for w in writable):
+            continue
+        if real.is_dir():
+            args.extend(["--tmpfs", str(real), "--remount-ro", str(real)])
+        else:
+            args.extend(["--ro-bind", "/dev/null", str(real)])
+    args.extend(["--setenv", "TMPDIR", "/tmp", "--chdir", str(tree), "--", *argv])
     return args
 
 

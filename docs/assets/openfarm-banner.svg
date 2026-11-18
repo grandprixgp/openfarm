@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1280" height="340" viewBox="0 0 1280 340" role="img" aria-labelledby="banner-t banner-d">
 <title id="banner-t">openfarm: Frontier thinks. The farm grinds. Code decides.</title>
-<desc id="banner-d">Banner for openfarm v0.8.1, a pre-release portable coding farm where frontier models architect and review, tiered worker models run parallel non-colliding cards over a shared board with a stdlib TUI, and plain code enforces every Rust, Python, and TypeScript gate.</desc>
+<desc id="banner-d">Banner for openfarm v0.8.5, a pre-release portable coding farm where frontier models architect and review, tiered worker models run parallel non-colliding cards over a shared board with a stdlib TUI, and plain code enforces every Rust, Python, and TypeScript gate.</desc>
 <defs>
   <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
     <stop offset="0" stop-color="#0b1220"/><stop offset="1" stop-color="#17233d"/>
@@ -147,7 +147,7 @@
 <text x="74" y="236" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="18" font-weight="400" fill="#9fb0c8" text-anchor="start" >Your best model designs and reviews. A cheaper model does the grind.</text>
 <text x="74" y="262" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="18" font-weight="400" fill="#9fb0c8" text-anchor="start" >Every gate is run by plain code, so no model ever grades its own work.</text>
 <rect x="74" y="286" width="69" height="27" rx="13.5" fill="#34d399" fill-opacity="0.14" stroke="#34d399" stroke-opacity="0.6"/>
-<text x="108.5" y="304" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#34d399" text-anchor="middle" >v0.8.1</text>
+<text x="108.5" y="304" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#34d399" text-anchor="middle" >v0.8.5</text>
 <rect x="151" y="286" width="98" height="27" rx="13.5" fill="#fbbf24" fill-opacity="0.14" stroke="#fbbf24" stroke-opacity="0.6"/>
 <text x="200.0" y="304" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#fbbf24" text-anchor="middle" >pre-release</text>
 <rect x="257" y="286" width="196" height="27" rx="13.5" fill="#a78bfa" fill-opacity="0.14" stroke="#a78bfa" stroke-opacity="0.6"/>

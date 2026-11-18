@@ -147,7 +147,7 @@ class TurnTimeoutOptionTests(unittest.TestCase):
             rc = cli_main(list(argv))
         return rc, out.getvalue() + err.getvalue()
 
-    def test_option_reaches_the_driver_and_defaults_to_180(self) -> None:
+    def test_option_reaches_the_driver_and_defaults_to_the_supervisor_wait(self) -> None:
         self.assertEqual(DriverAgent(agent="claude").timeout_s, 180.0)
         seen: list[float] = []
 
@@ -162,7 +162,15 @@ class TurnTimeoutOptionTests(unittest.TestCase):
         with mock.patch.object(driver_mod, "drive_run", fake_drive_run):
             self._cli("--repo", str(toy.root), "--json", "drive", "--turn-timeout", "7.5")
             self._cli("--repo", str(toy.root), "--json", "drive")
-        self.assertEqual(seen, [7.5, 180.0])
+        # With no flag, drive_run fills it in from [micromanager] timeout_s, never
+        # under 180 (v0.8.5: the wait an ACP supervisor gets).
+        self.assertEqual(seen, [7.5, None])
+        from openfarm_core.config import load_config
+        from openfarm_core.driver import drive_defaults
+
+        cfg = load_config(toy.root)
+        self.assertEqual(drive_defaults(cfg, "claude", None, None, None)[2],
+                         max(180.0, float(cfg.micromanager.timeout_s)))
 
     def test_bad_values_are_refused(self) -> None:
         from tests.test_python_e2e import build_python_toy

@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1280" height="470" viewBox="0 0 1280 470" role="img" aria-labelledby="pipeline-t pipeline-d">
 <title id="pipeline-t">openfarm per-card pipeline</title>
-<desc id="pipeline-d">Eight steps for every card, posted to board.jsonl: 1 claim and eligibility, 2 isolate (parallel when touches are disjoint), 3 baseline green, 4 shape and plan, 5 phase A tests, 6 phase B code (escalates effort or hands back early), 7 end gates, 8 catch-up and project plus global harness capture. Ends as a branch with a reviewer dossier or a handed-back/clean block.</desc>
+<desc id="pipeline-d">Eight steps for every card, posted to board.jsonl: 1 claim and eligibility, 2 isolate (parallel when touches are disjoint), 3 baseline green, 4 shape and plan with the contract stubs in one supervisor call, 5 phase A tests, 6 phase B code (retries on max effort or hands back early), 7 end gates including mutation for Rust, Python and TypeScript, 8 catch-up and project plus global harness capture. Ends as a branch with a reviewer dossier or a handed-back/clean block.</desc>
 <defs>
   <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
     <stop offset="0" stop-color="#0b1220"/><stop offset="1" stop-color="#17233d"/>
@@ -40,8 +40,8 @@
 <circle cx="988" cy="112" r="15" fill="#34d399"/>
 <text x="988" y="117.5" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="15" font-weight="800" fill="#0b1220" text-anchor="middle" >4</text>
 <text x="1014" y="118" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="17" font-weight="700" fill="#f1f5f9" text-anchor="start" >Shape + plan</text>
-<text x="978" y="158" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#9fb0c8" text-anchor="start" >Supervisor or planner shapes</text>
-<text x="978" y="179" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#9fb0c8" text-anchor="start" >checkpointed steps + contract.</text>
+<text x="978" y="158" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#9fb0c8" text-anchor="start" >Supervisor (in one call) or</text>
+<text x="978" y="179" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#9fb0c8" text-anchor="start" >planner shapes plan + stubs.</text>
 <rect x="958" y="248" width="282" height="128" rx="12" fill="#34d399" fill-opacity="0.08" stroke="#34d399" stroke-opacity="0.75" stroke-width="1.5"/>
 <circle cx="988" cy="280" r="15" fill="#34d399"/>
 <text x="988" y="285.5" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="15" font-weight="800" fill="#0b1220" text-anchor="middle" >5</text>
@@ -52,14 +52,14 @@
 <circle cx="682" cy="280" r="15" fill="#34d399"/>
 <text x="682" y="285.5" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="15" font-weight="800" fill="#0b1220" text-anchor="middle" >6</text>
 <text x="708" y="286" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="17" font-weight="700" fill="#f1f5f9" text-anchor="start" >Phase B: code</text>
-<text x="672" y="326" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#9fb0c8" text-anchor="start" >Edits only listed files; escalates</text>
-<text x="672" y="347" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#9fb0c8" text-anchor="start" >effort or hands back early.</text>
+<text x="672" y="326" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#9fb0c8" text-anchor="start" >Edits only listed files; retries</text>
+<text x="672" y="347" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#9fb0c8" text-anchor="start" >on max effort or hands back.</text>
 <rect x="346" y="248" width="282" height="128" rx="12" fill="#fbbf24" fill-opacity="0.08" stroke="#fbbf24" stroke-opacity="0.75" stroke-width="1.5"/>
 <circle cx="376" cy="280" r="15" fill="#fbbf24"/>
 <text x="376" y="285.5" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="15" font-weight="800" fill="#0b1220" text-anchor="middle" >7</text>
 <text x="402" y="286" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="17" font-weight="700" fill="#f1f5f9" text-anchor="start" >End gates</text>
 <text x="366" y="326" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="400" fill="#9fb0c8" text-anchor="start" >Revert check, lint, full suite,</text>
-<text x="366" y="347" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="400" fill="#9fb0c8" text-anchor="start" >checker counter-tests.</text>
+<text x="366" y="347" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="400" fill="#9fb0c8" text-anchor="start" >counter-tests, mutation.</text>
 <rect x="40" y="248" width="282" height="128" rx="12" fill="#fbbf24" fill-opacity="0.08" stroke="#fbbf24" stroke-opacity="0.75" stroke-width="1.5"/>
 <circle cx="70" cy="280" r="15" fill="#fbbf24"/>
 <text x="70" y="285.5" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="15" font-weight="800" fill="#0b1220" text-anchor="middle" >8</text>

@@ -50,7 +50,9 @@ PYTEST_CASES = {
         HEAD + PARAM + "    if c == 1:\n" + "\n".join("    " + line for line in
                                                      FAILS.splitlines()) + "\n",
         ["test_x[1]"], "fail"),
-    "every case known failing": (HEAD + PARAM + FAILS, ["test_x[1]", "test_x[2]"], "pass"),
+    # v0.8.5: refused at check (every case is on known_failing), so no run starts.
+    "every case known failing": (HEAD + PARAM + FAILS, ["test_x[1]", "test_x[2]"],
+                                 "ineligible"),
 }
 
 UNITTEST_SKIPPED = '''\
@@ -141,7 +143,13 @@ class PytestRowsAgreeWithFailBeforeTests(_Toy, unittest.TestCase):
         for label, (content, known, gate_result) in PYTEST_CASES.items():
             with self.subTest(label):
                 toy = self._toy(content, known, pytest_runner=True)
-                baseline = self._check(toy)["baseline"]
+                payload = self._check(toy)
+                if gate_result == "ineligible":
+                    self.assertFalse(payload["eligible"], payload)
+                    self.assertIn("known_failing", payload["baseline"]["error"])
+                    self.assertEqual(payload["baseline"]["known_failing_on_base"], ["test_x"])
+                    continue
+                baseline = payload["baseline"]
                 gate = self._fail_before(toy, content)
                 self.assertEqual(gate["result"], gate_result, gate["detail"])
                 self.assertEqual(baseline["ok"], gate_result == "pass", baseline)

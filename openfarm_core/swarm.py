@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import os
 import secrets
 import sys
 import threading
@@ -16,7 +15,7 @@ from .board import CODE_AUTHOR_NAMES, Board, is_stop_request, normalize_role, po
 from .cards import Card
 from .errors import Refused
 from .globs import globs_overlap
-from .state import _pid_alive, _this_host, utc_now
+from .state import holder_provably_gone, process_identity, utc_now
 
 WORKER_ROLES: tuple[str, ...] = ("planner", "test-writer", "implementer", "checker")
 SEAT_ROLES: tuple[str, ...] = ("coordinator", "supervisor")
@@ -294,7 +293,7 @@ def new_seat_holder() -> dict:
     The token stays in the caller's memory. The board keeps only its hash, so
     nothing that reads the roster can prove itself the holder.
     """
-    return {"pid": os.getpid(), "host": _this_host(), "token": secrets.token_hex(16)}
+    return {**process_identity(), "token": secrets.token_hex(16)}
 
 
 def _token_hash(token: str) -> str:
@@ -306,6 +305,9 @@ def _holder_record(holder: dict) -> dict:
     return {
         "pid": int(holder["pid"]),
         "host": str(holder["host"]),
+        # Machine, boot, pid namespace and start time where known (v0.8.5).
+        **{key: str(holder[key]) for key in ("machine_id", "boot_id", "pidns", "start")
+           if holder.get(key)},
         "since": utc_now(),
         "token_sha256": _token_hash(holder["token"]),
     }
@@ -327,13 +329,7 @@ def _holder_gone(rec: dict) -> bool:
     The run lock's rule (`StateDir.stale_lock_holder`): anything less certain,
     another host or a record that does not say, counts as still there.
     """
-    pid = rec.get("pid")
-    host = rec.get("host")
-    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
-        return False
-    if not isinstance(host, str) or not host or host != _this_host():
-        return False
-    return not _pid_alive(pid)
+    return holder_provably_gone(rec)
 
 
 def _describe_holder(rec: dict) -> str:

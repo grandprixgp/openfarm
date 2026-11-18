@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="460" viewBox="0 0 1280 460" role="img" aria-labelledby="tok-t tok-d">
+<title id="tok-t">openfarm v0.8.5 supervisor token savings</title>
+<desc id="tok-d">Left: supervisor prompt characters over the 12 bench tasks with scripted workers, v0.8.1 233,752 characters in 44 calls (pre_review 133,995, reflect_harness 49,102, scaffold_contract 25,777, shape_and_plan 24,878) against v0.8.5 87,814 in 24 calls (pre_review 52,795, shape_and_scaffold 28,541, shape_and_plan 6,478). Right: input tokens of one live shape_and_plan call through openfarm's bridges, full built-in system prompt against the lean one: Claude 4,239 to 1,779, Codex 10,936 to 4,673.</desc>
+<defs><linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#0b1220"/><stop offset="1" stop-color="#17233d"/></linearGradient></defs>
+<rect x="0" y="0" width="1280" height="460" rx="18" fill="url(#bg)"/>
+<rect x="0.5" y="0.5" width="1279" height="459" rx="18" fill="none" stroke="#ffffff" stroke-opacity="0.08"/>
+<text x="40" y="52" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="22" font-weight="750" fill="#f1f5f9" text-anchor="start">v0.8.5: the supervisor reads less and is called less</text>
+<text x="40" y="78" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="400" fill="#9fb0c8" text-anchor="start">Same cards, same gates, same answers checked by code. Only what the frontier model is sent changed.</text>
+<rect x="40" y="104" width="590" height="316" rx="12" fill="#ffffff" fill-opacity="0.03" stroke="#ffffff" stroke-opacity="0.10"/>
+<text x="62" y="136" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="16" font-weight="650" fill="#f1f5f9" text-anchor="start">Supervisor prompt characters, 12 bench tasks</text>
+<text x="62" y="158" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#9fb0c8" text-anchor="start">scripted workers, every supervisor op on (offline meter)</text>
+<text x="62" y="206" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="15" font-weight="700" fill="#f1f5f9" text-anchor="start">v0.8.1</text>
+<text x="62" y="224" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#9fb0c8" text-anchor="start">44 calls</text>
+<rect x="150.0" y="186" width="221.8" height="44" rx="4" fill="#38bdf8" fill-opacity="0.85"/>
+<rect x="373.5" y="186" width="80.1" height="44" rx="4" fill="#a78bfa" fill-opacity="0.85"/>
+<rect x="455.5" y="186" width="41.2" height="44" rx="4" fill="#fbbf24" fill-opacity="0.85"/>
+<rect x="498.5" y="186" width="39.7" height="44" rx="4" fill="#34d399" fill-opacity="0.85"/>
+<text x="547.1" y="214" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="14" font-weight="700" fill="#f1f5f9" text-anchor="start">233,752</text>
+<text x="62" y="276" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="15" font-weight="700" fill="#f1f5f9" text-anchor="start">v0.8.5</text>
+<text x="62" y="294" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#9fb0c8" text-anchor="start">24 calls</text>
+<rect x="150.0" y="256" width="86.3" height="44" rx="4" fill="#38bdf8" fill-opacity="0.85"/>
+<rect x="238.1" y="256" width="45.8" height="44" rx="4" fill="#fb923c" fill-opacity="0.85"/>
+<rect x="285.7" y="256" width="9.0" height="44" rx="4" fill="#34d399" fill-opacity="0.85"/>
+<text x="303.6" y="284" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="14" font-weight="700" fill="#f1f5f9" text-anchor="start">87,814</text>
+<text x="376.3" y="284" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="20" font-weight="800" fill="#34d399" text-anchor="start">−62%</text>
+<rect x="62.0" y="328" width="12.0" height="12" rx="3" fill="#38bdf8" fill-opacity="0.9"/>
+<text x="82" y="338" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#9fb0c8" text-anchor="start">pre_review: compact payload</text>
+<rect x="342.0" y="328" width="12.0" height="12" rx="3" fill="#a78bfa" fill-opacity="0.9"/>
+<text x="362" y="338" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#9fb0c8" text-anchor="start">reflect_harness: skipped on clean passes</text>
+<rect x="62.0" y="352" width="12.0" height="12" rx="3" fill="#fbbf24" fill-opacity="0.9"/>
+<text x="82" y="362" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#9fb0c8" text-anchor="start">scaffold_contract</text>
+<rect x="342.0" y="352" width="12.0" height="12" rx="3" fill="#34d399" fill-opacity="0.9"/>
+<text x="362" y="362" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#9fb0c8" text-anchor="start">shape_and_plan</text>
+<rect x="62.0" y="376" width="12.0" height="12" rx="3" fill="#fb923c" fill-opacity="0.9"/>
+<text x="82" y="386" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#9fb0c8" text-anchor="start">shape_and_scaffold: one call for both</text>
+<rect x="650" y="104" width="590" height="316" rx="12" fill="#ffffff" fill-opacity="0.03" stroke="#ffffff" stroke-opacity="0.10"/>
+<text x="672" y="136" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="16" font-weight="650" fill="#f1f5f9" text-anchor="start">Input tokens, one live shape_and_plan call</text>
+<text x="672" y="158" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#9fb0c8" text-anchor="start">through openfarm's bridges: built-in system prompt vs lean</text>
+<text x="672" y="220" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="15" font-weight="700" fill="#f1f5f9" text-anchor="start">Claude</text>
+<rect x="772.0" y="186" width="147.3" height="26" rx="4" fill="#64748b" fill-opacity="0.55"/>
+<text x="927.2951719092904" y="204" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="13" font-weight="600" fill="#cbd5e1" text-anchor="start">4,239</text>
+<rect x="772.0" y="218" width="61.8" height="26" rx="4" fill="#34d399" fill-opacity="0.85"/>
+<text x="841.8160204828091" y="236" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="13" font-weight="700" fill="#f1f5f9" text-anchor="start">1,779</text>
+<text x="903.8160204828091" y="236" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="14" font-weight="800" fill="#34d399" text-anchor="start">−58%</text>
+<text x="672" y="304" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="15" font-weight="700" fill="#f1f5f9" text-anchor="start">Codex</text>
+<rect x="772.0" y="270" width="380.0" height="26" rx="4" fill="#64748b" fill-opacity="0.55"/>
+<text x="1160.0" y="288" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="13" font-weight="600" fill="#cbd5e1" text-anchor="start">10,936</text>
+<rect x="772.0" y="302" width="162.4" height="26" rx="4" fill="#34d399" fill-opacity="0.85"/>
+<text x="942.3756400877835" y="320" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="13" font-weight="700" fill="#f1f5f9" text-anchor="start">4,673</text>
+<text x="1004.3756400877835" y="320" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="14" font-weight="800" fill="#34d399" text-anchor="start">−57%</text>
+<rect x="672.0" y="352" width="12.0" height="12" rx="3" fill="#64748b" fill-opacity="0.55"/>
+<text x="692" y="362" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#9fb0c8" text-anchor="start">v0.8.1: the CLI's own system prompt</text>
+<rect x="672.0" y="376" width="12.0" height="12" rx="3" fill="#34d399" fill-opacity="0.85"/>
+<text x="692" y="386" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#9fb0c8" text-anchor="start">v0.8.5: openfarm's lean prompt (--system-prompt, -c instructions)</text>
+<text x="40" y="446" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#7c8aa3" text-anchor="start">Measured 18 Nov 2026 on v0.8.1 (f612b71) and v0.8.5. Supervisor side only: worker tokens are in neither panel.</text>
+</svg>

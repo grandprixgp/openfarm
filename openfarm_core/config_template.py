@@ -79,6 +79,13 @@ def render_config(*, name: str, language: str, base_branch: str, state_dir: Path
         flagged_patterns = []
         tests_rule = "python_tests_in_test_files = true"
         runner = ["# Empty: the interpreter openfarm itself runs under.", 'python = ""']
+    runner += [
+        '# "bwrap": builds and tests run where only the card\'s worktree (and its',
+        "# build folder) can be written, logins under home are hidden. A tool that",
+        "# must write elsewhere (a download cache) needs that folder listed here.",
+        'confine = "off"',
+        "confine_write_roots = []",
+    ]
     mutation_required = ["test-backfill"] if mutation != "off" else []
     state_dir = Path(state_dir)
 
@@ -106,6 +113,8 @@ def render_config(*, name: str, language: str, base_branch: str, state_dir: Path
         "max_tokens = 32768",
         "cost_per_1k_in = 0.0005",
         "cost_per_1k_out = 0.0015",
+        "# A role can think harder on its retries than on its first attempt, e.g.",
+        "# `effort = \"high\", retry_effort = \"max\"` (sent as reasoning_effort).",
         f"test_writer = {{ model = {toml_str(model)}, temperature = 0.2 }}",
         f"implementer = {{ model = {toml_str(model)}, temperature = 0.3, vary_seed = true }}",
         f"checker     = {{ model = {toml_str(model)}, temperature = 0.35, vary_seed = true }}",
@@ -190,6 +199,10 @@ def render_config(*, name: str, language: str, base_branch: str, state_dir: Path
         "coach_on_stall = true",
         "adjudicate_counter_tests = true",
         "pre_review = true",
+        "# openfarm's own bridges replace the provider CLI's built-in system prompt.",
+        "lean_prompt = true",
+        "# One supervisor call shapes a card and declares its contract when it needs both.",
+        "combine_calls = true",
         "",
         "[state]",
         "min_free_mb = 256",
@@ -209,6 +222,8 @@ def render_config(*, name: str, language: str, base_branch: str, state_dir: Path
         "enabled = true",
         'dir = ""',
         'capture_on = ["retry_recovery", "fail", "counter_fail", "pass"]',
+        "# When the supervisor reflects on a card; add \"pass\" to include clean first-try passes.",
+        'reflect_on = ["retry_recovery", "fail", "counter_fail"]',
         "max_cues_per_brief = 4",
         "max_active_adaptations = 8",
         "min_confidence = 0.55",

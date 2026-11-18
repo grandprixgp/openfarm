@@ -23,7 +23,7 @@ import shutil
 from pathlib import Path
 
 from ..errors import Invalid, Refused
-from .base import Pack
+from .base import OwnMutationMixin, Pack
 
 PURPOSES = ("build", "test", "list", "lint", "ws-lint", "format", "fmt-check",
             "typecheck", "mutation", "extra")
@@ -801,7 +801,8 @@ def link_node_modules(worktree: Path, base: Path) -> str:
     return ""
 
 
-class TypeScriptPack(Pack):
+class TypeScriptPack(OwnMutationMixin, Pack):
+    mutation_language = "typescript"
     name = "typescript"
     extension = ".ts"
     test_dir = "tests"
@@ -1002,10 +1003,9 @@ class TypeScriptPack(Pack):
             return {"argv": [self.prettier_cmd, flag] + targets + extra}
 
         if purpose == "mutation":
-            raise Invalid(
-                "no-typescript-mutation",
-                'the TypeScript pack has no mutation tool; set [gates] mutation = "off"',
-            )
+            # openfarm's own mutation runner (v0.8.5): the card's named tests
+            # against small changes to the production files it changed.
+            return {"argv": self._own_mutation_argv(files, tests) + extra}
 
         return {"argv": list(extra)}
 
@@ -1046,9 +1046,6 @@ class TypeScriptPack(Pack):
     def parse_tests(self, stdout: str, stderr: str = "") -> dict:
         return _parse_node_output(stdout, stderr)
 
-    def parse_mutation(self, stdout: str) -> dict:
-        raise Invalid("no-typescript-mutation",
-                      "the TypeScript pack has no mutation tool")
 
     # -- files ----------------------------------------------------------------
 
@@ -1233,7 +1230,7 @@ class TypeScriptPack(Pack):
                 "failed_tests": failed_sorted[:12]}
 
     def mutation(self, files: list[str], tests: list[str] | None = None) -> dict:
-        return self.commands("mutation", files=files)
+        return self.commands("mutation", files=files, tests=tests)
 
 
 # -- helpers ------------------------------------------------------------------

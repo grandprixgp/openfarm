@@ -307,9 +307,11 @@ class CommandTests(unittest.TestCase):
         self.assertIn("SyntaxError", result.stderr)
         self.assertFalse((bad / "__pycache__").exists())
 
-    def test_mutation_is_refused(self) -> None:
-        with self.assertRaises(Invalid):
-            PythonPack(ruff=False).commands("mutation", files=["a.py"])
+    def test_mutation_runs_openfarms_own_runner(self) -> None:
+        # v0.8.5: no longer refused (tests/test_v085_mutate.py covers the runner).
+        argv = PythonPack(ruff=False).commands("mutation", files=["a.py"])["argv"]
+        self.assertTrue(argv[2].endswith("mutate.py"), argv)
+        self.assertEqual(argv[argv.index("--lang") + 1], "python")
 
 
 class FileTests(unittest.TestCase):
