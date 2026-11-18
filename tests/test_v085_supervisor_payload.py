@@ -153,3 +153,55 @@ class ReflectOnRecordTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DrivenTurnPromptTests(unittest.TestCase):
+    """A real (scripted) drive: what each turn's prompt carries."""
+
+    def test_question_turns_carry_the_whole_request_and_nothing_for_the_coordinator(self) -> None:
+        import json as _json
+        from pathlib import Path
+        from unittest import mock
+
+        from openfarm_core.config import load_config
+        from openfarm_core.driver import DriverAgent, drive_run
+        from openfarm_core.state import StateDir
+        from tests.test_python_e2e import build_python_toy
+        from tests.test_v081b_drive_spend import _WORKERS, _answer
+
+        toy = build_python_toy()
+        self.addCleanup(toy.cleanup)
+        toy.write_card(
+            "CARD-1", title="A full bundle refuses a push", category="pinned-bugfix",
+            unit=".", touches=["tally/bounded.py"],
+            tests=[{"name": "test_a_full_bundle_refuses_a_push", "file": "tests/test_full.py",
+                    "asserts": "push raises FullError"}],
+            done_text="push on a full bundle raises `FullError`.")
+        toy.commit("add CARD-1")
+        sp = Path(toy.base) / "script.json"
+        sp.write_text(_json.dumps({
+            **_WORKERS, "driver/*": {"actions": [], "answers": []},
+            "driver/plan": {"actions": [{"action": "start", "card": "CARD-1"}], "answers": []},
+            "driver/question/shape_and_plan": _answer({"verdict": "ready", "clarified_notes": "ok"}),
+            "driver/question/pre_review": _answer({"verdict": "approve", "reviewer_brief": "ok"}),
+        }))
+        prompts: list[str] = []
+        original = DriverAgent._complete_scripted
+
+        def capture(agent, prompt, *, turn_key):
+            prompts.append(prompt)
+            return original(agent, prompt, turn_key=turn_key)
+
+        with mock.patch.object(DriverAgent, "_complete_scripted", capture):
+            res = drive_run(toy.root, load_config(toy.root), StateDir(toy.state_dir),
+                            agent="claude", seat="both", card_ids=["CARD-1"], script=sp)
+        self.assertEqual(res["outcomes"][0]["final_state"], "in-review")
+        review = [p for p in prompts if "=== QUESTION #" in p and "(pre_review" in p]
+        self.assertTrue(review, "a pre-review question turn ran")
+        state, end = _json.JSONDecoder().raw_decode(review[0])
+        for key in ("roster", "tiers", "recent_posts"):
+            self.assertNotIn(key, state)
+        request = review[0][end:]
+        # The request is the whole one: its gate records and closing marker are there.
+        self.assertIn('"gates":', request)
+        self.assertIn("--- END DATA ---", request)

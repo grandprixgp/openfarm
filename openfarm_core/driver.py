@@ -2777,8 +2777,15 @@ def drive_run(
                         ],
                         "open_questions": [_question_details(board, q) for q in open_qs],
                     }
-                    user_prompt = render_driver_turn(prompt_payload)
                     has_coord_work = bool(startable or coord_events)
+                    if not has_coord_work:
+                        # A turn with only supervisor questions needs only them:
+                        # an ACP supervisor is sent the request and nothing else.
+                        for key in ("pending_ready_cards", "running_cards",
+                                    "finished_cards_with_active_members",
+                                    "unresolved_events", "tiers", "roster", "recent_posts"):
+                            prompt_payload.pop(key, None)
+                    user_prompt = render_driver_turn(prompt_payload)
 
                     resp = _driver_turn(
                         user_prompt, turn_key, sup_work=bool(open_qs), coord_work=has_coord_work
