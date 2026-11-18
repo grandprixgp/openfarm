@@ -370,6 +370,10 @@ def ignored_or_filtered(parsed: dict, named: list,
     return GateResult("pass-after", PASS, f"all {len(named)} named test(s) passed")
 
 
+#: The exit code pytest and unittest give a finished run that collected no test.
+_EMPTY_RUN_EXIT = 5
+
+
 def suite_green(parsed: dict, known_failing: list[str],
                 run_cls: str = "pass", exit_code: int = 0) -> GateResult:
     """Every failure must be on `known_failing`, by exact name.
@@ -460,7 +464,9 @@ def suite_green(parsed: dict, known_failing: list[str],
         # exit 5): a footer that counted no test at all.
         counted = sum(int(f.get("passed", 0)) + int(f.get("failed", 0))
                       + int(f.get("ignored", 0)) for f in footers)
-        if not footers or counted:
+        # Only that exit code is the empty run: pytest stopped by Ctrl-C prints
+        # "no tests ran" too, with exit code 2, and that is not a finished run.
+        if not footers or counted or exit_code != _EMPTY_RUN_EXIT:
             return GateResult(
                 "suite", FAIL,
                 f"the test run failed (exit code {exit_code}) and nothing it printed "

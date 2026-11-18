@@ -48,6 +48,17 @@ class FailedRunWithNothingRedTests(unittest.TestCase):
         self.assertEqual(gate.result, PASS)
         self.assertEqual(gate.evidence["known-red"], ["test_old"])
 
+    def test_an_interrupted_run_that_says_no_tests_ran_is_not_the_empty_run(self) -> None:
+        # Second outside review, 4: pytest stopped by Ctrl-C exits 2 and prints
+        # "no tests ran"; only exit 5 is a finished run with nothing in it.
+        empty = dict(EMPTY, footers=[_footer()])
+        self.assertEqual(suite_green(empty, [], run_cls="fail", exit_code=5).result, PASS)
+        for code in (2, 1, 4, 130):
+            with self.subTest(code=code):
+                gate = suite_green(empty, [], run_cls="fail", exit_code=code)
+                self.assertEqual(gate.result, FAIL)
+                self.assertIn(f"exit code {code}", gate.detail)
+
     def test_the_other_answers_are_unchanged(self) -> None:
         passed = dict(EMPTY, results=[{"name": "t", "status": "ok"}], footers=[_footer(passed=1)])
         self.assertEqual(suite_green(passed, [], run_cls="pass", exit_code=0).result, PASS)
