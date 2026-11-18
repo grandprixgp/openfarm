@@ -155,8 +155,11 @@ class DirectRunner:
     def __init__(self, repo: Path, timeout_s: float = 1800.0,
                  output_dir: Path | None = None,
                  limiter: BuildLimiter | None = None,
-                 budget=None) -> None:
+                 budget=None, confine: dict | None = None) -> None:
         self.repo = Path(repo)
+        #: `{"write_roots": [...], "hide_paths": [...]}` to run every command in a
+        #: boundary (`[runner] confine = "bwrap"`, v0.8.5); None runs them as they are.
+        self.confine = confine
         self.timeout_s = timeout_s
         self.output_dir = Path(output_dir) if output_dir else None
         self.limiter = limiter
@@ -184,10 +187,29 @@ class DirectRunner:
             run_env["CARGO_TARGET_DIR"] = str(target_dir)
             Path(target_dir).mkdir(parents=True, exist_ok=True)
 
+        run_argv = list(argv)
+        if self.confine is not None:
+            from .. import confine as confine_lib
+
+            write_roots = list(self.confine.get("write_roots") or ())
+            if target_dir:
+                write_roots.append(str(target_dir))
+            if kind == "mutation":
+                # A mutation tool writes its results to the card's evidence folder.
+                for flag in ("--out", "--output"):
+                    if flag in run_argv[:-1]:
+                        write_roots.append(run_argv[run_argv.index(flag) + 1])
+            try:
+                run_argv = confine_lib.runner_argv(
+                    run_argv, worktree=Path(cwd or self.repo), write_roots=write_roots,
+                    hide_paths=self.confine.get("hide_paths") or ())
+            except confine_lib.ConfineError as exc:
+                raise Refused("runner-confine-unavailable", exc.message) from exc
+
         started = time.monotonic()
         try:
             completed = subprocess.run(
-                argv, cwd=str(cwd or self.repo), capture_output=True, text=True,
+                run_argv, cwd=str(cwd or self.repo), capture_output=True, text=True,
                 env=run_env, timeout=timeout_s or self.timeout_s)
             stdout = completed.stdout or ""
             stderr = completed.stderr or ""
@@ -314,8 +336,20 @@ def open_runner(cfg, worktree: Path, output_dir: Path | None = None,
     """The runner the config names."""
     spec = cfg.runner_adapter
     if spec == "direct":
+        confine = None
+        if getattr(cfg, "runner_confine", "off") == "bwrap":
+            from .. import confine as confine_lib
+
+            usable, why = confine_lib.bwrap_status()
+            if not usable:
+                raise Refused("runner-confine-unavailable",
+                              f'[runner] confine = "bwrap", but bubblewrap is not usable '
+                              f'here ({why}); install it or set confine = "off"')
+            key_file = getattr(cfg, "key_file", None)
+            confine = {"write_roots": list(getattr(cfg, "runner_write_roots", []) or []),
+                       "hide_paths": [str(key_file)] if key_file else []}
         return DirectRunner(worktree, output_dir=output_dir,
-                            limiter=limiter, budget=budget)
+                            limiter=limiter, budget=budget, confine=confine)
     if spec.startswith("cmd:"):
         return CmdRunner(spec, worktree, limiter=limiter, budget=budget)
     raise Invalid("bad-runner", f"{spec!r} is not a runner adapter")

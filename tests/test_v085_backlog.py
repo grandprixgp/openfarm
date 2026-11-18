@@ -5,9 +5,13 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
+import shutil
+import tempfile
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -342,6 +346,80 @@ class ParallelSupervisorSpendTests(unittest.TestCase):
         self.assertAlmostEqual(mm.budget.usage_for("CARD-2")["spend"], 0.01)
         self.assertEqual(mm.budget.usage_for("CARD-1")["tokens_in"], 5000)
         self.assertEqual(mm.budget.usage_for("CARD-2")["tokens_in"], 100)
+
+
+class RunnerConfineTests(unittest.TestCase):
+    """v0.8.5: `[runner] confine = "bwrap"` runs gate commands with only the worktree writable."""
+
+    def test_config_reads_it_and_refuses_junk(self) -> None:
+        from openfarm_core.config import ConfigError, load_config
+        from tests.test_python_e2e import build_python_toy
+
+        toy = build_python_toy()
+        self.addCleanup(toy.cleanup)
+        cfg_path = toy.root / ".openfarm" / "config.toml"
+        text = cfg_path.read_text()
+        self.assertEqual(load_config(toy.root).runner_confine, "off")
+        base = text.replace("[runner]\n", "[runner]\nconfine = \"bwrap\"\n", 1)
+        self.assertNotEqual(base, text, "the toy has a [runner] table")
+        cfg_path.write_text(base)
+        self.assertEqual(load_config(toy.root).runner_confine, "bwrap")
+        cfg_path.write_text(text.replace("[runner]\n", "[runner]\nconfine = \"docker\"\n", 1))
+        with self.assertRaises(ConfigError):
+            load_config(toy.root)
+
+    def test_a_missing_bwrap_is_a_refusal(self) -> None:
+        from openfarm_core import confine
+        from openfarm_core.adapters.direct import DirectRunner
+        from openfarm_core.errors import Refused
+
+        tmp = Path(tempfile.mkdtemp(prefix="of-v085-rc-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        runner = DirectRunner(tmp, confine={"write_roots": [], "hide_paths": []})
+        with mock.patch.object(confine, "find_bwrap", return_value=None):
+            with self.assertRaises(Refused) as caught:
+                runner.exec("test", ["true"])
+        self.assertEqual(caught.exception.code, "runner-confine-unavailable")
+
+    @unittest.skipUnless(__import__("openfarm_core.confine", fromlist=["x"]).bwrap_status()[0],
+                         "needs a working bwrap")
+    def test_real_boundary_writes_only_in_the_worktree(self) -> None:
+        from openfarm_core.adapters.direct import DirectRunner
+
+        tmp = Path(tempfile.mkdtemp(prefix="of-v085-rc-", dir=os.environ.get("TMPDIR")))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        tree, base, target, key = tmp / "tree", tmp / "base", tmp / "target", tmp / "k.key"
+        for d in (tree, base):
+            d.mkdir()
+        key.write_text("SECRET_KEY\n")
+        script = (f"echo in > {tree}/ok.txt; echo t > {target}/t.txt; "
+                  f"echo out > {base}/leak.txt 2>/dev/null || echo blocked=base; "
+                  f"cat {key} 2>/dev/null | grep -q SECRET && echo key=read || echo key=hidden; "
+                  "echo tmp > /tmp/x && echo tmp=ok")
+        runner = DirectRunner(tree, confine={"write_roots": [], "hide_paths": [str(key)]})
+        result = runner.exec("test", ["/bin/sh", "-c", script], target_dir=target)
+        self.assertEqual(result.cls, "pass", result.stderr)
+        self.assertIn("blocked=base", result.stdout)
+        self.assertIn("key=hidden", result.stdout)
+        self.assertIn("tmp=ok", result.stdout)
+        self.assertTrue((tree / "ok.txt").exists())
+        self.assertTrue((target / "t.txt").exists())
+        self.assertFalse((base / "leak.txt").exists())
+
+    @unittest.skipUnless(__import__("openfarm_core.confine", fromlist=["x"]).bwrap_status()[0],
+                         "needs a working bwrap")
+    def test_real_boundary_a_mutation_run_can_write_its_results(self) -> None:
+        from openfarm_core.adapters.direct import DirectRunner
+
+        tmp = Path(tempfile.mkdtemp(prefix="of-v085-rcm-", dir=os.environ.get("TMPDIR")))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        tree, out = tmp / "tree", tmp / "evidence" / "1"
+        tree.mkdir()
+        runner = DirectRunner(tree, confine={"write_roots": [], "hide_paths": []})
+        result = runner.exec("mutation", ["/bin/sh", "-c", f"echo r > {out}/o.json", "x",
+                                          "--out", str(out)])
+        self.assertEqual(result.cls, "pass", result.stderr)
+        self.assertTrue((out / "o.json").exists())
 
 
 if __name__ == "__main__":

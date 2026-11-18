@@ -79,6 +79,13 @@ def render_config(*, name: str, language: str, base_branch: str, state_dir: Path
         flagged_patterns = []
         tests_rule = "python_tests_in_test_files = true"
         runner = ["# Empty: the interpreter openfarm itself runs under.", 'python = ""']
+    runner += [
+        '# "bwrap": builds and tests run where only the card\'s worktree (and its',
+        "# build folder) can be written, logins under home are hidden. A tool that",
+        "# must write elsewhere (a download cache) needs that folder listed here.",
+        'confine = "off"',
+        "confine_write_roots = []",
+    ]
     mutation_required = ["test-backfill"] if mutation != "off" else []
     state_dir = Path(state_dir)
 

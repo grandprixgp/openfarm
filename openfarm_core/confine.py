@@ -714,6 +714,69 @@ def boundary_argv(
     return args
 
 
+#: Folders under home that hold logins and keys: hidden from a confined test run.
+RUNNER_HIDDEN_HOME = (".ssh", ".gnupg", ".aws", ".config/openfarm", ".claude",
+                      ".claude.json", ".codex", ".gemini", ".config/gh", ".netrc",
+                      ".docker/config.json", ".kube", ".git-credentials", ".pypirc",
+                      ".npmrc")
+
+
+def runner_argv(
+    argv: list[str],
+    *,
+    worktree: Path | str,
+    write_roots=(),
+    hide_paths=(),
+    bwrap: str | None = None,
+) -> list[str]:
+    """Wrap one gate command (a build, a test run) in a boundary (v0.8.5).
+
+    The whole system is read-only, so toolchains installed anywhere still work;
+    only the card's worktree, the extra `write_roots` (a build target folder, a
+    cache) and a private /tmp can be written. A test that writes through a linked
+    `node_modules` into the base checkout, or anywhere else, gets an error instead.
+    Logins and keys under home, and `hide_paths`, are hidden. The network is shared.
+    """
+    exe = bwrap or find_bwrap()
+    if not exe:
+        raise ConfineError("confine-no-bwrap", "bwrap is not installed (not found on PATH)")
+    tree = Path(worktree).resolve()
+    real_home = _real_home()
+    if real_home is not None and _within(real_home, tree):
+        raise ConfineError("confine-session-is-home",
+                           f"refusing to make {tree} writable: it holds your home folder")
+    args = [exe, "--die-with-parent", "--unshare-all", "--share-net", "--new-session",
+            "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp"]
+    writable = [tree]
+    for raw in write_roots or ():
+        if not str(raw):
+            continue
+        path = Path(os.path.expanduser(str(raw)))
+        path.mkdir(parents=True, exist_ok=True)
+        resolved = path.resolve()
+        if real_home is not None and _within(real_home, resolved):
+            raise ConfineError("confine-write-root-holds-home",
+                               f"refusing to make {raw!r} writable: it holds your home folder")
+        writable.append(resolved)
+    for path in _dedupe(writable):
+        args.extend(["--bind", str(path), str(path)])
+    hidden: list[Path] = [Path(p) for p in (hide_paths or ()) if str(p)]
+    if real_home is not None:
+        hidden += [real_home / name for name in RUNNER_HIDDEN_HOME]
+    for path in _dedupe(hidden):
+        if not os.path.lexists(path):
+            continue
+        real = path.resolve()
+        if any(_within(real, w) for w in writable):
+            continue
+        if real.is_dir():
+            args.extend(["--tmpfs", str(real), "--remount-ro", str(real)])
+        else:
+            args.extend(["--ro-bind", "/dev/null", str(real)])
+    args.extend(["--setenv", "TMPDIR", "/tmp", "--chdir", str(tree), "--", *argv])
+    return args
+
+
 def _dedupe(paths: list[Path]) -> list[Path]:
     out: list[Path] = []
     for p in paths:

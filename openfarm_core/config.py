@@ -52,7 +52,7 @@ _TABLE_KEYS = {
                     "allow_type_changes", "max_context_files"},
     "brief": {"test_conventions"},
     "runner": {"env", "cargo_flags", "python", "typescript", "typescript_typecheck",
-               "typescript_format", "link_node_modules"},
+               "typescript_format", "link_node_modules", "confine", "confine_write_roots"},
     "budget": {"implementer_attempts", "test_writer_attempts",
                "model_build_calls_per_card", "mutation_build_calls_per_card",
                "tokens_per_card", "wall_clock_per_card", "frontier_cost_ratio",
@@ -565,6 +565,11 @@ class Config:
             ("auto", "prettier", "off"))
         self.link_node_modules = _as_bool(
             runner.get("link_node_modules"), "[runner] link_node_modules", True)
+        # v0.8.5: gate commands in a boundary where only the worktree is writable.
+        self.runner_confine = _as_choice(
+            runner.get("confine"), "[runner] confine", "off", ("off", "bwrap"))
+        self.runner_write_roots = _as_str_list(
+            runner.get("confine_write_roots", []), "[runner] confine_write_roots")
         env_table = runner.get("env") or {}
         if not isinstance(env_table, dict):
             raise ConfigError("[runner.env] must be a table")
