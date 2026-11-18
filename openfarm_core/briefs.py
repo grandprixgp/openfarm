@@ -441,16 +441,23 @@ def implementer_brief(card: Card, book: BriefBook, frozen_tests: dict[str, str],
 
     if attempt == 1:
         parts.append("Full text of files in your touches:")
+        shown: set[str] = set()
         for path in _expand_touch_paths(book, card.touches):
             if book.is_hidden(path):
                 continue
             target = _safe_existing_target(book, path)
             if target is not None:
+                shown.add(normalise(path))
                 parts.append(f"\n### {normalise(path)}\n{target.read_text()}")
         parts.append("\nThe frozen tests (you must not edit these):")
         for path, text in frozen_tests.items():
             parts.append(f"\n### {path}\n{text}")
-        if card.reference and not book.is_hidden(card.reference):
+        # A reference that is also a touched file is already shown in full above;
+        # sending it twice doubled a 5,700-line file's share of the brief (live,
+        # more-itertools, 18 Nov 2026).
+        if card.reference and normalise(card.reference) in shown:
+            parts.append(f"\nReference: {normalise(card.reference)} (shown above)")
+        elif card.reference and not book.is_hidden(card.reference):
             target = _safe_existing_target(book, card.reference)
             if target is not None:
                 parts.append(f"\n### Reference: {card.reference}\n{target.read_text()}")
