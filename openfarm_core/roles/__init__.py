@@ -223,7 +223,30 @@ def _plan_test_name(raw: str, card: Card | None) -> str:
                      f"{test.name} in `{test.file}`", f"`{test.name}` in `{test.file}`"):
             if raw.strip() == form or text == form:
                 return test.name
+    # The whole brief line copied back: "`name` in file — what it asserts" (pilot
+    # card M3, 18 Nov 2026, on the plan fix above). Read as the name only when it
+    # leads with one of the card's tests, names no file but that test's own, and
+    # what follows is that line's own description.
+    match = _LEADING_TEST.match(raw.strip())
+    if match:
+        name, rest = match.group("name"), match.group("rest").strip()
+        for test in card.tests:
+            if test.name != name:
+                continue
+            if rest.startswith("in "):
+                after = rest[3:].lstrip()
+                for spelled in (f"`{test.file}`", test.file):
+                    if test.file and after.startswith(spelled):
+                        rest = after[len(spelled):].strip()
+                        break
+                else:
+                    break
+            if not rest or rest[0] in "—–-:(":
+                return test.name
     return text
+
+
+_LEADING_TEST = re.compile(r"^`?(?P<name>[A-Za-z_][\w:]*)`?(?P<rest>(?:\s.*)?)$", re.S)
 
 
 def parse_plan(content: str, card: Card | None = None) -> Plan:

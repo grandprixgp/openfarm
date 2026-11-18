@@ -61,5 +61,26 @@ class PlanTestNameTests(unittest.TestCase):
                              ["op_symbol_matches_the_parsed_text"]), _card())
 
 
+
+class CopiedBriefLineTests(unittest.TestCase):
+    """The re-run on the fix above: the planner copied the whole brief line back."""
+
+    def test_name_file_and_description(self) -> None:
+        plan = parse_plan(_plan(
+            ['op_symbol_spells_each_operator in tests/test_op_symbol.rs \u2014 '
+             'Op::Caret.symbol() == "^", Op::Wildcard.symbol() == ""'],
+            ['`op_symbol_matches_the_parsed_text` in `tests/test_op_symbol.rs`: y']), _card())
+        self.assertEqual([s["tests"] for s in plan.steps],
+                         [["op_symbol_spells_each_operator"],
+                          ["op_symbol_matches_the_parsed_text"]])
+
+    def test_another_file_or_more_text_is_still_refused(self) -> None:
+        for bad in ("op_symbol_spells_each_operator in tests/other.rs \u2014 x",
+                    "op_symbol_spells_each_operator and op_symbol_matches_the_parsed_text",
+                    "cargo test op_symbol_spells_each_operator"):
+            with self.subTest(bad=bad), self.assertRaises(Invalid):
+                parse_plan(_plan([bad], ["op_symbol_matches_the_parsed_text"]), _card())
+
+
 if __name__ == "__main__":
     unittest.main()
