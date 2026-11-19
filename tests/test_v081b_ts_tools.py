@@ -106,7 +106,7 @@ class ToolDecisionTests(unittest.TestCase):
             pack = TypeScriptPack()
             pack.configure(worktree)
         self.assertEqual(pack.tooling["typecheck"], "tsc")
-        self.assertEqual(pack.commands("typecheck")["argv"][:2], [str(tsc), "--noEmit"])
+        self.assertEqual(pack.commands("typecheck")["argv"][:2], [str(tsc.resolve()), "--noEmit"])
         self.assertNotIn("syntax only", " ".join(pack.notes))
 
     def test_prettier_is_used_only_when_the_project_configures_it(self) -> None:

@@ -119,7 +119,7 @@ class ParallelAcpSupervisorTests(unittest.TestCase):
         # One ACP process for the run...
         self.assertEqual(len(spy.adapters), 1, spy.sessions)
         # ...with one session per card, each rooted at that card's own worktree.
-        worktrees = {f"CARD-{n}": str(StateDir(toy.state_dir).worktrees / f"CARD-{n}-{run_id}")
+        worktrees = {f"CARD-{n}": str((StateDir(toy.state_dir).worktrees / f"CARD-{n}-{run_id}").resolve())
                      for n in (1, 2)}
         self.assertEqual(sorted(cwd for _a, cwd in spy.sessions), sorted(worktrees.values()))
         # Every supervisor call ran in its own card's session, at its own worktree.

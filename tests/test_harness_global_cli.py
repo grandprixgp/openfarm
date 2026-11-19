@@ -79,7 +79,7 @@ class HarnessGlobalCliTests(unittest.TestCase):
 
         self.assertEqual(code, EXIT_OK)
         self.assertEqual(payload["active"], 1)
-        self.assertEqual(payload["dir"], str(self.global_dir))
+        self.assertEqual(Path(payload["dir"]).resolve(), self.global_dir.resolve())
         self.assertEqual(payload["entries"][0]["sources"], ["alpha"])
 
     def test_global_demote_retires_and_promote_restores(self) -> None:

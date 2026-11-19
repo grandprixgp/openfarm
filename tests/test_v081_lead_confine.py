@@ -19,7 +19,7 @@ class ScanTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
 
     def test_every_git_entry_is_listed_to_hide(self) -> None:
-        root = self.tmp / "s"
+        root = (self.tmp / "s").resolve()
         (root / ".git" / "objects").mkdir(parents=True)
         (root / "sub").mkdir()
         (root / "sub" / ".git").write_text("gitdir: ../.git/modules/sub\n")

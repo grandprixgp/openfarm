@@ -82,7 +82,7 @@ class ConfigTests(unittest.TestCase):
     def test_defaults(self) -> None:
         h = _config(self.repo, self.tmp / "state").harness
         self.assertEqual((h.learn_from, h.share, h.global_dir), ("both", True, ""))
-        self.assertEqual(global_dir_for(h), Path(os.environ["OPENFARM_GLOBAL_HARNESS"]))
+        self.assertEqual(global_dir_for(h), Path(os.environ["OPENFARM_GLOBAL_HARNESS"]).resolve())
 
     def test_values_and_refusals(self) -> None:
         h = _config(self.repo, self.tmp / "state", learn_from="global", share=False,
