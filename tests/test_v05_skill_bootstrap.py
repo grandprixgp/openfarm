@@ -498,10 +498,10 @@ class PackagingAndWheelTests(unittest.TestCase):
         data = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
         project = data["project"]
         self.assertEqual(project["name"], "openfarm")
-        self.assertEqual(project["version"], "0.9.1")
+        self.assertEqual(project["version"], "0.9.2")
         self.assertEqual(project["dependencies"], [])
         self.assertEqual(project["scripts"]["openfarm"], "openfarm_core.cli:main")
-        self.assertEqual(openfarm_core.__version__, "0.9.1")
+        self.assertEqual(openfarm_core.__version__, "0.9.2")
 
     def test_offline_wheel_contains_all_skill_assets(self) -> None:
         try:
