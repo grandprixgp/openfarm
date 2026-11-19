@@ -30,6 +30,7 @@ KNOWN_TABLES = {
 
 DEFAULT_EFFORTS = ("off", "low", "medium", "high", "xhigh", "max")
 _ACP_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+DEFAULT_EFFORT_LADDER = ("medium", "high", "max")
 _TIER_KEYS = {"model", "efforts", "effort_param"}
 _FORBIDDEN_TIER_KEYS = ("endpoint", "allowed_endpoints", "key_file", "headers")
 _RESERVED_EFFORT_PARAMS = frozenset({
@@ -41,7 +42,7 @@ _TABLE_KEYS = {
     "adapters": {"cards", "runner", "languages", "model",
                  "micromanager", "telemetry", "pack"},
     "model": {"endpoint", "allowed_endpoints", "key_file", "headers", "max_tokens",
-              "test_writer",
+              "effort_ladder", "test_writer",
               "implementer", "checker", "planner", "cost_per_1k_in",
               "cost_per_1k_out"},
     "policy": {"never_touch", "forbidden_files", "known_failing",
@@ -86,7 +87,7 @@ _TABLE_KEYS = {
               "on_external_timeout", "stall_after"},
     "tiers": set(_TIER_KEYS),
 }
-_ROLE_MODEL_KEYS = {"model", "temperature", "vary_seed", "effort", "retry_effort"}
+_ROLE_MODEL_KEYS = {"model", "temperature", "vary_seed", "effort", "retry_effort", "effort_ladder"}
 _HEADER_NAME = re.compile(r"^[A-Za-z0-9!#$%&'*+.^_`|~-]+$")
 # openfarm sets these itself; a config may not replace the key or the body type.
 _RESERVED_HEADERS = {"authorization", "content-type", "content-length", "host"}
@@ -213,19 +214,25 @@ def _nonneg_float(value, what: str, default: float) -> float:
 class RoleModel:
     """One model role's settings."""
 
-    __slots__ = ("model", "temperature", "vary_seed", "effort", "retry_effort")
+    __slots__ = ("model", "temperature", "vary_seed", "effort", "retry_effort", "effort_ladder")
 
     def __init__(self, model: str = "", temperature: float = 0.2,
                  vary_seed: bool = False, effort: str = "",
-                 retry_effort: str = "") -> None:
+                 retry_effort: str = "",
+                 effort_ladder: tuple[str, ...] = ()) -> None:
         self.model = model
         self.temperature = temperature
         self.vary_seed = vary_seed
         self.effort = effort
         #: The effort for every attempt after the first (v0.8.5); empty keeps `effort`.
         self.retry_effort = retry_effort
+        #: Optional per-attempt escalation ladder (v0.8.8), e.g. ("medium", "high", "max").
+        self.effort_ladder = tuple(effort_ladder)
 
     def effort_for_attempt(self, attempt: int = 1) -> str:
+        if self.effort_ladder:
+            idx = min(max(int(attempt), 1) - 1, len(self.effort_ladder) - 1)
+            return self.effort_ladder[idx]
         if attempt > 1 and self.retry_effort:
             return self.retry_effort
         return self.effort
@@ -233,7 +240,8 @@ class RoleModel:
     def as_dict(self) -> dict:
         return {"model": self.model, "temperature": self.temperature,
                 "vary_seed": self.vary_seed, "effort": self.effort,
-                "retry_effort": self.retry_effort}
+                "retry_effort": self.retry_effort,
+                "effort_ladder": list(self.effort_ladder)}
 
 
 @dataclasses.dataclass
@@ -583,7 +591,7 @@ class Config:
 
         budget = self._table("budget")
         self.implementer_attempts = _as_int(
-            budget.get("implementer_attempts"), "[budget] implementer_attempts", 3)
+            budget.get("implementer_attempts"), "[budget] implementer_attempts", 4)
         self.test_writer_attempts = _as_int(
             budget.get("test_writer_attempts"), "[budget] test_writer_attempts", 2)
         self.model_build_calls_per_card = _as_int(
@@ -669,15 +677,24 @@ class Config:
             self._data.get("tiers"), self.role_models["implementer"].model
         )
         self.swarm = self._parse_swarm(self._table("swarm"))
+        self.effort_ladder: tuple[str, ...] = tuple(
+            _as_str_list(self._table("model").get("effort_ladder", []), "[model] effort_ladder")
+        )
+        for val in self.effort_ladder:
+            if any(ch.isspace() for ch in val) or "\x00" in val or not val:
+                raise ConfigError(f"[model] effort_ladder contains invalid effort {val!r}")
         for role_name, role_model in self.role_models.items():
             if role_model.retry_effort and not role_model.effort:
                 raise ConfigError(
                     f"[model] {role_name}.retry_effort needs an effort for the first "
                     "attempt as well")
-            for key in ("effort", "retry_effort"):
-                value = getattr(role_model, key)
-                if not value:
-                    continue
+            to_check = [(k, getattr(role_model, k)) for k in ("effort", "retry_effort") if getattr(role_model, k)]
+            for step in role_model.effort_ladder:
+                to_check.append(("effort_ladder", step))
+            if not to_check and self.effort_ladder:
+                for step in self.effort_ladder:
+                    to_check.append(("effort_ladder", step))
+            for key, value in to_check:
                 if is_acp_adapter(self.model_adapter):
                     if value not in _ACP_EFFORTS:
                         raise ConfigError(
@@ -944,6 +961,16 @@ class Config:
                     f"[model] {role}.{key} {raw_effort!r} must not contain whitespace"
                 )
             efforts[key] = raw_effort
+        raw_ladder = value.get("effort_ladder")
+        ladder: tuple[str, ...] = ()
+        if raw_ladder is not None:
+            ladder_list = _as_str_list(raw_ladder, f"[model] {role}.effort_ladder")
+            for step in ladder_list:
+                if any(ch.isspace() for ch in step) or "\x00" in step or not step:
+                    raise ConfigError(
+                        f"[model] {role}.effort_ladder contains invalid effort {step!r}"
+                    )
+            ladder = tuple(ladder_list)
         effort = efforts["effort"]
         return RoleModel(
             model=model_name,
@@ -953,6 +980,7 @@ class Config:
                                f"[model] {role}.vary_seed", default_vary),
             effort=effort,
             retry_effort=efforts["retry_effort"],
+            effort_ladder=ladder,
         )
 
     def _parse_tiers(self, raw_tiers, default_model: str) -> dict[str, TierConfig]:
@@ -1257,6 +1285,9 @@ class Config:
         if role_model is None:
             role_model = self.role_models.get("implementer")
         effort = role_model.effort_for_attempt(attempt) if role_model is not None else ""
+        if not effort and self.effort_ladder:
+            idx = min(max(int(attempt), 1) - 1, len(self.effort_ladder) - 1)
+            effort = self.effort_ladder[idx]
         if not effort:
             return ("", "")
         if is_acp_adapter(self.model_adapter):

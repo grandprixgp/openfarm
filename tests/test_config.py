@@ -52,7 +52,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(cfg.state_dir, self.state.resolve())
         self.assertEqual(cfg.categories, ["pattern"])
         self.assertEqual(cfg.max_files, 6)
-        self.assertEqual(cfg.implementer_attempts, 3)
+        self.assertEqual(cfg.implementer_attempts, 4)
 
     def test_state_dir_inside_the_repo_is_refused(self) -> None:
         self.write(BASE.format(state=self.repo / "state"))
