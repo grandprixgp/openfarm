@@ -482,6 +482,7 @@ class RustPack(Pack):
                     and self._outcomes_counts() is None):
                 return {"killed": 0, "survived": 0, "timeout": 0, "unviable": 0,
                         "total": 0, "judged": 0, "capped": False,
+                        "scoped": bool(self.mutation_diff and self.mutation_diff.strip()),
                         "source": "no-mutants"}
             return self.parse_mutation(stdout)
         finally:
@@ -518,6 +519,7 @@ class RustPack(Pack):
                 "total": counts.get("total", 0),
                 "judged": caught + missed,
                 "capped": False,
+                "scoped": bool(self.mutation_diff and self.mutation_diff.strip()),
                 "source": counts.get("source", "")}
 
     def _outcomes_counts(self) -> dict | None:

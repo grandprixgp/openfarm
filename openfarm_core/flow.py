@@ -609,7 +609,13 @@ class CardRun:
                 index += 1
             path = folder / f"{stem}-{index}.json"
         gate.detail_path = path
-        write_json(path, gate.as_dict())
+        payload = gate.as_dict()
+        last_conf = getattr(self, "_last_confinement", None)
+        if last_conf and gate.name in ("baseline", "suite", "lint", "workspace-lint",
+                                       "pass-after", "fail-before", "revert-check",
+                                       "mutation", "format"):
+            payload["confinement"] = dict(last_conf)
+        write_json(path, payload)
         self.log(f"{self.card.id}: {gate.name} {gate.result}"
                  + (f" — {gate.detail}" if gate.detail else ""))
         if self.board is not None:
@@ -1588,6 +1594,11 @@ class CardRun:
             kind=kind, argv=argv, cwd=self.worktree,
             target_dir=self.target_dir, unit=resolved_unit,
             env=env, timeout_s=timeout)
+        self._last_confinement = {
+            "confined": bool(getattr(result, "confined", False)),
+            "network": str(getattr(result, "confine_network", "") or ""),
+            "runner_argv": list(getattr(result, "runner_argv", ()) or ())[:20],
+        }
         self.runner_seconds += getattr(result, "duration_s", 0.0) or 0.0
         if counted == "model":
             self.budget.note_model_build()

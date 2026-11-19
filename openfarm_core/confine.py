@@ -754,6 +754,7 @@ def runner_argv(
     unset_env=(),
     environ=None,
     bwrap: str | None = None,
+    network: str = "off",
 ) -> list[str]:
     """Wrap one gate command (a build, a test run) in a boundary (v0.8.5).
 
@@ -773,7 +774,8 @@ def runner_argv(
     if real_home is not None and _within(real_home, tree):
         raise ConfineError("confine-session-is-home",
                            f"refusing to make {tree} writable: it holds your home folder")
-    args = [exe, "--die-with-parent", "--unshare-all", "--share-net", "--new-session",
+    net_flag = "--share-net" if str(network or "off") == "on" else "--unshare-net"
+    args = [exe, "--die-with-parent", "--unshare-all", net_flag, "--new-session",
             "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp"]
     writable = [tree]
     for raw in write_roots or ():

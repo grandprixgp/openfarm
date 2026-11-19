@@ -1076,10 +1076,11 @@ class ClaudeAcpAdapter:
             if line:
                 self._stderr_tail.append(line)
 
-    def _stderr_summary(self) -> str:
+    def _stderr_summary(self, limit: int = 4096) -> str:
         if not self._stderr_tail:
             return ""
-        return " | ".join(list(self._stderr_tail)[-10:])[:600]
+        joined = " | ".join(list(self._stderr_tail))
+        return joined[-limit:] if len(joined) > limit else joined
 
     def _send_json(
         self,
@@ -2007,6 +2008,19 @@ class ClaudeAcpAdapter:
         self.last_usage = AcpUsage()
         if self._proc is None or self._proc.poll() is not None:
             raise Infra("acp-not-running", "ACP subprocess is not running")
+        if self._isolated_home is not None and self._cred_source is not None:
+            try:
+                ref_res, new_bytes = logins.refresh_isolated(
+                    self.provider,
+                    isolated_home=self._isolated_home,
+                    source=self._cred_source,
+                    initial=self._cred_initial,
+                    pinned=self._cred_pin,
+                )
+                if ref_res.status == "refreshed":
+                    self._cred_initial = new_bytes
+            except Exception:  # noqa: BLE001 - best-effort mid-run refresh
+                pass
 
         req_id = self._next_id()
         started = time.monotonic()
@@ -2247,7 +2261,11 @@ class ClaudeAcpAdapter:
                                 "acp-auth-required",
                                 _auth_error_hint(self.provider, message),
                             )
-                        raise Infra(f"acp-rpc-{code}", _rpc_error_text(message, data))
+                        detail = _rpc_error_text(message, data)
+                        stderr_tail = self._stderr_summary()
+                        if stderr_tail and stderr_tail not in detail:
+                            detail = f"{detail} [stderr: {stderr_tail[-600:]}]"
+                        raise Infra(f"acp-rpc-{code}", detail)
 
                     result = msg.get("result")
                     if not isinstance(result, dict):
