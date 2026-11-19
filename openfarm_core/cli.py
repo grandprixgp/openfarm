@@ -227,7 +227,7 @@ def cmd_check(ctx: Context, args) -> int:
     # formatter and the pack's notes, decided from the same config as above.
     payload.update(eligibility.info)
     try:
-        pack = _configured_pack(ctx.cfg, ctx.repo)
+        pack = _configured_pack(ctx.cfg, ctx.repo, unit=card.unit)
         summary = getattr(pack, "tooling_summary", None)
         payload["tooling"] = (summary() if summary is not None else
                               {"pack": str(getattr(pack, "name", "") or "external"),
@@ -251,14 +251,15 @@ def cmd_check(ctx: Context, args) -> int:
     return EXIT_OK if payload["eligible"] else EXIT_REFUSED
 
 
-def _pack_with_config(cfg, cwd: Path):
+def _pack_with_config(cfg, cwd: Path, unit: str = ""):
     """The project's pack, given the loaded config's settings.
 
     Straight after `pack_for`: a pack that reads `[runner]` settings (the
     TypeScript pack) then decides from the same config eligibility was given
     (`--config` included), not from the file in the base checkout.
     """
-    pack = pack_for(cfg.languages[0], cfg.cargo_flags, spec=cfg.pack_adapter,
+    lang = cfg.language_for_unit(unit) if hasattr(cfg, "language_for_unit") else cfg.languages[0]
+    pack = pack_for(lang, cfg.cargo_flags, spec=cfg.pack_adapter,
                     cwd=cwd, python=cfg.runner_python)
     apply_settings = getattr(pack, "apply_settings", None)
     if apply_settings is not None:
@@ -266,9 +267,9 @@ def _pack_with_config(cfg, cwd: Path):
     return pack
 
 
-def _configured_pack(cfg, worktree: Path):
+def _configured_pack(cfg, worktree: Path, unit: str = ""):
     """`_pack_with_config`, then configured for `worktree`."""
-    pack = _pack_with_config(cfg, worktree)
+    pack = _pack_with_config(cfg, worktree, unit=unit)
     configure = getattr(pack, "configure", None)
     if configure is not None:
         configure(worktree)
@@ -293,7 +294,7 @@ def _baseline_check(ctx: Context, source: FileCardSource, card: Card) -> dict:
         git.worktree_remove(worktree)
     git.worktree_add(worktree, base)
     try:
-        pack = _configured_pack(ctx.cfg, worktree)
+        pack = _configured_pack(ctx.cfg, worktree, unit=card.unit)
         unit = card.unit or derive_cargo_unit(card.touches, worktree)
         runner = ctx.runner(worktree)
         target = ctx.state.check_dir(card.id) / "target"
@@ -1136,7 +1137,7 @@ def _run_card(ctx: Context, source: FileCardSource, card_id: str, run_id: str,
     Git(ctx.repo).worktree_add(worktree, base_ref)
 
     card_dir = ctx.state.create_card(card.id, run_id)
-    pack = _configured_pack(cfg, worktree)
+    pack = _configured_pack(cfg, worktree, unit=card.unit)
     owns_backend = backend is None
     backend = backend if backend is not None else open_backend(cfg, script)
     runner = ctx.runner(worktree, output_dir=card_dir / "gates" / "output")

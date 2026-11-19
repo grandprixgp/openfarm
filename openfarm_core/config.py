@@ -25,8 +25,10 @@ CONFIG_PATH = Path(".openfarm") / "config.toml"
 KNOWN_TABLES = {
     "project", "adapters", "model", "policy", "eligibility", "brief",
     "runner", "budget", "gates", "cards", "micromanager", "state", "harness",
-    "swarm", "tiers",
+    "swarm", "tiers", "units",
 }
+
+_UNIT_LANGUAGES = ("rust", "python", "typescript", "go")
 
 DEFAULT_EFFORTS = ("off", "low", "medium", "high", "xhigh", "max")
 _ACP_EFFORTS = ("low", "medium", "high", "xhigh", "max")
@@ -88,6 +90,7 @@ _TABLE_KEYS = {
               "coordinator_tokens_per_run", "external_wait",
               "on_external_timeout", "stall_after"},
     "tiers": set(_TIER_KEYS),
+    "units": {"language"},
 }
 _ROLE_MODEL_KEYS = {"model", "temperature", "vary_seed", "effort", "retry_effort", "effort_ladder"}
 _HEADER_NAME = re.compile(r"^[A-Za-z0-9!#$%&'*+.^_`|~-]+$")
@@ -678,6 +681,7 @@ class Config:
         self.tiers = self._parse_tiers(
             self._data.get("tiers"), self.role_models["implementer"].model
         )
+        self.unit_languages = self._parse_units(self._data.get("units"))
         self.swarm = self._parse_swarm(self._table("swarm"))
         self.effort_ladder: tuple[str, ...] = tuple(
             _as_str_list(self._table("model").get("effort_ladder", []), "[model] effort_ladder")
@@ -984,6 +988,29 @@ class Config:
             retry_effort=efforts["retry_effort"],
             effort_ladder=ladder,
         )
+
+    def _parse_units(self, raw_units) -> dict[str, str]:
+        if raw_units is None:
+            return {}
+        if not isinstance(raw_units, dict):
+            raise ConfigError("[units] must be a table")
+        out: dict[str, str] = {}
+        for unit_name, entry in raw_units.items():
+            if not isinstance(entry, dict):
+                raise ConfigError(f"[units.{unit_name}] must be a table")
+            _check_keys(entry, {"language"}, f"[units.{unit_name}]")
+            if "language" in entry:
+                lang = _as_choice(
+                    entry.get("language"), f"[units.{unit_name}] language",
+                    self.languages[0], _UNIT_LANGUAGES)
+                out[str(unit_name).strip("/")] = lang
+        return out
+
+    def language_for_unit(self, unit: str = "") -> str:
+        key = str(unit or "").strip("/")
+        if key and key in self.unit_languages:
+            return self.unit_languages[key]
+        return self.languages[0]
 
     def _parse_tiers(self, raw_tiers, default_model: str) -> dict[str, TierConfig]:
         if raw_tiers is None:
