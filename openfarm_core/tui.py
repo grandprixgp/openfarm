@@ -570,7 +570,7 @@ def _read_cards_readonly(ctx: TuiContext) -> tuple[list[Card], str]:
                         "fields": fields,
                         "body": body,
                     }))
-                except Exception as exc:  # noqa: BLE001 - skip malformed card in TUI refresh
+                except (OSError, ValueError, KeyError, TypeError) as exc:
                     _ = exc
         return cards, "cards-source"
     if cards_dir.is_dir():

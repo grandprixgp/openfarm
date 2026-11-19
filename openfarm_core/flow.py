@@ -2018,11 +2018,12 @@ class CardRun:
             low_risk = ("pinned-bugfix", "test-backfill", "mechanical", "pattern", "small-feature")
             has_flagged = any(
                 g.name == "banned-patterns" and bool((g.evidence or {}).get("flagged"))
-                for g in self.gates
+                for g in (getattr(self, "gates", None) or ())
             )
+            cp2 = getattr(self, "checker_pass2", None)
             checker_requested = (
-                isinstance(self.checker_pass2, dict)
-                and str(self.checker_pass2.get("verdict") or "").lower() == "changes-requested"
+                isinstance(cp2, dict)
+                and str(cp2.get("verdict") or "").lower() == "changes-requested"
             )
             if (impl_attempts <= 1 and counter_failed == 0 and not self.handbacks
                     and not has_flagged and not checker_requested

@@ -2618,9 +2618,9 @@ def cmd_swarm(ctx: Context, args) -> int:
 # -- the parser ----------------------------------------------------------------
 
 _CLI_EPILOG = """\
-Command groups (26 commands):
+Command groups (27 commands):
   Setup & Auth         init, adopt, install-skill, acp
-  Run & Monitor        check, run, status, pause, resume, stop, tui
+  Run & Monitor        auto, check, run, status, pause, resume, stop, tui
   Review & Harness     triage, review, land, frontier-review, dossier, verdict, done, release, escape, supervise, harness
   Swarm, Board & Bench swarm, board, drive, bench
 
