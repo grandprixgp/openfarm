@@ -59,8 +59,8 @@ _TABLE_KEYS = {
                "spend_per_night", "concurrent_builds", "concurrent_cards",
                "lease_ttl", "kill_switch"},
     "gates": {"revert_check", "mutation", "mutation_required_for",
-              "mutation_min_kill_rate", "counter_tests", "coverage",
-              "workspace_lint", "baseline_cache", "catch_up",
+              "mutation_min_kill_rate", "counter_tests", "checker_mode",
+              "coverage", "workspace_lint", "baseline_cache", "catch_up",
               "findings_per_card", "circuit_breaker", "extra", "planner"},
     "cards": {"fields_block", "required_fields"},
     "micromanager": {"mode", "binary", "args", "model", "effort",
@@ -629,6 +629,9 @@ class Config:
         self.counter_tests = _as_choice(
             gates.get("counter_tests"), "[gates] counter_tests", "report",
             ("report", "reject"))
+        self.checker_mode = _as_choice(
+            gates.get("checker_mode"), "[gates] checker_mode", "two-pass",
+            ("two-pass", "single-pass"))
         self.coverage = _as_choice(
             gates.get("coverage"), "[gates] coverage", "off",
             ("off", "report", "required"))

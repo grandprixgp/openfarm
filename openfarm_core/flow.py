@@ -3851,54 +3851,61 @@ class CardRun:
 
     def _checker(self, changed: list[str], full_diff: str,
                  allow_bounce: bool = False) -> tuple[str, str, str, str] | None:
-        test_diff = diff_text(
-            self.worktree,
-            [path for path in changed if self._is_test_path(path)],
-            ref=self.base_commit or "HEAD")
-        form1 = pass1_answer_form()
-        brief1 = checker_pass1_brief(self.card, test_diff, handback=self.swarm_on,
-                                     answer_form=form1)
-        # A checker's answer is checked for a hand-back before anything reads it: a
-        # hand-back is never a restatement and never a passing checker gate.
-        call1, limit_err = self._call_role_with_handbacks(
-            "checker_pass1", brief1, first_attempt=1, response_name="checker-pass1")
-        if limit_err is not None:
-            self._checker_handback_limit("checker-pass1", limit_err)
-        first = parse_pass1(call1.content, self.card, cut_off=call1.cut_off)
-        first_problem1 = ""
-        if not first.readable:
-            # Never taken as the restatement: ask once more with the form
-            # restated. A hand-back is still read first.
-            first_problem1 = first.problem
-            retry1 = checker_pass1_brief(self.card, test_diff, handback=self.swarm_on,
-                                         answer_form=form1,
-                                         retry_problem=first.problem)
-            asked1 = sum(1 for c in getattr(self.roles, "calls", []) or []
-                         if getattr(c, "role", "") == "checker_pass1")
+        if getattr(self.cfg, "checker_mode", "two-pass") == "single-pass":
+            self.checker_pass1 = {"skipped": True, "mode": "single-pass"}
+            self._record_gate(GateResult(
+                "checker-pass1", PASS,
+                "skipped: checker_mode = single-pass (combined into checker-pass2)",
+                {"checker": self.checker_pass1}))
+        else:
+            test_diff = diff_text(
+                self.worktree,
+                [path for path in changed if self._is_test_path(path)],
+                ref=self.base_commit or "HEAD")
+            form1 = pass1_answer_form()
+            brief1 = checker_pass1_brief(self.card, test_diff, handback=self.swarm_on,
+                                         answer_form=form1)
+            # A checker's answer is checked for a hand-back before anything reads it: a
+            # hand-back is never a restatement and never a passing checker gate.
             call1, limit_err = self._call_role_with_handbacks(
-                "checker_pass1", retry1, first_attempt=1 + max(1, asked1),
-                response_name="checker-pass1-again")
+                "checker_pass1", brief1, first_attempt=1, response_name="checker-pass1")
             if limit_err is not None:
                 self._checker_handback_limit("checker-pass1", limit_err)
             first = parse_pass1(call1.content, self.card, cut_off=call1.cut_off)
-        restatement = first.restatement
-        self.checker_restatement = restatement
-        self.checker_pass1 = {**first.as_dict(), "asked_again": bool(first_problem1),
-                              "first_problem": first_problem1}
-        if not first.readable:
-            detail1 = ("the first pass could not be read, even when asked again "
-                       f"({first.problem}): no restatement to compare with the tests")
-        else:
-            detail1 = ("restatement flagged as drifting" if restatement.mismatch
-                       else "restatement matches the named tests")
-            said1 = {"yes": "would catch a bad implementation",
-                     "partly": "would partly catch a bad implementation",
-                     "no": "would not catch a bad implementation"}.get(first.catches)
-            if said1:
-                detail1 += f"; the checker says the tests {said1}"
-        gate1 = self._record_gate(GateResult(
-            "checker-pass1", PASS, detail1,
-            {"restatement": restatement.as_dict(), "checker": self.checker_pass1}))
+            first_problem1 = ""
+            if not first.readable:
+                # Never taken as the restatement: ask once more with the form
+                # restated. A hand-back is still read first.
+                first_problem1 = first.problem
+                retry1 = checker_pass1_brief(self.card, test_diff, handback=self.swarm_on,
+                                             answer_form=form1,
+                                             retry_problem=first.problem)
+                asked1 = sum(1 for c in getattr(self.roles, "calls", []) or []
+                             if getattr(c, "role", "") == "checker_pass1")
+                call1, limit_err = self._call_role_with_handbacks(
+                    "checker_pass1", retry1, first_attempt=1 + max(1, asked1),
+                    response_name="checker-pass1-again")
+                if limit_err is not None:
+                    self._checker_handback_limit("checker-pass1", limit_err)
+                first = parse_pass1(call1.content, self.card, cut_off=call1.cut_off)
+            restatement = first.restatement
+            self.checker_restatement = restatement
+            self.checker_pass1 = {**first.as_dict(), "asked_again": bool(first_problem1),
+                                  "first_problem": first_problem1}
+            if not first.readable:
+                detail1 = ("the first pass could not be read, even when asked again "
+                           f"({first.problem}): no restatement to compare with the tests")
+            else:
+                detail1 = ("restatement flagged as drifting" if restatement.mismatch
+                           else "restatement matches the named tests")
+                said1 = {"yes": "would catch a bad implementation",
+                         "partly": "would partly catch a bad implementation",
+                         "no": "would not catch a bad implementation"}.get(first.catches)
+                if said1:
+                    detail1 += f"; the checker says the tests {said1}"
+            self._record_gate(GateResult(
+                "checker-pass1", PASS, detail1,
+                {"restatement": restatement.as_dict(), "checker": self.checker_pass1}))
 
         from .roles import MAX_COUNTER_TESTS, parse_pass2, pass2_answer_form
 
