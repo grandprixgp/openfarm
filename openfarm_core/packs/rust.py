@@ -133,6 +133,9 @@ class RustPack(Pack):
         #: of missed mutants stay with the card. Unset, each run gets a temporary
         #: folder that is removed once the result is read.
         self.mutation_output: Path | None = None
+        #: Unified diff of the card's production changes; when set, passed to
+        #: cargo-mutants via `--in-diff` so untouched functions are skipped.
+        self.mutation_diff: str | None = None
         self._mutation_out: Path | None = None
         self._mutation_out_owned = False
         self._mutation_runs = 0
@@ -221,6 +224,10 @@ class RustPack(Pack):
                     "--output", str(out_dir)]
             for path in files or []:
                 argv += ["--file", str(path)]
+            if self.mutation_diff and self.mutation_diff.strip():
+                diff_path = out_dir / "card.diff"
+                diff_path.write_text(self.mutation_diff)
+                argv += ["--in-diff", str(diff_path)]
             return {"argv": argv + extra}
 
         return {"argv": list(extra)}
@@ -470,6 +477,12 @@ class RustPack(Pack):
                 raise Invalid("mutation-not-run",
                               f"cargo-mutants exited {exit_code}, {meaning}"
                               + (f": {tail}" if tail else ""))
+            if (exit_code in (None, 0) and not (stdout or "").strip()
+                    and "no mutants" in (stderr or "").lower()
+                    and self._outcomes_counts() is None):
+                return {"killed": 0, "survived": 0, "timeout": 0, "unviable": 0,
+                        "total": 0, "judged": 0, "capped": False,
+                        "source": "no-mutants"}
             return self.parse_mutation(stdout)
         finally:
             self._drop_mutation_dir()

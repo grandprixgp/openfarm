@@ -3703,6 +3703,18 @@ class CardRun:
                 except Exception as exc:  # noqa: BLE001 - whole files then
                     self.log(f"{self.card.id}: mutation: changed lines unknown ({exc}); "
                              "mutating the files whole")
+        if hasattr(self.pack, "mutation_diff"):
+            # cargo-mutants scopes to the card's diff with `--in-diff`; a
+            # test-backfill card has an empty diff and mutates the unit whole.
+            self.pack.mutation_diff = None
+            if self.base_commit:
+                try:
+                    diff = diff_text(self.worktree, list(production),
+                                     ref=self.base_commit)
+                    self.pack.mutation_diff = diff if diff.strip() else None
+                except Exception as exc:  # noqa: BLE001 - whole files then
+                    self.log(f"{self.card.id}: mutation: changed diff unknown ({exc}); "
+                             "mutating the files whole")
         try:
             argv = self.pack.commands(
                 "mutation", files=production, tests=self.card.test_names)["argv"]
