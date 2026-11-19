@@ -155,7 +155,10 @@ class BoardPipelineTests(unittest.TestCase):
         dossier_json = read_json(
             self.toy.state_dir / "cards" / "CARD-1" / "run-s4" / "dossier.json"
         )
-        self.assertEqual(dossier_json["board_path"], str(board.board_dir))
+        self.assertEqual(
+            Path(dossier_json["board_path"]).resolve(),
+            board.board_dir.resolve(),
+        )
         self.assertEqual(len(dossier_json["team"]), 4)
         impl_row = next(r for r in dossier_json["team"] if r["role"] == "implementer")
         self.assertEqual(impl_row["tokens"], 260)

@@ -57,9 +57,11 @@ def _safe_claude_auth_status(
         proc = subprocess.run(
             [claude_bin, "auth", "status"],
             env=env,
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=timeout_s,
+            start_new_session=True,
         )
     except (OSError, subprocess.TimeoutExpired):
         return {"available": False, "loggedIn": False}
@@ -113,9 +115,11 @@ def _safe_codex_auth_status(
         proc = subprocess.run(
             [codex_bin, "login", "status"],
             env=env,
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=timeout_s,
+            start_new_session=True,
         )
     except (OSError, subprocess.TimeoutExpired):
         return {"available": False, "loggedIn": False}

@@ -201,7 +201,7 @@ class RealBwrapBoundaryTests(unittest.TestCase):
     """Runs a small Python program as the fake CLI inside the real boundary."""
 
     def setUp(self) -> None:
-        self.tmp = Path(tempfile.mkdtemp(prefix="of-v081b-rb-"))
+        self.tmp = Path(tempfile.mkdtemp(prefix="of-v081b-rb-")).resolve()
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.session = self.tmp / "worktree"
         (self.session / "seams").mkdir(parents=True)

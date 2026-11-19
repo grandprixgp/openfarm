@@ -25,3 +25,4 @@ asserts = "validate_port(\"0\") raises ValidationError"
 - New `validate_port(value: str) -> int` in `forms/validators.py`, following `validate_username`: trim, check, return the cleaned value, or raise `ValidationError`.
 - After trimming, the value must be one or more ASCII digits `0`-`9` and nothing else, so `"+80"`, `"-1"`, `"1_000"` and `""` are refused.
 - The number must be 1 to 65535 inclusive; it is returned as an `int`.
+- Ordinary-length inputs only; inputs past Python's `int()` string-conversion digit limit are out of scope.

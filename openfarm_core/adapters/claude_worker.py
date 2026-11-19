@@ -80,7 +80,7 @@ class ClaudeAcpWorkerBackend:
         if self._cwd is not None:
             return self._cwd
         if self._own_cwd is None:
-            self._own_cwd = Path(tempfile.mkdtemp(prefix="openfarm-acp-empty-"))
+            self._own_cwd = Path(tempfile.mkdtemp(prefix="openfarm-acp-empty-")).resolve()
             self._own_cwd.chmod(0o700)
         return self._own_cwd
 
