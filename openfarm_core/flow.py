@@ -1760,6 +1760,10 @@ class CardRun:
             self.stop_code = StopCode.INFRA
             self.detail = exc.message
             final_state = "blocked"
+        except Exception as exc:
+            self.stop_code = StopCode.INFRA
+            self.detail = f"unexpected error ({type(exc).__name__}): {exc}"
+            final_state = "blocked"
         finally:
             self.budget.stop_clock()
             self.ended_at = utc_now()
@@ -3871,6 +3875,7 @@ class CardRun:
 
     def _checker(self, changed: list[str], full_diff: str,
                  allow_bounce: bool = False) -> tuple[str, str, str, str] | None:
+        restatement = None
         if getattr(self.cfg, "checker_mode", "two-pass") == "single-pass":
             self.checker_pass1 = {"skipped": True, "mode": "single-pass"}
             self._record_gate(GateResult(

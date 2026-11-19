@@ -1794,19 +1794,45 @@ def cmd_land(ctx: Context, args) -> int:
             payload = {"landed": landed, "stopped_at": cid, "reason": f"no such card {cid}"}
             _emit_ctx(ctx, payload, "land")
             return EXIT_REFUSED
+        if card.state != "in_review":
+            payload = {"landed": landed, "stopped_at": cid,
+                       "reason": f"{cid} is in state {card.state!r}, not 'in_review'"}
+            _emit_ctx(ctx, payload, "land")
+            return EXIT_REFUSED
+        # Require an approved verdict ('clean' or 'minor-fix') in the latest run's verdict.json.
+        candidates = sorted(ctx.state.cards.glob(f"{cid}/*/card-record.json"))
+        verdict_val = ""
+        if candidates:
+            vpath = candidates[-1].parent / "verdict.json"
+            if vpath.is_file():
+                try:
+                    verdict_val = str(json.loads(vpath.read_text()).get("verdict") or "")
+                except (OSError, ValueError):
+                    verdict_val = ""
+        if verdict_val not in ("clean", "minor-fix"):
+            payload = {
+                "landed": landed,
+                "stopped_at": cid,
+                "reason": (f"{cid} has verdict {verdict_val!r}; record an approved verdict "
+                           "('clean' or 'minor-fix') via `openfarm review` or `openfarm verdict` "
+                           "before landing"),
+            }
+            _emit_ctx(ctx, payload, "land")
+            return EXIT_REFUSED
         branch = f"openfarm/{card.id}-{card.slug()}"
         if not git.branch_exists(branch):
             payload = {"landed": landed, "stopped_at": cid, "reason": f"no branch {branch}"}
             _emit_ctx(ctx, payload, "land")
             return EXIT_REFUSED
 
-        # Trial-merge in a throwaway worktree and verify before touching base.
+        # Trial-merge in a throwaway worktree inside 0700 state_dir/worktrees.
         import shutil
-        import tempfile
-        from .packs.base import pack_for
+        from .gates.checks import suite_green
 
-        trial_wt = Path(tempfile.mkdtemp(prefix=f"openfarm-land-{cid}-")).resolve()
-        shutil.rmtree(trial_wt, ignore_errors=True)
+        trial_wt = (ctx.state.worktrees / f"land-{cid}").resolve()
+        if trial_wt.exists():
+            git.worktree_remove(trial_wt)
+            shutil.rmtree(trial_wt, ignore_errors=True)
         try:
             git.worktree_add(trial_wt, f"refs/heads/{base}")
             trial_git = Git(trial_wt)
@@ -1817,16 +1843,19 @@ def cmd_land(ctx: Context, args) -> int:
                 _emit_ctx(ctx, payload, "land")
                 return EXIT_REFUSED
             if not dry_run:
-                lang = ctx.cfg.language_for_unit(card.unit) if hasattr(ctx.cfg, "language_for_unit") else ctx.cfg.languages[0]
-                pack = pack_for(lang, cargo_flags=ctx.cfg.cargo_flags, python=ctx.cfg.runner_python)
-                if hasattr(pack, "configure"):
-                    pack.configure(trial_wt)
+                pack = _configured_pack(ctx.cfg, trial_wt, unit=card.unit)
+                if hasattr(pack, "prepare_worktree"):
+                    pack.prepare_worktree(trial_wt)
                 test_argv = pack.commands("test", unit=card.unit if card.unit != "." else "")["argv"]
                 run_cmd = getattr(runner, "exec")
-                res = run_cmd("test", test_argv, cwd=trial_wt)
-                if not res.ok:
+                unit_env = ctx.cfg.runner_env.get(card.unit, {})
+                res = run_cmd("test", test_argv, cwd=trial_wt, env=unit_env or None)
+                parsed = pack.parse_tests(res.stdout, res.stderr)
+                gate = suite_green(parsed, ctx.cfg.known_failing)
+                if not res.ok or gate.result != "pass":
                     payload = {"landed": landed, "stopped_at": cid,
-                               "reason": f"suite gate failed on trial merge of {branch} (exit {res.exit_code})"}
+                               "reason": (f"suite gate failed on trial merge of {branch} "
+                                          f"(exit {res.exit_code}: {gate.detail})")}
                     _emit_ctx(ctx, payload, "land")
                     return EXIT_REFUSED
         finally:
@@ -1850,15 +1879,14 @@ def cmd_land(ctx: Context, args) -> int:
         if wt_path is not None and wt_path.resolve() != ctx.repo.resolve():
             git.worktree_remove(wt_path)
             shutil.rmtree(wt_path, ignore_errors=True)
-        mark_note = ""
         try:
             source.mark_done(cid, note=f"landed {branch} onto {base}")
         except Refused as exc:
-            mark_note = str(exc)
-        entry = {"card": cid, "branch": branch, "merged": True, "base": base}
-        if mark_note:
-            entry["note"] = mark_note
-        landed.append(entry)
+            payload = {"landed": landed, "stopped_at": cid,
+                       "reason": f"merged {branch} onto {base} but mark_done failed: {exc}"}
+            _emit_ctx(ctx, payload, "land")
+            return EXIT_REFUSED
+        landed.append({"card": cid, "branch": branch, "merged": True, "base": base})
 
     payload = {"landed": landed, "count": len(landed), "base": base, "dry_run": dry_run}
     if ctx.json:

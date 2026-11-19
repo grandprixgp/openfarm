@@ -1718,7 +1718,15 @@ class SwarmRunner:
                         for fut in done_futs:
                             with rt.lock:
                                 cid = rt.in_flight.pop(fut)
-                            outcome = fut.result()
+                            try:
+                                outcome = fut.result()
+                            except Exception as exc:
+                                outcome = {
+                                    "card": cid,
+                                    "final_state": "blocked",
+                                    "stop_code": "infra",
+                                    "detail": f"worker crashed ({type(exc).__name__}): {exc}",
+                                }
                             with outcomes_lock:
                                 outcomes_by_card[cid] = outcome
                             with rt.lock:
