@@ -2027,7 +2027,7 @@ class ClaudeAcpAdapter:
         if self._proc is None or self._proc.poll() is not None:
             raise Infra("acp-not-running", "ACP subprocess is not running")
         if (self._isolated_home is not None and self._cred_source is not None
-                and self._auth_file is None and self._auth_mode in ("oauth", "auto")):
+                and self.auth_file is None and self.auth_mode in ("oauth", "auto")):
             try:
                 ref_res, new_bytes = logins.refresh_isolated(
                     self.provider,
