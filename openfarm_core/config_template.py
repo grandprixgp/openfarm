@@ -74,6 +74,11 @@ def render_config(*, name: str, language: str, base_branch: str, state_dir: Path
             "# links, so tsc, prettier, @types and imported packages resolve the same.",
             "link_node_modules = true",
         ]
+    elif language == "go":
+        forbidden_files = ["**/go.mod", "**/go.sum", ".openfarm/**", ".claude/**"]
+        flagged_patterns = []
+        tests_rule = ""
+        runner = []
     else:
         forbidden_files = ["pyproject.toml", "setup.py", ".openfarm/**", ".claude/**"]
         flagged_patterns = []

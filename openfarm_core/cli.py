@@ -2821,7 +2821,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     adopt.add_argument("--dir", default=None,
                        help="repository directory (default: the current directory)")
-    adopt.add_argument("--lang", choices=("rust", "python", "typescript"), default=None,
+    adopt.add_argument("--lang", choices=("rust", "python", "typescript", "go"), default=None,
                        help="language pack to use (default: detect from manifests)")
     adopt.add_argument("--state-dir", default=None, help="external state directory")
     adopt.add_argument("--key-file", default=None, help="external API key file path")

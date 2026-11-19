@@ -31,23 +31,25 @@ def detect_language(root: Path) -> str:
     has_cargo = (root / "Cargo.toml").is_file()
     has_python = ((root / "pyproject.toml").is_file()
                   or (root / "setup.py").is_file())
+    has_go = (root / "go.mod").is_file()
 
-    if has_cargo and has_python:
-        raise Refused(
-            "ambiguous-language",
-            "both a Rust and a Python manifest are present; pass --lang rust or "
-            "--lang python",
-        )
-    if has_cargo:
-        return "rust"
-    if has_python:
-        return "python"
+    primary = [lang for lang, present in (("rust", has_cargo), ("python", has_python), ("go", has_go))
+               if present]
+    if len(primary) > 1:
+        if primary == ["rust", "python"]:
+            msg = "both a Rust and a Python manifest are present; pass --lang rust or --lang python"
+        else:
+            opts = " or ".join(f"--lang {lang}" for lang in primary)
+            msg = f"multiple language manifests are present ({', '.join(primary)}); pass {opts}"
+        raise Refused("ambiguous-language", msg)
+    if primary:
+        return primary[0]
     if typescript_manifests(root):
         return "typescript"
     raise Refused(
         "unsupported-language",
         "no supported language manifest found: expected Cargo.toml, pyproject.toml, "
-        "setup.py, package.json, or tsconfig.json",
+        "setup.py, go.mod, package.json, or tsconfig.json",
     )
 
 
@@ -117,10 +119,10 @@ def adopt_config_text(
     `state_dir` or `key_file` is inside `root`, or "unsupported-language" when
     `language` is not "rust" or "python". Nothing is written.
     """
-    if language not in ("rust", "python", "typescript"):
+    if language not in ("rust", "python", "typescript", "go"):
         raise Refused(
             "unsupported-language",
-            f"unsupported language {language!r}: expected 'rust', 'python', or 'typescript'",
+            f"unsupported language {language!r}: expected 'rust', 'python', 'typescript', or 'go'",
         )
 
     resolved_root = Path(root).expanduser().resolve()

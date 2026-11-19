@@ -227,6 +227,40 @@ def typescript_mutants(source: str, lines: set[int] | None) -> list[dict]:
     return out
 
 
+_GO_SWAPS = [("==", "!="), ("!=", "=="),
+             (" <= ", " < "), (" >= ", " > "), (" < ", " <= "), (" > ", " >= "),
+             ("&&", "||"), ("||", "&&"), (" + ", " - "), (" - ", " + "),
+             (" * ", " / "), ("true", "false"), ("false", "true")]
+
+
+def go_mutants(source: str, lines: set[int] | None) -> list[dict]:
+    """Token-swap mutants for Go outside strings, raw strings, and comments."""
+    out: list[dict] = []
+    taken: set[int] = set()
+    for a, b in _code_spans(source):
+        chunk = source[a:b]
+        for old, new in _GO_SWAPS:
+            at = chunk.find(old)
+            while at >= 0:
+                pos = a + at
+                end = pos + len(old)
+                word = old.isalpha()
+                ok = pos not in taken
+                if word:
+                    ok = ok and not (pos > 0 and _WORD.match(source[pos - 1])) \
+                        and not (end < len(source) and _WORD.match(source[end]))
+                if old in (" < ", " > ") and (source[end:end + 1] == "=" or source[pos + 1:pos + 3] in ("<=", ">=")):
+                    ok = False
+                line = source.count("\n", 0, pos) + 1
+                if ok and (lines is None or line in lines):
+                    taken.add(pos)
+                    out.append({"line": line, "what": f"{old.strip()} -> {new.strip()}",
+                                "text": source[:pos] + new + source[end:]})
+                at = chunk.find(old, at + 1)
+    out.sort(key=lambda m: m["line"])
+    return out
+
+
 # -- running --------------------------------------------------------------------
 
 def changed_lines_from_diff(diff: str) -> dict[str, set[int]]:
@@ -306,7 +340,7 @@ def run_tests(argv: list[str], cwd: Path, timeout: float) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="openfarm-mutate")
-    parser.add_argument("--lang", choices=("python", "typescript"), required=True)
+    parser.add_argument("--lang", choices=("python", "typescript", "go"), required=True)
     parser.add_argument("--out", required=True)
     parser.add_argument("--test-argv", required=True, help="JSON list: the named tests' command")
     parser.add_argument("--lines", default="", help='JSON {"path": [line, ...]}')
@@ -338,7 +372,7 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_BASELINE
     per_mutant = args.timeout or (base_secs * 3 + 10)
 
-    make = python_mutants if args.lang == "python" else typescript_mutants
+    make = {"python": python_mutants, "typescript": typescript_mutants, "go": go_mutants}[args.lang]
     plan: list[tuple[str, dict]] = []
     originals: dict[str, bytes] = {}
     mtimes: dict[str, tuple[int, int]] = {}
