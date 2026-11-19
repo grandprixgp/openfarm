@@ -29,7 +29,8 @@ class RoleCall:
                  seed: int | None = None, tokens_in: int = 0,
                  tokens_out: int = 0, spend: float = 0.0,
                  finish_reason: str = "stop",
-                 effort: str = "", effort_param: str = "") -> None:
+                 effort: str = "", effort_param: str = "",
+                 tokens_in_cached: int = 0) -> None:
         self.role = role
         self.brief = brief
         self.content = content
@@ -37,11 +38,16 @@ class RoleCall:
         self.temperature = temperature
         self.seed = seed
         self.tokens_in = tokens_in
+        self.tokens_in_cached = max(0, int(tokens_in_cached or 0))
         self.tokens_out = tokens_out
         self.spend = spend
         self.finish_reason = finish_reason
         self.effort = effort
         self.effort_param = effort_param
+
+    @property
+    def tokens_in_fresh(self) -> int:
+        return max(0, self.tokens_in - self.tokens_in_cached)
 
     @property
     def cut_off(self) -> bool:
@@ -51,7 +57,10 @@ class RoleCall:
     def as_dict(self) -> dict:
         return {"role": self.role, "content": self.content, "model": self.model,
                 "temperature": self.temperature, "seed": self.seed,
-                "tokens_in": self.tokens_in, "tokens_out": self.tokens_out,
+                "tokens_in": self.tokens_in,
+                "tokens_in_fresh": self.tokens_in_fresh,
+                "tokens_in_cached": self.tokens_in_cached,
+                "tokens_out": self.tokens_out,
                 "spend": self.spend, "finish_reason": self.finish_reason,
                 "effort": self.effort}
 
@@ -172,7 +181,8 @@ class Roles:
                           spend=completion.cost,
                           finish_reason=str(getattr(completion, "finish_reason",
                                                     "stop") or "stop"),
-                          effort=eff, effort_param=eff_param)
+                          effort=eff, effort_param=eff_param,
+                          tokens_in_cached=int(getattr(completion, "tokens_in_cached", 0) or 0))
         self.calls.append(record)
         return record
 

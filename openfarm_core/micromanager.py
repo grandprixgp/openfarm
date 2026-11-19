@@ -215,11 +215,13 @@ class MicromanagerBudget:
 
     calls: int = 0
     tokens_in: int = 0
+    tokens_in_cached: int = 0
     tokens_out: int = 0
     spend: float = 0.0
     calls_per_card: dict[str, int] = dataclasses.field(default_factory=dict)
     tokens_by_card: dict[str, int] = dataclasses.field(default_factory=dict)
     tokens_in_by_card: dict[str, int] = dataclasses.field(default_factory=dict)
+    tokens_in_cached_by_card: dict[str, int] = dataclasses.field(default_factory=dict)
     tokens_out_by_card: dict[str, int] = dataclasses.field(default_factory=dict)
     spend_by_card: dict[str, float] = dataclasses.field(default_factory=dict)
     false_rejects_by_card: dict[str, int] = dataclasses.field(default_factory=dict)
@@ -265,13 +267,16 @@ class MicromanagerBudget:
         tokens_in: int = 0,
         tokens_out: int = 0,
         spend: float = 0.0,
+        tokens_in_cached: int = 0,
     ) -> None:
         with self._lock:
             tin = int(tokens_in)
+            tcached = max(0, int(tokens_in_cached or 0))
             tout = int(tokens_out)
             sp = float(spend)
             self.calls += 1
             self.tokens_in += tin
+            self.tokens_in_cached += tcached
             self.tokens_out += tout
             self.spend += sp
             if card_id:
@@ -281,6 +286,9 @@ class MicromanagerBudget:
                 )
                 self.tokens_in_by_card[card_id] = (
                     self.tokens_in_by_card.get(card_id, 0) + tin
+                )
+                self.tokens_in_cached_by_card[card_id] = (
+                    self.tokens_in_cached_by_card.get(card_id, 0) + tcached
                 )
                 self.tokens_out_by_card[card_id] = (
                     self.tokens_out_by_card.get(card_id, 0) + tout
@@ -299,9 +307,13 @@ class MicromanagerBudget:
 
     def usage_for(self, card_id: str) -> dict:
         with self._lock:
+            tin = int(self.tokens_in_by_card.get(card_id, 0))
+            tcached = int(self.tokens_in_cached_by_card.get(card_id, 0))
             return {
                 "calls": int(self.calls_per_card.get(card_id, 0)),
-                "tokens_in": int(self.tokens_in_by_card.get(card_id, 0)),
+                "tokens_in": tin,
+                "tokens_in_fresh": max(0, tin - tcached),
+                "tokens_in_cached": tcached,
                 "tokens_out": int(self.tokens_out_by_card.get(card_id, 0)),
                 "spend": float(self.spend_by_card.get(card_id, 0.0)),
                 "false_rejects_dismissed": int(
@@ -314,6 +326,8 @@ class MicromanagerBudget:
             return {
                 "calls": self.calls,
                 "tokens_in": self.tokens_in,
+                "tokens_in_fresh": max(0, self.tokens_in - self.tokens_in_cached),
+                "tokens_in_cached": self.tokens_in_cached,
                 "tokens_out": self.tokens_out,
                 "spend": round(self.spend, 6),
                 "calls_per_card": dict(self.calls_per_card),
@@ -935,6 +949,7 @@ class ClaudeAcpMicromanager(_ThreadLocalUsageMixin):
 
             self.last_usage = {
                 "tokens_in": res.tokens_in,
+                "tokens_in_cached": int(getattr(res, "tokens_in_cached", 0) or 0),
                 "tokens_out": res.tokens_out,
                 "spend": spend,
                 "vendor_cost_usd": res.vendor_cost_usd,
@@ -1584,6 +1599,7 @@ class Micromanager:
                 tokens_in=int(usage.get("tokens_in", 0) or 0),
                 tokens_out=int(usage.get("tokens_out", 0) or 0),
                 spend=float(usage.get("spend", 0.0) or 0.0),
+                tokens_in_cached=int(usage.get("tokens_in_cached", 0) or 0),
             )
         return answer if isinstance(answer, dict) else {}
 

@@ -1264,7 +1264,10 @@ class CardRun:
                 )
             except unavailable:
                 return None, None
-            self.budget.note_tokens(call.tokens_in, call.tokens_out, call.spend)
+            self.budget.note_tokens(
+                call.tokens_in, call.tokens_out, call.spend,
+                tokens_in_cached=int(getattr(call, "tokens_in_cached", 0) or 0),
+            )
             reason = self._handback_reason(call, json_form=json_handback)
             if reason is None:
                 return call, None
@@ -2200,7 +2203,10 @@ class CardRun:
                 attempt=call_seq,
                 response_path=self.card_layout / "responses" / f"A{call_seq}-test-writer.json",
             )
-            self.budget.note_tokens(call.tokens_in, call.tokens_out, call.spend)
+            self.budget.note_tokens(
+                call.tokens_in, call.tokens_out, call.spend,
+                tokens_in_cached=int(getattr(call, "tokens_in_cached", 0) or 0),
+            )
 
             hb_reason = self._handback_reason(call)
             if hb_reason is not None:
@@ -2770,7 +2776,10 @@ class CardRun:
                 brief_is_json=True,
                 response_path=self.card_layout / "responses" / f"{call_seq}-implementer.json",
             )
-            self.budget.note_tokens(call.tokens_in, call.tokens_out, call.spend)
+            self.budget.note_tokens(
+                call.tokens_in, call.tokens_out, call.spend,
+                tokens_in_cached=int(getattr(call, "tokens_in_cached", 0) or 0),
+            )
 
             hb_reason = self._handback_reason(call)
             if hb_reason is not None:
@@ -4802,10 +4811,14 @@ class CardRun:
             "runner_seconds": round(self.runner_seconds, 2),
             "wall_clock_s": round(self.budget.wall_clock_s, 2),
             "tokens_in": self.budget.tokens_in,
+            "tokens_in_fresh": self.budget.tokens_in_fresh,
+            "tokens_in_cached": self.budget.tokens_in_cached,
             "tokens_out": self.budget.tokens_out,
             "spend": round(self.budget.spend, 6),
             "micromanager_calls": mm_usage["calls"],
             "micromanager_tokens_in": mm_usage["tokens_in"],
+            "micromanager_tokens_in_fresh": int(mm_usage.get("tokens_in_fresh", mm_usage["tokens_in"]) or 0),
+            "micromanager_tokens_in_cached": int(mm_usage.get("tokens_in_cached", 0) or 0),
             "micromanager_tokens_out": mm_usage["tokens_out"],
             "micromanager_spend": mm_usage["spend"],
             "false_rejects_dismissed": mm_usage["false_rejects_dismissed"],

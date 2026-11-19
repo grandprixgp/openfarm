@@ -336,10 +336,11 @@ class NativeClaudeAcpServer:
         usage = parsed.get("usage")
         if not isinstance(usage, dict):
             usage = {}
+        tokens_in_cached = int(usage.get("cache_read_input_tokens", 0) or 0)
         tokens_in = (
             int(usage.get("input_tokens", 0) or 0)
             + int(usage.get("cache_creation_input_tokens", 0) or 0)
-            + int(usage.get("cache_read_input_tokens", 0) or 0)
+            + tokens_in_cached
         )
         tokens_out = int(usage.get("output_tokens", 0) or 0)
         turn_cost = float(parsed.get("total_cost_usd", 0.0) or 0.0)
@@ -369,6 +370,7 @@ class NativeClaudeAcpServer:
                     "update": {
                         "sessionUpdate": "usage_update",
                         "inputTokens": tokens_in,
+                        "cachedInputTokens": tokens_in_cached,
                         "outputTokens": tokens_out,
                         "used": session["used_tokens"],
                         "size": 200_000,
@@ -383,6 +385,7 @@ class NativeClaudeAcpServer:
                 "stopReason": "end_turn",
                 "usage": {
                     "inputTokens": tokens_in,
+                    "cachedInputTokens": tokens_in_cached,
                     "outputTokens": tokens_out,
                 },
             },

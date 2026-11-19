@@ -686,10 +686,17 @@ class AcpUsage:
     tokens_in: int = 0
     tokens_out: int = 0
     vendor_cost_usd: float = 0.0
+    tokens_in_cached: int = 0
+
+    @property
+    def tokens_in_fresh(self) -> int:
+        return max(0, self.tokens_in - self.tokens_in_cached)
 
     def as_dict(self) -> dict:
         return {
             "tokens_in": self.tokens_in,
+            "tokens_in_fresh": self.tokens_in_fresh,
+            "tokens_in_cached": self.tokens_in_cached,
             "tokens_out": self.tokens_out,
             "vendor_cost_usd": self.vendor_cost_usd,
         }
@@ -708,6 +715,11 @@ class AcpResult:
     latency_s: float = 0.0
     permission_events: list[dict] = dataclasses.field(default_factory=list)
     rejected_methods: list[dict] = dataclasses.field(default_factory=list)
+    tokens_in_cached: int = 0
+
+    @property
+    def tokens_in_fresh(self) -> int:
+        return max(0, self.tokens_in - self.tokens_in_cached)
 
     @property
     def usage(self) -> AcpUsage:
@@ -715,6 +727,7 @@ class AcpResult:
             tokens_in=self.tokens_in,
             tokens_out=self.tokens_out,
             vendor_cost_usd=self.vendor_cost_usd,
+            tokens_in_cached=self.tokens_in_cached,
         )
 
     def as_dict(self) -> dict:
@@ -723,6 +736,8 @@ class AcpResult:
             "stop_reason": self.stop_reason,
             "session_id": self.session_id,
             "tokens_in": self.tokens_in,
+            "tokens_in_fresh": self.tokens_in_fresh,
+            "tokens_in_cached": self.tokens_in_cached,
             "tokens_out": self.tokens_out,
             "vendor_cost_usd": self.vendor_cost_usd,
             "latency_s": self.latency_s,
@@ -2290,6 +2305,7 @@ class ClaudeAcpAdapter:
                             tokens_out = 0
                         if resp_in_raw is not None:
                             tokens_in = _with_cached_input(resp_usage, tokens_in, tokens_out)
+                        tokens_in_cached = _cached_input_from_usage(resp_usage)
                     except Invalid:
                         self._terminate_process_group()
                         raise
@@ -2305,6 +2321,7 @@ class ClaudeAcpAdapter:
                         tokens_in=tokens_in,
                         tokens_out=tokens_out,
                         vendor_cost_usd=turn_vendor_cost,
+                        tokens_in_cached=tokens_in_cached,
                     )
                     turn_completed = True
                     return AcpResult(
@@ -2317,6 +2334,7 @@ class ClaudeAcpAdapter:
                         latency_s=time.monotonic() - started,
                         permission_events=permission_events,
                         rejected_methods=rejected_methods,
+                        tokens_in_cached=tokens_in_cached,
                     )
         finally:
             if not turn_completed:
@@ -2366,6 +2384,16 @@ def _rpc_error_text(message: str, data: object, limit: int = 400) -> str:
     if not detail or detail == message:
         return message
     return f"{message}: {detail[:limit]}"
+
+def _cached_input_from_usage(usage: object) -> int:
+    if not isinstance(usage, dict):
+        return 0
+    for key in ("cachedInputTokens", "cachedReadTokens", "cache_read_input_tokens"):
+        raw = usage.get(key)
+        if not isinstance(raw, bool) and isinstance(raw, int) and raw >= 0:
+            return raw
+    return 0
+
 
 def _with_cached_input(usage: dict, tokens_in: int, tokens_out: int) -> int:
     """Input tokens with the cached ones counted.

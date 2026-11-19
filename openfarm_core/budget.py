@@ -53,6 +53,7 @@ class Budget:
         self.fixed_builds = 0
         self.mutation_builds = 0
         self.tokens_in = 0
+        self.tokens_in_cached = 0
         self.tokens_out = 0
         self.spend = 0.0
         self.implementer_attempts = 0
@@ -129,8 +130,14 @@ class Budget:
 
     # -- tokens, spend, time --------------------------------------------------
 
-    def note_tokens(self, tokens_in: int, tokens_out: int, spend: float = 0.0) -> None:
+    @property
+    def tokens_in_fresh(self) -> int:
+        return max(0, self.tokens_in - self.tokens_in_cached)
+
+    def note_tokens(self, tokens_in: int, tokens_out: int, spend: float = 0.0,
+                    tokens_in_cached: int = 0) -> None:
         self.tokens_in += tokens_in
+        self.tokens_in_cached += max(0, int(tokens_in_cached or 0))
         self.tokens_out += tokens_out
         self.spend += spend
         self._check_tokens()

@@ -99,11 +99,23 @@ def build_dossier(card_run, final_state: str,
             "test_writer_attempts": card_run.budget.test_writer_attempts,
             "planner_split": card_run.planner_used,
             "failed_attempts": _failed_attempts(card_run),
-            "tokens": token_split(
-                int(getattr(card_run.budget, "tokens_in", 0) or 0)
-                + int(getattr(card_run.budget, "tokens_out", 0) or 0),
-                int(mm_summary.get("tokens_in", 0) or 0)
-                + int(mm_summary.get("tokens_out", 0) or 0)),
+            "tokens": {
+                **token_split(
+                    int(getattr(card_run.budget, "tokens_in", 0) or 0)
+                    + int(getattr(card_run.budget, "tokens_out", 0) or 0),
+                    int(mm_summary.get("tokens_in", 0) or 0)
+                    + int(mm_summary.get("tokens_out", 0) or 0)),
+                "tokens_in_fresh": (
+                    int(getattr(card_run.budget, "tokens_in_fresh",
+                                getattr(card_run.budget, "tokens_in", 0)) or 0)
+                    + int(mm_summary.get("tokens_in_fresh",
+                                         mm_summary.get("tokens_in", 0)) or 0)
+                ),
+                "tokens_in_cached": (
+                    int(getattr(card_run.budget, "tokens_in_cached", 0) or 0)
+                    + int(mm_summary.get("tokens_in_cached", 0) or 0)
+                ),
+            },
         },
         "6_checker": {
             "restatement": restatement,
