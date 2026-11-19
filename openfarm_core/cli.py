@@ -3563,7 +3563,7 @@ def main(argv: list[str] | None = None) -> int:
             from types import SimpleNamespace
             tui_args = SimpleNamespace(
                 repo=args.repo, config=args.config, json=False,
-                run=None, refresh=1.0, once=False, view="home",
+                run_id=None, refresh=1.0, once=False, view="overview",
             )
             return cmd_tui(tui_args)
         parser.print_help()

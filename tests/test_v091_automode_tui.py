@@ -61,16 +61,18 @@ class AutomodeTuiTests(unittest.TestCase):
     def test_bare_openfarm_launches_tui_on_tty_and_help_on_non_tty(self) -> None:
         called = []
 
-        def fake_tui(args) -> int:
-            called.append(args)
+        def fake_run_tui(**kwargs) -> int:
+            called.append(kwargs)
             return 0
 
         with mock.patch("sys.stdin.isatty", return_value=True), \
              mock.patch("sys.stdout.isatty", return_value=True), \
-             mock.patch("openfarm_core.cli.cmd_tui", side_effect=fake_tui):
+             mock.patch("openfarm_core.cli.run_tui", side_effect=fake_run_tui):
             rc = cli_main([])
         self.assertEqual(rc, 0)
         self.assertEqual(len(called), 1)
+        self.assertIsNone(called[0]["run_id"])
+        self.assertEqual(called[0]["view"], "overview")
 
         # Non-TTY still prints help and exits 2 (scripts/CI safety)
         with mock.patch("sys.stdin.isatty", return_value=False), \
