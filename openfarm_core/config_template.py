@@ -63,8 +63,8 @@ def render_config(*, name: str, language: str, base_branch: str, state_dir: Path
         tests_rule = ""
         tools = typescript_tools or {}
         runner = [
-            "# Tests run with node --test (node:test), the only runner this version has.",
-            'typescript = "node"',
+            '# Tests run with "node" (node --test), "vitest", or "jest".',
+            f"typescript = {toml_str(tools.get('runner_kind', 'node'))}",
             '# "tsc" or "syntax" (node\'s own parse only): decided from this checkout by',
             "# adopt, and used the same way by check and by every card.",
             f"typescript_typecheck = {toml_str(tools.get('typecheck', 'auto'))}",

@@ -563,12 +563,9 @@ class Config:
         #: The interpreter the Python pack runs under; openfarm's own when empty.
         self.runner_python = python.strip()
         # The TypeScript pack's runner and tools, recorded by adopt.
-        if runner.get("typescript") not in (None, "node"):
-            raise ConfigError(
-                f"[runner] typescript: {runner.get('typescript')!r} is not supported; this "
-                "version runs TypeScript tests only with node --test, so the value is "
-                '"node"')
-        self.runner_typescript = "node"
+        self.runner_typescript = _as_choice(
+            runner.get("typescript"), "[runner] typescript", "node",
+            ("node", "vitest", "jest"))
         self.typescript_typecheck = _as_choice(
             runner.get("typescript_typecheck"), "[runner] typescript_typecheck", "auto",
             ("auto", "tsc", "syntax"))

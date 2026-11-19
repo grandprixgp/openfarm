@@ -263,13 +263,13 @@ class RunnerAndToolingTests(unittest.TestCase):
         self.assertEqual(test_script_problem(node_script), "")
 
         custom_npm = _project({
-            "package.json": '{"scripts": {"test": "vitest run"}}\n',
-            "node_modules/vitest/index.js": "",
+            "package.json": '{"scripts": {"test": "mocha"}}\n',
+            "node_modules/mocha/index.js": "",
         }, self)
         self.assertEqual(detect_runner(custom_npm), "node")
         problem = test_script_problem(custom_npm)
-        self.assertIn("'vitest run'", problem)
-        self.assertIn("only with node --test", problem)
+        self.assertIn("'mocha'", problem)
+        self.assertIn("not a supported", problem)
 
     def test_configure_notes_and_local_bins(self) -> None:
         root = _project({"package.json": '{"name": "a"}\n'}, self)
