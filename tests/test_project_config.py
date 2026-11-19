@@ -58,6 +58,7 @@ SPEC_KEYS = {
               "coordinator_tokens_per_run", "external_wait",
               "on_external_timeout", "stall_after"},
     "tiers": {"model", "efforts", "effort_param"},
+    "units": {"language"},
 }
 
 

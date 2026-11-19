@@ -1822,7 +1822,8 @@ def cmd_land(ctx: Context, args) -> int:
                 if hasattr(pack, "configure"):
                     pack.configure(trial_wt)
                 test_argv = pack.commands("test", unit=card.unit if card.unit != "." else "")["argv"]
-                res = runner.exec("test", test_argv, cwd=trial_wt)
+                run_cmd = getattr(runner, "exec")
+                res = run_cmd("test", test_argv, cwd=trial_wt)
                 if not res.ok:
                     payload = {"landed": landed, "stopped_at": cid,
                                "reason": f"suite gate failed on trial merge of {branch} (exit {res.exit_code})"}
@@ -1849,11 +1850,15 @@ def cmd_land(ctx: Context, args) -> int:
         if wt_path is not None and wt_path.resolve() != ctx.repo.resolve():
             git.worktree_remove(wt_path)
             shutil.rmtree(wt_path, ignore_errors=True)
+        mark_note = ""
         try:
             source.mark_done(cid, note=f"landed {branch} onto {base}")
-        except Refused:
-            pass
-        landed.append({"card": cid, "branch": branch, "merged": True, "base": base})
+        except Refused as exc:
+            mark_note = str(exc)
+        entry = {"card": cid, "branch": branch, "merged": True, "base": base}
+        if mark_note:
+            entry["note"] = mark_note
+        landed.append(entry)
 
     payload = {"landed": landed, "count": len(landed), "base": base, "dry_run": dry_run}
     if ctx.json:
