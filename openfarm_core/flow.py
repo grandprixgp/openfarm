@@ -609,7 +609,13 @@ class CardRun:
                 index += 1
             path = folder / f"{stem}-{index}.json"
         gate.detail_path = path
-        write_json(path, gate.as_dict())
+        payload = gate.as_dict()
+        last_conf = getattr(self, "_last_confinement", None)
+        if last_conf and gate.name in ("baseline", "suite", "lint", "workspace-lint",
+                                       "pass-after", "fail-before", "revert-check",
+                                       "mutation", "format"):
+            payload["confinement"] = dict(last_conf)
+        write_json(path, payload)
         self.log(f"{self.card.id}: {gate.name} {gate.result}"
                  + (f" — {gate.detail}" if gate.detail else ""))
         if self.board is not None:
@@ -1264,7 +1270,10 @@ class CardRun:
                 )
             except unavailable:
                 return None, None
-            self.budget.note_tokens(call.tokens_in, call.tokens_out, call.spend)
+            self.budget.note_tokens(
+                call.tokens_in, call.tokens_out, call.spend,
+                tokens_in_cached=int(getattr(call, "tokens_in_cached", 0) or 0),
+            )
             reason = self._handback_reason(call, json_form=json_handback)
             if reason is None:
                 return call, None
@@ -1585,6 +1594,11 @@ class CardRun:
             kind=kind, argv=argv, cwd=self.worktree,
             target_dir=self.target_dir, unit=resolved_unit,
             env=env, timeout_s=timeout)
+        self._last_confinement = {
+            "confined": bool(getattr(result, "confined", False)),
+            "network": str(getattr(result, "confine_network", "") or ""),
+            "runner_argv": list(getattr(result, "runner_argv", ()) or ())[:20],
+        }
         self.runner_seconds += getattr(result, "duration_s", 0.0) or 0.0
         if counted == "model":
             self.budget.note_model_build()
@@ -1971,9 +1985,43 @@ class CardRun:
 
     # -- step 4: planner ------------------------------------------------------
 
+    def _should_shape(self) -> tuple[bool, str]:
+        mode = str(getattr(self.cfg.micromanager, "shape_when", "always") or "always")
+        if mode == "off":
+            return False, "skipped: shape_when = off"
+        if mode == "new-symbols":
+            if not getattr(self.card, "new_symbols", False) and len(self.card.touches) <= 1:
+                return False, "skipped: shape_when = new-symbols (no new_symbols, single-file card)"
+        return True, ""
+
+    def _should_pre_review(self, added: int, removed: int) -> tuple[bool, str]:
+        mode = str(getattr(self.cfg.micromanager, "pre_review_when", "always") or "always")
+        if mode == "off":
+            return False, "skipped: pre_review_when = off"
+        if mode == "on-flag":
+            impl_attempts = sum(1 for a in self.attempts if a.get("role") == "implementer")
+            counter_failed = int((self.counter_summary or {}).get("failed", 0) or 0)
+            max_lines = int(getattr(self.cfg.micromanager, "pre_review_max_lines", 60) or 60)
+            low_risk = ("pinned-bugfix", "test-backfill", "mechanical", "pattern", "small-feature")
+            if (impl_attempts <= 1 and counter_failed == 0 and not self.handbacks
+                    and (added + removed) <= max_lines
+                    and self.card.category in low_risk):
+                return (
+                    False,
+                    f"skipped: pre_review_when = on-flag (attempt 1, 0 counter-test failures, {added + removed} lines)",
+                )
+        return True, ""
+
     def _step_plan(self) -> None:
         self.phase = "plan"
         if self.micromanager.enabled:
+            do_shape, shape_skip = self._should_shape()
+            if not do_shape:
+                self._record_gate(GateResult("micromanager-shape", PASS, shape_skip))
+                do_shape = False
+        else:
+            do_shape = False
+        if do_shape:
             sigs = {}
             for path in self.card.touches:
                 norm = normalise(path)
@@ -2166,7 +2214,10 @@ class CardRun:
                 attempt=call_seq,
                 response_path=self.card_layout / "responses" / f"A{call_seq}-test-writer.json",
             )
-            self.budget.note_tokens(call.tokens_in, call.tokens_out, call.spend)
+            self.budget.note_tokens(
+                call.tokens_in, call.tokens_out, call.spend,
+                tokens_in_cached=int(getattr(call, "tokens_in_cached", 0) or 0),
+            )
 
             hb_reason = self._handback_reason(call)
             if hb_reason is not None:
@@ -2736,7 +2787,10 @@ class CardRun:
                 brief_is_json=True,
                 response_path=self.card_layout / "responses" / f"{call_seq}-implementer.json",
             )
-            self.budget.note_tokens(call.tokens_in, call.tokens_out, call.spend)
+            self.budget.note_tokens(
+                call.tokens_in, call.tokens_out, call.spend,
+                tokens_in_cached=int(getattr(call, "tokens_in_cached", 0) or 0),
+            )
 
             hb_reason = self._handback_reason(call)
             if hb_reason is not None:
@@ -3494,64 +3548,68 @@ class CardRun:
             return checker_bounce
 
         if self.micromanager.enabled:
-            self._refresh_micromanager_harness_context("micromanager")
-            self._check_stop_requested()
-            try:
-                report = self.micromanager.triage_and_review("pre_review", {
-                    "card_id": self.card.id,
-                    "card": self.card.as_dict(),
-                    "full_diff": full_diff,
-                    "gates": [g.as_dict() for g in self.gates],
-                    "touches": list(self.card.touches),
-                    "counter_tests": dict(self.counter_summary),
-                    "mutation": dict(self.mutation_summary),
-                })
-            except (Refused, Invalid, ValueError, Infra) as exc:
-                if isinstance(exc, Infra) and exc.code != "acp-timeout":
-                    raise
-                self._record_gate(GateResult(
-                    "micromanager-pre-review",
-                    FAIL if isinstance(exc, Refused) else INFRA,
-                    f"pre_review degraded ({type(exc).__name__}): "
-                    f"{exc.message if hasattr(exc, 'message') else exc}",
-                    {"error": str(exc)},
-                ))
-                self.log(f"{self.card.id}: micromanager pre_review degraded: {exc}")
-                report = None
-            if report is not None:
-                self._record_gate(GateResult(
-                    "micromanager-pre-review",
-                    PASS if report.verdict == "approve" else FAIL,
-                    report.verdict,
-                    report.as_dict(),
-                ))
-                for entry in report.findings:
-                    self._file_finding(entry)
-                if report.reviewer_brief:
-                    self.reviewer_brief = report.reviewer_brief
-                if report.verdict == "block":
-                    raise GateFailure(
-                        StopCode.SUPERVISOR_REJECT,
-                        report.missed_clause or report.summary
-                        or "micromanager blocked pre-review",
-                    )
-                if report.verdict == "bounce":
-                    if allow_pre_review_bounce:
-                        self.coaching_guidance = (
-                            report.missed_clause or report.reviewer_brief
-                            or report.summary)
-                        return (
-                            "pre_review",
-                            full_diff,
-                            report.missed_clause
-                            or "supervisor requested changes during pre-review",
-                            "",
+            do_pre, pre_skip = self._should_pre_review(added, removed)
+            if not do_pre:
+                self._record_gate(GateResult("micromanager-pre-review", PASS, pre_skip))
+            else:
+                self._refresh_micromanager_harness_context("micromanager")
+                self._check_stop_requested()
+                try:
+                    report = self.micromanager.triage_and_review("pre_review", {
+                        "card_id": self.card.id,
+                        "card": self.card.as_dict(),
+                        "full_diff": full_diff,
+                        "gates": [g.as_dict() for g in self.gates],
+                        "touches": list(self.card.touches),
+                        "counter_tests": dict(self.counter_summary),
+                        "mutation": dict(self.mutation_summary),
+                    })
+                except (Refused, Invalid, ValueError, Infra) as exc:
+                    if isinstance(exc, Infra) and exc.code != "acp-timeout":
+                        raise
+                    self._record_gate(GateResult(
+                        "micromanager-pre-review",
+                        FAIL if isinstance(exc, Refused) else INFRA,
+                        f"pre_review degraded ({type(exc).__name__}): "
+                        f"{exc.message if hasattr(exc, 'message') else exc}",
+                        {"error": str(exc)},
+                    ))
+                    self.log(f"{self.card.id}: micromanager pre_review degraded: {exc}")
+                    report = None
+                if report is not None:
+                    self._record_gate(GateResult(
+                        "micromanager-pre-review",
+                        PASS if report.verdict == "approve" else FAIL,
+                        report.verdict,
+                        report.as_dict(),
+                    ))
+                    for entry in report.findings:
+                        self._file_finding(entry)
+                    if report.reviewer_brief:
+                        self.reviewer_brief = report.reviewer_brief
+                    if report.verdict == "block":
+                        raise GateFailure(
+                            StopCode.SUPERVISOR_REJECT,
+                            report.missed_clause or report.summary
+                            or "micromanager blocked pre-review",
                         )
-                    raise GateFailure(
-                        StopCode.SUPERVISOR_REJECT,
-                        report.missed_clause or report.summary
-                        or "micromanager bounced pre-review with no attempts left",
-                    )
+                    if report.verdict == "bounce":
+                        if allow_pre_review_bounce:
+                            self.coaching_guidance = (
+                                report.missed_clause or report.reviewer_brief
+                                or report.summary)
+                            return (
+                                "pre_review",
+                                full_diff,
+                                report.missed_clause
+                                or "supervisor requested changes during pre-review",
+                                "",
+                            )
+                        raise GateFailure(
+                            StopCode.SUPERVISOR_REJECT,
+                            report.missed_clause or report.summary
+                            or "micromanager bounced pre-review with no attempts left",
+                        )
 
         self.existing_tests_changed = [
             path for path in changed
@@ -3813,54 +3871,61 @@ class CardRun:
 
     def _checker(self, changed: list[str], full_diff: str,
                  allow_bounce: bool = False) -> tuple[str, str, str, str] | None:
-        test_diff = diff_text(
-            self.worktree,
-            [path for path in changed if self._is_test_path(path)],
-            ref=self.base_commit or "HEAD")
-        form1 = pass1_answer_form()
-        brief1 = checker_pass1_brief(self.card, test_diff, handback=self.swarm_on,
-                                     answer_form=form1)
-        # A checker's answer is checked for a hand-back before anything reads it: a
-        # hand-back is never a restatement and never a passing checker gate.
-        call1, limit_err = self._call_role_with_handbacks(
-            "checker_pass1", brief1, first_attempt=1, response_name="checker-pass1")
-        if limit_err is not None:
-            self._checker_handback_limit("checker-pass1", limit_err)
-        first = parse_pass1(call1.content, self.card, cut_off=call1.cut_off)
-        first_problem1 = ""
-        if not first.readable:
-            # Never taken as the restatement: ask once more with the form
-            # restated. A hand-back is still read first.
-            first_problem1 = first.problem
-            retry1 = checker_pass1_brief(self.card, test_diff, handback=self.swarm_on,
-                                         answer_form=form1,
-                                         retry_problem=first.problem)
-            asked1 = sum(1 for c in getattr(self.roles, "calls", []) or []
-                         if getattr(c, "role", "") == "checker_pass1")
+        if getattr(self.cfg, "checker_mode", "two-pass") == "single-pass":
+            self.checker_pass1 = {"skipped": True, "mode": "single-pass"}
+            self._record_gate(GateResult(
+                "checker-pass1", PASS,
+                "skipped: checker_mode = single-pass (combined into checker-pass2)",
+                {"checker": self.checker_pass1}))
+        else:
+            test_diff = diff_text(
+                self.worktree,
+                [path for path in changed if self._is_test_path(path)],
+                ref=self.base_commit or "HEAD")
+            form1 = pass1_answer_form()
+            brief1 = checker_pass1_brief(self.card, test_diff, handback=self.swarm_on,
+                                         answer_form=form1)
+            # A checker's answer is checked for a hand-back before anything reads it: a
+            # hand-back is never a restatement and never a passing checker gate.
             call1, limit_err = self._call_role_with_handbacks(
-                "checker_pass1", retry1, first_attempt=1 + max(1, asked1),
-                response_name="checker-pass1-again")
+                "checker_pass1", brief1, first_attempt=1, response_name="checker-pass1")
             if limit_err is not None:
                 self._checker_handback_limit("checker-pass1", limit_err)
             first = parse_pass1(call1.content, self.card, cut_off=call1.cut_off)
-        restatement = first.restatement
-        self.checker_restatement = restatement
-        self.checker_pass1 = {**first.as_dict(), "asked_again": bool(first_problem1),
-                              "first_problem": first_problem1}
-        if not first.readable:
-            detail1 = ("the first pass could not be read, even when asked again "
-                       f"({first.problem}): no restatement to compare with the tests")
-        else:
-            detail1 = ("restatement flagged as drifting" if restatement.mismatch
-                       else "restatement matches the named tests")
-            said1 = {"yes": "would catch a bad implementation",
-                     "partly": "would partly catch a bad implementation",
-                     "no": "would not catch a bad implementation"}.get(first.catches)
-            if said1:
-                detail1 += f"; the checker says the tests {said1}"
-        gate1 = self._record_gate(GateResult(
-            "checker-pass1", PASS, detail1,
-            {"restatement": restatement.as_dict(), "checker": self.checker_pass1}))
+            first_problem1 = ""
+            if not first.readable:
+                # Never taken as the restatement: ask once more with the form
+                # restated. A hand-back is still read first.
+                first_problem1 = first.problem
+                retry1 = checker_pass1_brief(self.card, test_diff, handback=self.swarm_on,
+                                             answer_form=form1,
+                                             retry_problem=first.problem)
+                asked1 = sum(1 for c in getattr(self.roles, "calls", []) or []
+                             if getattr(c, "role", "") == "checker_pass1")
+                call1, limit_err = self._call_role_with_handbacks(
+                    "checker_pass1", retry1, first_attempt=1 + max(1, asked1),
+                    response_name="checker-pass1-again")
+                if limit_err is not None:
+                    self._checker_handback_limit("checker-pass1", limit_err)
+                first = parse_pass1(call1.content, self.card, cut_off=call1.cut_off)
+            restatement = first.restatement
+            self.checker_restatement = restatement
+            self.checker_pass1 = {**first.as_dict(), "asked_again": bool(first_problem1),
+                                  "first_problem": first_problem1}
+            if not first.readable:
+                detail1 = ("the first pass could not be read, even when asked again "
+                           f"({first.problem}): no restatement to compare with the tests")
+            else:
+                detail1 = ("restatement flagged as drifting" if restatement.mismatch
+                           else "restatement matches the named tests")
+                said1 = {"yes": "would catch a bad implementation",
+                         "partly": "would partly catch a bad implementation",
+                         "no": "would not catch a bad implementation"}.get(first.catches)
+                if said1:
+                    detail1 += f"; the checker says the tests {said1}"
+            self._record_gate(GateResult(
+                "checker-pass1", PASS, detail1,
+                {"restatement": restatement.as_dict(), "checker": self.checker_pass1}))
 
         from .roles import MAX_COUNTER_TESTS, parse_pass2, pass2_answer_form
 
@@ -4757,10 +4822,14 @@ class CardRun:
             "runner_seconds": round(self.runner_seconds, 2),
             "wall_clock_s": round(self.budget.wall_clock_s, 2),
             "tokens_in": self.budget.tokens_in,
+            "tokens_in_fresh": self.budget.tokens_in_fresh,
+            "tokens_in_cached": self.budget.tokens_in_cached,
             "tokens_out": self.budget.tokens_out,
             "spend": round(self.budget.spend, 6),
             "micromanager_calls": mm_usage["calls"],
             "micromanager_tokens_in": mm_usage["tokens_in"],
+            "micromanager_tokens_in_fresh": int(mm_usage.get("tokens_in_fresh", mm_usage["tokens_in"]) or 0),
+            "micromanager_tokens_in_cached": int(mm_usage.get("tokens_in_cached", 0) or 0),
             "micromanager_tokens_out": mm_usage["tokens_out"],
             "micromanager_spend": mm_usage["spend"],
             "false_rejects_dismissed": mm_usage["false_rejects_dismissed"],

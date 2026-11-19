@@ -143,7 +143,8 @@ class ClaudeAcpWorkerBackend:
                     + result.tokens_out / 1000.0 * self.cost_per_1k_out)
         finish = "length" if result.stop_reason == "max_tokens" else "stop"
         return Completion(content=result.text, tokens_in=result.tokens_in,
-                          tokens_out=result.tokens_out, model=model or self.provider,
+                          tokens_out=result.tokens_out,
+                          tokens_in_cached=getattr(result, "tokens_in_cached", 0), model=model or self.provider,
                           finish_reason=finish, latency_s=result.latency_s,
                           cost=cost)
 

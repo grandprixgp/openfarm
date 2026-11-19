@@ -414,6 +414,49 @@ def sync_back(
         return SyncResult("refused", f"write failed ({exc.strerror})", str(dest))
 
 
+def refresh_isolated(
+    provider: str,
+    *,
+    isolated_home: Path | str,
+    source: Path | str,
+    initial: bytes | None,
+    pinned: str | None = None,
+) -> tuple[SyncResult, bytes | None]:
+    """Refresh an isolated home's credential copy if the host file changed on disk.
+
+    Handles the case where an interactive Claude/Codex session refreshes the
+    user's real login while a long-running openfarm card is in flight. Only
+    copies when the new host file passes `check_shape` for the same account.
+    """
+    if provider not in PROVIDERS:
+        return SyncResult("refused", f"unknown provider {provider!r}"), initial
+    src = Path(source)
+    if pinned is not None:
+        if pin_path(source) != pinned:
+            return SyncResult("refused", "host login symlink target changed", str(source)), initial
+        src = Path(pinned)
+    elif src.is_symlink():
+        try:
+            src = src.resolve(strict=True)
+        except OSError as exc:
+            return SyncResult("refused", f"host login link unreadable ({exc.strerror})", str(source)), initial
+    try:
+        raw = src.read_bytes()
+    except OSError as exc:
+        return SyncResult("skipped", f"host login unreadable ({exc.strerror})", str(src)), initial
+    if len(raw) > _MAX_BYTES[provider]:
+        return SyncResult("refused", "host login exceeds max size", str(src)), initial
+    if initial is not None and raw == initial:
+        return SyncResult("unchanged", "", str(src)), initial
+    problem = check_shape(provider, raw, initial)
+    if problem:
+        return SyncResult("refused", problem, str(src)), initial
+    iso = isolated_place(provider, isolated_home)
+    iso.credential.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _write_atomic(iso.credential.parent, iso.credential.name, raw, ".openfarm-refresh-")
+    return SyncResult("refreshed", "", str(iso.credential)), raw
+
+
 def pin_path(target: Path | str) -> str:
     """The real file behind a login path right now, links followed."""
     return os.path.realpath(str(target))

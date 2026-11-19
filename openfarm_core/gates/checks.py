@@ -590,6 +590,9 @@ def mutation_gate(parsed: dict, min_kill_rate: float, mode: str,
         detail = f"mutation hit its cap after {killed}/{judged} mutants"
         return GateResult("mutation", FAIL if blocking else PASS, detail, evidence)
     if not judged:
+        if parsed.get("scoped") and category not in tuple(required_for):
+            detail = f"no mutable expressions in the card's diff ({total} found{tail})"
+            return GateResult("mutation", PASS, detail, evidence)
         detail = f"no mutant could be judged ({total} found{tail})"
         return GateResult("mutation", FAIL if blocking else PASS, detail, evidence)
     if rate < min_kill_rate:

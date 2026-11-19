@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.8.7-16a34a?style=flat-square" alt="version 0.8.7">
+  <img src="https://img.shields.io/badge/version-0.8.8-16a34a?style=flat-square" alt="version 0.8.8">
   <img src="https://img.shields.io/badge/status-pre--release-d97706?style=flat-square" alt="status: pre-release">
   <img src="https://img.shields.io/badge/python-3.11%2B-7c3aed?style=flat-square" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/runtime%20deps-stdlib%20only-0284c7?style=flat-square" alt="runtime dependencies: standard library only">
@@ -21,7 +21,7 @@
 
 <p align="center">
   <a href="#quickstart"><b>Quickstart</b></a> &nbsp;&bull;&nbsp;
-  <a href="#what-changed-in-v087"><b>What changed in v0.8.7</b></a> &nbsp;&bull;&nbsp;
+  <a href="#what-changed-in-v088"><b>What changed in v0.8.8</b></a> &nbsp;&bull;&nbsp;
   <a href="#how-it-works"><b>How it works</b></a> &nbsp;&bull;&nbsp;
   <a href="#commands"><b>Commands</b></a> &nbsp;&bull;&nbsp;
   <a href="#whats-verified"><b>What's verified</b></a> &nbsp;&bull;&nbsp;
@@ -34,7 +34,7 @@
 </p>
 
 > [!IMPORTANT]
-> **Pre-release (v0.8.7).** v0.8.7 scopes `cargo-mutants` to the card's own diff (`--in-diff`), validates the v0.8.6 pre-review rule across a full 3-repeat bench on both Claude and Codex ([`docs/bench-v0.8.7.md`](docs/bench-v0.8.7.md)), and fixes TTY-hang and symlinked-`TMPDIR` `bwrap` bugs ([`docs/v0.8.7-build-log.md`](docs/v0.8.7-build-log.md)). On the v0.8.7 bench, Claude farm passed 35 of 36 (vs solo 34 of 36, 37.5% fewer frontier tokens) and Codex farm jumped from 27 of 36 to 34 of 36 (45.9% fewer frontier tokens vs solo 36 of 36), with zero false pre-review bounces across all 72 farm runs. The offline suite has 1569 tests with no failures. What ran live, and what has not run at all, is in [What's verified](#whats-verified) and [Not yet tested](#not-yet-tested). With `[swarm] enabled = false` a run behaves as in v0.7.
+> **Pre-release (v0.8.8).** v0.8.8 ships small-card economics (`shape_when`, `pre_review_when`, single-pass checker, fresh-vs-cached token accounting), the default `medium` → `high` → `max` retry effort ladder (3 retries minimum), network-off runner `bwrap` (`--unshare-net`), and operational hardening ([`docs/v0.8.8-build-log.md`](docs/v0.8.8-build-log.md)). On the v0.8.8 bench ([`docs/bench-v0.8.8.md`](docs/bench-v0.8.8.md)), Codex farm passed 35 of 36 using **4.6% fewer total tokens than Codex solo** (69.4% fewer frontier tokens), and Claude farm passed 34 of 36 (34/34 non-infra) cutting total tokens by 36% vs v0.8.7 and frontier tokens by **77.9%** vs solo (80.7% worker share). The offline suite has 1589 tests with no failures. With `[swarm] enabled = false` a run behaves as in v0.7.
 
 ---
 
@@ -152,6 +152,16 @@ openfarm check CARD-001
 - **Python** repositories use `unittest` unless they configure pytest (`pytest.ini` or `[tool.pytest.ini_options]`). `ruff` runs (lint and format) only when the project configures it (`[tool.ruff]` in `pyproject.toml`, `ruff.toml` or `.ruff.toml`) and it is installed. Otherwise lint is a syntax check, formatting is not checked, and the run's notes say which case applies.
 - **TypeScript** tests run only with `node --test`. A test script that uses npm, jest, vitest or mocha is refused at adopt and at check. `tsc --noEmit` runs when the project has `tsc` and a `tsconfig.json`; otherwise the type check is a syntax check by node's own type stripping, no types are checked, and the notes and gate records say "syntax only". `prettier` runs only when the project configures it. Adopt records these choices under `[runner]`, and check and every card use the same ones. Card worktrees link the base checkout's git-ignored `node_modules`.
 - **Mutation** for Python and TypeScript (v0.8.5) is openfarm's own runner. It mutates only the lines the card changed, runs the card's named tests against each mutant, and reports caught, missed, timed-out and unviable mutants, as cargo-mutants does for Rust. Nothing needs installing in the project.
+
+## What changed in v0.8.8
+
+For a reader upgrading from v0.8.7. Details are in [`docs/v0.8.8-build-log.md`](docs/v0.8.8-build-log.md) and [`docs/bench-v0.8.8.md`](docs/bench-v0.8.8.md).
+
+- **Conditional supervision:** `[micromanager] shape_when = "always" | "new-symbols" | "off"` and `pre_review_when = "always" | "on-flag" | "off"` (with `pre_review_max_lines = 60`).
+- **Leaner checker:** `[gates] checker_mode = "two-pass" | "single-pass"` plus per-role checker effort.
+- **Default retry effort ladder:** `effort_ladder = ["medium", "high", "max"]` (configurable globally or per role, default in new configs) with `implementer_attempts = 4` (minimum 3 retries).
+- **Fresh vs. cached token accounting:** `tokens_in_fresh` and `tokens_in_cached` tracked across adapters, budgets, `card-record.json`, dossiers, and `openfarm bench`.
+- **Operational hardening & runner network isolation:** `[runner] confine_network = "off" | "on"` (`--unshare-net` by default under `bwrap`), auto-refresh of stale Claude login copies mid-run, 4 KB ACP stderr ring-buffer on `Infra` errors, confinement metadata in gate JSON, and a `judged == 0` guard for diff-scoped Rust `mutation = "required"` on non-`test-backfill` cards.
 
 ## What changed in v0.8.7
 
@@ -431,12 +441,12 @@ Every key, gate, stop code (`19` per-card stop codes including `handed-back` and
 
 ### The offline suite
 
-On the final v0.8.7 tree, Python 3.14 on Linux:
+On the final v0.8.8 tree, Python 3.14 on Linux:
 
 | Run | Result |
 | --- | --- |
-| Default, no optional tools on `PATH` | **1569 tests**, 98 skipped, **0 failures** |
-| `OPENFARM_E2E=1` with ruff 0.17.5, tsc 7.0.2, prettier 3.10.1, cargo-mutants 27.1.0 and pytest 9.2.0 on `PATH` | **1569 tests**, 6 skipped, **0 failures** |
+| Default, no optional tools on `PATH` | **1589 tests**, 98 skipped, **0 failures** |
+| `OPENFARM_E2E=1` with ruff 0.17.5, tsc 7.0.2, prettier 3.10.1, cargo-mutants 27.1.0 and pytest 9.2.0 on `PATH` | **1589 tests**, 6 skipped, **0 failures** |
 
 A test that needs a real tool skips itself when the tool is missing, so the default run's skip count depends on what you have installed. The ones skipped in the second run are stand-in tests that step aside when the real tool is there. Each test process keeps its temp files in one folder of its own and removes it at exit.
 
@@ -536,7 +546,7 @@ The first build's live runs (before the fix work) are kept, with what has change
 - [x] **Efficacy pilot & gate calibration:** the 25-card all-Rust pilot with frontier baseline cards ([`docs/pilot-v0.8.6.md`](docs/pilot-v0.8.6.md)). Counter-tests on `reject` gave no false rejects. cargo-mutants pays back on test-backfill cards, where `required` stays.
 - [x] **Scope cargo-mutants to the card's own lines (v0.8.7):** `--in-diff` written to the card's mutation output folder, leaving `test-backfill` mutating whole unit files.
 - [x] **Re-check the pre-review rule on both Claude and Codex (v0.8.7):** full 144-run 3-repeat bench ([`docs/bench-v0.8.7.md`](docs/bench-v0.8.7.md)); 0 false pre-review bounces across all 72 farm runs.
-- [ ] **v0.8.8 — Small-card economics, worker effort ladder & hardening:** conditional supervision (`shape_when`, `pre_review_when`), leaner checker, configurable `medium` → `high` → `max` retry effort ladder (default, 3 retries min), fresh-vs-cached token accounting, network-off runner `bwrap` (`--unshare-net`), stale Claude login auto-refresh, ACP stderr ring-buffer, confinement metadata in gate JSON, and `judged == 0` guard for diff-scoped Rust mutation.
+- [x] **v0.8.8 — Small-card economics, worker effort ladder & hardening:** conditional supervision (`shape_when`, `pre_review_when`), leaner checker, configurable `medium` → `high` → `max` retry effort ladder (default, 3 retries min), fresh-vs-cached token accounting, network-off runner `bwrap` (`--unshare-net`), stale Claude login auto-refresh, ACP stderr ring-buffer, confinement metadata in gate JSON, and `judged == 0` guard for diff-scoped Rust mutation ([`docs/bench-v0.8.8.md`](docs/bench-v0.8.8.md)).
 - [ ] **v0.9.0 — Defaults, wave review/merge UX & ecosystem breadth:** `counter_tests = "reject"` default, named supervision profiles, `openfarm review` + `openfarm land` (local serial merge queue), Go language pack, TypeScript `vitest`/`jest`, and polyglot per-unit languages.
 
 ## Contributing

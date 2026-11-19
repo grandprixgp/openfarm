@@ -69,13 +69,16 @@ class RunResult:
     """One runner call's answer."""
 
     __slots__ = ("cls", "exit_code", "duration_s", "stdout", "stderr",
-                 "stdout_path", "stderr_path", "argv", "kind")
+                 "stdout_path", "stderr_path", "argv", "kind",
+                 "confined", "confine_network", "runner_argv")
 
     def __init__(self, cls: str, exit_code: int, duration_s: float,
                  stdout: str = "", stderr: str = "",
                  stdout_path: Path | None = None,
                  stderr_path: Path | None = None,
-                 argv: list[str] | None = None, kind: str = "") -> None:
+                 argv: list[str] | None = None, kind: str = "",
+                 confined: bool = False, confine_network: str = "",
+                 runner_argv: list[str] | None = None) -> None:
         self.cls = cls
         self.exit_code = exit_code
         self.duration_s = duration_s
@@ -85,6 +88,9 @@ class RunResult:
         self.stderr_path = stderr_path
         self.argv = list(argv or [])
         self.kind = kind
+        self.confined = bool(confined)
+        self.confine_network = str(confine_network or "")
+        self.runner_argv = list(runner_argv or [])
 
     @property
     def ok(self) -> bool:
@@ -188,6 +194,8 @@ class DirectRunner:
             Path(target_dir).mkdir(parents=True, exist_ok=True)
 
         run_argv = list(argv)
+        is_confined = False
+        net_mode = ""
         if self.confine is not None:
             from .. import confine as confine_lib
 
@@ -199,12 +207,14 @@ class DirectRunner:
                 for flag in ("--out", "--output"):
                     if flag in run_argv[:-1]:
                         write_roots.append(run_argv[run_argv.index(flag) + 1])
+            net_mode = str(self.confine.get("network") or "off")
             try:
                 run_argv = confine_lib.runner_argv(
                     run_argv, worktree=Path(cwd or self.repo), write_roots=write_roots,
                     hide_paths=self.confine.get("hide_paths") or (),
                     unset_env=confine_lib.secret_env_names(run_env, keep=(env or {})),
-                    environ=run_env)
+                    environ=run_env, network=net_mode)
+                is_confined = True
             except confine_lib.ConfineError as exc:
                 raise Refused("runner-confine-unavailable", exc.message) from exc
 
@@ -230,10 +240,14 @@ class DirectRunner:
 
         if timed_out:
             return RunResult(INFRA, exit_code, duration, stdout, stderr,
-                             stdout_path, stderr_path, argv, kind)
+                             stdout_path, stderr_path, argv, kind,
+                             confined=is_confined, confine_network=net_mode,
+                             runner_argv=run_argv[:40])
         cls = self.classify(exit_code, stdout, stderr, kind)
         return RunResult(cls, exit_code, duration, stdout, stderr,
-                         stdout_path, stderr_path, argv, kind)
+                         stdout_path, stderr_path, argv, kind,
+                         confined=is_confined, confine_network=net_mode,
+                         runner_argv=run_argv[:40])
 
     def classify(self, exit_code: int, stdout: str, stderr: str,
                  kind: str = "") -> str:
@@ -349,7 +363,8 @@ def open_runner(cfg, worktree: Path, output_dir: Path | None = None,
                               f'here ({why}); install it or set confine = "off"')
             key_file = getattr(cfg, "key_file", None)
             confine = {"write_roots": list(getattr(cfg, "runner_write_roots", []) or []),
-                       "hide_paths": [str(key_file)] if key_file else []}
+                       "hide_paths": [str(key_file)] if key_file else [],
+                       "network": str(getattr(cfg, "runner_confine_network", "off") or "off")}
         return DirectRunner(worktree, output_dir=output_dir,
                             limiter=limiter, budget=budget, confine=confine)
     if spec.startswith("cmd:"):

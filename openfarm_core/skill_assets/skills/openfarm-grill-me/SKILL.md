@@ -7,7 +7,7 @@ description: >-
   setup, and concrete card Done assertions into .openfarm/GRILL_DECISIONS.md.
 ---
 
-# Openfarm Grill-Me Skill (`v0.8.7`)
+# Openfarm Grill-Me Skill (`v0.8.8`)
 
 Use this skill whenever the user invokes `/openfarm-grill-me`, asks to stress-test a project idea before `/openfarm-initialize`, or wants to sharpen a multi-card feature specification on an existing Openfarm repository.
 

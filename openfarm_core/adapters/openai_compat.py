@@ -31,11 +31,12 @@ class Completion:
     """One model answer, and what it cost."""
 
     __slots__ = ("content", "tokens_in", "tokens_out", "model", "finish_reason",
-                 "latency_s", "cost")
+                 "latency_s", "cost", "tokens_in_cached")
 
     def __init__(self, content: str, tokens_in: int = 0, tokens_out: int = 0,
                  model: str = "", finish_reason: str = "stop",
-                 latency_s: float = 0.0, cost: float = 0.0) -> None:
+                 latency_s: float = 0.0, cost: float = 0.0,
+                 tokens_in_cached: int = 0) -> None:
         self.content = content
         self.tokens_in = tokens_in
         self.tokens_out = tokens_out
@@ -43,9 +44,16 @@ class Completion:
         self.finish_reason = finish_reason
         self.latency_s = latency_s
         self.cost = cost
+        self.tokens_in_cached = max(0, int(tokens_in_cached or 0))
+
+    @property
+    def tokens_in_fresh(self) -> int:
+        return max(0, self.tokens_in - self.tokens_in_cached)
 
     def as_dict(self) -> dict:
         return {"content": self.content, "tokens_in": self.tokens_in,
+                "tokens_in_fresh": self.tokens_in_fresh,
+                "tokens_in_cached": self.tokens_in_cached,
                 "tokens_out": self.tokens_out, "model": self.model,
                 "finish_reason": self.finish_reason,
                 "latency_s": self.latency_s, "cost": self.cost}
@@ -248,11 +256,16 @@ class OpenAICompatibleBackend:
         usage = raw_usage if isinstance(raw_usage, dict) else {}
         tokens_in = _safe_int(usage.get("prompt_tokens"))
         tokens_out = _safe_int(usage.get("completion_tokens"))
+        details = usage.get("prompt_tokens_details")
+        tokens_in_cached = (
+            _safe_int(details.get("cached_tokens")) if isinstance(details, dict) else 0
+        ) or _safe_int(usage.get("prompt_cache_hit_tokens"))
         cost = (tokens_in / 1000.0 * self.cost_per_1k_in
                 + tokens_out / 1000.0 * self.cost_per_1k_out)
         return Completion(
             content=str(content or ""),
             tokens_in=tokens_in, tokens_out=tokens_out,
+            tokens_in_cached=tokens_in_cached,
             model=str(answer.get("model", model)),
             finish_reason=str(choice.get("finish_reason", "stop")),
             latency_s=latency, cost=cost)

@@ -30,6 +30,7 @@ KNOWN_TABLES = {
 
 DEFAULT_EFFORTS = ("off", "low", "medium", "high", "xhigh", "max")
 _ACP_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+DEFAULT_EFFORT_LADDER = ("medium", "high", "max")
 _TIER_KEYS = {"model", "efforts", "effort_param"}
 _FORBIDDEN_TIER_KEYS = ("endpoint", "allowed_endpoints", "key_file", "headers")
 _RESERVED_EFFORT_PARAMS = frozenset({
@@ -41,7 +42,7 @@ _TABLE_KEYS = {
     "adapters": {"cards", "runner", "languages", "model",
                  "micromanager", "telemetry", "pack"},
     "model": {"endpoint", "allowed_endpoints", "key_file", "headers", "max_tokens",
-              "test_writer",
+              "effort_ladder", "test_writer",
               "implementer", "checker", "planner", "cost_per_1k_in",
               "cost_per_1k_out"},
     "policy": {"never_touch", "forbidden_files", "known_failing",
@@ -52,15 +53,16 @@ _TABLE_KEYS = {
                     "allow_type_changes", "max_context_files"},
     "brief": {"test_conventions"},
     "runner": {"env", "cargo_flags", "python", "typescript", "typescript_typecheck",
-               "typescript_format", "link_node_modules", "confine", "confine_write_roots"},
+               "typescript_format", "link_node_modules", "confine",
+               "confine_network", "confine_write_roots"},
     "budget": {"implementer_attempts", "test_writer_attempts",
                "model_build_calls_per_card", "mutation_build_calls_per_card",
                "tokens_per_card", "wall_clock_per_card", "frontier_cost_ratio",
                "spend_per_night", "concurrent_builds", "concurrent_cards",
                "lease_ttl", "kill_switch"},
     "gates": {"revert_check", "mutation", "mutation_required_for",
-              "mutation_min_kill_rate", "counter_tests", "coverage",
-              "workspace_lint", "baseline_cache", "catch_up",
+              "mutation_min_kill_rate", "counter_tests", "checker_mode",
+              "coverage", "workspace_lint", "baseline_cache", "catch_up",
               "findings_per_card", "circuit_breaker", "extra", "planner"},
     "cards": {"fields_block", "required_fields"},
     "micromanager": {"mode", "binary", "args", "model", "effort",
@@ -71,7 +73,8 @@ _TABLE_KEYS = {
                      "scaffold_contracts", "coach_on_stall",
                      "adjudicate_counter_tests", "pre_review",
                      "confine", "confine_read_roots", "lean_prompt",
-                     "combine_calls"},
+                     "combine_calls", "shape_when", "pre_review_when",
+                     "pre_review_max_lines"},
     "state": {"min_free_mb"},
     "harness": {"enabled", "dir", "capture_on", "max_cues_per_brief",
                 "max_active_adaptations", "min_confidence", "probe_window",
@@ -85,7 +88,7 @@ _TABLE_KEYS = {
               "on_external_timeout", "stall_after"},
     "tiers": set(_TIER_KEYS),
 }
-_ROLE_MODEL_KEYS = {"model", "temperature", "vary_seed", "effort", "retry_effort"}
+_ROLE_MODEL_KEYS = {"model", "temperature", "vary_seed", "effort", "retry_effort", "effort_ladder"}
 _HEADER_NAME = re.compile(r"^[A-Za-z0-9!#$%&'*+.^_`|~-]+$")
 # openfarm sets these itself; a config may not replace the key or the body type.
 _RESERVED_HEADERS = {"authorization", "content-type", "content-length", "host"}
@@ -212,19 +215,25 @@ def _nonneg_float(value, what: str, default: float) -> float:
 class RoleModel:
     """One model role's settings."""
 
-    __slots__ = ("model", "temperature", "vary_seed", "effort", "retry_effort")
+    __slots__ = ("model", "temperature", "vary_seed", "effort", "retry_effort", "effort_ladder")
 
     def __init__(self, model: str = "", temperature: float = 0.2,
                  vary_seed: bool = False, effort: str = "",
-                 retry_effort: str = "") -> None:
+                 retry_effort: str = "",
+                 effort_ladder: tuple[str, ...] = ()) -> None:
         self.model = model
         self.temperature = temperature
         self.vary_seed = vary_seed
         self.effort = effort
         #: The effort for every attempt after the first (v0.8.5); empty keeps `effort`.
         self.retry_effort = retry_effort
+        #: Optional per-attempt escalation ladder (v0.8.8), e.g. ("medium", "high", "max").
+        self.effort_ladder = tuple(effort_ladder)
 
     def effort_for_attempt(self, attempt: int = 1) -> str:
+        if self.effort_ladder:
+            idx = min(max(int(attempt), 1) - 1, len(self.effort_ladder) - 1)
+            return self.effort_ladder[idx]
         if attempt > 1 and self.retry_effort:
             return self.retry_effort
         return self.effort
@@ -232,7 +241,8 @@ class RoleModel:
     def as_dict(self) -> dict:
         return {"model": self.model, "temperature": self.temperature,
                 "vary_seed": self.vary_seed, "effort": self.effort,
-                "retry_effort": self.retry_effort}
+                "retry_effort": self.retry_effort,
+                "effort_ladder": list(self.effort_ladder)}
 
 
 @dataclasses.dataclass
@@ -320,6 +330,7 @@ class MicromanagerConfig:
         "scaffold_contracts", "coach_on_stall",
         "adjudicate_counter_tests", "pre_review",
         "confine", "confine_read_roots", "lean_prompt", "combine_calls",
+        "shape_when", "pre_review_when", "pre_review_max_lines",
     )
 
     def __init__(self, **kwargs) -> None:
@@ -568,6 +579,9 @@ class Config:
         # v0.8.5: gate commands in a boundary where only the worktree is writable.
         self.runner_confine = _as_choice(
             runner.get("confine"), "[runner] confine", "off", ("off", "bwrap"))
+        self.runner_confine_network = _as_choice(
+            runner.get("confine_network"), "[runner] confine_network", "off",
+            ("off", "on"))
         self.runner_write_roots = _as_str_list(
             runner.get("confine_write_roots", []), "[runner] confine_write_roots")
         env_table = runner.get("env") or {}
@@ -581,7 +595,7 @@ class Config:
 
         budget = self._table("budget")
         self.implementer_attempts = _as_int(
-            budget.get("implementer_attempts"), "[budget] implementer_attempts", 3)
+            budget.get("implementer_attempts"), "[budget] implementer_attempts", 4)
         self.test_writer_attempts = _as_int(
             budget.get("test_writer_attempts"), "[budget] test_writer_attempts", 2)
         self.model_build_calls_per_card = _as_int(
@@ -627,6 +641,9 @@ class Config:
         self.counter_tests = _as_choice(
             gates.get("counter_tests"), "[gates] counter_tests", "report",
             ("report", "reject"))
+        self.checker_mode = _as_choice(
+            gates.get("checker_mode"), "[gates] checker_mode", "two-pass",
+            ("two-pass", "single-pass"))
         self.coverage = _as_choice(
             gates.get("coverage"), "[gates] coverage", "off",
             ("off", "report", "required"))
@@ -664,15 +681,24 @@ class Config:
             self._data.get("tiers"), self.role_models["implementer"].model
         )
         self.swarm = self._parse_swarm(self._table("swarm"))
+        self.effort_ladder: tuple[str, ...] = tuple(
+            _as_str_list(self._table("model").get("effort_ladder", []), "[model] effort_ladder")
+        )
+        for val in self.effort_ladder:
+            if any(ch.isspace() for ch in val) or "\x00" in val or not val:
+                raise ConfigError(f"[model] effort_ladder contains invalid effort {val!r}")
         for role_name, role_model in self.role_models.items():
             if role_model.retry_effort and not role_model.effort:
                 raise ConfigError(
                     f"[model] {role_name}.retry_effort needs an effort for the first "
                     "attempt as well")
-            for key in ("effort", "retry_effort"):
-                value = getattr(role_model, key)
-                if not value:
-                    continue
+            to_check = [(k, getattr(role_model, k)) for k in ("effort", "retry_effort") if getattr(role_model, k)]
+            for step in role_model.effort_ladder:
+                to_check.append(("effort_ladder", step))
+            if not to_check and self.effort_ladder:
+                for step in self.effort_ladder:
+                    to_check.append(("effort_ladder", step))
+            for key, value in to_check:
                 if is_acp_adapter(self.model_adapter):
                     if value not in _ACP_EFFORTS:
                         raise ConfigError(
@@ -860,6 +886,15 @@ class Config:
             # One supervisor call for shape and scaffold when a card needs both.
             combine_calls=_as_bool(mm.get("combine_calls"),
                                    "[micromanager] combine_calls", True),
+            shape_when=_as_choice(mm.get("shape_when"),
+                                  "[micromanager] shape_when", "always",
+                                  ("always", "new-symbols", "off")),
+            pre_review_when=_as_choice(mm.get("pre_review_when"),
+                                       "[micromanager] pre_review_when", "always",
+                                       ("always", "on-flag", "off")),
+            pre_review_max_lines=_nonneg_int(
+                mm.get("pre_review_max_lines"),
+                "[micromanager] pre_review_max_lines", 60),
         )
 
     def _confine_read_roots(self, value) -> list[str]:
@@ -930,6 +965,16 @@ class Config:
                     f"[model] {role}.{key} {raw_effort!r} must not contain whitespace"
                 )
             efforts[key] = raw_effort
+        raw_ladder = value.get("effort_ladder")
+        ladder: tuple[str, ...] = ()
+        if raw_ladder is not None:
+            ladder_list = _as_str_list(raw_ladder, f"[model] {role}.effort_ladder")
+            for step in ladder_list:
+                if any(ch.isspace() for ch in step) or "\x00" in step or not step:
+                    raise ConfigError(
+                        f"[model] {role}.effort_ladder contains invalid effort {step!r}"
+                    )
+            ladder = tuple(ladder_list)
         effort = efforts["effort"]
         return RoleModel(
             model=model_name,
@@ -939,6 +984,7 @@ class Config:
                                f"[model] {role}.vary_seed", default_vary),
             effort=effort,
             retry_effort=efforts["retry_effort"],
+            effort_ladder=ladder,
         )
 
     def _parse_tiers(self, raw_tiers, default_model: str) -> dict[str, TierConfig]:
@@ -1243,6 +1289,9 @@ class Config:
         if role_model is None:
             role_model = self.role_models.get("implementer")
         effort = role_model.effort_for_attempt(attempt) if role_model is not None else ""
+        if not effort and self.effort_ladder:
+            idx = min(max(int(attempt), 1) - 1, len(self.effort_ladder) - 1)
+            effort = self.effort_ladder[idx]
         if not effort:
             return ("", "")
         if is_acp_adapter(self.model_adapter):

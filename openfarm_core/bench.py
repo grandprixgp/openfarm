@@ -156,7 +156,7 @@ def score(records: list[dict]) -> dict:
 
         arm_stats = arm_totals.setdefault(
             arm, {"runs": 0, "passed": 0, "spend": 0.0, "tokens": 0, "worker_tokens": 0,
-                  "coordinator_tokens": 0}
+                  "coordinator_tokens": 0, "tokens_in_fresh": 0, "tokens_in_cached": 0}
         )
         arm_stats["runs"] += 1
         if passed:
@@ -166,6 +166,8 @@ def score(records: list[dict]) -> dict:
         # Older records have no split; count all their tokens as the worker's.
         arm_stats["worker_tokens"] += int(record.get("worker_tokens", record["tokens"]))
         arm_stats["coordinator_tokens"] += int(record.get("coordinator_tokens", 0) or 0)
+        arm_stats["tokens_in_fresh"] += int(record.get("tokens_in_fresh", 0) or 0)
+        arm_stats["tokens_in_cached"] += int(record.get("tokens_in_cached", 0) or 0)
 
         category_arms = category_totals.setdefault(category, {})
         category_stats = category_arms.setdefault(arm, {"runs": 0, "passed": 0})
@@ -196,6 +198,9 @@ def score(records: list[dict]) -> dict:
             arms[arm]["coordinator_tokens"] = stats["coordinator_tokens"]
             arms[arm]["coordinator_share"] = (
                 round(stats["coordinator_tokens"] / tokens, 4) if tokens else 0.0)
+        if stats["tokens_in_fresh"] or stats["tokens_in_cached"]:
+            arms[arm]["tokens_in_fresh"] = stats["tokens_in_fresh"]
+            arms[arm]["tokens_in_cached"] = stats["tokens_in_cached"]
 
     categories: dict[str, dict[str, float]] = {}
     for category, arm_stats_by_arm in category_totals.items():
@@ -223,8 +228,16 @@ def render_report(summary: dict) -> str:
     # tokens (a swarm arm with a model coordinator), so other reports read as before.
     with_coord = any(int(stats.get("coordinator_tokens", 0) or 0) > 0
                      for stats in summary.get("arms", {}).values())
+    with_fresh = any(
+        int(stats.get("tokens_in_fresh", 0) or 0) > 0
+        or int(stats.get("tokens_in_cached", 0) or 0) > 0
+        for stats in summary.get("arms", {}).values()
+    )
     header = "| Arm | Runs | Passed | Pass rate | Tokens | Tokens per pass | Worker share |"
     rule = "| --- | --- | --- | --- | --- | --- | --- |"
+    if with_fresh:
+        header += " Fresh in | Cached in |"
+        rule += " --- | --- |"
     if with_coord:
         header += " Coordinator share |"
         rule += " --- |"
@@ -236,6 +249,11 @@ def render_report(summary: dict) -> str:
             f"{percent(stats['pass_rate'])} | {count(stats['tokens'])} | "
             f"{count(stats['tokens_per_pass'])} | {percent(stats['worker_share'])} |"
         )
+        if with_fresh:
+            row += (
+                f" {count(int(stats.get('tokens_in_fresh', 0) or 0))} |"
+                f" {count(int(stats.get('tokens_in_cached', 0) or 0))} |"
+            )
         if with_coord:
             row += f" {percent(float(stats.get('coordinator_share', 0.0) or 0.0))} |"
         lines.append(row)
@@ -547,6 +565,15 @@ def run_once(task: BenchTask, arm: str, arm_text: str | None, repeat: int,
                                   for k in ("tokens_in", "tokens_out"))
     record["supervisor_tokens"] = sum(int(outcome.get(k, 0) or 0) for k in (
         "micromanager_tokens_in", "micromanager_tokens_out"))
+    record["tokens_in_fresh"] = (
+        int(outcome.get("tokens_in_fresh", outcome.get("tokens_in", 0)) or 0)
+        + int(outcome.get("micromanager_tokens_in_fresh",
+                          outcome.get("micromanager_tokens_in", 0)) or 0)
+    )
+    record["tokens_in_cached"] = (
+        int(outcome.get("tokens_in_cached", 0) or 0)
+        + int(outcome.get("micromanager_tokens_in_cached", 0) or 0)
+    )
     record["coordinator_tokens"] = int(run_tokens.get("coordinator", 0) or 0)
     record["tokens"] = (record["worker_tokens"] + record["supervisor_tokens"]
                         + record["coordinator_tokens"])
