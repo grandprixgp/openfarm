@@ -537,7 +537,6 @@ def _read_cards_readonly(ctx: TuiContext) -> tuple[list[Card], str]:
     cards_branch = getattr(ctx.cfg, "cards_branch", "openfarm-cards")
 
     if git.ref_exists(f"refs/heads/{cards_branch}"):
-        from .adapters.files import parse_card_file
         from .cards import CARD_FIELDS, OPTIONAL_CARD_FIELDS, extract_fenced_fields
 
         cards: list[Card] = []
@@ -2340,12 +2339,20 @@ def _uninstall_routers() -> None:
 @contextlib.contextmanager
 def _capture_streams(out_buf, err_buf):
     """Capture this thread's command output, routers or not."""
-    if isinstance(sys.stdout, _OutputRouter) and isinstance(sys.stderr, _OutputRouter):
-        with sys.stdout.capture(out_buf), sys.stderr.capture(err_buf):
+    prev_cap = os.environ.get("OPENFARM_TUI_CAPTURE")
+    os.environ["OPENFARM_TUI_CAPTURE"] = "1"
+    try:
+        if isinstance(sys.stdout, _OutputRouter) and isinstance(sys.stderr, _OutputRouter):
+            with sys.stdout.capture(out_buf), sys.stderr.capture(err_buf):
+                yield
+            return
+        with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
             yield
-        return
-    with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
-        yield
+    finally:
+        if prev_cap is None:
+            os.environ.pop("OPENFARM_TUI_CAPTURE", None)
+        else:
+            os.environ["OPENFARM_TUI_CAPTURE"] = prev_cap
 
 
 class _LineSink:

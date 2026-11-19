@@ -3037,6 +3037,16 @@ def build_parser() -> argparse.ArgumentParser:
     acp.add_argument("--setup-token", action="store_true",
                      help="run `claude setup-token` for long-lived CLAUDE_CODE_OAUTH_TOKEN")
 
+    auto_p = sub.add_parser(
+        "auto",
+        help="context-aware automode landing & command palette (default when running bare `openfarm` on a TTY)",
+    )
+    auto_p.add_argument("--once", action="store_true",
+                        help="print detected workspace state, next action, and palette without starting curses")
+    auto_p.add_argument("--run", dest="run_id", default=None)
+    auto_p.add_argument("--refresh", type=float, default=1.0)
+    auto_p.add_argument("--view", default="overview")
+
     tui_p = sub.add_parser(
         "tui",
         help="open interactive terminal UI or render one snapshot",
@@ -3340,6 +3350,22 @@ def cmd_acp(args) -> int:
     return EXIT_OK
 
 
+def cmd_auto(args) -> int:
+    """Automode landing state (`--once` / `--json`) or interactive Automode TUI."""
+    from .automode import detect_workspace_state, render_automode_summary
+
+    root = Path(args.repo).expanduser().resolve()
+    cfg_path = Path(args.config) if getattr(args, "config", None) else None
+    if getattr(args, "once", False) or getattr(args, "json", False):
+        state = detect_workspace_state(root, cfg_path)
+        if getattr(args, "json", False):
+            print(json.dumps(state, indent=2))
+        else:
+            print(render_automode_summary(state))
+        return EXIT_OK
+    return cmd_tui(args)
+
+
 def cmd_tui(args) -> int:
     if args.refresh is not None and args.refresh <= 0:
         raise UsageError("--refresh must be positive")
@@ -3388,6 +3414,7 @@ def cmd_drive(ctx: Context, args) -> int:
 
 PRE_CONFIG_COMMANDS = {
     "adopt": cmd_adopt,
+    "auto": cmd_auto,
     "bench": cmd_bench,
     "init": cmd_init,
     "install-skill": cmd_install_skill,
@@ -3532,6 +3559,13 @@ def main(argv: list[str] | None = None) -> int:
     if not args.command:
         if want_json:
             return _emit_error("usage error", "no subcommand specified", EXIT_USAGE)
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            from types import SimpleNamespace
+            tui_args = SimpleNamespace(
+                repo=args.repo, config=args.config, json=False,
+                run=None, refresh=1.0, once=False, view="home",
+            )
+            return cmd_tui(tui_args)
         parser.print_help()
         return EXIT_USAGE
 
