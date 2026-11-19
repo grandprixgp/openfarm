@@ -1,12 +1,25 @@
-# Openfarm v0.8.6 Engineering Handoff
+# Openfarm v0.8.7 Engineering Handoff
 
-Concise entry point for engineers reviewing, testing, or extending Openfarm v0.8.6.
+Concise entry point for engineers reviewing, testing, or extending Openfarm v0.8.7.
 
 For greenfield empty-folder initialization (`"Read and install this skill <link>"` -> `/openfarm-grill-me` -> `"/openfarm-initialize calorie-log ..."`), see [docs/FROM-IDEA-TO-SHIPPED-APP.md](FROM-IDEA-TO-SHIPPED-APP.md). For step-by-step operator instructions, config table reference, provider setup, card authoring rules, and the executable `tallybox` first-deployment runbook on existing repos, see [docs/USAGE-AND-FIRST-DEPLOYMENT.md](USAGE-AND-FIRST-DEPLOYMENT.md). Module-level detail is in [docs/openfarm-internals.md](openfarm-internals.md).
 
-## Current State (v0.8.6, 18 Nov 2026)
+## Current State (v0.8.7, 19 Nov 2026)
 
-v0.8.6 ran v0.8.5's two roadmap items live and fixed what they found. The full 3-repeat bench with Claude and Codex is in [docs/bench-v0.8.5.md](bench-v0.8.5.md), and the 25-card Rust pilot with frontier baselines is in [docs/pilot-v0.8.6.md](pilot-v0.8.6.md). Every change, with the run that found it, is in [docs/v0.8.6-build-log.md](v0.8.6-build-log.md).
+v0.8.7 scopes `cargo-mutants` to the card's own diff (`--in-diff`), validates the v0.8.6 pre-review rule across a full 3-repeat bench on both Claude and Codex ([docs/bench-v0.8.7.md](bench-v0.8.7.md)), aligns the two bench cards' Done text, and fixes TTY-hang and symlinked-`TMPDIR` `bwrap` bugs ([docs/v0.8.7-build-log.md](v0.8.7-build-log.md)).
+
+### Done in v0.8.7
+
+- **`cargo-mutants` scoped to the card's own diff (`--in-diff`).** `RustPack` writes `card.diff` into the mutation output folder (outside the worktree, mounted inside `bwrap`), keeps `test-backfill` mutating whole unit files, and handles zero-mutant diffs cleanly. Verified live on pilot card B4 (14 mutants → 1).
+- **Symlinked `TMPDIR` fixed for `bwrap` children.** Resolved `isolated_home`, ACP worker empty `cwd`, and standalone mutation temp folders before `bwrap` mounts them.
+- **Auth-status checks detached from the controlling TTY.** `claude auth status` and `codex login status` now run with `stdin=DEVNULL` and `start_new_session=True`.
+- **Bench card wording aligned.** `py-money-parse` and `py-validate-port` state that inputs past Python's `int()` digit limit are out of scope.
+- **Tests.** 1569 offline tests on the final tree with no failures (98 skipped default, 6 skipped with `WITH_TOOLS=1 OPENFARM_E2E=1`).
+
+### Tested live in v0.8.7
+
+- Full 12-task, 3-repeat bench on Claude and Codex, farm and solo (144 runs): Claude farm 35/36 vs solo 34/36 (37.5% fewer frontier tokens, 0 `supervisor-reject`); Codex farm 34/36 vs solo 36/36 (45.9% fewer frontier tokens, 0 false pre-review bounces).
+- Scoped `cargo-mutants --in-diff` on pilot card B4 (`semver-r2`).
 
 ### Done in v0.8.6
 
@@ -42,7 +55,6 @@ v0.8.6 ran v0.8.5's two roadmap items live and fixed what they found. The full 3
 - Codex `read-only` inside the boundary on a system that allows a nested sandbox.
 - Hosted worker endpoints other than Command Code.
 - A Claude child on an API key inside the boundary.
-- The pre-review rule with Claude supervising, and a full 3-repeat bench on v0.8.6.
 - `openfarm run` with no bubblewrap and the real Antigravity program.
 
 ### Known Limits found in v0.8.6

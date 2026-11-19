@@ -1,4 +1,4 @@
-# Openfarm v0.8.6 Usage, Operations Guide & First-Deployment Runbook
+# Openfarm v0.8.7 Usage, Operations Guide & First-Deployment Runbook
 
 > **Audience**: Human operators and autonomous frontier agents bringing up **Openfarm v0.8.1** on a Rust, Python or TypeScript repository. Part 2 and Part 3 walk through a first deployment on a Rust example crate.  
 > **Local-only guarantee**: Openfarm has **no `git push` code path**. Every passing card ends on a local branch (`openfarm/<card-id>-<slug>`) for human/frontier review and local landing.
