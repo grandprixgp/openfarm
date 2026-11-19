@@ -25,12 +25,15 @@ CONFIG_PATH = Path(".openfarm") / "config.toml"
 KNOWN_TABLES = {
     "project", "adapters", "model", "policy", "eligibility", "brief",
     "runner", "budget", "gates", "cards", "micromanager", "state", "harness",
-    "swarm", "tiers",
+    "swarm", "tiers", "units",
 }
+
+_UNIT_LANGUAGES = ("rust", "python", "typescript", "go")
 
 DEFAULT_EFFORTS = ("off", "low", "medium", "high", "xhigh", "max")
 _ACP_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 DEFAULT_EFFORT_LADDER = ("medium", "high", "max")
+SUPERVISION_PROFILES = ("lean", "balanced", "strict")
 _TIER_KEYS = {"model", "efforts", "effort_param"}
 _FORBIDDEN_TIER_KEYS = ("endpoint", "allowed_endpoints", "key_file", "headers")
 _RESERVED_EFFORT_PARAMS = frozenset({
@@ -87,6 +90,7 @@ _TABLE_KEYS = {
               "coordinator_tokens_per_run", "external_wait",
               "on_external_timeout", "stall_after"},
     "tiers": set(_TIER_KEYS),
+    "units": {"language"},
 }
 _ROLE_MODEL_KEYS = {"model", "temperature", "vary_seed", "effort", "retry_effort", "effort_ladder"}
 _HEADER_NAME = re.compile(r"^[A-Za-z0-9!#$%&'*+.^_`|~-]+$")
@@ -562,12 +566,9 @@ class Config:
         #: The interpreter the Python pack runs under; openfarm's own when empty.
         self.runner_python = python.strip()
         # The TypeScript pack's runner and tools, recorded by adopt.
-        if runner.get("typescript") not in (None, "node"):
-            raise ConfigError(
-                f"[runner] typescript: {runner.get('typescript')!r} is not supported; this "
-                "version runs TypeScript tests only with node --test, so the value is "
-                '"node"')
-        self.runner_typescript = "node"
+        self.runner_typescript = _as_choice(
+            runner.get("typescript"), "[runner] typescript", "node",
+            ("node", "vitest", "jest"))
         self.typescript_typecheck = _as_choice(
             runner.get("typescript_typecheck"), "[runner] typescript_typecheck", "auto",
             ("auto", "tsc", "syntax"))
@@ -639,7 +640,7 @@ class Config:
             gates.get("mutation_min_kill_rate"),
             "[gates] mutation_min_kill_rate", 0.8)
         self.counter_tests = _as_choice(
-            gates.get("counter_tests"), "[gates] counter_tests", "report",
+            gates.get("counter_tests"), "[gates] counter_tests", "reject",
             ("report", "reject"))
         self.checker_mode = _as_choice(
             gates.get("checker_mode"), "[gates] checker_mode", "two-pass",
@@ -680,6 +681,7 @@ class Config:
         self.tiers = self._parse_tiers(
             self._data.get("tiers"), self.role_models["implementer"].model
         )
+        self.unit_languages = self._parse_units(self._data.get("units"))
         self.swarm = self._parse_swarm(self._table("swarm"))
         self.effort_ladder: tuple[str, ...] = tuple(
             _as_str_list(self._table("model").get("effort_ladder", []), "[model] effort_ladder")
@@ -986,6 +988,29 @@ class Config:
             retry_effort=efforts["retry_effort"],
             effort_ladder=ladder,
         )
+
+    def _parse_units(self, raw_units) -> dict[str, str]:
+        if raw_units is None:
+            return {}
+        if not isinstance(raw_units, dict):
+            raise ConfigError("[units] must be a table")
+        out: dict[str, str] = {}
+        for unit_name, entry in raw_units.items():
+            if not isinstance(entry, dict):
+                raise ConfigError(f"[units.{unit_name}] must be a table")
+            _check_keys(entry, {"language"}, f"[units.{unit_name}]")
+            if "language" in entry:
+                lang = _as_choice(
+                    entry.get("language"), f"[units.{unit_name}] language",
+                    self.languages[0], _UNIT_LANGUAGES)
+                out[str(unit_name).strip("/")] = lang
+        return out
+
+    def language_for_unit(self, unit: str = "") -> str:
+        key = str(unit or "").strip("/")
+        if key and key in self.unit_languages:
+            return self.unit_languages[key]
+        return self.languages[0]
 
     def _parse_tiers(self, raw_tiers, default_model: str) -> dict[str, TierConfig]:
         if raw_tiers is None:
@@ -1334,6 +1359,37 @@ class Config:
 
     def __repr__(self) -> str:
         return f"Config({self.name!r}, {self.base_branch!r})"
+
+
+def apply_supervision_profile(cfg: Config, profile: str) -> None:
+    """Apply a named supervision preset (`lean`, `balanced`, or `strict`) to `cfg`."""
+    name = str(profile or "").strip().lower()
+    if name not in SUPERVISION_PROFILES:
+        raise ConfigError(
+            f"profile {profile!r} must be one of {list(SUPERVISION_PROFILES)!r}"
+        )
+    if name == "lean":
+        cfg.micromanager.shape_when = "new-symbols"
+        cfg.micromanager.pre_review_when = "on-flag"
+        cfg.checker_mode = "single-pass"
+        cfg.counter_tests = "reject"
+        cfg.mutation = "report"
+        cfg.runner_confine = "off"
+    elif name == "balanced":
+        cfg.micromanager.shape_when = "always"
+        cfg.micromanager.pre_review_when = "always"
+        cfg.checker_mode = "two-pass"
+        cfg.counter_tests = "reject"
+        cfg.mutation = "report"
+        cfg.runner_confine = "off"
+    elif name == "strict":
+        cfg.micromanager.shape_when = "always"
+        cfg.micromanager.pre_review_when = "always"
+        cfg.checker_mode = "two-pass"
+        cfg.counter_tests = "reject"
+        cfg.mutation = "required"
+        cfg.runner_confine = "bwrap"
+        cfg.runner_confine_network = "off"
 
 
 def load_config(repo: Path, path: Path | None = None) -> Config:

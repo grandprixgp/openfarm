@@ -1,10 +1,24 @@
-# Openfarm v0.8.8 Engineering Handoff
+# Openfarm v0.9.0 Engineering Handoff
 
-Concise entry point for engineers reviewing, testing, or extending Openfarm v0.8.8.
+Concise entry point for engineers reviewing, testing, or extending Openfarm v0.9.0.
 
 For greenfield empty-folder initialization (`"Read and install this skill <link>"` -> `/openfarm-grill-me` -> `"/openfarm-initialize calorie-log ..."`), see [docs/FROM-IDEA-TO-SHIPPED-APP.md](FROM-IDEA-TO-SHIPPED-APP.md). For step-by-step operator instructions, config table reference, provider setup, card authoring rules, and the executable `tallybox` first-deployment runbook on existing repos, see [docs/USAGE-AND-FIRST-DEPLOYMENT.md](USAGE-AND-FIRST-DEPLOYMENT.md). Module-level detail is in [docs/openfarm-internals.md](openfarm-internals.md).
 
-## Current State (v0.8.7, 19 Nov 2026)
+## Current State (v0.9.0, 19 Nov 2026)
+
+v0.9.0 promotes `[gates] counter_tests = "reject"` to default, adds named supervision profiles (`--profile lean | balanced | strict`), adds `openfarm review` and opt-in local-only `openfarm land`, adds the Go language pack (`openfarm_core/packs/go.py`), adds `vitest` and `jest` runner support to `TypeScriptPack`, and adds polyglot per-unit languages under `[units.<name>]` ([docs/v0.9.0-build-log.md](v0.9.0-build-log.md)). Builds on v0.8.8's small-card economics and retry effort ladder ([docs/bench-v0.8.8.md](bench-v0.8.8.md), [docs/v0.8.8-build-log.md](v0.8.8-build-log.md)).
+
+### Done in v0.9.0
+
+- **Defaults & named profiles.** `counter_tests = "reject"` is now the default; `--profile lean | balanced | strict` bundles `shape_when`, `pre_review_when`, `checker_mode`, `counter_tests`, `mutation`, and `confine`.
+- **Wave review & local serial merge queue.** `openfarm review` (interactive + `--json` parity) and `openfarm land <CARD...>` (local-only trial-merge + test gate + `git merge --no-ff` + worktree cleanup + `done`; zero `git push`).
+- **Go language pack.** `openfarm_core/packs/go.py`, `adopt --lang go` (`go.mod` detection), `go test -json`, `go vet`, `gofmt`, banned patterns, and `mutate.py --lang go`.
+- **TypeScript `vitest` / `jest`.** `[runner] typescript` accepts `"node"`, `"vitest"`, or `"jest"`, with JSON output parsing and `adopt` auto-detection.
+- **Polyglot per-unit languages.** `[units.<name>] language = "rust" | "python" | "typescript" | "go"` routed through `_configured_pack`.
+- **Tests.** 1,611 offline tests with 0 failures (default and `WITH_TOOLS=1 OPENFARM_E2E=1`).
+- **Untested in v0.9.0.** Live execution against real `go`, `vitest`, and `jest` binaries (none installed on this machine) and a live multi-language polyglot wave.
+
+## Previous State (v0.8.7, 19 Nov 2026)
 
 v0.8.7 scopes `cargo-mutants` to the card's own diff (`--in-diff`), validates the v0.8.6 pre-review rule across a full 3-repeat bench on both Claude and Codex ([docs/bench-v0.8.7.md](bench-v0.8.7.md)), aligns the two bench cards' Done text, and fixes TTY-hang and symlinked-`TMPDIR` `bwrap` bugs ([docs/v0.8.7-build-log.md](v0.8.7-build-log.md)).
 

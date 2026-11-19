@@ -168,17 +168,17 @@ class ConfigAndAdoptTests(unittest.TestCase):
             text.replace('typescript = "node"', 'typescript = "npm"'))
         with self.assertRaises(ConfigError) as caught:
             load_config(root)
-        self.assertIn("only with node --test", str(caught.exception))
+        self.assertIn("[runner] typescript", str(caught.exception))
 
     def test_adopt_refuses_a_test_script_that_is_not_node_test(self) -> None:
         root = _git_repo(self, {
-            "package.json": '{"name": "a", "scripts": {"test": "vitest run"}}\n',
+            "package.json": '{"name": "a", "scripts": {"test": "mocha"}}\n',
         })
         with self.assertRaises(Refused) as caught:
             adopt_project(root, state_dir=root.parent / "s", key_file=root.parent / "k")
         self.assertEqual(caught.exception.code, "unsupported-test-runner")
-        self.assertIn("'vitest run'", caught.exception.message)
-        self.assertIn("only with node --test", caught.exception.message)
+        self.assertIn("'mocha'", caught.exception.message)
+        self.assertIn("not a supported", caught.exception.message)
         self.assertFalse((root / ".openfarm").exists())
 
     def test_adopt_records_the_tools_it_decided_and_says_so(self) -> None:
@@ -197,11 +197,11 @@ class ConfigAndAdoptTests(unittest.TestCase):
         root = _tmp(self) / "r"
         root.mkdir()
         cfg = _adopted_cfg(self, root)
-        _write(root, {"package.json": '{"scripts": {"test": "jest"}}\n'})
+        _write(root, {"package.json": '{"scripts": {"test": "mocha"}}\n'})
         result = check_eligibility(_card(), cfg, worktree=root)
         rules = {f["rule"]: f["detail"] for f in result.failures}
         self.assertIn("typescript-test-runner", rules)
-        self.assertIn("'jest'", rules["typescript-test-runner"])
+        self.assertIn("'mocha'", rules["typescript-test-runner"])
         self.assertEqual(result.as_dict()["typescript"]["runner"], "node --test")
 
     def test_check_refuses_a_recorded_tool_that_is_missing(self) -> None:

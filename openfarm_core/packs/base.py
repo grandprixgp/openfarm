@@ -264,6 +264,9 @@ def pack_for(language: str, cargo_flags: list[str] | None = None,
     if language in ("typescript", "ts", "javascript", "js"):
         from .typescript import TypeScriptPack
         return TypeScriptPack()
+    if language in ("go", "golang"):
+        from .go import GoPack
+        return GoPack()
     return UnsupportedPack(language)
 
 

@@ -227,7 +227,7 @@ def cmd_check(ctx: Context, args) -> int:
     # formatter and the pack's notes, decided from the same config as above.
     payload.update(eligibility.info)
     try:
-        pack = _configured_pack(ctx.cfg, ctx.repo)
+        pack = _configured_pack(ctx.cfg, ctx.repo, unit=card.unit)
         summary = getattr(pack, "tooling_summary", None)
         payload["tooling"] = (summary() if summary is not None else
                               {"pack": str(getattr(pack, "name", "") or "external"),
@@ -251,14 +251,15 @@ def cmd_check(ctx: Context, args) -> int:
     return EXIT_OK if payload["eligible"] else EXIT_REFUSED
 
 
-def _pack_with_config(cfg, cwd: Path):
+def _pack_with_config(cfg, cwd: Path, unit: str = ""):
     """The project's pack, given the loaded config's settings.
 
     Straight after `pack_for`: a pack that reads `[runner]` settings (the
     TypeScript pack) then decides from the same config eligibility was given
     (`--config` included), not from the file in the base checkout.
     """
-    pack = pack_for(cfg.languages[0], cfg.cargo_flags, spec=cfg.pack_adapter,
+    lang = cfg.language_for_unit(unit) if hasattr(cfg, "language_for_unit") else cfg.languages[0]
+    pack = pack_for(lang, cfg.cargo_flags, spec=cfg.pack_adapter,
                     cwd=cwd, python=cfg.runner_python)
     apply_settings = getattr(pack, "apply_settings", None)
     if apply_settings is not None:
@@ -266,9 +267,9 @@ def _pack_with_config(cfg, cwd: Path):
     return pack
 
 
-def _configured_pack(cfg, worktree: Path):
+def _configured_pack(cfg, worktree: Path, unit: str = ""):
     """`_pack_with_config`, then configured for `worktree`."""
-    pack = _pack_with_config(cfg, worktree)
+    pack = _pack_with_config(cfg, worktree, unit=unit)
     configure = getattr(pack, "configure", None)
     if configure is not None:
         configure(worktree)
@@ -293,7 +294,7 @@ def _baseline_check(ctx: Context, source: FileCardSource, card: Card) -> dict:
         git.worktree_remove(worktree)
     git.worktree_add(worktree, base)
     try:
-        pack = _configured_pack(ctx.cfg, worktree)
+        pack = _configured_pack(ctx.cfg, worktree, unit=card.unit)
         unit = card.unit or derive_cargo_unit(card.touches, worktree)
         runner = ctx.runner(worktree)
         target = ctx.state.check_dir(card.id) / "target"
@@ -449,6 +450,10 @@ def cmd_run(ctx: Context, args) -> int:
             _emit_ctx(ctx, {"refused": True, "reason": reason,
                             "code": "self-host-unpinned"}, "run")
             return EXIT_REFUSED
+
+    if getattr(args, "profile", None):
+        from .config import apply_supervision_profile
+        apply_supervision_profile(ctx.cfg, args.profile)
 
     if getattr(args, "learn_from", None):
         import dataclasses
@@ -1132,7 +1137,7 @@ def _run_card(ctx: Context, source: FileCardSource, card_id: str, run_id: str,
     Git(ctx.repo).worktree_add(worktree, base_ref)
 
     card_dir = ctx.state.create_card(card.id, run_id)
-    pack = _configured_pack(cfg, worktree)
+    pack = _configured_pack(cfg, worktree, unit=card.unit)
     owns_backend = backend is None
     backend = backend if backend is not None else open_backend(cfg, script)
     runner = ctx.runner(worktree, output_dir=card_dir / "gates" / "output")
@@ -1680,6 +1685,188 @@ def cmd_done(ctx: Context, args) -> int:
         _emit_ctx(ctx, {"card": card_id, "done": False, "reason": exc.message}, "done")
         return EXIT_REFUSED
     _emit_ctx(ctx, {"card": card_id, "done": True, "branch": branch, "base": base}, "done")
+    return EXIT_OK
+
+
+def cmd_review(ctx: Context, args) -> int:
+    """Single-pass wave review over `in-review` cards (interactive or `--json`)."""
+    source = ctx.cards()
+    source.prepare()
+    all_cards = source.all_cards()
+    wanted = [ _check_id(cid, "card id") for cid in (getattr(args, "cards", None) or []) ]
+    if wanted:
+        cards = [c for c in all_cards if c.id in wanted]
+    else:
+        cards = [c for c in all_cards if str(getattr(c, "state", "")).lower().replace("-", "_") == "in_review"]
+
+    git = Git(ctx.repo)
+    base = ctx.cfg.base_branch
+    reviewed: list[dict] = []
+    preset_verdict = getattr(args, "verdict", None)
+    preset_note = str(getattr(args, "note", "") or "")
+
+    for card in cards:
+        branch = f"openfarm/{card.id}-{card.slug()}"
+        candidates = sorted(ctx.state.cards.glob(f"{card.id}/*/dossier.json"))
+        dossier_path = candidates[-1] if candidates else None
+        dossier = read_json(dossier_path) if dossier_path and dossier_path.exists() else {}
+        diff_stat = ""
+        if git.ref_exists(f"refs/heads/{base}") and git.branch_exists(branch):
+            diff_text_out = git.diff(ref=f"{base}...{branch}")
+            added = sum(1 for ln in diff_text_out.splitlines() if ln.startswith("+") and not ln.startswith("+++"))
+            removed = sum(1 for ln in diff_text_out.splitlines() if ln.startswith("-") and not ln.startswith("---"))
+            diff_stat = f"+{added} / -{removed}"
+        entry: dict = {
+            "card": card.id,
+            "title": card.title,
+            "state": card.state,
+            "branch": branch,
+            "diff_stat": diff_stat,
+            "dossier_path": str(dossier_path) if dossier_path else "",
+            "verdict": "",
+        }
+        chosen = preset_verdict
+        note = preset_note
+        if chosen is None and not ctx.json and sys.stdin.isatty():
+            print(f"\n=== {card.id}: {card.title} ({branch}, {diff_stat or 'no diff'}) ===")
+            try:
+                ans = input("Verdict [a]pprove(clean) / [m]inor-fix / [b]ounce / [s]kip / [q]uit: ").strip().lower()
+            except EOFError:
+                ans = "q"
+            if ans == "q":
+                break
+            mapping = {"a": "clean", "m": "minor-fix", "b": "bounced"}
+            chosen = mapping.get(ans)
+        if chosen:
+            from types import SimpleNamespace
+            v_args = SimpleNamespace(
+                card=card.id, verdict=chosen, note=note,
+                minutes=None, review_tokens=None,
+            )
+            sub_ctx = Context(ctx.repo, getattr(ctx.cfg, "path", None), json_output=True)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                v_rc = cmd_verdict(sub_ctx, v_args)
+            entry["verdict"] = chosen if v_rc == EXIT_OK else f"error:{v_rc}"
+        reviewed.append(entry)
+
+    payload = {"cards": reviewed, "count": len(reviewed)}
+    if ctx.json:
+        print(json.dumps(payload, indent=2))
+    else:
+        for item in reviewed:
+            v = f" -> {item['verdict']}" if item["verdict"] else ""
+            print(f"{item['card']}: {item['title']} ({item['diff_stat'] or 'no diff'}){v}")
+    return EXIT_OK
+
+
+def cmd_land(ctx: Context, args) -> int:
+    """Opt-in local-only serial merge queue for approved `in-review` cards.
+
+    Never pushes to any remote. Serially trial-merges each card branch onto the
+    local base branch in a throwaway worktree, runs the verification suite gate
+    once per head (unless `--dry-run`), merges locally with `--no-ff`, marks the
+    card `done`, and cleans up lingering card worktrees.
+    """
+    card_ids = [_check_id(cid, "card id") for cid in (args.cards or [])]
+    if not card_ids:
+        _emit_ctx(ctx, {"landed": [], "reason": "no cards specified"}, "land")
+        return EXIT_USAGE
+    git = Git(ctx.repo)
+    base = ctx.cfg.base_branch
+    if not git.ref_exists(f"refs/heads/{base}"):
+        _emit_ctx(ctx, {"landed": [], "reason": f"base branch {base} does not exist"}, "land")
+        return EXIT_REFUSED
+    if not git.is_clean():
+        _emit_ctx(ctx, {"landed": [], "reason": "working tree is not clean; commit or stash first"}, "land")
+        return EXIT_REFUSED
+
+    source = ctx.cards()
+    source.prepare()
+    cards_by_id = {c.id: c for c in source.all_cards()}
+    landed: list[dict] = []
+    dry_run = bool(getattr(args, "dry_run", False))
+    runner = open_runner(ctx.cfg, ctx.repo)
+
+    for cid in card_ids:
+        card = cards_by_id.get(cid)
+        if card is None:
+            payload = {"landed": landed, "stopped_at": cid, "reason": f"no such card {cid}"}
+            _emit_ctx(ctx, payload, "land")
+            return EXIT_REFUSED
+        branch = f"openfarm/{card.id}-{card.slug()}"
+        if not git.branch_exists(branch):
+            payload = {"landed": landed, "stopped_at": cid, "reason": f"no branch {branch}"}
+            _emit_ctx(ctx, payload, "land")
+            return EXIT_REFUSED
+
+        # Trial-merge in a throwaway worktree and verify before touching base.
+        import shutil
+        import tempfile
+        from .packs.base import pack_for
+
+        trial_wt = Path(tempfile.mkdtemp(prefix=f"openfarm-land-{cid}-")).resolve()
+        shutil.rmtree(trial_wt, ignore_errors=True)
+        try:
+            git.worktree_add(trial_wt, f"refs/heads/{base}")
+            trial_git = Git(trial_wt)
+            ok_merge, merge_out = trial_git.merge_no_commit(f"refs/heads/{branch}")
+            if not ok_merge:
+                payload = {"landed": landed, "stopped_at": cid,
+                           "reason": f"merge conflict on {branch}: {merge_out[:300]}"}
+                _emit_ctx(ctx, payload, "land")
+                return EXIT_REFUSED
+            if not dry_run:
+                lang = ctx.cfg.language_for_unit(card.unit) if hasattr(ctx.cfg, "language_for_unit") else ctx.cfg.languages[0]
+                pack = pack_for(lang, cargo_flags=ctx.cfg.cargo_flags, python=ctx.cfg.runner_python)
+                if hasattr(pack, "configure"):
+                    pack.configure(trial_wt)
+                test_argv = pack.commands("test", unit=card.unit if card.unit != "." else "")["argv"]
+                run_cmd = getattr(runner, "exec")
+                res = run_cmd("test", test_argv, cwd=trial_wt)
+                if not res.ok:
+                    payload = {"landed": landed, "stopped_at": cid,
+                               "reason": f"suite gate failed on trial merge of {branch} (exit {res.exit_code})"}
+                    _emit_ctx(ctx, payload, "land")
+                    return EXIT_REFUSED
+        finally:
+            git.worktree_remove(trial_wt)
+            shutil.rmtree(trial_wt, ignore_errors=True)
+
+        if dry_run:
+            landed.append({"card": cid, "branch": branch, "merged": False, "dry_run": True})
+            continue
+
+        # Merge locally into base_branch with --no-ff and mark done.
+        git.checkout(base)
+        ok_real, real_out = git.merge_no_ff(f"refs/heads/{branch}", message=f"Merge {branch} ({cid})")
+        if not ok_real:
+            payload = {"landed": landed, "stopped_at": cid,
+                       "reason": f"local merge failed on {branch}: {real_out[:300]}"}
+            _emit_ctx(ctx, payload, "land")
+            return EXIT_REFUSED
+        # Clean up any lingering card worktree for this branch.
+        wt_path = git._worktree_holding(branch)
+        if wt_path is not None and wt_path.resolve() != ctx.repo.resolve():
+            git.worktree_remove(wt_path)
+            shutil.rmtree(wt_path, ignore_errors=True)
+        mark_note = ""
+        try:
+            source.mark_done(cid, note=f"landed {branch} onto {base}")
+        except Refused as exc:
+            mark_note = str(exc)
+        entry = {"card": cid, "branch": branch, "merged": True, "base": base}
+        if mark_note:
+            entry["note"] = mark_note
+        landed.append(entry)
+
+    payload = {"landed": landed, "count": len(landed), "base": base, "dry_run": dry_run}
+    if ctx.json:
+        print(json.dumps(payload, indent=2))
+    else:
+        for item in landed:
+            verb = "verified (dry-run)" if dry_run else f"merged into {base} and marked done"
+            print(f"{item['card']}: {item['branch']} {verb}")
     return EXIT_OK
 
 
@@ -2354,6 +2541,9 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--learn-from", dest="learn_from", default=None,
                      choices=("both", "project", "global"),
                      help="which lessons this run applies, over [harness] learn_from")
+    run.add_argument("--profile", dest="profile", default=None,
+                     choices=("lean", "balanced", "strict"),
+                     help="apply a named supervision preset (lean, balanced, strict)")
 
     status = sub.add_parser(
         "status",
@@ -2390,6 +2580,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     done.add_argument("card")
     done.add_argument("--note", default=None)
+
+    review = sub.add_parser(
+        "review",
+        help="single-pass review over in-review cards",
+        formatter_class=raw_fmt,
+    )
+    review.add_argument("cards", nargs="*", help="optional card IDs to review")
+    review.add_argument("--verdict", default=None,
+                        choices=("clean", "minor-fix", "bounced", "scrapped"),
+                        help="record this verdict non-interactively")
+    review.add_argument("--note", default="", help="optional review note")
+
+    land = sub.add_parser(
+        "land",
+        help="local-only serial merge queue for reviewed cards",
+        formatter_class=raw_fmt,
+    )
+    land.add_argument("cards", nargs="+", help="card IDs to land serially onto base_branch")
+    land.add_argument("--dry-run", action="store_true",
+                      help="trial-merge and verify only, without modifying base_branch")
 
     dossier = sub.add_parser(
         "dossier",
@@ -2617,7 +2827,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     adopt.add_argument("--dir", default=None,
                        help="repository directory (default: the current directory)")
-    adopt.add_argument("--lang", choices=("rust", "python", "typescript"), default=None,
+    adopt.add_argument("--lang", choices=("rust", "python", "typescript", "go"), default=None,
                        help="language pack to use (default: detect from manifests)")
     adopt.add_argument("--state-dir", default=None, help="external state directory")
     adopt.add_argument("--key-file", default=None, help="external API key file path")
@@ -3032,6 +3242,8 @@ COMMANDS = {
     "stop": cmd_stop,
     "release": cmd_release,
     "done": cmd_done,
+    "review": cmd_review,
+    "land": cmd_land,
     "dossier": cmd_dossier,
     "check": cmd_check,
     "verdict": cmd_verdict,

@@ -63,8 +63,8 @@ def render_config(*, name: str, language: str, base_branch: str, state_dir: Path
         tests_rule = ""
         tools = typescript_tools or {}
         runner = [
-            "# Tests run with node --test (node:test), the only runner this version has.",
-            'typescript = "node"',
+            '# Tests run with "node" (node --test), "vitest", or "jest".',
+            f"typescript = {toml_str(tools.get('runner_kind', 'node'))}",
             '# "tsc" or "syntax" (node\'s own parse only): decided from this checkout by',
             "# adopt, and used the same way by check and by every card.",
             f"typescript_typecheck = {toml_str(tools.get('typecheck', 'auto'))}",
@@ -74,6 +74,11 @@ def render_config(*, name: str, language: str, base_branch: str, state_dir: Path
             "# links, so tsc, prettier, @types and imported packages resolve the same.",
             "link_node_modules = true",
         ]
+    elif language == "go":
+        forbidden_files = ["**/go.mod", "**/go.sum", ".openfarm/**", ".claude/**"]
+        flagged_patterns = []
+        tests_rule = ""
+        runner = []
     else:
         forbidden_files = ["pyproject.toml", "setup.py", ".openfarm/**", ".claude/**"]
         flagged_patterns = []
@@ -165,7 +170,7 @@ def render_config(*, name: str, language: str, base_branch: str, state_dir: Path
         f"mutation = {toml_str(mutation)}",
         f"mutation_required_for = {toml_list(mutation_required)}",
         "mutation_min_kill_rate = 0.8",
-        'counter_tests = "report"',
+        'counter_tests = "reject"',
         'coverage = "off"',
         "workspace_lint = true",
         "baseline_cache = true",

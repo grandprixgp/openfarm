@@ -11,17 +11,17 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.8.8-16a34a?style=flat-square" alt="version 0.8.8">
+  <img src="https://img.shields.io/badge/version-0.9.0-16a34a?style=flat-square" alt="version 0.9.0">
   <img src="https://img.shields.io/badge/status-pre--release-d97706?style=flat-square" alt="status: pre-release">
   <img src="https://img.shields.io/badge/python-3.11%2B-7c3aed?style=flat-square" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/runtime%20deps-stdlib%20only-0284c7?style=flat-square" alt="runtime dependencies: standard library only">
-  <img src="https://img.shields.io/badge/language%20packs-Rust%20%7C%20Python%20%7C%20TypeScript-ea580c?style=flat-square" alt="language packs: Rust, Python and TypeScript">
+  <img src="https://img.shields.io/badge/language%20packs-Rust%20%7C%20Python%20%7C%20TypeScript%20%7C%20Go-ea580c?style=flat-square" alt="language packs: Rust, Python, TypeScript and Go">
   <img src="https://img.shields.io/badge/UI-stdlib%20TUI%20%2B%20CLI-0ea5e9?style=flat-square" alt="UI: stdlib TUI + CLI">
 </p>
 
 <p align="center">
   <a href="#quickstart"><b>Quickstart</b></a> &nbsp;&bull;&nbsp;
-  <a href="#what-changed-in-v088"><b>What changed in v0.8.8</b></a> &nbsp;&bull;&nbsp;
+  <a href="#what-changed-in-v088"><b>What changed</b></a> &nbsp;&bull;&nbsp;
   <a href="#how-it-works"><b>How it works</b></a> &nbsp;&bull;&nbsp;
   <a href="#commands"><b>Commands</b></a> &nbsp;&bull;&nbsp;
   <a href="#whats-verified"><b>What's verified</b></a> &nbsp;&bull;&nbsp;
@@ -30,11 +30,11 @@
 </p>
 
 <p align="center">
-  <img src="docs/assets/openfarm-stats.svg" alt="1557 offline tests with 0 failures, 22 CLI subcommands, 6 adapter interfaces, 0 runtime dependencies" width="100%">
+  <img src="docs/assets/openfarm-stats.svg" alt="1611 offline tests with 0 failures, 24 CLI subcommands, 6 adapter interfaces, 0 runtime dependencies" width="100%">
 </p>
 
 > [!IMPORTANT]
-> **Pre-release (v0.8.8).** v0.8.8 ships small-card economics (`shape_when`, `pre_review_when`, single-pass checker, fresh-vs-cached token accounting), the default `medium` → `high` → `max` retry effort ladder (3 retries minimum), network-off runner `bwrap` (`--unshare-net`), and operational hardening ([`docs/v0.8.8-build-log.md`](docs/v0.8.8-build-log.md)). On the v0.8.8 bench ([`docs/bench-v0.8.8.md`](docs/bench-v0.8.8.md)), Codex farm passed 35 of 36 using **4.6% fewer total tokens than Codex solo** (69.4% fewer frontier tokens), and Claude farm passed 34 of 36 (34/34 non-infra) cutting total tokens by 36% vs v0.8.7 and frontier tokens by **77.9%** vs solo (80.7% worker share). The offline suite has 1589 tests with no failures. With `[swarm] enabled = false` a run behaves as in v0.7.
+> **Pre-release (v0.9.0).** v0.9.0 promotes `[gates] counter_tests = "reject"` to default, adds named supervision profiles (`--profile lean | balanced | strict`), adds `openfarm review` and opt-in local-only `openfarm land` (still zero `git push` paths), adds a Go language pack (`openfarm adopt --lang go`, `go test -json`, `go vet`, `gofmt`, diff-scoped Go mutation), adds `vitest` and `jest` runner support to `TypeScriptPack`, and adds polyglot per-unit languages under `[units.<name>]` ([`docs/v0.9.0-build-log.md`](docs/v0.9.0-build-log.md)). Builds on v0.8.8's small-card economics and default `medium` → `high` → `max` retry effort ladder ([`docs/bench-v0.8.8.md`](docs/bench-v0.8.8.md)). The offline suite has 1,611 tests with no failures. Live execution against real `go`, `vitest`, and `jest` binaries is untested on this machine. With `[swarm] enabled = false` a run behaves as in v0.7.
 
 ---
 

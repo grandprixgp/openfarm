@@ -381,6 +381,19 @@ class Git:
         with _git_lock_for(self.cwd):
             self._run(["merge", "--abort"], check=False)
 
+    def merge_no_ff(self, ref: str, message: str = "") -> tuple[bool, str]:
+        """Local-only `--no-ff` merge into the current branch. Never pushes."""
+        with _git_lock_for(self.cwd):
+            args = ["merge", "--no-ff", ref]
+            if message:
+                args += ["-m", message]
+            result = self._run(args, check=False)
+            output = (result.stdout or "") + (result.stderr or "")
+            if result.returncode != 0:
+                self._run(["merge", "--abort"], check=False)
+                return False, output.strip()
+            return True, output.strip()
+
     def diff(self, paths: list[str] | None = None, ref: str = "HEAD") -> str:
         """A unified diff against `ref`, optionally limited to paths."""
         args = ["diff", ref]

@@ -483,6 +483,8 @@ DEFAULT_SETTINGS = {"typescript": "node", "typescript_typecheck": "auto",
                     "typescript_format": "auto", "link_node_modules": True}
 
 _NODE_TEST_SCRIPT_RE = re.compile(r"(?:^|\s|&&|;)node(?:\s+\S+)*\s+--test(?:\s|$)")
+_VITEST_SCRIPT_RE = re.compile(r"(?:^|\s|&&|;|/)(?:npx\s+)?vitest(?:\s|$)")
+_JEST_SCRIPT_RE = re.compile(r"(?:^|\s|&&|;|/)(?:npx\s+)?jest(?:\s|$)")
 _LINK_MARKER = ".openfarm-linked"
 
 
@@ -494,31 +496,38 @@ def _package_json(root: Path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def _test_script(worktree: Path) -> str:
+    scripts = _package_json(worktree).get("scripts")
+    script = scripts.get("test") if isinstance(scripts, dict) else None
+    return script.strip() if isinstance(script, str) else ""
+
+
 def test_script_problem(worktree: Path) -> str:
     """Why `package.json`'s test script can't be served, or "" when it can.
 
-    Only `node --test` runs are understood: the parser reads node's TAP, not
-    jest, vitest or mocha output. A missing script, npm's placeholder and any
-    script that runs `node --test` are fine (the pack runs node itself).
+    Supports `node --test`, `vitest`, and `jest`. A missing script or npm's
+    placeholder defaults to `node --test`.
     """
-    scripts = _package_json(worktree).get("scripts")
-    script = scripts.get("test") if isinstance(scripts, dict) else None
-    if not isinstance(script, str):
-        return ""
-    cleaned = script.strip()
+    cleaned = _test_script(worktree)
     if not cleaned or "no test specified" in cleaned:
         return ""
-    if _NODE_TEST_SCRIPT_RE.search(cleaned):
+    if (_NODE_TEST_SCRIPT_RE.search(cleaned)
+            or _VITEST_SCRIPT_RE.search(cleaned)
+            or _JEST_SCRIPT_RE.search(cleaned)):
         return ""
-    return (f"package.json's test script is {cleaned!r}, which is not a node --test "
-            "command. This version of openfarm runs TypeScript and JavaScript tests "
-            "only with node --test (node:test); it does not understand jest, vitest "
-            "or mocha. If the tests use node:test, set the script to a node --test "
-            "command; otherwise this project cannot be run by openfarm yet")
+    return (f"package.json's test script is {cleaned!r}, which is not a supported "
+            "TypeScript test runner. This version of openfarm runs TypeScript and "
+            "JavaScript tests with node --test, vitest, or jest; it does not "
+            "understand other runners such as mocha")
 
 
 def detect_runner(worktree: Path) -> str:
-    """Always `"node"`: the only runner this version has. See `test_script_problem`."""
+    """Detect `"vitest"`, `"jest"`, or `"node"` from `package.json`."""
+    cleaned = _test_script(worktree)
+    if _VITEST_SCRIPT_RE.search(cleaned):
+        return "vitest"
+    if _JEST_SCRIPT_RE.search(cleaned):
+        return "jest"
     return "node"
 
 
@@ -604,8 +613,17 @@ def resolve_tooling(worktree: Path, settings: dict | None = None) -> dict:
     """
     root = Path(worktree)
     base = base_checkout(root)
+    raw_settings = settings if settings is not None else runner_settings(base)
     chosen = dict(DEFAULT_SETTINGS)
-    chosen.update(settings if settings is not None else runner_settings(base))
+    chosen.update(raw_settings)
+    if settings is not None and settings.get("typescript") in ("node", "vitest", "jest"):
+        runner_kind = str(settings["typescript"])
+    elif (settings is None and (base / ".openfarm" / "config.toml").is_file()
+          and raw_settings.get("typescript") in ("node", "vitest", "jest")):
+        runner_kind = str(raw_settings["typescript"])
+    else:
+        runner_kind = detect_runner(root)
+    runner_bin = _tool_bin(base, runner_kind) if runner_kind in ("vitest", "jest") else ""
     tsc = _tool_bin(base, "tsc")
     prettier = _tool_bin(base, "prettier")
     has_tsconfig = (root / "tsconfig.json").is_file()
@@ -657,7 +675,9 @@ def resolve_tooling(worktree: Path, settings: dict | None = None) -> dict:
             format_notes.append(_NOTE_NO_PRETTIER)
 
     return {
-        "runner": "node --test",
+        "runner": "node --test" if runner_kind == "node" else runner_kind,
+        "runner_kind": runner_kind,
+        "runner_bin": runner_bin,
         "typecheck": typecheck,
         "tsc": tsc if typecheck == "tsc" else "",
         "format": fmt,
@@ -812,6 +832,7 @@ class TypeScriptPack(OwnMutationMixin, Pack):
                  tsc: bool | None = None, prettier: bool | None = None) -> None:
         self.node = str(node or "node")
         self.runner = runner or "node"
+        self.runner_bin = ""
         self._runner_fixed = bool(runner)
         self._tsc_arg = tsc
         self._prettier_arg = prettier
@@ -844,6 +865,9 @@ class TypeScriptPack(OwnMutationMixin, Pack):
         self.worktree = root
         tooling = resolve_tooling(root, self._settings)
         self.tooling = tooling
+        if not self._runner_fixed:
+            self.runner = str(tooling.get("runner_kind") or "node")
+        self.runner_bin = str(tooling.get("runner_bin") or "")
         notes: list[str] = []
         if self._tsc_arg is None:
             self.has_tsc = tooling["typecheck"] == "tsc"
@@ -957,11 +981,27 @@ class TypeScriptPack(OwnMutationMixin, Pack):
 
         if purpose == "test":
             name_pattern = _test_name_regex(tests)
+            if self.runner == "vitest":
+                bin_cmd = self.runner_bin or "vitest"
+                argv = [bin_cmd, "run", "--reporter=json"]
+                if name_pattern:
+                    argv += ["-t", name_pattern]
+                if files:
+                    argv += [str(f) for f in files]
+                return {"argv": argv + extra}
+            if self.runner == "jest":
+                bin_cmd = self.runner_bin or "jest"
+                argv = [bin_cmd, "--json", "--ci"]
+                if name_pattern:
+                    argv += ["-t", name_pattern]
+                if files:
+                    argv += [str(f) for f in files]
+                return {"argv": argv + extra}
             if self.runner != "node":
                 raise Invalid(
                     "unsupported-test-runner",
-                    f"the TypeScript pack runs tests only with node --test, not "
-                    f"{self.runner!r}")
+                    f"unsupported TypeScript test runner {self.runner!r}: expected "
+                    "'node', 'vitest', or 'jest'")
             argv = [self.node, "--test",
                     "--test-reporter=tap", "--test-reporter-destination=stdout",
                     f"--test-reporter={_REPORTER_URL}",
@@ -1044,6 +1084,8 @@ class TypeScriptPack(OwnMutationMixin, Pack):
         return None
 
     def parse_tests(self, stdout: str, stderr: str = "") -> dict:
+        if self.runner in ("vitest", "jest"):
+            return _parse_jest_vitest_json(stdout, stderr, self.runner, self.worktree)
         return _parse_node_output(stdout, stderr)
 
 
@@ -2879,3 +2921,96 @@ def _opens_class_body(masked: str) -> bool:
         else:
             header += ch
     return bool(stack) and stack[-1]
+
+
+def _extract_json_object(text: str) -> dict | None:
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return parsed
+    except ValueError:
+        pass
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            parsed = json.loads(raw[start:end + 1])
+            if isinstance(parsed, dict):
+                return parsed
+        except ValueError:
+            pass
+    return None
+
+
+def _parse_jest_vitest_json(stdout: str, stderr: str, runner: str,
+                            worktree: Path | None = None) -> dict:
+    """Parse Vitest (`--reporter=json`) or Jest (`--json`) JSON output."""
+    data = _extract_json_object(stdout) or _extract_json_object(stderr)
+    if data is None or not isinstance(data.get("testResults"), list):
+        return {
+            "results": [],
+            "footers": [],
+            "missing_footers": [runner],
+            "compile_errors": [],
+        }
+
+    results: list[dict] = []
+    compile_errors: list[dict] = []
+    passed = failed = ignored = 0
+    wt = worktree.resolve() if worktree is not None else None
+
+    for suite in data.get("testResults") or []:
+        if not isinstance(suite, dict):
+            continue
+        raw_name = str(suite.get("name") or "")
+        file_rel = raw_name
+        if wt is not None and raw_name:
+            try:
+                file_rel = Path(raw_name).resolve().relative_to(wt).as_posix()
+            except (OSError, ValueError):
+                file_rel = raw_name
+        assertions = suite.get("assertionResults")
+        if not isinstance(assertions, list) or (
+                not assertions and str(suite.get("status") or "").lower() == "failed"):
+            if str(suite.get("status") or "").lower() == "failed":
+                key = file_rel or runner
+                compile_errors.append({"pkg": key, "target": key, "binary": key})
+            continue
+        for item in assertions:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("title") or item.get("fullName") or "")
+            raw_status = str(item.get("status") or "").lower()
+            if raw_status == "passed":
+                status = "ok"
+                passed += 1
+            elif raw_status == "failed":
+                status = "FAILED"
+                failed += 1
+            else:
+                status = "ignored"
+                ignored += 1
+            row = {"name": name, "binary": file_rel, "status": status}
+            if file_rel:
+                row["file"] = file_rel
+            results.append(row)
+
+    success = bool(data.get("success", failed == 0 and not compile_errors))
+    footer = {
+        "binary": runner,
+        "status": "FAILED" if (not success or failed > 0) else "ok",
+        "passed": passed,
+        "failed": failed,
+        "ignored": ignored,
+        "filtered": 0,
+    }
+    missing = [e["binary"] for e in compile_errors]
+    return {
+        "results": results,
+        "footers": [footer],
+        "missing_footers": missing,
+        "compile_errors": compile_errors,
+    }
