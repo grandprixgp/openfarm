@@ -8,11 +8,15 @@ recent card records, and exposes both guided A->B flows and direct power tools.
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from pathlib import Path
 
 from . import adopt
+from .acp_setup import inspect_acp_status
 from .config import CONFIG_PATH, load_config
 from .errors import ConfigError, Refused
+from .globs import resolves_within
 from .state import StateDir
 
 AUTOMODE_PALETTE: tuple[dict, ...] = (
@@ -171,3 +175,251 @@ def render_automode_summary(state: dict) -> str:
         )
     lines.append("  Palette: init | adopt | triage | run | review | land | frontier-review | grill | stats | acp")
     return "\n".join(lines)
+
+
+# -- In-TUI Automode Pipeline Engine (v0.9.2) ---------------------------------
+
+DEFAULT_GRILL_QUESTIONS: tuple[dict, ...] = (
+    {
+        "id": "goal",
+        "question": "Core user workflow / MVP scope (1 sentence)",
+        "default": "Deliver the core happy path cleanly with deterministic tests",
+    },
+    {
+        "id": "invariants",
+        "question": "Key invariants that must never break (e.g. data integrity, no network)",
+        "default": "No silent data loss; deterministic error handling on invalid inputs",
+    },
+    {
+        "id": "slice",
+        "question": "First golden slice & Wave 1 feature",
+        "default": "Core domain model + first end-to-end command with unit tests",
+    },
+)
+
+
+def list_existing_key_files(key_dir: Path | None = None) -> list[Path]:
+    """List non-empty, regular `*.key` files in `~/.config/openfarm` (names only)."""
+    folder = Path(key_dir) if key_dir is not None else (Path.home() / ".config" / "openfarm")
+    if not folder.is_dir():
+        return []
+    found: list[Path] = []
+    for entry in sorted(folder.glob("*.key")):
+        try:
+            if entry.is_symlink() or not entry.is_file():
+                continue
+            if entry.stat().st_size > 0:
+                found.append(entry)
+        except OSError:
+            continue
+    return found
+
+
+def save_worker_key_atomic(key_file: Path, secret: str) -> Path:
+    """Write a worker API key atomically at mode 0600 without following symlinks."""
+    cleaned = str(secret or "").strip()
+    if not cleaned:
+        raise Refused("empty-key", "API key cannot be empty")
+    target = Path(key_file).expanduser()
+    if target.is_symlink():
+        raise Refused("symlink-key", f"refusing to overwrite symlink key file {target}")
+    parent = target.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    resolved_parent = parent.resolve()
+    if str(resolved_parent) not in ("/", "/tmp", "/var/tmp"):
+        os.chmod(resolved_parent, 0o700)
+
+    fd, tmp_name = tempfile.mkstemp(prefix=".openfarm-key-", dir=str(resolved_parent))
+    try:
+        os.chmod(tmp_name, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(cleaned + "\n")
+        os.replace(tmp_name, target)
+        os.chmod(target, 0o600)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+    return target
+
+
+def reuse_existing_key_file(source: Path, dest: Path) -> Path:
+    """Copy an existing regular `*.key` file into `dest` at mode 0600."""
+    src = Path(source).expanduser()
+    if src.is_symlink() or not src.is_file():
+        raise Refused("bad-key-source", f"{src} is not a regular key file")
+    secret = src.read_text(encoding="utf-8").strip()
+    if not secret:
+        raise Refused("empty-key", f"{src} is empty")
+    return save_worker_key_atomic(dest, secret)
+
+
+def _spec_and_cards_ready(root: Path, counts: dict) -> bool:
+    spec = root / ".openfarm" / "PROJECT_SPEC.md"
+    spec_ok = False
+    if spec.is_file():
+        try:
+            text = spec.read_text(encoding="utf-8", errors="replace").strip()
+            spec_ok = len(text) >= 60 and len(text.splitlines()) >= 3
+        except OSError:
+            spec_ok = False
+    total_cards = sum(int(v or 0) for v in (counts or {}).values())
+    if total_cards == 0 and (root / "cards").is_dir():
+        total_cards = sum(1 for p in (root / "cards").glob("*.md") if p.is_file())
+    return spec_ok and total_cards > 0
+
+
+def compute_pipeline_stages(
+    root: Path,
+    config_path: Path | None = None,
+    *,
+    acp_status: dict | None = None,
+) -> dict:
+    """Compute the 5 live in-TUI Automode pipeline stages for `root`."""
+    ws = detect_workspace_state(root, config_path)
+    stage_name = ws["stage"]
+    root_p = Path(root).expanduser().resolve()
+    cfg_file = Path(config_path) if config_path else (root_p / CONFIG_PATH)
+
+    stages: list[dict] = []
+    if stage_name != "adopted":
+        ws_action = "init" if stage_name == "empty" else "adopt"
+        ws_prompt = (
+            "Initialize new openfarm app here (name, language, idea)"
+            if stage_name == "empty"
+            else f"Adopt existing {ws.get('detected_language') or 'git'} repository into openfarm"
+        )
+        stages = [
+            {"id": "workspace", "label": "Workspace", "status": "current", "action": ws_action, "prompt": ws_prompt},
+            {"id": "auth", "label": "Auth", "status": "pending", "action": "auth", "prompt": "Sign in to Frontier provider"},
+            {"id": "worker_key", "label": "Worker Key", "status": "pending", "action": "worker_key", "prompt": "Configure Worker API key"},
+            {"id": "spec_and_slice", "label": "Spec & Cards", "status": "pending", "action": "grill", "prompt": "Grill & scaffold spec, invariants, and Wave 1 cards"},
+            {"id": "wave", "label": "Wave", "status": "pending", "action": "run", "prompt": "Triage, run, review, and land cards"},
+        ]
+        return {
+            "stage": stage_name,
+            "stages": stages,
+            "current_stage": stages[0],
+            "summary": ws["summary"],
+            "reusable_keys": [str(p) for p in list_existing_key_files()],
+        }
+
+    # Adopted repository: inspect auth, worker key, spec/cards, and wave queue.
+    cfg = None
+    try:
+        cfg = load_config(root_p, cfg_file)
+    except (ConfigError, OSError):
+        cfg = None
+
+    mm_adapter = str(getattr(cfg, "micromanager_adapter", "off") or "off") if cfg else "off"
+    auth_done = mm_adapter in ("off", "scripted")
+    auth_provider = "claude"
+    if not auth_done:
+        if "codex" in mm_adapter:
+            auth_provider = "codex"
+        elif "antigravity" in mm_adapter or "agy" in mm_adapter:
+            auth_provider = "antigravity"
+        info = acp_status
+        if info is None:
+            try:
+                info = inspect_acp_status(root_p, provider=auth_provider)
+            except Exception:
+                info = {}
+        auth_done = bool((info or {}).get("oauth_ready") or (info or {}).get("ok"))
+
+    key_done = True
+    key_file_path = ""
+    if cfg is not None and getattr(cfg, "model_adapter", "") == "openai-compatible":
+        kf = getattr(cfg, "key_file", None)
+        key_file_path = str(kf or "")
+        key_done = bool(kf and Path(kf).is_file() and Path(kf).stat().st_size > 0)
+
+    counts = ws.get("counts") or {}
+    spec_done = _spec_and_cards_ready(root_p, counts)
+
+    raw_stages = [
+        {"id": "workspace", "label": "Workspace", "done": True, "action": "init", "prompt": "Workspace configured"},
+        {"id": "auth", "label": "Auth", "done": auth_done, "action": "auth",
+         "prompt": f"Sign in to Frontier {auth_provider} OAuth in-TUI", "provider": auth_provider},
+        {"id": "worker_key", "label": "Worker Key", "done": key_done, "action": "worker_key",
+         "prompt": f"Set Worker API key in-TUI ({key_file_path or 'key_file'})", "key_file": key_file_path},
+        {"id": "spec_and_slice", "label": "Spec & Cards", "done": spec_done, "action": "grill",
+         "prompt": "Run in-TUI Grill & Architect to expand PROJECT_SPEC.md, invariants, and Wave 1 cards"},
+        {"id": "wave", "label": "Wave", "done": False, "action": ws["next_action"], "prompt": ws["summary"]},
+    ]
+    found_current = False
+    for item in raw_stages:
+        if item["done"] and not found_current:
+            status = "done"
+        elif not found_current:
+            status = "current"
+            found_current = True
+        else:
+            status = "pending"
+        stages.append({k: v for k, v in item.items() if k != "done"} | {"status": status})
+
+    current = next((s for s in stages if s["status"] == "current"), stages[-1])
+    return {
+        "stage": "adopted",
+        "stages": stages,
+        "current_stage": current,
+        "summary": current["prompt"],
+        "counts": counts,
+        "reusable_keys": [str(p) for p in list_existing_key_files()],
+    }
+
+
+def run_grill_and_architect(
+    repo: Path,
+    *,
+    answers: list[dict],
+    backend=None,
+) -> dict:
+    """Write `.openfarm/GRILL_DECISIONS.md` and expand spec/cards via Frontier backend."""
+    root = Path(repo).expanduser().resolve()
+    decisions_path = root / ".openfarm" / "GRILL_DECISIONS.md"
+    decisions_path.parent.mkdir(parents=True, exist_ok=True)
+    lines = ["# Grill Decisions\n"]
+    for item in answers:
+        q = str(item.get("question") or item.get("id") or "Question")
+        a = str(item.get("answer") or "").strip()
+        lines.append(f"## {q}\n\n{a}\n")
+    decisions_path.write_text("\n".join(lines), encoding="utf-8")
+
+    written: list[str] = [".openfarm/GRILL_DECISIONS.md"]
+    if backend is not None:
+        prompt = (
+            "Expand this openfarm repository from the owner's Grill decisions.\n"
+            "Return ONLY a JSON object: {\"files\": {\"<repo-relative-path>\": \"<content>\", ...}}.\n"
+            "Include `.openfarm/PROJECT_SPEC.md` and at least one Wave 1 card under `cards/`.\n"
+            "Never modify `.openfarm/config.toml`.\n\n"
+            + "\n".join(lines)
+        )
+        raw = str(backend.ask(prompt) if hasattr(backend, "ask") else backend(prompt))
+        from .frontier_review import _extract_json_dict
+        parsed = _extract_json_dict(raw) or {}
+        files = parsed.get("files") if isinstance(parsed, dict) else None
+        if isinstance(files, dict):
+            for rel, content in files.items():
+                rel_s = str(rel).strip().lstrip("/")
+                if not rel_s or rel_s in (".openfarm/config.toml",) or rel_s.startswith(".git/"):
+                    continue
+                target = resolves_within(root, rel_s)
+                if target is None:
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(str(content), encoding="utf-8")
+                written.append(rel_s)
+    else:
+        spec_path = root / ".openfarm" / "PROJECT_SPEC.md"
+        spec_lines = [f"# {root.name} — Project Specification\n"]
+        for item in answers:
+            q = str(item.get("question") or item.get("id") or "")
+            a = str(item.get("answer") or "").strip()
+            spec_lines.append(f"## {q}\n\n{a}\n")
+        spec_path.write_text("\n".join(spec_lines), encoding="utf-8")
+        written.append(".openfarm/PROJECT_SPEC.md")
+
+    return {"written": written, "decisions_path": str(decisions_path)}

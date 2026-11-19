@@ -1,10 +1,14 @@
-# Openfarm v0.9.1 Engineering Handoff
+# Openfarm v0.9.2 Engineering Handoff
 
-Concise entry point for engineers reviewing, testing, or extending Openfarm v0.9.1.
+Concise entry point for engineers reviewing, testing, or extending Openfarm v0.9.2.
 
 For greenfield empty-folder initialization (`"Read and install this skill <link>"` -> `/openfarm-grill-me` -> `"/openfarm-initialize calorie-log ..."`), see [docs/FROM-IDEA-TO-SHIPPED-APP.md](FROM-IDEA-TO-SHIPPED-APP.md). For step-by-step operator instructions, config table reference, provider setup, card authoring rules, and the executable `tallybox` first-deployment runbook on existing repos, see [docs/USAGE-AND-FIRST-DEPLOYMENT.md](USAGE-AND-FIRST-DEPLOYMENT.md). Module-level detail is in [docs/openfarm-internals.md](openfarm-internals.md).
 
-## Current State (v0.9.1, 19 Nov 2026)
+## Current State (v0.9.2, 19 Nov 2026)
+
+v0.9.2 makes the TUI **high-contrast by default** (`OPENFARM_TUI_THEME=high-contrast`, optional `soft`) and turns bare `openfarm` Automode into an **in-TUI execution pipeline** handling workspace init/adopt, Frontier OAuth login, masked Worker API key setup (`0600` atomic or reuse from `~/.config/openfarm/*.key`), interactive Grill + spec expansion, and native in-TUI card review ([docs/v0.9.2-build-log.md](v0.9.2-build-log.md)).
+
+## Previous State (v0.9.1, 19 Nov 2026)
 
 v0.9.1 resolves all findings from the Carbon (High) full-codebase audit of v0.9.0 and adds bare `openfarm` Automode TUI + command palette (`openfarm auto`), frontier card-complexity triage (`openfarm triage`), and mixture-of-frontiers review (`openfarm frontier-review`) ([docs/v0.9.1-build-log.md](v0.9.1-build-log.md)).
 

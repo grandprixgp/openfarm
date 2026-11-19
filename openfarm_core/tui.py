@@ -1533,8 +1533,14 @@ def _classify_line_theme(line: str, default_key: str = "") -> str:
 
 
 def _init_curses_theme() -> dict[str, int]:
-    """Build semantic curses attribute map, honoring NO_COLOR and terminal color support."""
+    """Build semantic curses attribute map, high-contrast by default.
+
+    Honors `NO_COLOR` and `OPENFARM_TUI_THEME=high-contrast|soft` (default:
+    `high-contrast`, with zero `A_DIM` so borders, tabs, and labels stay crisp
+    on both dark and light terminals).
+    """
     no_color = bool(str(os.environ.get("NO_COLOR", "")).strip())
+    soft = str(os.environ.get("OPENFARM_TUI_THEME", "high-contrast") or "high-contrast").strip().lower() == "soft"
     has_colors = False
     with contextlib.suppress(curses.error):
         has_colors = bool(curses.has_colors())
@@ -1573,32 +1579,38 @@ def _init_curses_theme() -> dict[str, int]:
         except curses.error:
             return fb
 
+    if soft:
+        return {
+            "brand": _pair(1, curses.COLOR_BLACK, curses.COLOR_CYAN, curses.A_BOLD, fallback["brand"]),
+            "header": _pair(2, curses.COLOR_WHITE, curses.COLOR_BLUE, curses.A_BOLD, fallback["header"]),
+            "tab_active": _pair(3, curses.COLOR_BLACK, curses.COLOR_CYAN, curses.A_BOLD, fallback["tab_active"]),
+            "tab_idle": _pair(4, -1 if default_bg == -1 else curses.COLOR_WHITE, default_bg, curses.A_DIM, fallback["tab_idle"]),
+            "ok": _pair(5, curses.COLOR_GREEN, default_bg, curses.A_BOLD, fallback["ok"]),
+            "warn": _pair(6, curses.COLOR_YELLOW, default_bg, curses.A_BOLD, fallback["warn"]),
+            "err": _pair(7, curses.COLOR_RED, default_bg, curses.A_BOLD, fallback["err"]),
+            "info": _pair(8, curses.COLOR_CYAN, default_bg, 0, fallback["info"]),
+            "accent": _pair(9, curses.COLOR_MAGENTA, default_bg, curses.A_BOLD, fallback["accent"]),
+            "border": _pair(10, curses.COLOR_BLUE, default_bg, curses.A_DIM, fallback["border"]),
+            "selected": _pair(11, curses.COLOR_CYAN, default_bg, curses.A_BOLD | curses.A_REVERSE, fallback["selected"]),
+            "key": _pair(12, curses.COLOR_BLACK, curses.COLOR_WHITE, curses.A_BOLD, fallback["key"]),
+            "muted": curses.A_DIM,
+        }
+
+    fg_default = -1 if default_bg == -1 else curses.COLOR_WHITE
     return {
-        "brand": _pair(1, curses.COLOR_BLACK, curses.COLOR_CYAN, curses.A_BOLD, fallback["brand"]),
-        "header": _pair(2, curses.COLOR_WHITE, curses.COLOR_BLUE, curses.A_BOLD, fallback["header"]),
-        "tab_active": _pair(3, curses.COLOR_BLACK, curses.COLOR_CYAN, curses.A_BOLD, fallback["tab_active"]),
-        "tab_idle": _pair(
-            4,
-            -1 if default_bg == -1 else curses.COLOR_WHITE,
-            default_bg,
-            curses.A_DIM,
-            fallback["tab_idle"],
-        ),
+        "brand": _pair(1, curses.COLOR_BLACK, curses.COLOR_WHITE, curses.A_BOLD, fallback["brand"]),
+        "header": _pair(2, curses.COLOR_WHITE, curses.COLOR_BLACK, curses.A_BOLD, fallback["header"]),
+        "tab_active": _pair(3, curses.COLOR_BLACK, curses.COLOR_WHITE, curses.A_BOLD, fallback["tab_active"]),
+        "tab_idle": _pair(4, fg_default, default_bg, 0, fallback["tab_idle"]),
         "ok": _pair(5, curses.COLOR_GREEN, default_bg, curses.A_BOLD, fallback["ok"]),
         "warn": _pair(6, curses.COLOR_YELLOW, default_bg, curses.A_BOLD, fallback["warn"]),
-        "err": _pair(7, curses.COLOR_RED, default_bg, curses.A_BOLD, fallback["err"]),
-        "info": _pair(8, curses.COLOR_CYAN, default_bg, 0, fallback["info"]),
-        "accent": _pair(9, curses.COLOR_MAGENTA, default_bg, curses.A_BOLD, fallback["accent"]),
-        "border": _pair(10, curses.COLOR_BLUE, default_bg, curses.A_DIM, fallback["border"]),
-        "selected": _pair(
-            11,
-            curses.COLOR_CYAN,
-            default_bg,
-            curses.A_BOLD | curses.A_REVERSE,
-            fallback["selected"],
-        ),
+        "err": _pair(7, curses.COLOR_WHITE, curses.COLOR_RED, curses.A_BOLD, fallback["err"]),
+        "info": _pair(8, curses.COLOR_CYAN, default_bg, curses.A_BOLD, fallback["info"]),
+        "accent": _pair(9, curses.COLOR_WHITE, default_bg, curses.A_BOLD, fallback["accent"]),
+        "border": _pair(10, curses.COLOR_WHITE, default_bg, 0, fallback["border"]),
+        "selected": _pair(11, curses.COLOR_BLACK, curses.COLOR_YELLOW, curses.A_BOLD, fallback["selected"]),
         "key": _pair(12, curses.COLOR_BLACK, curses.COLOR_WHITE, curses.A_BOLD, fallback["key"]),
-        "muted": curses.A_DIM,
+        "muted": 0,
     }
 
 
@@ -1662,19 +1674,33 @@ def _tab_label(idx: int, view_name: str, counts: dict, *, include_count: bool = 
     return f" {idx} {label} "
 
 
+def _automode_hero_lines(repo_path: Path, width: int) -> list[str]:
+    """Render the high-contrast Automode Pipeline Hero for any directory state."""
+    from .automode import compute_pipeline_stages
+
+    pipe = compute_pipeline_stages(repo_path)
+    icon_map = {"done": "✓", "current": "▶", "pending": "○"}
+    pills = [f"[{icon_map.get(s['status'], '○')}] {s['label']}" for s in pipe["stages"]]
+    cur = pipe.get("current_stage") or {}
+    hero = [
+        "  ".join(pills),
+        f"Next step: {cur.get('prompt', pipe.get('summary', ''))}",
+        "Press [Enter] to run this step in-TUI, or [:] to open the Command Palette.",
+    ]
+    return _box_lines("Automode Pipeline", hero, width=width)
+
+
 def _format_overview_lines(snap: dict, *, width: int = 96) -> list[str]:
     d = snap["data"]
+    repo_path = Path(str(d.get("repo") or "."))
     if not d.get("configured"):
-        msg = "No .openfarm/config.toml found." if not d.get("config_error") else f"Config error: {d['config_error']}"
-        return _box_lines(
-            f"Overview — {d['repo']} (not configured)",
-            [
-                msg,
-                "Switch to [7] Ops to run `init`, `adopt`, or `install-skill`, or press `:` for command bar.",
-            ],
-            width=width,
-        )
+        out = _automode_hero_lines(repo_path, width=width)
+        if d.get("config_error"):
+            out.extend(_box_lines("Config Error", [str(d["config_error"])], width=width))
+        out.append("Actions: [Enter]next step  [:]palette  [i]nit  [a]dopt  [?]help  [q]uit")
+        return out
 
+    out = _automode_hero_lines(repo_path, width=width)
     sw = d["swarm"]
     br = d["breaker"]
     run_icon = "●" if d["active_run_id"] else "○"
@@ -1684,14 +1710,13 @@ def _format_overview_lines(snap: dict, *, width: int = 96) -> list[str]:
     pause_icon = "⏸ yes" if d["paused"] else "✓ no"
     kill_icon = "✗ ACTIVE" if d["kill_switch"] else "✓ clear"
     brk_icon = "⚡ TRIPPED" if br.get("tripped") else "✓ ok"
+    key_badge = "✓ ready" if d["model"]["key_file_present"] else "✗ missing (press [Enter] or [k])"
     proj_lines = [
-        f"Project: {d['project']}  lane={d['lane']}  base={d['base_branch']}",
-        f"State dir: {d['state_dir']}",
+        f"Project: {d['project']}  lane={d['lane']}  base={d['base_branch']}  workers={d['concurrent_cards']}  builds={d['concurrent_builds']}",
         f"Live run: {run_icon} {d['active_run_id'] or live_none}   Paused: {pause_icon}   Kill: {kill_icon}   Breaker: {brk_icon}",
-        f"Caps: spend_per_night={d['spend_cap']}   concurrent_cards={d['concurrent_cards']}   concurrent_builds={d['concurrent_builds']}",
-        f"Model: adapter={d['model']['adapter']}   endpoint={d['model']['endpoint'] or '—'}   key_file_present={d['model']['key_file_present']}",
+        f"Worker model: {d['model']['adapter']}   key: {key_badge}",
     ]
-    out = _box_lines("Project & Safety", proj_lines, width=width)
+    out.extend(_box_lines("Project & Safety", proj_lines, width=width))
 
     swarm_lines = [
         f"Swarm: {'⇄ enabled' if sw['enabled'] else '○ off'}   coordinator={sw['coordinator']} ({sw['coordinator_effort']})   supervisor={sw['supervisor']} ({sw['supervisor_effort']})   default_tier={sw['default_tier']}"
@@ -1713,7 +1738,7 @@ def _format_overview_lines(snap: dict, *, width: int = 96) -> list[str]:
         total_cards = sum(int(v or 0) for v in counts.values()) or 1
         outcome_bits = [f"{_state_icon(k)[0]} {k}:{v}" for k, v in sorted(counts.items())]
         run_lines = [
-            f"Run: {lr.get('run_id')}   finished={lr.get('finished_at') or '—'}   spend=${lr.get('spend', 0.0):.4f}",
+            f"Run: {lr.get('run_id')}   finished={lr.get('finished_at') or '—'}",
             "Outcomes: " + ("  ".join(outcome_bits) if outcome_bits else "(none)"),
         ]
         for k, v in sorted(counts.items()):
@@ -1763,7 +1788,7 @@ def _format_overview_lines(snap: dict, *, width: int = 96) -> list[str]:
             width=width,
         )
     )
-    out.append("Actions: [p]ause  [u]resume  [x]stop  [n]run")
+    out.append("Actions: [Enter]next step  [:]palette  [t]riage  [n]run  [v]review  [l]and  [p]ause  [u]resume  [x]stop")
     return out
 
 
@@ -4036,6 +4061,7 @@ def _prompt_line(
     ctrl: TuiController | None = None,
     theme: dict[str, int] | None = None,
     on_change=None,
+    mask: str = "",
 ) -> str | None:
     if theme is None:
         theme = _init_curses_theme()
@@ -4049,7 +4075,8 @@ def _prompt_line(
                 _render_curses_frame(stdscr, ctrl, theme=theme)
             max_y, max_x = stdscr.getmaxyx()
             y = max(0, max_y - 1)
-            line_text = f"{prompt}{buf}"
+            shown = (mask * len(buf)) if mask else buf
+            line_text = f"{prompt}{shown}"
             _safe_addstr(stdscr, y, 0, " " * max(1, max_x - 1), theme.get("header", curses.A_REVERSE))
             _safe_addstr(stdscr, y, 0, _truncate(line_text, max(1, max_x - 2)), theme.get("header", curses.A_REVERSE))
             if hasattr(stdscr, "move"):
@@ -4230,10 +4257,228 @@ def _render_curses_frame(
     stdscr.refresh()
 
 
+def _run_suspended_tty(stdscr, cli_argv: list[str], cwd: Path) -> int:
+    """Cleanly suspend curses to run an interactive CLI command (e.g. OAuth login)."""
+    from .cli import main as cli_main
+
+    with contextlib.suppress(curses.error):
+        curses.def_prog_mode()
+        curses.endwin()
+    try:
+        return int(cli_main(["--repo", str(cwd), *cli_argv]))
+    finally:
+        with contextlib.suppress(curses.error):
+            curses.reset_prog_mode()
+            stdscr.refresh()
+
+
+def _run_worker_key_modal(stdscr, ctrl: TuiController, *, theme: dict[str, int] | None = None) -> None:
+    """In-TUI worker API key setup: reuse an existing key or paste masked (0600 atomic)."""
+    from .automode import list_existing_key_files, reuse_existing_key_file, save_worker_key_atomic
+
+    tctx = _load_tui_context(ctrl.repo, ctrl.config_path)
+    cfg = tctx.cfg
+    key_file = getattr(cfg, "key_file", None) if cfg is not None else None
+    if key_file is None:
+        ctrl.status_message = "no worker key_file configured yet; init or adopt first"
+        return
+    dest = Path(key_file)
+    existing = list_existing_key_files()
+    if existing:
+        choices = ", ".join(f"[{i}] {p.name}" for i, p in enumerate(existing[:5], 1))
+        pick = _prompt_line(
+            stdscr,
+            f"Worker key — reuse {choices} or [p]aste new: ",
+            theme=theme,
+        )
+        if pick is None:
+            ctrl.status_message = "worker key setup cancelled"
+            return
+        pick = pick.strip()
+        if pick.isdigit() and 1 <= int(pick) <= len(existing[:5]):
+            src = existing[int(pick) - 1]
+            reuse_existing_key_file(src, dest)
+            ctrl.refresh()
+            ctrl.status_message = f"copied worker key from {src.name} -> {dest.name} (0600)"
+            return
+
+    secret = _prompt_line(stdscr, f"Paste Worker API key for {dest.name} (masked): ", theme=theme, mask="*")
+    if not secret or not secret.strip():
+        ctrl.status_message = "worker key setup cancelled"
+        return
+    save_worker_key_atomic(dest, secret)
+    ctrl.refresh()
+    ctrl.status_message = f"saved worker key to {dest} (0600)"
+
+
+def _run_grill_modal(stdscr, ctrl: TuiController, *, theme: dict[str, int] | None = None) -> None:
+    """In-TUI interactive Grill session writing GRILL_DECISIONS.md and expanding PROJECT_SPEC.md."""
+    from .automode import DEFAULT_GRILL_QUESTIONS, run_grill_and_architect
+
+    answers: list[dict] = []
+    for idx, q in enumerate(DEFAULT_GRILL_QUESTIONS, 1):
+        default = str(q.get("default") or "")
+        ans = _prompt_line(
+            stdscr,
+            f"Grill {idx}/{len(DEFAULT_GRILL_QUESTIONS)} — {q['question']} (Enter=default): ",
+            theme=theme,
+        )
+        if ans is None:
+            ctrl.status_message = "grill cancelled"
+            return
+        answers.append({
+            "id": q["id"],
+            "question": q["question"],
+            "answer": ans.strip() or default,
+        })
+    res = run_grill_and_architect(ctrl.repo, answers=answers)
+    ctrl.refresh()
+    ctrl.status_message = f"grill saved: {', '.join(res.get('written') or [])}"
+
+
+def _run_review_modal(stdscr, ctrl: TuiController, *, theme: dict[str, int] | None = None) -> None:
+    """Native in-TUI single-pass review over `in-review` cards (no input() deadlock)."""
+    tctx = _load_tui_context(ctrl.repo, ctrl.config_path)
+    cards, _ = _read_cards_readonly(tctx)
+    in_rev = [c for c in cards if str(getattr(c, "state", "")).lower().replace("-", "_") == "in_review"]
+    if not in_rev:
+        ctrl.status_message = "no cards in-review"
+        return
+    recorded = 0
+    for c in in_rev:
+        ans = _prompt_line(
+            stdscr,
+            f"Review {c.id} ({c.title[:36]}) — [a]clean [m]inor-fix [b]ounce [s]kip [q]uit: ",
+            theme=theme,
+        )
+        if ans is None or ans.strip().lower() == "q":
+            break
+        choice = {"a": "clean", "m": "minor-fix", "b": "bounced"}.get(ans.strip().lower())
+        if choice:
+            ctrl.execute_command(f"verdict {c.id} {choice} --review-tokens 0")
+            recorded += 1
+    ctrl.refresh()
+    ctrl.status_message = f"review complete: {recorded} verdict(s) recorded"
+
+
+def _run_automode_step(stdscr, ctrl: TuiController, *, theme: dict[str, int] | None = None) -> bool:
+    """Execute the current Automode pipeline stage directly inside the TUI."""
+    from .automode import compute_pipeline_stages
+
+    pipe = compute_pipeline_stages(ctrl.repo, ctrl.config_path)
+    cur = pipe.get("current_stage") or {}
+    action = str(cur.get("action") or "")
+
+    if action == "init":
+        default_name = ctrl.repo.name or "my-app"
+        name = _prompt_line(stdscr, f"Project name (Enter={default_name}): ", theme=theme)
+        if name is None:
+            return True
+        name = name.strip() or default_name
+        idea = _prompt_line(stdscr, "Project idea (1 sentence): ", theme=theme)
+        if idea is None:
+            return True
+        prov = _prompt_line(stdscr, "Frontier provider [claude|codex|antigravity] (Enter=claude): ", theme=theme)
+        if prov is None:
+            return True
+        prov = (prov.strip().lower() or "claude")
+        if prov not in ("claude", "codex", "antigravity"):
+            prov = "claude"
+        cmd = f"init {shlex.quote(name)} --dir {shlex.quote(str(ctrl.repo))} --acp-provider {prov}"
+        if idea.strip():
+            cmd += f" --idea {shlex.quote(idea.strip())}"
+        ctrl.execute_command(cmd)
+        ctrl.refresh()
+        return True
+
+    if action == "adopt":
+        ctrl.execute_command(f"adopt --dir {shlex.quote(str(ctrl.repo))}")
+        ctrl.refresh()
+        return True
+
+    if action == "auth":
+        default_prov = str(cur.get("provider") or "claude")
+        prov = _prompt_line(stdscr, f"Frontier OAuth login provider (Enter={default_prov}): ", theme=theme)
+        if prov is None:
+            return True
+        prov = prov.strip().lower() or default_prov
+        rc = _run_suspended_tty(
+            stdscr,
+            ["acp", "login", "--provider", prov],
+            ctrl.repo,
+        )
+        ctrl.refresh()
+        ctrl.status_message = f"acp login ({prov}) exited {rc}"
+        return True
+
+    if action == "worker_key":
+        _run_worker_key_modal(stdscr, ctrl, theme=theme)
+        return True
+
+    if action == "grill":
+        _run_grill_modal(stdscr, ctrl, theme=theme)
+        return True
+
+    if action == "review":
+        _run_review_modal(stdscr, ctrl, theme=theme)
+        return True
+
+    if action == "run":
+        ctrl.execute_command("run --cards 3")
+        return True
+
+    if action == "triage":
+        ctrl.execute_command("triage --heuristic")
+        return True
+
+    if action == "land":
+        cids = _prompt_line(stdscr, "Land card ids (space-separated): ", theme=theme)
+        if cids and cids.strip():
+            ctrl.execute_command("land " + cids.strip())
+        return True
+
+    _run_grill_modal(stdscr, ctrl, theme=theme)
+    return True
+
+
 def _handle_view_hotkey(stdscr, ctrl: TuiController, ch: int, *, theme: dict[str, int] | None = None) -> bool:
     """Handle view-specific interactive prompts; return True if key was consumed."""
     v = ctrl.view
     if v == "overview":
+        if ch in (ord("\n"), ord("\r")):
+            return _run_automode_step(stdscr, ctrl, theme=theme)
+        if ch == ord("k"):
+            _run_worker_key_modal(stdscr, ctrl, theme=theme)
+            return True
+        if ch == ord("g"):
+            _run_grill_modal(stdscr, ctrl, theme=theme)
+            return True
+        if ch == ord("v"):
+            _run_review_modal(stdscr, ctrl, theme=theme)
+            return True
+        if ch == ord("t"):
+            ctrl.execute_command("triage --heuristic")
+            return True
+        if ch == ord("l"):
+            cids = _prompt_line(stdscr, "land card ids (space-separated): ", theme=theme)
+            if cids and cids.strip():
+                ctrl.execute_command("land " + cids.strip())
+            return True
+        if ch == ord("i"):
+            default_name = ctrl.repo.name or "my-app"
+            name = _prompt_line(stdscr, f"init project name (Enter={default_name}): ", theme=theme)
+            if name is not None:
+                idea = _prompt_line(stdscr, "idea (optional): ", theme=theme) or ""
+                cmd = f"init {shlex.quote(name.strip() or default_name)} --dir {shlex.quote(str(ctrl.repo))}"
+                if idea.strip():
+                    cmd += f" --idea {shlex.quote(idea.strip())}"
+                ctrl.execute_command(cmd)
+                ctrl.refresh()
+            return True
+        if ch == ord("a"):
+            ctrl.execute_command(f"adopt --dir {shlex.quote(str(ctrl.repo))}")
+            ctrl.refresh()
+            return True
         if ch == ord("p"):
             reason = _prompt_line(stdscr, "pause reason (optional): ", theme=theme)
             if reason is not None:
