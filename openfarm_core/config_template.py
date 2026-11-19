@@ -165,7 +165,7 @@ def render_config(*, name: str, language: str, base_branch: str, state_dir: Path
         f"mutation = {toml_str(mutation)}",
         f"mutation_required_for = {toml_list(mutation_required)}",
         "mutation_min_kill_rate = 0.8",
-        'counter_tests = "report"',
+        'counter_tests = "reject"',
         'coverage = "off"',
         "workspace_lint = true",
         "baseline_cache = true",

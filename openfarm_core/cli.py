@@ -450,6 +450,10 @@ def cmd_run(ctx: Context, args) -> int:
                             "code": "self-host-unpinned"}, "run")
             return EXIT_REFUSED
 
+    if getattr(args, "profile", None):
+        from .config import apply_supervision_profile
+        apply_supervision_profile(ctx.cfg, args.profile)
+
     if getattr(args, "learn_from", None):
         import dataclasses
         ctx.cfg.harness = dataclasses.replace(ctx.cfg.harness, learn_from=args.learn_from)
@@ -2354,6 +2358,9 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--learn-from", dest="learn_from", default=None,
                      choices=("both", "project", "global"),
                      help="which lessons this run applies, over [harness] learn_from")
+    run.add_argument("--profile", dest="profile", default=None,
+                     choices=("lean", "balanced", "strict"),
+                     help="apply a named supervision preset (lean, balanced, strict)")
 
     status = sub.add_parser(
         "status",

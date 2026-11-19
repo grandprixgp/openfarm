@@ -31,6 +31,7 @@ KNOWN_TABLES = {
 DEFAULT_EFFORTS = ("off", "low", "medium", "high", "xhigh", "max")
 _ACP_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 DEFAULT_EFFORT_LADDER = ("medium", "high", "max")
+SUPERVISION_PROFILES = ("lean", "balanced", "strict")
 _TIER_KEYS = {"model", "efforts", "effort_param"}
 _FORBIDDEN_TIER_KEYS = ("endpoint", "allowed_endpoints", "key_file", "headers")
 _RESERVED_EFFORT_PARAMS = frozenset({
@@ -639,7 +640,7 @@ class Config:
             gates.get("mutation_min_kill_rate"),
             "[gates] mutation_min_kill_rate", 0.8)
         self.counter_tests = _as_choice(
-            gates.get("counter_tests"), "[gates] counter_tests", "report",
+            gates.get("counter_tests"), "[gates] counter_tests", "reject",
             ("report", "reject"))
         self.checker_mode = _as_choice(
             gates.get("checker_mode"), "[gates] checker_mode", "two-pass",
@@ -1334,6 +1335,37 @@ class Config:
 
     def __repr__(self) -> str:
         return f"Config({self.name!r}, {self.base_branch!r})"
+
+
+def apply_supervision_profile(cfg: Config, profile: str) -> None:
+    """Apply a named supervision preset (`lean`, `balanced`, or `strict`) to `cfg`."""
+    name = str(profile or "").strip().lower()
+    if name not in SUPERVISION_PROFILES:
+        raise ConfigError(
+            f"profile {profile!r} must be one of {list(SUPERVISION_PROFILES)!r}"
+        )
+    if name == "lean":
+        cfg.micromanager.shape_when = "new-symbols"
+        cfg.micromanager.pre_review_when = "on-flag"
+        cfg.checker_mode = "single-pass"
+        cfg.counter_tests = "reject"
+        cfg.mutation = "report"
+        cfg.runner_confine = "off"
+    elif name == "balanced":
+        cfg.micromanager.shape_when = "always"
+        cfg.micromanager.pre_review_when = "always"
+        cfg.checker_mode = "two-pass"
+        cfg.counter_tests = "reject"
+        cfg.mutation = "report"
+        cfg.runner_confine = "off"
+    elif name == "strict":
+        cfg.micromanager.shape_when = "always"
+        cfg.micromanager.pre_review_when = "always"
+        cfg.checker_mode = "two-pass"
+        cfg.counter_tests = "reject"
+        cfg.mutation = "required"
+        cfg.runner_confine = "bwrap"
+        cfg.runner_confine_network = "off"
 
 
 def load_config(repo: Path, path: Path | None = None) -> Config:
