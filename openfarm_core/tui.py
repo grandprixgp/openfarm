@@ -4061,6 +4061,7 @@ def _prompt_line(
     ctrl: TuiController | None = None,
     theme: dict[str, int] | None = None,
     on_change=None,
+    mask: str = "",
 ) -> str | None:
     if theme is None:
         theme = _init_curses_theme()
@@ -4074,7 +4075,8 @@ def _prompt_line(
                 _render_curses_frame(stdscr, ctrl, theme=theme)
             max_y, max_x = stdscr.getmaxyx()
             y = max(0, max_y - 1)
-            line_text = f"{prompt}{buf}"
+            shown = (mask * len(buf)) if mask else buf
+            line_text = f"{prompt}{shown}"
             _safe_addstr(stdscr, y, 0, " " * max(1, max_x - 1), theme.get("header", curses.A_REVERSE))
             _safe_addstr(stdscr, y, 0, _truncate(line_text, max(1, max_x - 2)), theme.get("header", curses.A_REVERSE))
             if hasattr(stdscr, "move"):
@@ -4255,10 +4257,228 @@ def _render_curses_frame(
     stdscr.refresh()
 
 
+def _run_suspended_tty(stdscr, cli_argv: list[str], cwd: Path) -> int:
+    """Cleanly suspend curses to run an interactive CLI command (e.g. OAuth login)."""
+    from .cli import main as cli_main
+
+    with contextlib.suppress(curses.error):
+        curses.def_prog_mode()
+        curses.endwin()
+    try:
+        return int(cli_main(["--repo", str(cwd), *cli_argv]))
+    finally:
+        with contextlib.suppress(curses.error):
+            curses.reset_prog_mode()
+            stdscr.refresh()
+
+
+def _run_worker_key_modal(stdscr, ctrl: TuiController, *, theme: dict[str, int] | None = None) -> None:
+    """In-TUI worker API key setup: reuse an existing key or paste masked (0600 atomic)."""
+    from .automode import list_existing_key_files, reuse_existing_key_file, save_worker_key_atomic
+
+    tctx = _load_tui_context(ctrl.repo, ctrl.config_path)
+    cfg = tctx.cfg
+    key_file = getattr(cfg, "key_file", None) if cfg is not None else None
+    if key_file is None:
+        ctrl.status_message = "no worker key_file configured yet; init or adopt first"
+        return
+    dest = Path(key_file)
+    existing = list_existing_key_files()
+    if existing:
+        choices = ", ".join(f"[{i}] {p.name}" for i, p in enumerate(existing[:5], 1))
+        pick = _prompt_line(
+            stdscr,
+            f"Worker key — reuse {choices} or [p]aste new: ",
+            theme=theme,
+        )
+        if pick is None:
+            ctrl.status_message = "worker key setup cancelled"
+            return
+        pick = pick.strip()
+        if pick.isdigit() and 1 <= int(pick) <= len(existing[:5]):
+            src = existing[int(pick) - 1]
+            reuse_existing_key_file(src, dest)
+            ctrl.refresh()
+            ctrl.status_message = f"copied worker key from {src.name} -> {dest.name} (0600)"
+            return
+
+    secret = _prompt_line(stdscr, f"Paste Worker API key for {dest.name} (masked): ", theme=theme, mask="*")
+    if not secret or not secret.strip():
+        ctrl.status_message = "worker key setup cancelled"
+        return
+    save_worker_key_atomic(dest, secret)
+    ctrl.refresh()
+    ctrl.status_message = f"saved worker key to {dest} (0600)"
+
+
+def _run_grill_modal(stdscr, ctrl: TuiController, *, theme: dict[str, int] | None = None) -> None:
+    """In-TUI interactive Grill session writing GRILL_DECISIONS.md and expanding PROJECT_SPEC.md."""
+    from .automode import DEFAULT_GRILL_QUESTIONS, run_grill_and_architect
+
+    answers: list[dict] = []
+    for idx, q in enumerate(DEFAULT_GRILL_QUESTIONS, 1):
+        default = str(q.get("default") or "")
+        ans = _prompt_line(
+            stdscr,
+            f"Grill {idx}/{len(DEFAULT_GRILL_QUESTIONS)} — {q['question']} (Enter=default): ",
+            theme=theme,
+        )
+        if ans is None:
+            ctrl.status_message = "grill cancelled"
+            return
+        answers.append({
+            "id": q["id"],
+            "question": q["question"],
+            "answer": ans.strip() or default,
+        })
+    res = run_grill_and_architect(ctrl.repo, answers=answers)
+    ctrl.refresh()
+    ctrl.status_message = f"grill saved: {', '.join(res.get('written') or [])}"
+
+
+def _run_review_modal(stdscr, ctrl: TuiController, *, theme: dict[str, int] | None = None) -> None:
+    """Native in-TUI single-pass review over `in-review` cards (no input() deadlock)."""
+    tctx = _load_tui_context(ctrl.repo, ctrl.config_path)
+    cards, _ = _read_cards_readonly(tctx)
+    in_rev = [c for c in cards if str(getattr(c, "state", "")).lower().replace("-", "_") == "in_review"]
+    if not in_rev:
+        ctrl.status_message = "no cards in-review"
+        return
+    recorded = 0
+    for c in in_rev:
+        ans = _prompt_line(
+            stdscr,
+            f"Review {c.id} ({c.title[:36]}) — [a]clean [m]inor-fix [b]ounce [s]kip [q]uit: ",
+            theme=theme,
+        )
+        if ans is None or ans.strip().lower() == "q":
+            break
+        choice = {"a": "clean", "m": "minor-fix", "b": "bounced"}.get(ans.strip().lower())
+        if choice:
+            ctrl.execute_command(f"verdict {c.id} {choice} --review-tokens 0")
+            recorded += 1
+    ctrl.refresh()
+    ctrl.status_message = f"review complete: {recorded} verdict(s) recorded"
+
+
+def _run_automode_step(stdscr, ctrl: TuiController, *, theme: dict[str, int] | None = None) -> bool:
+    """Execute the current Automode pipeline stage directly inside the TUI."""
+    from .automode import compute_pipeline_stages
+
+    pipe = compute_pipeline_stages(ctrl.repo, ctrl.config_path)
+    cur = pipe.get("current_stage") or {}
+    action = str(cur.get("action") or "")
+
+    if action == "init":
+        default_name = ctrl.repo.name or "my-app"
+        name = _prompt_line(stdscr, f"Project name (Enter={default_name}): ", theme=theme)
+        if name is None:
+            return True
+        name = name.strip() or default_name
+        idea = _prompt_line(stdscr, "Project idea (1 sentence): ", theme=theme)
+        if idea is None:
+            return True
+        prov = _prompt_line(stdscr, "Frontier provider [claude|codex|antigravity] (Enter=claude): ", theme=theme)
+        if prov is None:
+            return True
+        prov = (prov.strip().lower() or "claude")
+        if prov not in ("claude", "codex", "antigravity"):
+            prov = "claude"
+        cmd = f"init {shlex.quote(name)} --dir {shlex.quote(str(ctrl.repo))} --acp-provider {prov}"
+        if idea.strip():
+            cmd += f" --idea {shlex.quote(idea.strip())}"
+        ctrl.execute_command(cmd)
+        ctrl.refresh()
+        return True
+
+    if action == "adopt":
+        ctrl.execute_command(f"adopt --dir {shlex.quote(str(ctrl.repo))}")
+        ctrl.refresh()
+        return True
+
+    if action == "auth":
+        default_prov = str(cur.get("provider") or "claude")
+        prov = _prompt_line(stdscr, f"Frontier OAuth login provider (Enter={default_prov}): ", theme=theme)
+        if prov is None:
+            return True
+        prov = prov.strip().lower() or default_prov
+        rc = _run_suspended_tty(
+            stdscr,
+            ["acp", "login", "--provider", prov],
+            ctrl.repo,
+        )
+        ctrl.refresh()
+        ctrl.status_message = f"acp login ({prov}) exited {rc}"
+        return True
+
+    if action == "worker_key":
+        _run_worker_key_modal(stdscr, ctrl, theme=theme)
+        return True
+
+    if action == "grill":
+        _run_grill_modal(stdscr, ctrl, theme=theme)
+        return True
+
+    if action == "review":
+        _run_review_modal(stdscr, ctrl, theme=theme)
+        return True
+
+    if action == "run":
+        ctrl.execute_command("run --cards 3")
+        return True
+
+    if action == "triage":
+        ctrl.execute_command("triage --heuristic")
+        return True
+
+    if action == "land":
+        cids = _prompt_line(stdscr, "Land card ids (space-separated): ", theme=theme)
+        if cids and cids.strip():
+            ctrl.execute_command("land " + cids.strip())
+        return True
+
+    _run_grill_modal(stdscr, ctrl, theme=theme)
+    return True
+
+
 def _handle_view_hotkey(stdscr, ctrl: TuiController, ch: int, *, theme: dict[str, int] | None = None) -> bool:
     """Handle view-specific interactive prompts; return True if key was consumed."""
     v = ctrl.view
     if v == "overview":
+        if ch in (ord("\n"), ord("\r")):
+            return _run_automode_step(stdscr, ctrl, theme=theme)
+        if ch == ord("k"):
+            _run_worker_key_modal(stdscr, ctrl, theme=theme)
+            return True
+        if ch == ord("g"):
+            _run_grill_modal(stdscr, ctrl, theme=theme)
+            return True
+        if ch == ord("v"):
+            _run_review_modal(stdscr, ctrl, theme=theme)
+            return True
+        if ch == ord("t"):
+            ctrl.execute_command("triage --heuristic")
+            return True
+        if ch == ord("l"):
+            cids = _prompt_line(stdscr, "land card ids (space-separated): ", theme=theme)
+            if cids and cids.strip():
+                ctrl.execute_command("land " + cids.strip())
+            return True
+        if ch == ord("i"):
+            default_name = ctrl.repo.name or "my-app"
+            name = _prompt_line(stdscr, f"init project name (Enter={default_name}): ", theme=theme)
+            if name is not None:
+                idea = _prompt_line(stdscr, "idea (optional): ", theme=theme) or ""
+                cmd = f"init {shlex.quote(name.strip() or default_name)} --dir {shlex.quote(str(ctrl.repo))}"
+                if idea.strip():
+                    cmd += f" --idea {shlex.quote(idea.strip())}"
+                ctrl.execute_command(cmd)
+                ctrl.refresh()
+            return True
+        if ch == ord("a"):
+            ctrl.execute_command(f"adopt --dir {shlex.quote(str(ctrl.repo))}")
+            ctrl.refresh()
+            return True
         if ch == ord("p"):
             reason = _prompt_line(stdscr, "pause reason (optional): ", theme=theme)
             if reason is not None:
