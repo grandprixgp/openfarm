@@ -458,3 +458,29 @@ def run_grill_and_architect(
         written.append("cards/W1-01-golden-slice.md")
 
     return {"written": written, "decisions_path": str(decisions_path)}
+
+
+def ensure_baseline_committed(repo: Path) -> bool:
+    """Ensure the repo has an initial HEAD commit and committed `.openfarm/` + `cards/` baseline."""
+    from .git import Git
+
+    root = Path(repo).expanduser().resolve()
+    if not (root / ".git").exists():
+        return False
+    git = Git(root)
+    if not git.ref_exists("HEAD"):
+        if git.status_lines():
+            git.commit_all("chore: commit initial openfarm baseline")
+            return True
+        return False
+    lines = git.status_lines()
+    if not lines:
+        return False
+    paths = [line[3:].strip().split(" -> ")[-1].strip('"') for line in lines if len(line) > 3]
+    if paths and all(
+        p.startswith(".openfarm/") or p.startswith("cards/") or p in (".openfarm", "cards")
+        for p in paths
+    ):
+        git.commit_all("chore: commit openfarm spec and cards")
+        return True
+    return False
