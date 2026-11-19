@@ -2016,7 +2016,16 @@ class CardRun:
             counter_failed = int((self.counter_summary or {}).get("failed", 0) or 0)
             max_lines = int(getattr(self.cfg.micromanager, "pre_review_max_lines", 60) or 60)
             low_risk = ("pinned-bugfix", "test-backfill", "mechanical", "pattern", "small-feature")
+            has_flagged = any(
+                g.name == "banned-patterns" and bool((g.evidence or {}).get("flagged"))
+                for g in self.gates
+            )
+            checker_requested = (
+                isinstance(self.checker_pass2, dict)
+                and str(self.checker_pass2.get("verdict") or "").lower() == "changes-requested"
+            )
             if (impl_attempts <= 1 and counter_failed == 0 and not self.handbacks
+                    and not has_flagged and not checker_requested
                     and (added + removed) <= max_lines
                     and self.card.category in low_risk):
                 return (

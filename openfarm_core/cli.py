@@ -1787,6 +1787,90 @@ def cmd_review(ctx: Context, args) -> int:
     return EXIT_OK
 
 
+def cmd_triage(ctx: Context, args) -> int:
+    """Score card complexity (`low | medium | high | split`) via frontier or heuristics."""
+    from .triage import apply_triage_to_card_file, triage_cards_with_frontier
+
+    source = ctx.cards()
+    source.prepare()
+    all_cards = source.all_cards()
+    wanted = [_check_id(cid, "card id") for cid in (getattr(args, "cards", None) or [])]
+    if wanted:
+        cards = [c for c in all_cards if c.id in wanted]
+    else:
+        cards = [c for c in all_cards if str(getattr(c, "state", "")).lower() == "ready"]
+
+    backend = None
+    if not getattr(args, "heuristic", False) and getattr(args, "script", None):
+        script_data = json.loads(Path(args.script).read_text(encoding="utf-8"))
+        if isinstance(script_data, dict) and "triage" in script_data:
+            raw = script_data["triage"]
+            backend = lambda _p: raw if isinstance(raw, str) else json.dumps(raw)
+
+    results = triage_cards_with_frontier(cards, backend=backend)
+    applied = 0
+    if getattr(args, "apply", False):
+        for entry in results:
+            cpath = source._path(entry["card"])
+            if apply_triage_to_card_file(cpath, entry):
+                applied += 1
+        if applied:
+            Git(source.worktree).commit_all(f"openfarm: apply triage to {applied} card(s)")
+
+    payload = {"cards": results, "count": len(results), "applied": applied}
+    if ctx.json:
+        print(json.dumps(payload, indent=2))
+    else:
+        for r in results:
+            flag = " [SPLIT]" if r.get("split_suggested") else ""
+            print(f"{r['card']}: {r['complexity']} -> profile={r['recommended_profile']} "
+                  f"effort={r['starting_effort']}{flag} ({', '.join(r.get('reasons') or [])})")
+    return EXIT_OK
+
+
+def cmd_frontier_review(ctx: Context, args) -> int:
+    """Run a mixture-of-frontiers review across multiple providers."""
+    from .frontier_review import review_with_frontiers
+
+    scope = str(getattr(args, "scope", "diff") or "diff")
+    raw_providers = str(getattr(args, "providers", "claude,codex") or "claude,codex")
+    providers = [p.strip() for p in raw_providers.split(",") if p.strip()]
+    target = str(getattr(args, "target", "") or "")
+    target_text = ""
+    if scope == "card" and target:
+        source = ctx.cards()
+        source.prepare()
+        card = source.read(_check_id(target, "card id"))
+        target_text = json.dumps(card, indent=2)
+    elif scope == "diff":
+        git = Git(ctx.repo)
+        ref = target or ctx.cfg.base_branch
+        target_text = git.diff(ref=ref)
+    else:
+        git = Git(ctx.repo)
+        target_text = "\n".join(git.tracked_files()[:200])
+
+    backends: dict = {}
+    if getattr(args, "script", None):
+        script_data = json.loads(Path(args.script).read_text(encoding="utf-8"))
+        if isinstance(script_data, dict):
+            for prov in providers:
+                if prov in script_data:
+                    val = script_data[prov]
+                    backends[prov] = (lambda _p, v=val: v if isinstance(v, str) else json.dumps(v))
+
+    report = review_with_frontiers(scope, target_text, providers, backends=backends)
+    if ctx.json:
+        print(json.dumps(report, indent=2))
+    else:
+        print(f"Frontier review ({scope}): agreed={report['agreed_verdict']} (consensus={report['consensus']})")
+        for r in report["reviews"]:
+            print(f"  [{r['provider']}] {r['verdict']}: {r['summary']}")
+            for f in r["findings"]:
+                print(f"    - {f}")
+    return EXIT_OK
+
+
 def cmd_land(ctx: Context, args) -> int:
     """Opt-in local-only serial merge queue for approved `in-review` cards.
 
@@ -2534,10 +2618,10 @@ def cmd_swarm(ctx: Context, args) -> int:
 # -- the parser ----------------------------------------------------------------
 
 _CLI_EPILOG = """\
-Command groups (24 commands):
+Command groups (26 commands):
   Setup & Auth         init, adopt, install-skill, acp
   Run & Monitor        check, run, status, pause, resume, stop, tui
-  Review & Harness     review, land, dossier, verdict, done, release, escape, supervise, harness
+  Review & Harness     triage, review, land, frontier-review, dossier, verdict, done, release, escape, supervise, harness
   Swarm, Board & Bench swarm, board, drive, bench
 
 Common workflows:
@@ -2842,6 +2926,29 @@ def build_parser() -> argparse.ArgumentParser:
                            help="report folder (default ~/.openfarm/bench/<time>)")
     bench_run.add_argument("--dry-run", action="store_true",
                            help="scripted answers from each task's script.json; costs nothing")
+
+    triage_p = sub.add_parser(
+        "triage",
+        help="score card complexity (low/medium/high/split) and recommend profiles",
+    )
+    triage_p.add_argument("cards", nargs="*", help="optional card ids (default: all ready cards)")
+    triage_p.add_argument("--apply", action="store_true",
+                          help="write Complexity and Profile fields back to card files")
+    triage_p.add_argument("--heuristic", action="store_true",
+                          help="score deterministically without calling a frontier model")
+    triage_p.add_argument("--script", default=None,
+                          help="optional JSON script file for offline frontier triage")
+
+    frev_p = sub.add_parser(
+        "frontier-review",
+        help="run a mixture-of-frontiers review across multiple providers",
+    )
+    frev_p.add_argument("--scope", choices=("card", "diff", "repo"), default="diff")
+    frev_p.add_argument("target", nargs="?", default="", help="optional card id or git ref")
+    frev_p.add_argument("--providers", default="claude,codex",
+                        help="comma-separated provider names (default: claude,codex)")
+    frev_p.add_argument("--script", default=None,
+                        help="optional JSON script file mapping provider -> response")
 
     init = sub.add_parser(
         "init",
@@ -3299,6 +3406,8 @@ COMMANDS = {
     "done": cmd_done,
     "review": cmd_review,
     "land": cmd_land,
+    "triage": cmd_triage,
+    "frontier-review": cmd_frontier_review,
     "dossier": cmd_dossier,
     "check": cmd_check,
     "verdict": cmd_verdict,
