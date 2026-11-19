@@ -1,10 +1,14 @@
-# Openfarm v0.9.0 Engineering Handoff
+# Openfarm v0.9.1 Engineering Handoff
 
-Concise entry point for engineers reviewing, testing, or extending Openfarm v0.9.0.
+Concise entry point for engineers reviewing, testing, or extending Openfarm v0.9.1.
 
 For greenfield empty-folder initialization (`"Read and install this skill <link>"` -> `/openfarm-grill-me` -> `"/openfarm-initialize calorie-log ..."`), see [docs/FROM-IDEA-TO-SHIPPED-APP.md](FROM-IDEA-TO-SHIPPED-APP.md). For step-by-step operator instructions, config table reference, provider setup, card authoring rules, and the executable `tallybox` first-deployment runbook on existing repos, see [docs/USAGE-AND-FIRST-DEPLOYMENT.md](USAGE-AND-FIRST-DEPLOYMENT.md). Module-level detail is in [docs/openfarm-internals.md](openfarm-internals.md).
 
-## Current State (v0.9.0, 19 Nov 2026)
+## Current State (v0.9.1, 19 Nov 2026)
+
+v0.9.1 resolves all findings from the Carbon (High) full-codebase audit of v0.9.0 and adds bare `openfarm` Automode TUI + command palette (`openfarm auto`), frontier card-complexity triage (`openfarm triage`), and mixture-of-frontiers review (`openfarm frontier-review`) ([docs/v0.9.1-build-log.md](v0.9.1-build-log.md)).
+
+## Previous State (v0.9.0, 19 Nov 2026)
 
 v0.9.0 promotes `[gates] counter_tests = "reject"` to default, adds named supervision profiles (`--profile lean | balanced | strict`), adds `openfarm review` and opt-in local-only `openfarm land`, adds the Go language pack (`openfarm_core/packs/go.py`), adds `vitest` and `jest` runner support to `TypeScriptPack`, and adds polyglot per-unit languages under `[units.<name>]` ([docs/v0.9.0-build-log.md](v0.9.0-build-log.md)). Builds on v0.8.8's small-card economics and retry effort ladder ([docs/bench-v0.8.8.md](bench-v0.8.8.md), [docs/v0.8.8-build-log.md](v0.8.8-build-log.md)).
 
