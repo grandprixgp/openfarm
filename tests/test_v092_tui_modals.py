@@ -19,12 +19,15 @@ from tests.test_python_e2e import build_python_toy
 
 
 class _FakeStdscr:
-    def __init__(self, keys: list[int]) -> None:
+    def __init__(self, keys: list[int], *, rows: int = 30, cols: int = 100) -> None:
         self._keys = list(keys)
+        self._rows = rows
+        self._cols = cols
         self.drawn: list[str] = []
+        self.cursor_positions: list[tuple[int, int]] = []
 
     def getmaxyx(self) -> tuple[int, int]:
-        return (30, 100)
+        return (self._rows, self._cols)
 
     def timeout(self, _ms: int) -> None:
         return None
@@ -35,8 +38,8 @@ class _FakeStdscr:
     def addstr(self, _y: int, _x: int, text: str, _attr: int = 0) -> None:
         self.drawn.append(text)
 
-    def move(self, _y: int, _x: int) -> None:
-        return None
+    def move(self, y: int, x: int) -> None:
+        self.cursor_positions.append((y, x))
 
     def refresh(self) -> None:
         return None
@@ -104,6 +107,62 @@ class TuiModalsTests(unittest.TestCase):
         self.assertEqual(len(called), 1)
         self.assertIn("login", called[0])
         self.assertIn("claude", called[0])
+
+    def test_prompt_line_scrolls_horizontally_when_input_exceeds_width(self) -> None:
+        long_text = "one two three four five six seven eight nine TAIL_END"
+        keys = [ord(c) for c in long_text] + [ord("\n")]
+        scr = _FakeStdscr(keys, rows=24, cols=40)
+        val = _prompt_line(scr, "Answer> ")
+        self.assertEqual(val, long_text)
+        last_drawn = scr.drawn[-1]
+        self.assertIn("TAIL_END", last_drawn)
+        self.assertIn("…", last_drawn)
+        self.assertLessEqual(len(last_drawn), 38)
+
+    def test_grill_modal_shows_full_question_and_long_answer_without_cutoff(self) -> None:
+        toy = build_python_toy()
+        self.addCleanup(toy.cleanup)
+        ctrl = TuiController(toy.root)
+        long_workflow = (
+            "User uploads daily photos, tags locations and cameras, "
+            "generates a static gallery with EXIF metadata and FINAL_WORKFLOW_TOKEN"
+        )
+        keys = [ord(c) for c in long_workflow] + [ord("\n"), ord("\n"), ord("\n")]
+        scr = _FakeStdscr(keys, rows=28, cols=80)
+        _run_grill_modal(scr, ctrl)
+        decisions = (toy.root / ".openfarm" / "GRILL_DECISIONS.md").read_text()
+        self.assertIn("FINAL_WORKFLOW_TOKEN", decisions)
+        combined = "\n".join(scr.drawn)
+        self.assertIn("Grill 1/3", combined)
+        self.assertIn("FINAL_WORKFLOW_TOKEN", combined)
+        self.assertIn("Answer> ", combined)
+
+    def test_grill_modal_advances_pipeline_out_of_spec_stage_without_looping(self) -> None:
+        from openfarm_core.automode import compute_pipeline_stages
+
+        toy = build_python_toy()
+        self.addCleanup(toy.cleanup)
+        # Simulate freshly initialized repo with empty cards/ folder and minimal spec.
+        cards_dir = toy.root / "cards"
+        for md in cards_dir.glob("*.md"):
+            md.unlink()
+        spec_p = toy.root / ".openfarm" / "PROJECT_SPEC.md"
+        if spec_p.exists():
+            spec_p.unlink()
+
+        before = compute_pipeline_stages(toy.root, acp_status={"oauth_ready": True})
+        self.assertEqual(before["current_stage"]["id"], "spec_and_slice")
+        self.assertEqual(before["current_stage"]["action"], "grill")
+
+        ctrl = TuiController(toy.root)
+        scr = _FakeStdscr([ord(c) for c in "Daily photo gallery app"] + [ord("\n"), ord("\n"), ord("\n")])
+        _run_grill_modal(scr, ctrl)
+
+        card_files = list(cards_dir.glob("*.md"))
+        self.assertGreaterEqual(len(card_files), 1)
+        after = compute_pipeline_stages(toy.root, acp_status={"oauth_ready": True})
+        self.assertEqual(after["current_stage"]["id"], "wave")
+        self.assertNotEqual(after["current_stage"]["action"], "grill")
 
 
 if __name__ == "__main__":

@@ -4054,6 +4054,27 @@ def _render_modal_box(
     return clamped_scroll
 
 
+def _tail_fit(text: str, max_cols: int) -> str:
+    """Keep the rightmost characters of `text` fitting within `max_cols`, prefixed with `…`."""
+    if max_cols <= 0:
+        return ""
+    if _display_width(text) <= max_cols:
+        return text
+    if max_cols == 1:
+        return "…"
+    out: list[str] = []
+    used = 0
+    limit = max_cols - 1
+    for ch in reversed(text):
+        w = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        if used + w > limit:
+            break
+        out.append(ch)
+        used += w
+    out.reverse()
+    return "…" + "".join(out)
+
+
 def _prompt_line(
     stdscr,
     prompt: str,
@@ -4062,6 +4083,8 @@ def _prompt_line(
     theme: dict[str, int] | None = None,
     on_change=None,
     mask: str = "",
+    box_title: str = "",
+    box_lines: list[str] | None = None,
 ) -> str | None:
     if theme is None:
         theme = _init_curses_theme()
@@ -4074,14 +4097,58 @@ def _prompt_line(
             if ctrl is not None and on_change is not None:
                 _render_curses_frame(stdscr, ctrl, theme=theme)
             max_y, max_x = stdscr.getmaxyx()
-            y = max(0, max_y - 1)
             shown = (mask * len(buf)) if mask else buf
-            line_text = f"{prompt}{shown}"
+            if box_title and max_y >= 8 and max_x >= 24:
+                bw = min(max_x - 4, 84)
+                bh = min(max_y - 3, 14)
+                by = max(1, (max_y - 1 - bh) // 2)
+                bx = max(1, (max_x - bw) // 2)
+                iy, ix, ih, iw = _draw_box_frame(
+                    stdscr,
+                    by,
+                    bx,
+                    bh,
+                    bw,
+                    box_title,
+                    theme,
+                    footer_hint="Enter submit · Esc cancel",
+                    clear=True,
+                )
+                header_rows: list[tuple[str, int]] = []
+                for idx_l, raw_l in enumerate(box_lines or []):
+                    attr = (theme.get("text", 0) | curses.A_BOLD) if idx_l == 0 else theme.get("muted", 0)
+                    for wl in _wrap_text(raw_l, iw):
+                        header_rows.append((wl, attr))
+                answer_wrapped = _wrap_text(shown or "(press Enter to use default)", iw)
+                answer_attr = theme.get("info", 0) if shown else theme.get("muted", 0)
+                max_ans_rows = max(1, ih - len(header_rows) - 1)
+                visible_ans = answer_wrapped[-max_ans_rows:]
+                row_y = iy
+                for txt, attr in header_rows[: max(0, ih - 2)]:
+                    _safe_addstr(stdscr, row_y, ix, _truncate(txt, iw), attr)
+                    row_y += 1
+                if row_y < iy + ih:
+                    row_y += 1  # blank separator before live answer preview
+                for wl in visible_ans:
+                    if row_y >= iy + ih:
+                        break
+                    _safe_addstr(stdscr, row_y, ix, _truncate(wl, iw), answer_attr)
+                    row_y += 1
+            y = max(0, max_y - 1)
+            avail = max(1, max_x - 2)
+            if _display_width(prompt) + _display_width(shown) <= avail:
+                visible = f"{prompt}{shown}"
+            else:
+                min_input = min(avail, max(12, avail // 2))
+                max_prompt = max(0, avail - min_input)
+                vis_prompt = prompt if _display_width(prompt) <= max_prompt else _truncate(prompt, max_prompt)
+                input_budget = max(1, avail - _display_width(vis_prompt))
+                visible = f"{vis_prompt}{_tail_fit(shown, input_budget)}"
             _safe_addstr(stdscr, y, 0, " " * max(1, max_x - 1), theme.get("header", curses.A_REVERSE))
-            _safe_addstr(stdscr, y, 0, _truncate(line_text, max(1, max_x - 2)), theme.get("header", curses.A_REVERSE))
+            _safe_addstr(stdscr, y, 0, visible, theme.get("header", curses.A_REVERSE))
             if hasattr(stdscr, "move"):
                 with contextlib.suppress(curses.error):
-                    stdscr.move(y, min(max(0, max_x - 2), _display_width(line_text)))
+                    stdscr.move(y, min(max(0, max_x - 2), _display_width(visible)))
             stdscr.refresh()
             ch = stdscr.getch()
             if ch == curses.ERR:
@@ -4320,8 +4387,10 @@ def _run_grill_modal(stdscr, ctrl: TuiController, *, theme: dict[str, int] | Non
         default = str(q.get("default") or "")
         ans = _prompt_line(
             stdscr,
-            f"Grill {idx}/{len(DEFAULT_GRILL_QUESTIONS)} — {q['question']} (Enter=default): ",
+            "Answer> ",
             theme=theme,
+            box_title=f"Grill {idx}/{len(DEFAULT_GRILL_QUESTIONS)}",
+            box_lines=[str(q["question"]), f"Default: {default}"],
         )
         if ans is None:
             ctrl.status_message = "grill cancelled"

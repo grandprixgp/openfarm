@@ -422,4 +422,39 @@ def run_grill_and_architect(
         spec_path.write_text("\n".join(spec_lines), encoding="utf-8")
         written.append(".openfarm/PROJECT_SPEC.md")
 
+    cards_dir = root / "cards"
+    cards_dir.mkdir(parents=True, exist_ok=True)
+    if not any(p.is_file() for p in cards_dir.glob("*.md")):
+        from .adapters.files import render_card_file
+
+        by_id = {str(item.get("id") or ""): str(item.get("answer") or "").strip() for item in answers}
+        goal_ans = by_id.get("goal") or "Deliver the core happy path cleanly with deterministic tests"
+        inv_ans = by_id.get("invariants") or "No silent data loss; deterministic error handling on invalid inputs"
+        slice_ans = by_id.get("slice") or "Core domain model + first end-to-end command with unit tests"
+        touches: list[str] = []
+        if (root / "src" / "lib.rs").is_file():
+            touches = ["src/lib.rs"]
+            if (root / "tests" / "baseline_tests.rs").is_file():
+                touches.append("tests/baseline_tests.rs")
+        elif (root / "main.go").is_file():
+            touches = ["main.go"]
+        header = {
+            "id": "W1-01",
+            "title": (slice_ans.splitlines()[0] if slice_ans else "Wave 1 golden slice")[:80],
+            "state": "ready",
+            "touches": touches,
+            "depends": [],
+            "category": "new",
+        }
+        body = (
+            "## Done\n\n"
+            f"- Core workflow: {goal_ans}\n"
+            f"- Golden slice: {slice_ans}\n"
+            f"- Preserve invariants: {inv_ans}\n"
+            "- All baseline and new unit tests pass.\n"
+        )
+        card_path = cards_dir / "W1-01-golden-slice.md"
+        card_path.write_text(render_card_file(header, body), encoding="utf-8")
+        written.append("cards/W1-01-golden-slice.md")
+
     return {"written": written, "decisions_path": str(decisions_path)}
