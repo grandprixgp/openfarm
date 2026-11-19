@@ -566,10 +566,10 @@ def scan_masks(
     # Each entry is (the real folder, the path it is reached by inside the session).
     # A symlinked folder inside the session is walked again under its link's name
     # (v0.8.5): `never_touch = ["link/secret"]` must hide the file `link/` leads to.
-    stack: list[tuple[Path, str]] = [(root, "")]
-    walked_links: set[Path] = set()
+    stack: list[tuple[Path, str, frozenset[Path]]] = [(root, "", frozenset({root}))]
+    walked_links: set[tuple[Path, str]] = set()
     while stack:
-        current, prefix = stack.pop()
+        current, prefix, ancestors = stack.pop()
         try:
             entries = list(os.scandir(current))
         except OSError:
@@ -595,15 +595,16 @@ def scan_masks(
                         if inside:
                             (dirs if target.is_dir() else files).append(target)
                     elif (inside and globs and target.is_dir()
-                          and target not in walked_links):
-                        walked_links.add(target)
-                        stack.append((target, rel))
+                          and target not in ancestors
+                          and (target, rel) not in walked_links):
+                        walked_links.add((target, rel))
+                        stack.append((target, rel, ancestors | {target}))
                     continue
                 if entry.is_dir(follow_symlinks=False):
                     if hit:
                         dirs.append(full)
                     elif entry.name != ".git":
-                        stack.append((full, rel))
+                        stack.append((full, rel, ancestors | {full.resolve()}))
                 elif hit:
                     files.append(full)
             except OSError:
@@ -799,7 +800,7 @@ def runner_argv(
         if raw and os.path.isabs(os.path.expanduser(raw)):
             hidden.append(Path(os.path.expanduser(raw)))
     for path in _dedupe(hidden):
-        if not os.path.lexists(path):
+        if not os.path.lexists(path) or not path.exists():
             continue
         real = path.resolve()
         if any(_within(real, w) for w in writable):

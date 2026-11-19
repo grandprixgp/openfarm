@@ -799,13 +799,18 @@ def link_node_modules(worktree: Path, base: Path) -> str:
         return ""
     if target.is_symlink() or (target.exists() and not (target / _LINK_MARKER).exists()):
         return ""
+    if os.path.islink(target / _LINK_MARKER):
+        return "node_modules is not linked into card worktrees: marker is a symlink"
     try:
         from ..git import Git
         if Git(base).untracked_files(["node_modules"]):
             return ("node_modules is not linked into card worktrees: git does not "
                     "ignore it in the base checkout")
         target.mkdir(exist_ok=True)
-        (target / _LINK_MARKER).write_text("links made by openfarm\n")
+        marker_path = target / _LINK_MARKER
+        fd = os.open(marker_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write("links made by openfarm\n")
         for entry in sorted(source.iterdir()):
             link = target / entry.name
             if not (link.exists() or link.is_symlink()):

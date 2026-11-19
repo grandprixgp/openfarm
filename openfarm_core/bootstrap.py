@@ -358,7 +358,11 @@ def initialize_project(
     ):
         folder.mkdir(parents=True, exist_ok=True)
     os.chmod(resolved_state, 0o700)
-    os.chmod(resolved_key.parent, 0o700)
+    try:
+        if resolved_key.parent.resolve().is_relative_to(Path.home().resolve()):
+            os.chmod(resolved_key.parent, 0o700)
+    except OSError:
+        pass
 
     acp_label = {"claude": "Claude", "antigravity": "Antigravity", "codex": "Codex"}[resolved_acp_provider]
     acp_cmd_hint = (

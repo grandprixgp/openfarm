@@ -452,6 +452,15 @@ def refresh_isolated(
     if problem:
         return SyncResult("refused", problem, str(src)), initial
     iso = isolated_place(provider, isolated_home)
+    # Refuse if any component under isolated_home is a symlink (prevents child-planted symlink overwrite).
+    iso_root = Path(isolated_home)
+    if iso_root.is_symlink():
+        return SyncResult("refused", "isolated home is a symlink", str(iso_root)), initial
+    cur = iso_root
+    for part in iso.credential.relative_to(iso_root).parts:
+        cur = cur / part
+        if os.path.islink(cur):
+            return SyncResult("refused", f"isolated path {cur} is a symlink", str(cur)), initial
     iso.credential.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     _write_atomic(iso.credential.parent, iso.credential.name, raw, ".openfarm-refresh-")
     return SyncResult("refreshed", "", str(iso.credential)), raw

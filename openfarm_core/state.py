@@ -79,6 +79,10 @@ class StateDir:
     def __init__(self, root: Path) -> None:
         self.root = Path(root).expanduser()
         self.root.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(self.root, 0o700)
+        except OSError:
+            pass
         #: The dead holder the last `acquire_run_lock` took the lock over from.
         self.last_lock_takeover: dict | None = None
 
