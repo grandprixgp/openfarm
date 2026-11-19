@@ -71,7 +71,8 @@ _TABLE_KEYS = {
                      "scaffold_contracts", "coach_on_stall",
                      "adjudicate_counter_tests", "pre_review",
                      "confine", "confine_read_roots", "lean_prompt",
-                     "combine_calls"},
+                     "combine_calls", "shape_when", "pre_review_when",
+                     "pre_review_max_lines"},
     "state": {"min_free_mb"},
     "harness": {"enabled", "dir", "capture_on", "max_cues_per_brief",
                 "max_active_adaptations", "min_confidence", "probe_window",
@@ -320,6 +321,7 @@ class MicromanagerConfig:
         "scaffold_contracts", "coach_on_stall",
         "adjudicate_counter_tests", "pre_review",
         "confine", "confine_read_roots", "lean_prompt", "combine_calls",
+        "shape_when", "pre_review_when", "pre_review_max_lines",
     )
 
     def __init__(self, **kwargs) -> None:
@@ -860,6 +862,15 @@ class Config:
             # One supervisor call for shape and scaffold when a card needs both.
             combine_calls=_as_bool(mm.get("combine_calls"),
                                    "[micromanager] combine_calls", True),
+            shape_when=_as_choice(mm.get("shape_when"),
+                                  "[micromanager] shape_when", "always",
+                                  ("always", "new-symbols", "off")),
+            pre_review_when=_as_choice(mm.get("pre_review_when"),
+                                       "[micromanager] pre_review_when", "always",
+                                       ("always", "on-flag", "off")),
+            pre_review_max_lines=_nonneg_int(
+                mm.get("pre_review_max_lines"),
+                "[micromanager] pre_review_max_lines", 60),
         )
 
     def _confine_read_roots(self, value) -> list[str]:

@@ -1971,9 +1971,43 @@ class CardRun:
 
     # -- step 4: planner ------------------------------------------------------
 
+    def _should_shape(self) -> tuple[bool, str]:
+        mode = str(getattr(self.cfg.micromanager, "shape_when", "always") or "always")
+        if mode == "off":
+            return False, "skipped: shape_when = off"
+        if mode == "new-symbols":
+            if not getattr(self.card, "new_symbols", False) and len(self.card.touches) <= 1:
+                return False, "skipped: shape_when = new-symbols (no new_symbols, single-file card)"
+        return True, ""
+
+    def _should_pre_review(self, added: int, removed: int) -> tuple[bool, str]:
+        mode = str(getattr(self.cfg.micromanager, "pre_review_when", "always") or "always")
+        if mode == "off":
+            return False, "skipped: pre_review_when = off"
+        if mode == "on-flag":
+            impl_attempts = sum(1 for a in self.attempts if a.get("role") == "implementer")
+            counter_failed = int((self.counter_summary or {}).get("failed", 0) or 0)
+            max_lines = int(getattr(self.cfg.micromanager, "pre_review_max_lines", 60) or 60)
+            low_risk = ("pinned-bugfix", "test-backfill", "mechanical", "pattern", "small-feature")
+            if (impl_attempts <= 1 and counter_failed == 0 and not self.handbacks
+                    and (added + removed) <= max_lines
+                    and self.card.category in low_risk):
+                return (
+                    False,
+                    f"skipped: pre_review_when = on-flag (attempt 1, 0 counter-test failures, {added + removed} lines)",
+                )
+        return True, ""
+
     def _step_plan(self) -> None:
         self.phase = "plan"
         if self.micromanager.enabled:
+            do_shape, shape_skip = self._should_shape()
+            if not do_shape:
+                self._record_gate(GateResult("micromanager-shape", PASS, shape_skip))
+                do_shape = False
+        else:
+            do_shape = False
+        if do_shape:
             sigs = {}
             for path in self.card.touches:
                 norm = normalise(path)
@@ -3494,64 +3528,68 @@ class CardRun:
             return checker_bounce
 
         if self.micromanager.enabled:
-            self._refresh_micromanager_harness_context("micromanager")
-            self._check_stop_requested()
-            try:
-                report = self.micromanager.triage_and_review("pre_review", {
-                    "card_id": self.card.id,
-                    "card": self.card.as_dict(),
-                    "full_diff": full_diff,
-                    "gates": [g.as_dict() for g in self.gates],
-                    "touches": list(self.card.touches),
-                    "counter_tests": dict(self.counter_summary),
-                    "mutation": dict(self.mutation_summary),
-                })
-            except (Refused, Invalid, ValueError, Infra) as exc:
-                if isinstance(exc, Infra) and exc.code != "acp-timeout":
-                    raise
-                self._record_gate(GateResult(
-                    "micromanager-pre-review",
-                    FAIL if isinstance(exc, Refused) else INFRA,
-                    f"pre_review degraded ({type(exc).__name__}): "
-                    f"{exc.message if hasattr(exc, 'message') else exc}",
-                    {"error": str(exc)},
-                ))
-                self.log(f"{self.card.id}: micromanager pre_review degraded: {exc}")
-                report = None
-            if report is not None:
-                self._record_gate(GateResult(
-                    "micromanager-pre-review",
-                    PASS if report.verdict == "approve" else FAIL,
-                    report.verdict,
-                    report.as_dict(),
-                ))
-                for entry in report.findings:
-                    self._file_finding(entry)
-                if report.reviewer_brief:
-                    self.reviewer_brief = report.reviewer_brief
-                if report.verdict == "block":
-                    raise GateFailure(
-                        StopCode.SUPERVISOR_REJECT,
-                        report.missed_clause or report.summary
-                        or "micromanager blocked pre-review",
-                    )
-                if report.verdict == "bounce":
-                    if allow_pre_review_bounce:
-                        self.coaching_guidance = (
-                            report.missed_clause or report.reviewer_brief
-                            or report.summary)
-                        return (
-                            "pre_review",
-                            full_diff,
-                            report.missed_clause
-                            or "supervisor requested changes during pre-review",
-                            "",
+            do_pre, pre_skip = self._should_pre_review(added, removed)
+            if not do_pre:
+                self._record_gate(GateResult("micromanager-pre-review", PASS, pre_skip))
+            else:
+                self._refresh_micromanager_harness_context("micromanager")
+                self._check_stop_requested()
+                try:
+                    report = self.micromanager.triage_and_review("pre_review", {
+                        "card_id": self.card.id,
+                        "card": self.card.as_dict(),
+                        "full_diff": full_diff,
+                        "gates": [g.as_dict() for g in self.gates],
+                        "touches": list(self.card.touches),
+                        "counter_tests": dict(self.counter_summary),
+                        "mutation": dict(self.mutation_summary),
+                    })
+                except (Refused, Invalid, ValueError, Infra) as exc:
+                    if isinstance(exc, Infra) and exc.code != "acp-timeout":
+                        raise
+                    self._record_gate(GateResult(
+                        "micromanager-pre-review",
+                        FAIL if isinstance(exc, Refused) else INFRA,
+                        f"pre_review degraded ({type(exc).__name__}): "
+                        f"{exc.message if hasattr(exc, 'message') else exc}",
+                        {"error": str(exc)},
+                    ))
+                    self.log(f"{self.card.id}: micromanager pre_review degraded: {exc}")
+                    report = None
+                if report is not None:
+                    self._record_gate(GateResult(
+                        "micromanager-pre-review",
+                        PASS if report.verdict == "approve" else FAIL,
+                        report.verdict,
+                        report.as_dict(),
+                    ))
+                    for entry in report.findings:
+                        self._file_finding(entry)
+                    if report.reviewer_brief:
+                        self.reviewer_brief = report.reviewer_brief
+                    if report.verdict == "block":
+                        raise GateFailure(
+                            StopCode.SUPERVISOR_REJECT,
+                            report.missed_clause or report.summary
+                            or "micromanager blocked pre-review",
                         )
-                    raise GateFailure(
-                        StopCode.SUPERVISOR_REJECT,
-                        report.missed_clause or report.summary
-                        or "micromanager bounced pre-review with no attempts left",
-                    )
+                    if report.verdict == "bounce":
+                        if allow_pre_review_bounce:
+                            self.coaching_guidance = (
+                                report.missed_clause or report.reviewer_brief
+                                or report.summary)
+                            return (
+                                "pre_review",
+                                full_diff,
+                                report.missed_clause
+                                or "supervisor requested changes during pre-review",
+                                "",
+                            )
+                        raise GateFailure(
+                            StopCode.SUPERVISOR_REJECT,
+                            report.missed_clause or report.summary
+                            or "micromanager bounced pre-review with no attempts left",
+                        )
 
         self.existing_tests_changed = [
             path for path in changed
