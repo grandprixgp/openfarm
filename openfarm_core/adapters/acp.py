@@ -559,7 +559,9 @@ def _sanitised_env(
 
     isolated_home: Path | None = None
     if isolate_home:
-        isolated_home = Path(tempfile.mkdtemp(prefix="openfarm-acp-home-"))
+        # Resolve symlinks in TMPDIR so HOME/CODEX_HOME/apiKeyHelper match the
+        # canonical path bind-mounted inside bwrap.
+        isolated_home = Path(tempfile.mkdtemp(prefix="openfarm-acp-home-")).resolve()
         os.chmod(isolated_home, 0o700)
         _register_isolated_home(isolated_home)
         # The real login folders are never handed on; the provider's own variable
