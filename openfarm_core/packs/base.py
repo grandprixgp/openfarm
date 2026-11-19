@@ -296,7 +296,7 @@ class OwnMutationMixin:
             shutil.rmtree(out, ignore_errors=True)
             out.mkdir(parents=True, exist_ok=True)
         else:
-            out = Path(tempfile.mkdtemp(prefix="openfarm-mutants-"))
+            out = Path(tempfile.mkdtemp(prefix="openfarm-mutants-")).resolve()
         self._mutation_dir = out
         test_argv = self.commands("test", tests=list(tests or []))["argv"]
         argv = [sys.executable, "-I", str(Path(mutate.__file__)), "--lang", self.mutation_language,

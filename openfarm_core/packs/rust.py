@@ -450,7 +450,7 @@ class RustPack(Pack):
             out.mkdir(parents=True, exist_ok=True)
             self._mutation_out_owned = False
         else:
-            out = Path(tempfile.mkdtemp(prefix="openfarm-mutants-"))
+            out = Path(tempfile.mkdtemp(prefix="openfarm-mutants-")).resolve()
             self._mutation_out_owned = True
         self._mutation_out = out
         return out
