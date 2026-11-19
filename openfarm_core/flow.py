@@ -417,6 +417,9 @@ class CardRun:
             cur = {
                 "calls": int(getattr(mm_budget, "calls", 0) or 0),
                 "tokens_in": int(getattr(mm_budget, "tokens_in", 0) or 0),
+                "tokens_in": int(getattr(mm_budget, "tokens_in", 0) or 0),
+                "tokens_in_fresh": int(getattr(mm_budget, "tokens_in_fresh", 0) or 0),
+                "tokens_in_cached": int(getattr(mm_budget, "tokens_in_cached", 0) or 0),
                 "tokens_out": int(getattr(mm_budget, "tokens_out", 0) or 0),
                 "spend": float(getattr(mm_budget, "spend", 0.0) or 0.0),
                 "false_rejects_dismissed": int(
@@ -427,6 +430,12 @@ class CardRun:
             "calls": max(0, int(cur.get("calls", 0)) - int(start.get("calls", 0))),
             "tokens_in": max(
                 0, int(cur.get("tokens_in", 0)) - int(start.get("tokens_in", 0))
+            ),
+            "tokens_in_fresh": max(
+                0, int(cur.get("tokens_in_fresh", 0)) - int(start.get("tokens_in_fresh", 0))
+            ),
+            "tokens_in_cached": max(
+                0, int(cur.get("tokens_in_cached", 0)) - int(start.get("tokens_in_cached", 0))
             ),
             "tokens_out": max(
                 0, int(cur.get("tokens_out", 0)) - int(start.get("tokens_out", 0))
@@ -3968,8 +3977,9 @@ class CardRun:
         brief2 = checker_pass2_brief(
             self.card, full_diff, gate_list, modified,
             handback=self.swarm_on, answer_form=answer_form)
+        pass2_first = 1 if getattr(self.cfg, "checker_mode", "two-pass") == "single-pass" else 2
         call2, limit_err = self._call_role_with_handbacks(
-            "checker_pass2", brief2, first_attempt=2, response_name="checker-pass2")
+            "checker_pass2", brief2, first_attempt=pass2_first, response_name="checker-pass2")
         if limit_err is not None:
             self._checker_handback_limit("checker-pass2", limit_err)
         answer = parse_pass2(call2.content, cut_off=call2.cut_off)

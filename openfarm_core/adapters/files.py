@@ -191,8 +191,7 @@ class FileCardSource:
                         checker.reset_hard(target)
 
             (self.worktree / self.folder).mkdir(parents=True, exist_ok=True)
-            if created:
-                self._seed_from_base()
+            self._seed_from_base()
             return self.worktree
 
     def _seed_from_base(self) -> None:

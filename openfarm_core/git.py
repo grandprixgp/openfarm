@@ -63,7 +63,7 @@ def _git_lock_for(cwd: Path) -> threading.RLock:
 ALLOWED_SUBCOMMANDS = frozenset({
     "init", "add", "commit", "status", "diff", "rev-parse", "rev-list",
     "checkout", "switch", "branch", "worktree", "merge", "merge-base", "reset",
-    "clean", "ls-files", "show", "cat-file", "hash-object", "for-each-ref",
+    "clean", "ls-files", "ls-tree", "show", "cat-file", "hash-object", "for-each-ref",
     "update-ref", "symbolic-ref", "log", "config", "stash", "rm", "mv",
     "describe", "tag", "apply", "restore",
 })

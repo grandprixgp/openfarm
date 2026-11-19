@@ -537,11 +537,43 @@ def _read_cards_readonly(ctx: TuiContext) -> tuple[list[Card], str]:
     cards_branch = getattr(ctx.cfg, "cards_branch", "openfarm-cards")
 
     if git.ref_exists(f"refs/heads/{cards_branch}"):
-        from .adapters.files import open_file_source
+        from .adapters.files import parse_card_file
+        from .cards import CARD_FIELDS, OPTIONAL_CARD_FIELDS, extract_fenced_fields
 
-        fsource = open_file_source(ctx.cfg, ctx.state.root)
-        fsource.prepare()
-        return fsource.all_cards(), "cards-source"
+        cards: list[Card] = []
+        ls = git._run(["ls-tree", "--name-only", f"refs/heads/{cards_branch}", f"{folder}/"], check=False)
+        if ls.returncode == 0:
+            for rel in sorted(line.strip() for line in ls.stdout.splitlines() if line.strip().endswith(".md")):
+                blob = git._run(["show", f"refs/heads/{cards_branch}:{rel}"], check=False)
+                if blob.returncode != 0:
+                    continue
+                try:
+                    header, body = parse_card_file(blob.stdout)
+                    if not header.get("id"):
+                        header["id"] = Path(rel).stem
+                    merged = dict(header)
+                    fields_block = getattr(ctx.cfg, "cards_fields_block", "")
+                    if fields_block == "toml":
+                        block_fields, body = extract_fenced_fields(body, fields_block)
+                        if block_fields:
+                            merged = {**block_fields, **header}
+                    fields = {k: merged[k] for k in (*CARD_FIELDS, *OPTIONAL_CARD_FIELDS) if k in merged}
+                    deps = [str(d) for d in merged.get("depends", merged.get("deps", [])) or []]
+                    touches = [str(t) for t in merged.get("touches", []) or []]
+                    cards.append(Card.from_dict({
+                        "id": str(merged["id"]),
+                        "title": str(merged.get("title", merged["id"])),
+                        "state": str(merged.get("state", "ready")),
+                        "unit": str(merged.get("unit", ".")),
+                        "touches": touches,
+                        "depends": deps,
+                        "tests": merged.get("tests") or [],
+                        "fields": fields,
+                        "body": body,
+                    }))
+                except Exception as exc:  # noqa: BLE001 - skip malformed card in TUI refresh
+                    _ = exc
+        return cards, "cards-source"
     if cards_dir.is_dir():
         source_mode = "cards-source"
         scan_dir = cards_dir
@@ -733,8 +765,10 @@ def _render_team_and_board_section(
             tok = m.get("tokens")
             if isinstance(tok, dict):
                 tok_total = int(tok.get("in", 0) or 0) + int(tok.get("out", 0) or 0)
+            elif tok is not None:
+                tok_total = int(tok or 0)
             else:
-                tok_total = int(tok or 0) + int(m.get("tokens_in", 0) or 0) + int(m.get("tokens_out", 0) or 0)
+                tok_total = int(m.get("tokens_in", 0) or 0) + int(m.get("tokens_out", 0) or 0)
             team_rows.append(
                 {
                     "member": m.get("name", name),

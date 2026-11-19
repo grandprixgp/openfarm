@@ -267,7 +267,7 @@ def _pick_wildcard(forbidden: set[str]) -> str:
         code += 1
 
 
-@lru_cache(maxsize=1024)
+@lru_cache(maxsize=16384)
 def _globs_overlap_norm(pat1: str, pat2: str) -> bool:
     accept1, eps1, edges1, lit1 = _compile_glob_nfa(pat1)
     accept2, eps2, edges2, lit2 = _compile_glob_nfa(pat2)

@@ -16,7 +16,9 @@ from pathlib import Path
 SCOPES = ("project", "general")
 _DEFINITION_RE = re.compile(
     r"^(?:async\s+def|def|class|pub\s+fn|fn|pub\s+struct|struct|"
-    r"pub\s+enum|enum|pub\s+trait|trait)\s+"
+    r"pub\s+enum|enum|pub\s+trait|trait|"
+    r"export\s+async\s+function|export\s+function|async\s+function|function|"
+    r"export\s+class|export\s+interface|interface|export\s+type|type|func)\s+"
     r"([A-Za-z_][A-Za-z0-9_]*)",
     re.MULTILINE,
 )
@@ -47,7 +49,7 @@ def project_markers(repo_root: Path, project_name: str,
         if len(stem) >= 5:
             markers.add(stem)
 
-        if not lower_path.endswith((".py", ".rs")):
+        if not lower_path.endswith((".py", ".rs", ".ts", ".tsx", ".js", ".jsx", ".go")):
             continue
 
         file_path = repo_root / path
