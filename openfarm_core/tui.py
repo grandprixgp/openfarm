@@ -1533,8 +1533,14 @@ def _classify_line_theme(line: str, default_key: str = "") -> str:
 
 
 def _init_curses_theme() -> dict[str, int]:
-    """Build semantic curses attribute map, honoring NO_COLOR and terminal color support."""
+    """Build semantic curses attribute map, high-contrast by default.
+
+    Honors `NO_COLOR` and `OPENFARM_TUI_THEME=high-contrast|soft` (default:
+    `high-contrast`, with zero `A_DIM` so borders, tabs, and labels stay crisp
+    on both dark and light terminals).
+    """
     no_color = bool(str(os.environ.get("NO_COLOR", "")).strip())
+    soft = str(os.environ.get("OPENFARM_TUI_THEME", "high-contrast") or "high-contrast").strip().lower() == "soft"
     has_colors = False
     with contextlib.suppress(curses.error):
         has_colors = bool(curses.has_colors())
@@ -1573,32 +1579,38 @@ def _init_curses_theme() -> dict[str, int]:
         except curses.error:
             return fb
 
+    if soft:
+        return {
+            "brand": _pair(1, curses.COLOR_BLACK, curses.COLOR_CYAN, curses.A_BOLD, fallback["brand"]),
+            "header": _pair(2, curses.COLOR_WHITE, curses.COLOR_BLUE, curses.A_BOLD, fallback["header"]),
+            "tab_active": _pair(3, curses.COLOR_BLACK, curses.COLOR_CYAN, curses.A_BOLD, fallback["tab_active"]),
+            "tab_idle": _pair(4, -1 if default_bg == -1 else curses.COLOR_WHITE, default_bg, curses.A_DIM, fallback["tab_idle"]),
+            "ok": _pair(5, curses.COLOR_GREEN, default_bg, curses.A_BOLD, fallback["ok"]),
+            "warn": _pair(6, curses.COLOR_YELLOW, default_bg, curses.A_BOLD, fallback["warn"]),
+            "err": _pair(7, curses.COLOR_RED, default_bg, curses.A_BOLD, fallback["err"]),
+            "info": _pair(8, curses.COLOR_CYAN, default_bg, 0, fallback["info"]),
+            "accent": _pair(9, curses.COLOR_MAGENTA, default_bg, curses.A_BOLD, fallback["accent"]),
+            "border": _pair(10, curses.COLOR_BLUE, default_bg, curses.A_DIM, fallback["border"]),
+            "selected": _pair(11, curses.COLOR_CYAN, default_bg, curses.A_BOLD | curses.A_REVERSE, fallback["selected"]),
+            "key": _pair(12, curses.COLOR_BLACK, curses.COLOR_WHITE, curses.A_BOLD, fallback["key"]),
+            "muted": curses.A_DIM,
+        }
+
+    fg_default = -1 if default_bg == -1 else curses.COLOR_WHITE
     return {
-        "brand": _pair(1, curses.COLOR_BLACK, curses.COLOR_CYAN, curses.A_BOLD, fallback["brand"]),
-        "header": _pair(2, curses.COLOR_WHITE, curses.COLOR_BLUE, curses.A_BOLD, fallback["header"]),
-        "tab_active": _pair(3, curses.COLOR_BLACK, curses.COLOR_CYAN, curses.A_BOLD, fallback["tab_active"]),
-        "tab_idle": _pair(
-            4,
-            -1 if default_bg == -1 else curses.COLOR_WHITE,
-            default_bg,
-            curses.A_DIM,
-            fallback["tab_idle"],
-        ),
+        "brand": _pair(1, curses.COLOR_BLACK, curses.COLOR_WHITE, curses.A_BOLD, fallback["brand"]),
+        "header": _pair(2, curses.COLOR_WHITE, curses.COLOR_BLACK, curses.A_BOLD, fallback["header"]),
+        "tab_active": _pair(3, curses.COLOR_BLACK, curses.COLOR_WHITE, curses.A_BOLD, fallback["tab_active"]),
+        "tab_idle": _pair(4, fg_default, default_bg, 0, fallback["tab_idle"]),
         "ok": _pair(5, curses.COLOR_GREEN, default_bg, curses.A_BOLD, fallback["ok"]),
         "warn": _pair(6, curses.COLOR_YELLOW, default_bg, curses.A_BOLD, fallback["warn"]),
-        "err": _pair(7, curses.COLOR_RED, default_bg, curses.A_BOLD, fallback["err"]),
-        "info": _pair(8, curses.COLOR_CYAN, default_bg, 0, fallback["info"]),
-        "accent": _pair(9, curses.COLOR_MAGENTA, default_bg, curses.A_BOLD, fallback["accent"]),
-        "border": _pair(10, curses.COLOR_BLUE, default_bg, curses.A_DIM, fallback["border"]),
-        "selected": _pair(
-            11,
-            curses.COLOR_CYAN,
-            default_bg,
-            curses.A_BOLD | curses.A_REVERSE,
-            fallback["selected"],
-        ),
+        "err": _pair(7, curses.COLOR_WHITE, curses.COLOR_RED, curses.A_BOLD, fallback["err"]),
+        "info": _pair(8, curses.COLOR_CYAN, default_bg, curses.A_BOLD, fallback["info"]),
+        "accent": _pair(9, curses.COLOR_WHITE, default_bg, curses.A_BOLD, fallback["accent"]),
+        "border": _pair(10, curses.COLOR_WHITE, default_bg, 0, fallback["border"]),
+        "selected": _pair(11, curses.COLOR_BLACK, curses.COLOR_YELLOW, curses.A_BOLD, fallback["selected"]),
         "key": _pair(12, curses.COLOR_BLACK, curses.COLOR_WHITE, curses.A_BOLD, fallback["key"]),
-        "muted": curses.A_DIM,
+        "muted": 0,
     }
 
 
@@ -1662,19 +1674,33 @@ def _tab_label(idx: int, view_name: str, counts: dict, *, include_count: bool = 
     return f" {idx} {label} "
 
 
+def _automode_hero_lines(repo_path: Path, width: int) -> list[str]:
+    """Render the high-contrast Automode Pipeline Hero for any directory state."""
+    from .automode import compute_pipeline_stages
+
+    pipe = compute_pipeline_stages(repo_path)
+    icon_map = {"done": "✓", "current": "▶", "pending": "○"}
+    pills = [f"[{icon_map.get(s['status'], '○')}] {s['label']}" for s in pipe["stages"]]
+    cur = pipe.get("current_stage") or {}
+    hero = [
+        "  ".join(pills),
+        f"Next step: {cur.get('prompt', pipe.get('summary', ''))}",
+        "Press [Enter] to run this step in-TUI, or [:] to open the Command Palette.",
+    ]
+    return _box_lines("Automode Pipeline", hero, width=width)
+
+
 def _format_overview_lines(snap: dict, *, width: int = 96) -> list[str]:
     d = snap["data"]
+    repo_path = Path(str(d.get("repo") or "."))
     if not d.get("configured"):
-        msg = "No .openfarm/config.toml found." if not d.get("config_error") else f"Config error: {d['config_error']}"
-        return _box_lines(
-            f"Overview — {d['repo']} (not configured)",
-            [
-                msg,
-                "Switch to [7] Ops to run `init`, `adopt`, or `install-skill`, or press `:` for command bar.",
-            ],
-            width=width,
-        )
+        out = _automode_hero_lines(repo_path, width=width)
+        if d.get("config_error"):
+            out.extend(_box_lines("Config Error", [str(d["config_error"])], width=width))
+        out.append("Actions: [Enter]next step  [:]palette  [i]nit  [a]dopt  [?]help  [q]uit")
+        return out
 
+    out = _automode_hero_lines(repo_path, width=width)
     sw = d["swarm"]
     br = d["breaker"]
     run_icon = "●" if d["active_run_id"] else "○"
@@ -1684,14 +1710,13 @@ def _format_overview_lines(snap: dict, *, width: int = 96) -> list[str]:
     pause_icon = "⏸ yes" if d["paused"] else "✓ no"
     kill_icon = "✗ ACTIVE" if d["kill_switch"] else "✓ clear"
     brk_icon = "⚡ TRIPPED" if br.get("tripped") else "✓ ok"
+    key_badge = "✓ ready" if d["model"]["key_file_present"] else "✗ missing (press [Enter] or [k])"
     proj_lines = [
-        f"Project: {d['project']}  lane={d['lane']}  base={d['base_branch']}",
-        f"State dir: {d['state_dir']}",
+        f"Project: {d['project']}  lane={d['lane']}  base={d['base_branch']}  workers={d['concurrent_cards']}  builds={d['concurrent_builds']}",
         f"Live run: {run_icon} {d['active_run_id'] or live_none}   Paused: {pause_icon}   Kill: {kill_icon}   Breaker: {brk_icon}",
-        f"Caps: spend_per_night={d['spend_cap']}   concurrent_cards={d['concurrent_cards']}   concurrent_builds={d['concurrent_builds']}",
-        f"Model: adapter={d['model']['adapter']}   endpoint={d['model']['endpoint'] or '—'}   key_file_present={d['model']['key_file_present']}",
+        f"Worker model: {d['model']['adapter']}   key: {key_badge}",
     ]
-    out = _box_lines("Project & Safety", proj_lines, width=width)
+    out.extend(_box_lines("Project & Safety", proj_lines, width=width))
 
     swarm_lines = [
         f"Swarm: {'⇄ enabled' if sw['enabled'] else '○ off'}   coordinator={sw['coordinator']} ({sw['coordinator_effort']})   supervisor={sw['supervisor']} ({sw['supervisor_effort']})   default_tier={sw['default_tier']}"
@@ -1713,7 +1738,7 @@ def _format_overview_lines(snap: dict, *, width: int = 96) -> list[str]:
         total_cards = sum(int(v or 0) for v in counts.values()) or 1
         outcome_bits = [f"{_state_icon(k)[0]} {k}:{v}" for k, v in sorted(counts.items())]
         run_lines = [
-            f"Run: {lr.get('run_id')}   finished={lr.get('finished_at') or '—'}   spend=${lr.get('spend', 0.0):.4f}",
+            f"Run: {lr.get('run_id')}   finished={lr.get('finished_at') or '—'}",
             "Outcomes: " + ("  ".join(outcome_bits) if outcome_bits else "(none)"),
         ]
         for k, v in sorted(counts.items()):
@@ -1763,7 +1788,7 @@ def _format_overview_lines(snap: dict, *, width: int = 96) -> list[str]:
             width=width,
         )
     )
-    out.append("Actions: [p]ause  [u]resume  [x]stop  [n]run")
+    out.append("Actions: [Enter]next step  [:]palette  [t]riage  [n]run  [v]review  [l]and  [p]ause  [u]resume  [x]stop")
     return out
 
 
