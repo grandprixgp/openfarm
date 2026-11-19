@@ -529,7 +529,24 @@ class DirectRunnerTestsV04(unittest.TestCase):
         exc = subprocess.TimeoutExpired(
             cmd=["echo"], timeout=0.1, output=b"partial out\xff", stderr=b"partial err"
         )
-        with mock.patch("openfarm_core.adapters.direct.subprocess.run", side_effect=exc):
+
+        class _FakeProc:
+            pid = 999999
+            returncode = -9
+
+            def __init__(self) -> None:
+                self._calls = 0
+
+            def communicate(self, timeout=None):
+                self._calls += 1
+                if self._calls == 1:
+                    raise exc
+                return b"partial out\xff", b"partial err"
+
+            def kill(self) -> None:
+                return None
+
+        with mock.patch("openfarm_core.adapters.direct.subprocess.Popen", return_value=_FakeProc()):
             res = runner.exec("test", ["echo", "x"])
         self.assertEqual(res.cls, INFRA)
         self.assertIn("partial out", res.stdout)

@@ -172,8 +172,8 @@ _TS_SWAPS = [("===", "!=="), ("!==", "==="), ("==", "!="), ("!=", "=="),
 _WORD = re.compile(r"[A-Za-z0-9_$]")
 
 
-def _code_spans(text: str) -> list[tuple[int, int]]:
-    """The parts of a TypeScript file outside strings, templates and comments."""
+def _code_spans(text: str, *, raw_backtick: bool = False) -> list[tuple[int, int]]:
+    """The parts of a TS/Go file outside strings, templates/raw strings, and comments."""
     spans, i, start, n = [], 0, 0, len(text)
     while i < n:
         ch = text[i]
@@ -189,7 +189,10 @@ def _code_spans(text: str) -> list[tuple[int, int]]:
             else:
                 i += 1
                 while i < n and text[i] != ch:
-                    i += 2 if text[i] == "\\" else 1
+                    if ch == "`" and raw_backtick:
+                        i += 1
+                    else:
+                        i += 2 if text[i] == "\\" else 1
                 i += 1
             start = i
             continue
@@ -198,12 +201,13 @@ def _code_spans(text: str) -> list[tuple[int, int]]:
     return [(a, b) for a, b in spans if b > a]
 
 
-def typescript_mutants(source: str, lines: set[int] | None) -> list[dict]:
+def _token_mutants(source: str, lines: set[int] | None, swaps: list[tuple[str, str]],
+                   *, raw_backtick: bool = False, check_triple_eq: bool = False) -> list[dict]:
     out: list[dict] = []
     taken: set[int] = set()
-    for a, b in _code_spans(source):
+    for a, b in _code_spans(source, raw_backtick=raw_backtick):
         chunk = source[a:b]
-        for old, new in _TS_SWAPS:
+        for old, new in swaps:
             at = chunk.find(old)
             while at >= 0:
                 pos = a + at
@@ -213,7 +217,8 @@ def typescript_mutants(source: str, lines: set[int] | None) -> list[dict]:
                 if word:
                     ok = ok and not (pos > 0 and _WORD.match(source[pos - 1])) \
                         and not (end < len(source) and _WORD.match(source[end]))
-                if old in ("==", "!=") and (source[end:end + 1] == "=" or source[pos - 1:pos] in "=!"):
+                if check_triple_eq and old in ("==", "!=") and (
+                        source[end:end + 1] == "=" or source[pos - 1:pos] in "=!"):
                     ok = False  # part of === or !==
                 if old in (" < ", " > ") and (source[end:end + 1] == "=" or source[pos + 1:pos + 3] in ("<=", ">=")):
                     ok = False
@@ -227,6 +232,10 @@ def typescript_mutants(source: str, lines: set[int] | None) -> list[dict]:
     return out
 
 
+def typescript_mutants(source: str, lines: set[int] | None) -> list[dict]:
+    return _token_mutants(source, lines, _TS_SWAPS, raw_backtick=False, check_triple_eq=True)
+
+
 _GO_SWAPS = [("==", "!="), ("!=", "=="),
              (" <= ", " < "), (" >= ", " > "), (" < ", " <= "), (" > ", " >= "),
              ("&&", "||"), ("||", "&&"), (" + ", " - "), (" - ", " + "),
@@ -235,30 +244,7 @@ _GO_SWAPS = [("==", "!="), ("!=", "=="),
 
 def go_mutants(source: str, lines: set[int] | None) -> list[dict]:
     """Token-swap mutants for Go outside strings, raw strings, and comments."""
-    out: list[dict] = []
-    taken: set[int] = set()
-    for a, b in _code_spans(source):
-        chunk = source[a:b]
-        for old, new in _GO_SWAPS:
-            at = chunk.find(old)
-            while at >= 0:
-                pos = a + at
-                end = pos + len(old)
-                word = old.isalpha()
-                ok = pos not in taken
-                if word:
-                    ok = ok and not (pos > 0 and _WORD.match(source[pos - 1])) \
-                        and not (end < len(source) and _WORD.match(source[end]))
-                if old in (" < ", " > ") and (source[end:end + 1] == "=" or source[pos + 1:pos + 3] in ("<=", ">=")):
-                    ok = False
-                line = source.count("\n", 0, pos) + 1
-                if ok and (lines is None or line in lines):
-                    taken.add(pos)
-                    out.append({"line": line, "what": f"{old.strip()} -> {new.strip()}",
-                                "text": source[:pos] + new + source[end:]})
-                at = chunk.find(old, at + 1)
-    out.sort(key=lambda m: m["line"])
-    return out
+    return _token_mutants(source, lines, _GO_SWAPS, raw_backtick=True, check_triple_eq=False)
 
 
 # -- running --------------------------------------------------------------------
@@ -385,8 +371,14 @@ def main(argv: list[str] | None = None) -> int:
             continue
         originals[rel] = data
         mtimes[rel] = (info.st_atime_ns, info.st_mtime_ns)
-        lines = set(wanted.get(rel) or ()) if wanted is not None else None
-        mutants = make(data.decode("utf-8", errors="replace"), lines or None)
+        if wanted is not None:
+            if rel in wanted and not wanted[rel]:
+                # Delete-only diff: 0 added/changed lines in this file -> 0 mutants.
+                continue
+            lines = set(wanted.get(rel) or ()) or None
+        else:
+            lines = None
+        mutants = make(data.decode("utf-8", errors="replace"), lines)
         plan.extend((rel, m) for m in mutants)
     total_found = len(plan)
     plan = spread(plan, args.max)
@@ -434,7 +426,8 @@ def main(argv: list[str] | None = None) -> int:
     counts = {k: sum(1 for r in results if r["outcome"] == k)
               for k in ("caught", "missed", "timeout", "unviable")}
     payload = {"tool": "openfarm-mutate", "lang": args.lang, "total": len(results),
-               "found": total_found, "capped": total_found > len(results), **counts,
+               "found": total_found, "capped": total_found > len(results),
+               "scoped": wanted is not None, **counts,
                "outcomes": results}
     (out_dir / "outcomes.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
     for r in results:
@@ -473,6 +466,7 @@ def read_outcomes(out_dir: Path | None, stdout: str, stderr: str, exit_code: int
     return {"killed": caught, "survived": missed, "timeout": int(payload.get("timeout", 0)),
             "unviable": int(payload.get("unviable", 0)), "total": int(payload.get("total", 0)),
             "judged": caught + missed, "capped": bool(payload.get("capped", False)),
+            "scoped": bool(payload.get("scoped", False)),
             "source": "openfarm-mutate"}
 
 

@@ -213,6 +213,10 @@ class CoordinatorRuntime:
             cand = self.card_map.get(card_id)
             if cand is None or cand.state != "ready":
                 return False
+            for dep_id in getattr(cand, "deps", ()) or ():
+                dep = self.card_map.get(dep_id)
+                if dep is None or dep.state != "done":
+                    return False
             for active_id in self.in_flight.values():
                 active = self.card_map.get(active_id)
                 if active is not None and cards_collide(cand, active):
@@ -331,7 +335,9 @@ def retry_covers(cfg, role: str, current: str, step: str) -> bool:
         return False
     try:
         first, _ = effort_for_role(role, 1)
-        later, _ = effort_for_role(role, 2)
+        ladder = getattr(cfg, "effort_ladder", None) or ()
+        top_attempt = max(2, len(ladder))
+        later, _ = effort_for_role(role, top_attempt)
     except TypeError:
         return False
     if not later or later == first or str(current or "") not in ("", first):
@@ -1718,7 +1724,15 @@ class SwarmRunner:
                         for fut in done_futs:
                             with rt.lock:
                                 cid = rt.in_flight.pop(fut)
-                            outcome = fut.result()
+                            try:
+                                outcome = fut.result()
+                            except Exception as exc:
+                                outcome = {
+                                    "card": cid,
+                                    "final_state": "blocked",
+                                    "stop_code": "infra",
+                                    "detail": f"worker crashed ({type(exc).__name__}): {exc}",
+                                }
                             with outcomes_lock:
                                 outcomes_by_card[cid] = outcome
                             with rt.lock:

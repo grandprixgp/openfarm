@@ -1707,28 +1707,55 @@ def cmd_review(ctx: Context, args) -> int:
 
     for card in cards:
         branch = f"openfarm/{card.id}-{card.slug()}"
-        candidates = sorted(ctx.state.cards.glob(f"{card.id}/*/dossier.json"))
-        dossier_path = candidates[-1] if candidates else None
-        dossier = read_json(dossier_path) if dossier_path and dossier_path.exists() else {}
+        candidates = sorted(ctx.state.cards.glob(f"{card.id}/*/card-record.json"))
+        record_path = candidates[-1] if candidates else None
+        dossier_path = (record_path.parent / "dossier.md") if record_path else None
+        record = read_json(record_path) if record_path and record_path.exists() else {}
         diff_stat = ""
         if git.ref_exists(f"refs/heads/{base}") and git.branch_exists(branch):
             diff_text_out = git.diff(ref=f"{base}...{branch}")
             added = sum(1 for ln in diff_text_out.splitlines() if ln.startswith("+") and not ln.startswith("+++"))
             removed = sum(1 for ln in diff_text_out.splitlines() if ln.startswith("-") and not ln.startswith("---"))
             diff_stat = f"+{added} / -{removed}"
+        gates_list: list[dict] = []
+        if record_path is not None:
+            gates_dir = record_path.parent / "gates"
+            if gates_dir.is_dir():
+                for gp in sorted(gates_dir.rglob("*.json")):
+                    gdata = read_json(gp)
+                    if isinstance(gdata, dict) and "result" in gdata:
+                        gates_list.append(gdata)
+        if not gates_list and isinstance(record, dict) and isinstance(record.get("gates"), list):
+            gates_list = [g for g in record["gates"] if isinstance(g, dict)]
+        gates_pass = sum(1 for g in gates_list if g.get("result") == "pass")
+        gates_fail = sum(1 for g in gates_list if g.get("result") == "fail")
+        findings = []
+        if isinstance(record, dict):
+            mm = record.get("micromanager") or {}
+            if isinstance(mm, dict):
+                pr = mm.get("pre_review") or {}
+                if isinstance(pr, dict) and isinstance(pr.get("findings"), list):
+                    findings = [str(f) for f in pr["findings"][:5]]
         entry: dict = {
             "card": card.id,
             "title": card.title,
             "state": card.state,
             "branch": branch,
             "diff_stat": diff_stat,
+            "gates": {"pass": gates_pass, "fail": gates_fail},
+            "findings": findings,
             "dossier_path": str(dossier_path) if dossier_path else "",
             "verdict": "",
         }
         chosen = preset_verdict
         note = preset_note
-        if chosen is None and not ctx.json and sys.stdin.isatty():
+        import os
+        in_tui_capture = bool(os.environ.get("OPENFARM_TUI_CAPTURE"))
+        if chosen is None and not ctx.json and sys.stdin.isatty() and not in_tui_capture:
             print(f"\n=== {card.id}: {card.title} ({branch}, {diff_stat or 'no diff'}) ===")
+            print(f"    Gates: {gates_pass} pass, {gates_fail} fail | Dossier: {entry['dossier_path'] or 'none'}")
+            for finding in findings:
+                print(f"    Finding: {finding}")
             try:
                 ans = input("Verdict [a]pprove(clean) / [m]inor-fix / [b]ounce / [s]kip / [q]uit: ").strip().lower()
             except EOFError:
@@ -1757,6 +1784,90 @@ def cmd_review(ctx: Context, args) -> int:
         for item in reviewed:
             v = f" -> {item['verdict']}" if item["verdict"] else ""
             print(f"{item['card']}: {item['title']} ({item['diff_stat'] or 'no diff'}){v}")
+    return EXIT_OK
+
+
+def cmd_triage(ctx: Context, args) -> int:
+    """Score card complexity (`low | medium | high | split`) via frontier or heuristics."""
+    from .triage import apply_triage_to_card_file, triage_cards_with_frontier
+
+    source = ctx.cards()
+    source.prepare()
+    all_cards = source.all_cards()
+    wanted = [_check_id(cid, "card id") for cid in (getattr(args, "cards", None) or [])]
+    if wanted:
+        cards = [c for c in all_cards if c.id in wanted]
+    else:
+        cards = [c for c in all_cards if str(getattr(c, "state", "")).lower() == "ready"]
+
+    backend = None
+    if not getattr(args, "heuristic", False) and getattr(args, "script", None):
+        script_data = json.loads(Path(args.script).read_text(encoding="utf-8"))
+        if isinstance(script_data, dict) and "triage" in script_data:
+            raw = script_data["triage"]
+            backend = lambda _p: raw if isinstance(raw, str) else json.dumps(raw)
+
+    results = triage_cards_with_frontier(cards, backend=backend)
+    applied = 0
+    if getattr(args, "apply", False):
+        for entry in results:
+            cpath = source._path(entry["card"])
+            if apply_triage_to_card_file(cpath, entry):
+                applied += 1
+        if applied:
+            Git(source.worktree).commit_all(f"openfarm: apply triage to {applied} card(s)")
+
+    payload = {"cards": results, "count": len(results), "applied": applied}
+    if ctx.json:
+        print(json.dumps(payload, indent=2))
+    else:
+        for r in results:
+            flag = " [SPLIT]" if r.get("split_suggested") else ""
+            print(f"{r['card']}: {r['complexity']} -> profile={r['recommended_profile']} "
+                  f"effort={r['starting_effort']}{flag} ({', '.join(r.get('reasons') or [])})")
+    return EXIT_OK
+
+
+def cmd_frontier_review(ctx: Context, args) -> int:
+    """Run a mixture-of-frontiers review across multiple providers."""
+    from .frontier_review import review_with_frontiers
+
+    scope = str(getattr(args, "scope", "diff") or "diff")
+    raw_providers = str(getattr(args, "providers", "claude,codex") or "claude,codex")
+    providers = [p.strip() for p in raw_providers.split(",") if p.strip()]
+    target = str(getattr(args, "target", "") or "")
+    target_text = ""
+    if scope == "card" and target:
+        source = ctx.cards()
+        source.prepare()
+        card = source.read(_check_id(target, "card id"))
+        target_text = json.dumps(card, indent=2)
+    elif scope == "diff":
+        git = Git(ctx.repo)
+        ref = target or ctx.cfg.base_branch
+        target_text = git.diff(ref=ref)
+    else:
+        git = Git(ctx.repo)
+        target_text = "\n".join(git.tracked_files()[:200])
+
+    backends: dict = {}
+    if getattr(args, "script", None):
+        script_data = json.loads(Path(args.script).read_text(encoding="utf-8"))
+        if isinstance(script_data, dict):
+            for prov in providers:
+                if prov in script_data:
+                    val = script_data[prov]
+                    backends[prov] = (lambda _p, v=val: v if isinstance(v, str) else json.dumps(v))
+
+    report = review_with_frontiers(scope, target_text, providers, backends=backends)
+    if ctx.json:
+        print(json.dumps(report, indent=2))
+    else:
+        print(f"Frontier review ({scope}): agreed={report['agreed_verdict']} (consensus={report['consensus']})")
+        for r in report["reviews"]:
+            print(f"  [{r['provider']}] {r['verdict']}: {r['summary']}")
+            for f in r["findings"]:
+                print(f"    - {f}")
     return EXIT_OK
 
 
@@ -1794,19 +1905,45 @@ def cmd_land(ctx: Context, args) -> int:
             payload = {"landed": landed, "stopped_at": cid, "reason": f"no such card {cid}"}
             _emit_ctx(ctx, payload, "land")
             return EXIT_REFUSED
+        if card.state != "in_review":
+            payload = {"landed": landed, "stopped_at": cid,
+                       "reason": f"{cid} is in state {card.state!r}, not 'in_review'"}
+            _emit_ctx(ctx, payload, "land")
+            return EXIT_REFUSED
+        # Require an approved verdict ('clean' or 'minor-fix') in the latest run's verdict.json.
+        candidates = sorted(ctx.state.cards.glob(f"{cid}/*/card-record.json"))
+        verdict_val = ""
+        if candidates:
+            vpath = candidates[-1].parent / "verdict.json"
+            if vpath.is_file():
+                try:
+                    verdict_val = str(json.loads(vpath.read_text()).get("verdict") or "")
+                except (OSError, ValueError):
+                    verdict_val = ""
+        if verdict_val not in ("clean", "minor-fix"):
+            payload = {
+                "landed": landed,
+                "stopped_at": cid,
+                "reason": (f"{cid} has verdict {verdict_val!r}; record an approved verdict "
+                           "('clean' or 'minor-fix') via `openfarm review` or `openfarm verdict` "
+                           "before landing"),
+            }
+            _emit_ctx(ctx, payload, "land")
+            return EXIT_REFUSED
         branch = f"openfarm/{card.id}-{card.slug()}"
         if not git.branch_exists(branch):
             payload = {"landed": landed, "stopped_at": cid, "reason": f"no branch {branch}"}
             _emit_ctx(ctx, payload, "land")
             return EXIT_REFUSED
 
-        # Trial-merge in a throwaway worktree and verify before touching base.
+        # Trial-merge in a throwaway worktree inside 0700 state_dir/worktrees.
         import shutil
-        import tempfile
-        from .packs.base import pack_for
+        from .gates.checks import suite_green
 
-        trial_wt = Path(tempfile.mkdtemp(prefix=f"openfarm-land-{cid}-")).resolve()
-        shutil.rmtree(trial_wt, ignore_errors=True)
+        trial_wt = (ctx.state.worktrees / f"land-{cid}").resolve()
+        if trial_wt.exists():
+            git.worktree_remove(trial_wt)
+            shutil.rmtree(trial_wt, ignore_errors=True)
         try:
             git.worktree_add(trial_wt, f"refs/heads/{base}")
             trial_git = Git(trial_wt)
@@ -1817,16 +1954,19 @@ def cmd_land(ctx: Context, args) -> int:
                 _emit_ctx(ctx, payload, "land")
                 return EXIT_REFUSED
             if not dry_run:
-                lang = ctx.cfg.language_for_unit(card.unit) if hasattr(ctx.cfg, "language_for_unit") else ctx.cfg.languages[0]
-                pack = pack_for(lang, cargo_flags=ctx.cfg.cargo_flags, python=ctx.cfg.runner_python)
-                if hasattr(pack, "configure"):
-                    pack.configure(trial_wt)
+                pack = _configured_pack(ctx.cfg, trial_wt, unit=card.unit)
+                if hasattr(pack, "prepare_worktree"):
+                    pack.prepare_worktree(trial_wt)
                 test_argv = pack.commands("test", unit=card.unit if card.unit != "." else "")["argv"]
                 run_cmd = getattr(runner, "exec")
-                res = run_cmd("test", test_argv, cwd=trial_wt)
-                if not res.ok:
+                unit_env = ctx.cfg.runner_env.get(card.unit, {})
+                res = run_cmd("test", test_argv, cwd=trial_wt, env=unit_env or None)
+                parsed = pack.parse_tests(res.stdout, res.stderr)
+                gate = suite_green(parsed, ctx.cfg.known_failing)
+                if not res.ok or gate.result != "pass":
                     payload = {"landed": landed, "stopped_at": cid,
-                               "reason": f"suite gate failed on trial merge of {branch} (exit {res.exit_code})"}
+                               "reason": (f"suite gate failed on trial merge of {branch} "
+                                          f"(exit {res.exit_code}: {gate.detail})")}
                     _emit_ctx(ctx, payload, "land")
                     return EXIT_REFUSED
         finally:
@@ -1850,15 +1990,14 @@ def cmd_land(ctx: Context, args) -> int:
         if wt_path is not None and wt_path.resolve() != ctx.repo.resolve():
             git.worktree_remove(wt_path)
             shutil.rmtree(wt_path, ignore_errors=True)
-        mark_note = ""
         try:
             source.mark_done(cid, note=f"landed {branch} onto {base}")
         except Refused as exc:
-            mark_note = str(exc)
-        entry = {"card": cid, "branch": branch, "merged": True, "base": base}
-        if mark_note:
-            entry["note"] = mark_note
-        landed.append(entry)
+            payload = {"landed": landed, "stopped_at": cid,
+                       "reason": f"merged {branch} onto {base} but mark_done failed: {exc}"}
+            _emit_ctx(ctx, payload, "land")
+            return EXIT_REFUSED
+        landed.append({"card": cid, "branch": branch, "merged": True, "base": base})
 
     payload = {"landed": landed, "count": len(landed), "base": base, "dry_run": dry_run}
     if ctx.json:
@@ -2479,10 +2618,10 @@ def cmd_swarm(ctx: Context, args) -> int:
 # -- the parser ----------------------------------------------------------------
 
 _CLI_EPILOG = """\
-Command groups (22 commands):
+Command groups (27 commands):
   Setup & Auth         init, adopt, install-skill, acp
-  Run & Monitor        check, run, status, pause, resume, stop, tui
-  Review & Harness     dossier, verdict, done, release, escape, supervise, harness
+  Run & Monitor        auto, check, run, status, pause, resume, stop, tui
+  Review & Harness     triage, review, land, frontier-review, dossier, verdict, done, release, escape, supervise, harness
   Swarm, Board & Bench swarm, board, drive, bench
 
 Common workflows:
@@ -2788,6 +2927,29 @@ def build_parser() -> argparse.ArgumentParser:
     bench_run.add_argument("--dry-run", action="store_true",
                            help="scripted answers from each task's script.json; costs nothing")
 
+    triage_p = sub.add_parser(
+        "triage",
+        help="score card complexity (low/medium/high/split) and recommend profiles",
+    )
+    triage_p.add_argument("cards", nargs="*", help="optional card ids (default: all ready cards)")
+    triage_p.add_argument("--apply", action="store_true",
+                          help="write Complexity and Profile fields back to card files")
+    triage_p.add_argument("--heuristic", action="store_true",
+                          help="score deterministically without calling a frontier model")
+    triage_p.add_argument("--script", default=None,
+                          help="optional JSON script file for offline frontier triage")
+
+    frev_p = sub.add_parser(
+        "frontier-review",
+        help="run a mixture-of-frontiers review across multiple providers",
+    )
+    frev_p.add_argument("--scope", choices=("card", "diff", "repo"), default="diff")
+    frev_p.add_argument("target", nargs="?", default="", help="optional card id or git ref")
+    frev_p.add_argument("--providers", default="claude,codex",
+                        help="comma-separated provider names (default: claude,codex)")
+    frev_p.add_argument("--script", default=None,
+                        help="optional JSON script file mapping provider -> response")
+
     init = sub.add_parser(
         "init",
         help="scaffold a new openfarm Rust project",
@@ -2874,6 +3036,16 @@ def build_parser() -> argparse.ArgumentParser:
     acp.add_argument("--email", default="", help="pre-populate login email")
     acp.add_argument("--setup-token", action="store_true",
                      help="run `claude setup-token` for long-lived CLAUDE_CODE_OAUTH_TOKEN")
+
+    auto_p = sub.add_parser(
+        "auto",
+        help="context-aware automode landing & command palette (default when running bare `openfarm` on a TTY)",
+    )
+    auto_p.add_argument("--once", action="store_true",
+                        help="print detected workspace state, next action, and palette without starting curses")
+    auto_p.add_argument("--run", dest="run_id", default=None)
+    auto_p.add_argument("--refresh", type=float, default=1.0)
+    auto_p.add_argument("--view", default="overview")
 
     tui_p = sub.add_parser(
         "tui",
@@ -3178,6 +3350,22 @@ def cmd_acp(args) -> int:
     return EXIT_OK
 
 
+def cmd_auto(args) -> int:
+    """Automode landing state (`--once` / `--json`) or interactive Automode TUI."""
+    from .automode import detect_workspace_state, render_automode_summary
+
+    root = Path(args.repo).expanduser().resolve()
+    cfg_path = Path(args.config) if getattr(args, "config", None) else None
+    if getattr(args, "once", False) or getattr(args, "json", False):
+        state = detect_workspace_state(root, cfg_path)
+        if getattr(args, "json", False):
+            print(json.dumps(state, indent=2))
+        else:
+            print(render_automode_summary(state))
+        return EXIT_OK
+    return cmd_tui(args)
+
+
 def cmd_tui(args) -> int:
     if args.refresh is not None and args.refresh <= 0:
         raise UsageError("--refresh must be positive")
@@ -3226,6 +3414,7 @@ def cmd_drive(ctx: Context, args) -> int:
 
 PRE_CONFIG_COMMANDS = {
     "adopt": cmd_adopt,
+    "auto": cmd_auto,
     "bench": cmd_bench,
     "init": cmd_init,
     "install-skill": cmd_install_skill,
@@ -3244,6 +3433,8 @@ COMMANDS = {
     "done": cmd_done,
     "review": cmd_review,
     "land": cmd_land,
+    "triage": cmd_triage,
+    "frontier-review": cmd_frontier_review,
     "dossier": cmd_dossier,
     "check": cmd_check,
     "verdict": cmd_verdict,
@@ -3368,6 +3559,13 @@ def main(argv: list[str] | None = None) -> int:
     if not args.command:
         if want_json:
             return _emit_error("usage error", "no subcommand specified", EXIT_USAGE)
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            from types import SimpleNamespace
+            tui_args = SimpleNamespace(
+                repo=args.repo, config=args.config, json=False,
+                run_id=None, refresh=1.0, once=False, view="overview",
+            )
+            return cmd_tui(tui_args)
         parser.print_help()
         return EXIT_USAGE
 

@@ -1826,6 +1826,12 @@ class Micromanager:
                         "methods and arrows whose whole body is one "
                         f"`throw new Error(...)` ({problem})",
                     )
+            elif edit.path.endswith(".go"):
+                if "panic(" not in body:
+                    raise Refused(
+                        "scaffold-missing-todo",
+                        f"{edit.path}: Go production scaffold must contain `panic(...)` stubs only",
+                    )
             elif not _valid_production_scaffold(body):
                 raise Refused(
                     "scaffold-missing-todo",

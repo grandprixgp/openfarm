@@ -14,6 +14,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import uuid
 from pathlib import Path
@@ -294,8 +295,13 @@ class NativeAgyAcpServer:
         hold = session.get("hold")
         if hold is None:
             return argv
+        session_dir = session["cwd"]
+        if str(session.get("tool_policy") or "none") == "none":
+            empty = Path(tempfile.mkdtemp(prefix="openfarm-agy-empty-")).resolve()
+            session.setdefault("_temp_dirs", []).append(empty)
+            session_dir = str(empty)
         return confine_lib.bridge_child_argv(
-            argv, hold, session.get("confine_meta"), session_dir=session["cwd"])
+            argv, hold, session.get("confine_meta"), session_dir=session_dir)
 
     def _run_prompt(self, req_id: object, params: dict) -> None:
         sid = str(params.get("sessionId") or "")

@@ -220,18 +220,27 @@ class DirectRunner:
 
         started = time.monotonic()
         try:
-            completed = subprocess.run(
-                run_argv, cwd=str(cwd or self.repo), capture_output=True, text=True,
-                env=run_env, timeout=timeout_s or self.timeout_s)
-            stdout = completed.stdout or ""
-            stderr = completed.stderr or ""
-            exit_code = completed.returncode
-            timed_out = False
-        except subprocess.TimeoutExpired as exc:
-            stdout = _decode_output(exc.stdout)
-            stderr = _decode_output(exc.stderr)
-            exit_code = -1
-            timed_out = True
+            proc = subprocess.Popen(
+                run_argv, cwd=str(cwd or self.repo),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, env=run_env, start_new_session=True)
+            try:
+                stdout, stderr = proc.communicate(timeout=timeout_s or self.timeout_s)
+                stdout = stdout or ""
+                stderr = stderr or ""
+                exit_code = proc.returncode
+                timed_out = False
+            except subprocess.TimeoutExpired:
+                import signal
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except OSError:
+                    proc.kill()
+                out_raw, err_raw = proc.communicate()
+                stdout = _decode_output(out_raw)
+                stderr = _decode_output(err_raw)
+                exit_code = -1
+                timed_out = True
         except OSError as exc:
             raise Infra("spawn-failed", f"{argv[0]} could not start: {exc}") from exc
 
@@ -361,10 +370,17 @@ def open_runner(cfg, worktree: Path, output_dir: Path | None = None,
                 raise Refused("runner-confine-unavailable",
                               f'[runner] confine = "bwrap", but bubblewrap is not usable '
                               f'here ({why}); install it or set confine = "off"')
-            key_file = getattr(cfg, "key_file", None)
+            hide: list[str] = []
+            for p in (getattr(cfg, "key_file", None),
+                      getattr(cfg, "state_dir", None),
+                      getattr(getattr(cfg, "micromanager", None), "auth_file", None)):
+                if p:
+                    hide.append(str(p))
+            confine_net = str(getattr(cfg, "runner_confine_network", "off") or "off")
+            net_arg = "off" if confine_net == "on" else "on"
             confine = {"write_roots": list(getattr(cfg, "runner_write_roots", []) or []),
-                       "hide_paths": [str(key_file)] if key_file else [],
-                       "network": str(getattr(cfg, "runner_confine_network", "off") or "off")}
+                       "hide_paths": hide,
+                       "network": net_arg}
         return DirectRunner(worktree, output_dir=output_dir,
                             limiter=limiter, budget=budget, confine=confine)
     if spec.startswith("cmd:"):

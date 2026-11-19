@@ -191,8 +191,7 @@ class FileCardSource:
                         checker.reset_hard(target)
 
             (self.worktree / self.folder).mkdir(parents=True, exist_ok=True)
-            if created:
-                self._seed_from_base()
+            self._seed_from_base()
             return self.worktree
 
     def _seed_from_base(self) -> None:
@@ -204,10 +203,12 @@ class FileCardSource:
             return
         copied = 0
         for path in sorted(source.glob("*.md")):
+            if path.is_symlink():
+                continue
             target = self.worktree / self.folder / path.name
             if target.exists():
                 continue
-            shutil.copy2(path, target)
+            shutil.copy2(path, target, follow_symlinks=False)
             copied += 1
         if copied:
             Git(self.worktree).commit_all(
@@ -222,7 +223,11 @@ class FileCardSource:
     # -- reading -------------------------------------------------------------
 
     def _path(self, card_id: str) -> Path:
-        return self.cards_dir / f"{card_id}.md"
+        cid = str(card_id or "")
+        if (not cid or "/" in cid or "\\" in cid or "\x00" in cid
+                or cid in (".", "..") or ".." in cid):
+            raise Invalid("bad-card-id", f"invalid card id {card_id!r}")
+        return self.cards_dir / f"{cid}.md"
 
     def _read_raw(self, card_id: str) -> tuple[dict, str, Path]:
         path = self._path(card_id)

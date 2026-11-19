@@ -537,11 +537,42 @@ def _read_cards_readonly(ctx: TuiContext) -> tuple[list[Card], str]:
     cards_branch = getattr(ctx.cfg, "cards_branch", "openfarm-cards")
 
     if git.ref_exists(f"refs/heads/{cards_branch}"):
-        from .adapters.files import open_file_source
+        from .cards import CARD_FIELDS, OPTIONAL_CARD_FIELDS, extract_fenced_fields
 
-        fsource = open_file_source(ctx.cfg, ctx.state.root)
-        fsource.prepare()
-        return fsource.all_cards(), "cards-source"
+        cards: list[Card] = []
+        ls = git._run(["ls-tree", "--name-only", f"refs/heads/{cards_branch}", f"{folder}/"], check=False)
+        if ls.returncode == 0:
+            for rel in sorted(line.strip() for line in ls.stdout.splitlines() if line.strip().endswith(".md")):
+                blob = git._run(["show", f"refs/heads/{cards_branch}:{rel}"], check=False)
+                if blob.returncode != 0:
+                    continue
+                try:
+                    header, body = parse_card_file(blob.stdout)
+                    if not header.get("id"):
+                        header["id"] = Path(rel).stem
+                    merged = dict(header)
+                    fields_block = getattr(ctx.cfg, "cards_fields_block", "")
+                    if fields_block == "toml":
+                        block_fields, body = extract_fenced_fields(body, fields_block)
+                        if block_fields:
+                            merged = {**block_fields, **header}
+                    fields = {k: merged[k] for k in (*CARD_FIELDS, *OPTIONAL_CARD_FIELDS) if k in merged}
+                    deps = [str(d) for d in merged.get("depends", merged.get("deps", [])) or []]
+                    touches = [str(t) for t in merged.get("touches", []) or []]
+                    cards.append(Card.from_dict({
+                        "id": str(merged["id"]),
+                        "title": str(merged.get("title", merged["id"])),
+                        "state": str(merged.get("state", "ready")),
+                        "unit": str(merged.get("unit", ".")),
+                        "touches": touches,
+                        "depends": deps,
+                        "tests": merged.get("tests") or [],
+                        "fields": fields,
+                        "body": body,
+                    }))
+                except (OSError, ValueError, KeyError, TypeError) as exc:
+                    _ = exc
+        return cards, "cards-source"
     if cards_dir.is_dir():
         source_mode = "cards-source"
         scan_dir = cards_dir
@@ -733,8 +764,10 @@ def _render_team_and_board_section(
             tok = m.get("tokens")
             if isinstance(tok, dict):
                 tok_total = int(tok.get("in", 0) or 0) + int(tok.get("out", 0) or 0)
+            elif tok is not None:
+                tok_total = int(tok or 0)
             else:
-                tok_total = int(tok or 0) + int(m.get("tokens_in", 0) or 0) + int(m.get("tokens_out", 0) or 0)
+                tok_total = int(m.get("tokens_in", 0) or 0) + int(m.get("tokens_out", 0) or 0)
             team_rows.append(
                 {
                     "member": m.get("name", name),
@@ -2306,12 +2339,20 @@ def _uninstall_routers() -> None:
 @contextlib.contextmanager
 def _capture_streams(out_buf, err_buf):
     """Capture this thread's command output, routers or not."""
-    if isinstance(sys.stdout, _OutputRouter) and isinstance(sys.stderr, _OutputRouter):
-        with sys.stdout.capture(out_buf), sys.stderr.capture(err_buf):
+    prev_cap = os.environ.get("OPENFARM_TUI_CAPTURE")
+    os.environ["OPENFARM_TUI_CAPTURE"] = "1"
+    try:
+        if isinstance(sys.stdout, _OutputRouter) and isinstance(sys.stderr, _OutputRouter):
+            with sys.stdout.capture(out_buf), sys.stderr.capture(err_buf):
+                yield
+            return
+        with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
             yield
-        return
-    with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
-        yield
+    finally:
+        if prev_cap is None:
+            os.environ.pop("OPENFARM_TUI_CAPTURE", None)
+        else:
+            os.environ["OPENFARM_TUI_CAPTURE"] = prev_cap
 
 
 class _LineSink:

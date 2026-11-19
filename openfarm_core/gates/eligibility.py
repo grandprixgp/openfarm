@@ -37,7 +37,7 @@ DESIGN_WORDS = ("decide how", "design", "choose an approach", "figure out how")
 
 _SOURCE_CONTAINERS = ("src", "tests", "benches", "examples")
 #: A folder holding one of these is a unit: a crate, a Python project, a package.
-_UNIT_MANIFESTS = ("Cargo.toml", "package.json", "tsconfig.json", "pyproject.toml", "setup.py")
+_UNIT_MANIFESTS = ("Cargo.toml", "package.json", "tsconfig.json", "pyproject.toml", "setup.py", "go.mod")
 
 
 class EligibilityResult:
@@ -233,21 +233,23 @@ def check_eligibility(card: Card, cfg, deps_done: bool = True,
                     "a pinned-bugfix or test-backfill card may not declare new "
                     "symbols: only pattern, mechanical, small-feature, feature, "
                     "refactor, integration and port may")
-    if cfg.rust_tests_in_separate_files and "rust" in cfg.languages:
+    card_lang = (cfg.language_for_unit(card.unit)
+                 if hasattr(cfg, "language_for_unit") else (cfg.languages[0] if cfg.languages else "rust"))
+    if cfg.rust_tests_in_separate_files and card_lang == "rust":
         for test in card.tests:
             if test.file and not _is_integration_test_file(test.file):
                 result.fail(
                     "rust-tests-in-separate-files",
                     f"test {test.name!r} is declared in {test.file!r}; pilot tests "
                     f"go in a crate's tests/ folder")
-    if getattr(cfg, "python_tests_in_test_files", True) and "python" in cfg.languages:
+    if getattr(cfg, "python_tests_in_test_files", True) and card_lang in ("python", "py"):
         for test in card.tests:
             if test.file and not _is_python_test_file(test.file):
                 result.fail(
                     "python-tests-in-test-files",
                     f"test {test.name!r} is declared in {test.file!r}; Python card "
                     f"tests go in tests/test_<subject>.py")
-    if _uses_typescript(cfg):
+    if card_lang in ("typescript", "ts", "javascript", "js"):
         _check_typescript(card, cfg, root, result)
         from ..packs.typescript import test_file_problem
 

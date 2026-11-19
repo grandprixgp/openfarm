@@ -77,7 +77,7 @@ categories = ["pinned-bugfix"]
         apply_supervision_profile(cfg_strict, "strict")
         self.assertEqual(cfg_strict.mutation, "required")
         self.assertEqual(cfg_strict.runner_confine, "bwrap")
-        self.assertEqual(cfg_strict.runner_confine_network, "off")
+        self.assertEqual(cfg_strict.runner_confine_network, "on")
         self.assertEqual(cfg_strict.counter_tests, "reject")
 
         with self.assertRaises(ConfigError):

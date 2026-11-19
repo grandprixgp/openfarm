@@ -63,7 +63,7 @@ def _git_lock_for(cwd: Path) -> threading.RLock:
 ALLOWED_SUBCOMMANDS = frozenset({
     "init", "add", "commit", "status", "diff", "rev-parse", "rev-list",
     "checkout", "switch", "branch", "worktree", "merge", "merge-base", "reset",
-    "clean", "ls-files", "show", "cat-file", "hash-object", "for-each-ref",
+    "clean", "ls-files", "ls-tree", "show", "cat-file", "hash-object", "for-each-ref",
     "update-ref", "symbolic-ref", "log", "config", "stash", "rm", "mv",
     "describe", "tag", "apply", "restore",
 })
@@ -203,7 +203,8 @@ class Git:
         env.update(self.extra_env)
         try:
             result = subprocess.run(
-                ["git", *args], cwd=self.cwd, capture_output=True, text=True,
+                ["git", "-c", "core.hooksPath=/dev/null", *args],
+                cwd=self.cwd, capture_output=True, text=True,
                 env=env, timeout=timeout)
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise Infra("git-failed", f"git {args[0]} could not run: {exc}") from exc

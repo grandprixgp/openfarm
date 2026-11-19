@@ -69,14 +69,14 @@ def _origin(url: str) -> str:
 def _within(url: str, allowed: list[str]) -> bool:
     """True when `url` is one of the allowed endpoints or sits strictly under one."""
     target = urllib.parse.urlsplit(url)
-    if not target.scheme or not target.netloc or target.fragment:
+    target_scheme = target.scheme.lower()
+    if target_scheme not in ("http", "https") or not target.netloc or target.fragment:
         return False
-    if "\\" in target.path:
+    if "\\" in target.path or "%2f" in target.path.lower() or "%5c" in target.path.lower():
         return False
     target_segs = [seg for seg in target.path.split("/") if seg]
     if any(urllib.parse.unquote(seg) in (".", "..") for seg in target_segs):
         return False
-    target_scheme = target.scheme.lower()
     target_netloc = target.netloc.lower()
 
     for entry in allowed:

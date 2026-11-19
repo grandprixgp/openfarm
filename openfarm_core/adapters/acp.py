@@ -528,7 +528,7 @@ def _sanitised_env(
                 and bool(str(val or "").strip())
             )
         if prov == "claude":
-            if key == "ANTHROPIC_API_KEY" and auth_mode == "oauth" and auth_file is None:
+            if key == "ANTHROPIC_API_KEY" and (auth_mode == "oauth" or auth_file is not None):
                 return False
         elif prov == "antigravity":
             if key in ("GEMINI_API_KEY", "GOOGLE_API_KEY") and (auth_mode == "oauth" or auth_file is not None):
@@ -587,7 +587,7 @@ def _sanitised_env(
                 deny_rules = [
                     f"{tool}({pat})"
                     for pat in deny_patterns
-                    for tool in ("Read", "Edit", "Write")
+                    for tool in ("Read", "Edit", "Write", "Grep", "Glob")
                 ]
 
                 settings: dict[str, object] = {
@@ -1895,6 +1895,24 @@ class ClaudeAcpAdapter:
                         all_ok = False
                         reason = why
                         break
+                    if tool_kind == "search" and session_root is not None:
+                        try:
+                            cand = Path(p)
+                            if not cand.is_absolute():
+                                cand = (session_root / cand).resolve()
+                            else:
+                                cand = cand.resolve()
+                            if cand.is_dir():
+                                rel = cand.relative_to(session_root.resolve()).as_posix()
+                                tree_pat = "**" if rel in ("", ".") else f"{rel}/**"
+                                from ..globs import globs_overlap
+                                protected = (*_DEFAULT_FORBIDDEN_FILES, *self.forbidden_files, *self.never_touch)
+                                if any(globs_overlap(tree_pat, pat) for pat in protected if pat):
+                                    all_ok = False
+                                    reason = "search-overlaps-protected"
+                                    break
+                        except (OSError, ValueError):
+                            pass
                 if all_ok:
                     allow = True
                     reason = "read-only-contained"
@@ -2008,19 +2026,20 @@ class ClaudeAcpAdapter:
         self.last_usage = AcpUsage()
         if self._proc is None or self._proc.poll() is not None:
             raise Infra("acp-not-running", "ACP subprocess is not running")
-        if self._isolated_home is not None and self._cred_source is not None:
+        if (self._isolated_home is not None and self._cred_source is not None
+                and self.auth_file is None and self.auth_mode in ("oauth", "auto")):
             try:
                 ref_res, new_bytes = logins.refresh_isolated(
                     self.provider,
                     isolated_home=self._isolated_home,
                     source=self._cred_source,
-                    initial=self._cred_initial,
+                    initial=self._initial_creds_bytes,
                     pinned=self._cred_pin,
                 )
                 if ref_res.status == "refreshed":
-                    self._cred_initial = new_bytes
-            except Exception:  # noqa: BLE001 - best-effort mid-run refresh
-                pass
+                    self._initial_creds_bytes = new_bytes
+            except Exception as exc:  # noqa: BLE001 - best-effort mid-run refresh
+                _ = exc
 
         req_id = self._next_id()
         started = time.monotonic()

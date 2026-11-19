@@ -126,7 +126,6 @@ def _default_for(field: str):
                  "micromanager_calls", "micromanager_tokens_in",
                  "micromanager_tokens_in_fresh", "micromanager_tokens_in_cached",
                  "tokens_in_fresh", "tokens_in_cached",
-    "micromanager_tokens_in_fresh", "micromanager_tokens_in_cached",
                  "micromanager_tokens_out", "false_rejects_dismissed",
                  "harness_revision"):
         return 0

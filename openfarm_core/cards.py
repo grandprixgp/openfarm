@@ -68,6 +68,8 @@ OPTIONAL_CARD_FIELDS = (
     "context_files",
     "type_changes",
     "replan_if",
+    "complexity",
+    "profile",
 )
 
 _OPENFARM_BLOCK_RE = re.compile(

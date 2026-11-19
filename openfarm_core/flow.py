@@ -417,6 +417,9 @@ class CardRun:
             cur = {
                 "calls": int(getattr(mm_budget, "calls", 0) or 0),
                 "tokens_in": int(getattr(mm_budget, "tokens_in", 0) or 0),
+                "tokens_in": int(getattr(mm_budget, "tokens_in", 0) or 0),
+                "tokens_in_fresh": int(getattr(mm_budget, "tokens_in_fresh", 0) or 0),
+                "tokens_in_cached": int(getattr(mm_budget, "tokens_in_cached", 0) or 0),
                 "tokens_out": int(getattr(mm_budget, "tokens_out", 0) or 0),
                 "spend": float(getattr(mm_budget, "spend", 0.0) or 0.0),
                 "false_rejects_dismissed": int(
@@ -427,6 +430,12 @@ class CardRun:
             "calls": max(0, int(cur.get("calls", 0)) - int(start.get("calls", 0))),
             "tokens_in": max(
                 0, int(cur.get("tokens_in", 0)) - int(start.get("tokens_in", 0))
+            ),
+            "tokens_in_fresh": max(
+                0, int(cur.get("tokens_in_fresh", 0)) - int(start.get("tokens_in_fresh", 0))
+            ),
+            "tokens_in_cached": max(
+                0, int(cur.get("tokens_in_cached", 0)) - int(start.get("tokens_in_cached", 0))
             ),
             "tokens_out": max(
                 0, int(cur.get("tokens_out", 0)) - int(start.get("tokens_out", 0))
@@ -1760,6 +1769,10 @@ class CardRun:
             self.stop_code = StopCode.INFRA
             self.detail = exc.message
             final_state = "blocked"
+        except Exception as exc:
+            self.stop_code = StopCode.INFRA
+            self.detail = f"unexpected error ({type(exc).__name__}): {exc}"
+            final_state = "blocked"
         finally:
             self.budget.stop_clock()
             self.ended_at = utc_now()
@@ -2003,7 +2016,17 @@ class CardRun:
             counter_failed = int((self.counter_summary or {}).get("failed", 0) or 0)
             max_lines = int(getattr(self.cfg.micromanager, "pre_review_max_lines", 60) or 60)
             low_risk = ("pinned-bugfix", "test-backfill", "mechanical", "pattern", "small-feature")
+            has_flagged = any(
+                g.name == "banned-patterns" and bool((g.evidence or {}).get("flagged"))
+                for g in (getattr(self, "gates", None) or ())
+            )
+            cp2 = getattr(self, "checker_pass2", None)
+            checker_requested = (
+                isinstance(cp2, dict)
+                and str(cp2.get("verdict") or "").lower() == "changes-requested"
+            )
             if (impl_attempts <= 1 and counter_failed == 0 and not self.handbacks
+                    and not has_flagged and not checker_requested
                     and (added + removed) <= max_lines
                     and self.card.category in low_risk):
                 return (
@@ -3871,6 +3894,7 @@ class CardRun:
 
     def _checker(self, changed: list[str], full_diff: str,
                  allow_bounce: bool = False) -> tuple[str, str, str, str] | None:
+        restatement = None
         if getattr(self.cfg, "checker_mode", "two-pass") == "single-pass":
             self.checker_pass1 = {"skipped": True, "mode": "single-pass"}
             self._record_gate(GateResult(
@@ -3963,8 +3987,9 @@ class CardRun:
         brief2 = checker_pass2_brief(
             self.card, full_diff, gate_list, modified,
             handback=self.swarm_on, answer_form=answer_form)
+        pass2_first = 1 if getattr(self.cfg, "checker_mode", "two-pass") == "single-pass" else 2
         call2, limit_err = self._call_role_with_handbacks(
-            "checker_pass2", brief2, first_attempt=2, response_name="checker-pass2")
+            "checker_pass2", brief2, first_attempt=pass2_first, response_name="checker-pass2")
         if limit_err is not None:
             self._checker_handback_limit("checker-pass2", limit_err)
         answer = parse_pass2(call2.content, cut_off=call2.cut_off)
@@ -4134,6 +4159,10 @@ class CardRun:
         ext = self._extension()
         # Python test files are found by their `test_` prefix, TypeScript ones by
         # their `.test` suffix (the pack's own test-file rule).
+        if ext == ".go":
+            pkg_dir = unit.strip("/") if unit and unit != "." and (self.worktree / unit).is_dir() else ""
+            fname = f"openfarm_counter_{index}_test.go"
+            return f"{pkg_dir}/{fname}" if pkg_dir else fname
         stem = (f"test_openfarm_counter_{index}" if ext == ".py"
                 else f"openfarm_counter_{index}.test" if ext == ".ts"
                 else f"openfarm_counter_{index}")

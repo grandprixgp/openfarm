@@ -1374,14 +1374,16 @@ def apply_supervision_profile(cfg: Config, profile: str) -> None:
         cfg.checker_mode = "single-pass"
         cfg.counter_tests = "reject"
         cfg.mutation = "report"
-        cfg.runner_confine = "off"
+        if cfg.runner_confine != "bwrap":
+            cfg.runner_confine = "off"
     elif name == "balanced":
         cfg.micromanager.shape_when = "always"
         cfg.micromanager.pre_review_when = "always"
         cfg.checker_mode = "two-pass"
         cfg.counter_tests = "reject"
         cfg.mutation = "report"
-        cfg.runner_confine = "off"
+        if cfg.runner_confine != "bwrap":
+            cfg.runner_confine = "off"
     elif name == "strict":
         cfg.micromanager.shape_when = "always"
         cfg.micromanager.pre_review_when = "always"
@@ -1389,7 +1391,7 @@ def apply_supervision_profile(cfg: Config, profile: str) -> None:
         cfg.counter_tests = "reject"
         cfg.mutation = "required"
         cfg.runner_confine = "bwrap"
-        cfg.runner_confine_network = "off"
+        cfg.runner_confine_network = "on"
 
 
 def load_config(repo: Path, path: Path | None = None) -> Config:

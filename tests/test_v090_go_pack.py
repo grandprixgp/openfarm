@@ -46,10 +46,13 @@ class GoPackUnitTests(unittest.TestCase):
         run_arg = filtered[filtered.index("-run") + 1]
         self.assertIn("TestAdd", run_arg)
         self.assertIn("TestSub", run_arg)
+        pack.has_gofmt = True
         fmt = pack.commands("format", files=["pkg/a.go"])["argv"]
         self.assertEqual(fmt, ["gofmt", "-w", "pkg/a.go"])
         fmt_check = pack.commands("fmt-check", files=["pkg/a.go"])["argv"]
         self.assertIn("pkg/a.go", fmt_check)
+        pack.has_gofmt = False
+        self.assertEqual(pack.commands("format", files=["pkg/a.go"])["argv"][-1], "pass")
 
     def test_parse_tests_ndjson_pass_fail_skip(self) -> None:
         pack = pack_for("go")

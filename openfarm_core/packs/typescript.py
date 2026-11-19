@@ -799,13 +799,18 @@ def link_node_modules(worktree: Path, base: Path) -> str:
         return ""
     if target.is_symlink() or (target.exists() and not (target / _LINK_MARKER).exists()):
         return ""
+    if os.path.islink(target / _LINK_MARKER):
+        return "node_modules is not linked into card worktrees: marker is a symlink"
     try:
         from ..git import Git
         if Git(base).untracked_files(["node_modules"]):
             return ("node_modules is not linked into card worktrees: git does not "
                     "ignore it in the base checkout")
         target.mkdir(exist_ok=True)
-        (target / _LINK_MARKER).write_text("links made by openfarm\n")
+        marker_path = target / _LINK_MARKER
+        fd = os.open(marker_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write("links made by openfarm\n")
         for entry in sorted(source.iterdir()):
             link = target / entry.name
             if not (link.exists() or link.is_symlink()):
@@ -984,18 +989,24 @@ class TypeScriptPack(OwnMutationMixin, Pack):
             if self.runner == "vitest":
                 bin_cmd = self.runner_bin or "vitest"
                 argv = [bin_cmd, "run", "--reporter=json"]
-                if name_pattern:
-                    argv += ["-t", name_pattern]
+                if tests:
+                    vj_pat = r"(?:^|\s)(?:" + "|".join(re.escape(str(t)) for t in tests) + r")$"
+                    argv += ["-t", vj_pat]
                 if files:
                     argv += [str(f) for f in files]
+                elif top != ".":
+                    argv.append(top)
                 return {"argv": argv + extra}
             if self.runner == "jest":
                 bin_cmd = self.runner_bin or "jest"
                 argv = [bin_cmd, "--json", "--ci"]
-                if name_pattern:
-                    argv += ["-t", name_pattern]
+                if tests:
+                    vj_pat = r"(?:^|\s)(?:" + "|".join(re.escape(str(t)) for t in tests) + r")$"
+                    argv += ["-t", vj_pat]
                 if files:
                     argv += [str(f) for f in files]
+                elif top != ".":
+                    argv.append(top)
                 return {"argv": argv + extra}
             if self.runner != "node":
                 raise Invalid(
@@ -2929,20 +2940,27 @@ def _extract_json_object(text: str) -> dict | None:
         return None
     try:
         parsed = json.loads(raw)
-        if isinstance(parsed, dict):
+        if isinstance(parsed, dict) and isinstance(parsed.get("testResults"), list):
             return parsed
     except ValueError:
         pass
-    start = raw.find("{")
-    end = raw.rfind("}")
-    if start >= 0 and end > start:
+    decoder = json.JSONDecoder()
+    idx = 0
+    best: dict | None = None
+    while True:
+        pos = raw.find("{", idx)
+        if pos < 0:
+            break
         try:
-            parsed = json.loads(raw[start:end + 1])
-            if isinstance(parsed, dict):
-                return parsed
+            obj, end = decoder.raw_decode(raw, pos)
+            if isinstance(obj, dict):
+                if isinstance(obj.get("testResults"), list):
+                    return obj
+                best = obj
+            idx = end
         except ValueError:
-            pass
-    return None
+            idx = pos + 1
+    return best
 
 
 def _parse_jest_vitest_json(stdout: str, stderr: str, runner: str,

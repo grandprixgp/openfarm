@@ -358,7 +358,9 @@ def initialize_project(
     ):
         folder.mkdir(parents=True, exist_ok=True)
     os.chmod(resolved_state, 0o700)
-    os.chmod(resolved_key.parent, 0o700)
+    key_parent = resolved_key.parent.resolve()
+    if str(key_parent) not in ("/", "/tmp", "/var/tmp"):
+        os.chmod(key_parent, 0o700)
 
     acp_label = {"claude": "Claude", "antigravity": "Antigravity", "codex": "Codex"}[resolved_acp_provider]
     acp_cmd_hint = (

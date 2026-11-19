@@ -3,7 +3,7 @@ name: openfarm-initialize
 description: >-
   Initialize a new software project from an empty directory and a plain-English
   idea (invoked via /openfarm-initialize <project_name> <project_idea> or when
-  starting a fresh app with Openfarm v0.9.0). Integrates /openfarm-grill-me
+  starting a fresh app with Openfarm v0.9.1). Integrates /openfarm-grill-me
   alignment, configures native Claude ACP via OAuth for Frontier + API key for
   Workers, scaffolds protected seams, a golden slice, and checked Wave cards.
 ---
