@@ -1,5 +1,5 @@
 ---
-description: Initialize a new Openfarm v0.8.7 project from an empty directory and plain-English idea
+description: Initialize a new Openfarm v0.8.8 project from an empty directory and plain-English idea
 argument-hint: <project_name> <project_idea>
 ---
 

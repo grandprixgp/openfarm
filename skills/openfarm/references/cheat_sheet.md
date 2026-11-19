@@ -1,4 +1,4 @@
-# Openfarm v0.8.7 Cheat Sheet
+# Openfarm v0.8.8 Cheat Sheet
 
 ## 22 CLI Subcommands (`--repo`, `--config`, `--json`)
 

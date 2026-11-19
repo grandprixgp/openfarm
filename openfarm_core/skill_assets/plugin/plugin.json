@@ -1,5 +1,5 @@
 {
   "name": "openfarm",
-  "description": "Openfarm v0.8.7 project initializer (/openfarm-initialize), openfarm-grill-me alignment, multi-provider Frontier ACP OAuth & Driver mode (Claude, Antigravity, Codex), deterministic wave orchestrator, multi-member swarm coordination, stdlib TUI, and recursive harness efficiency toolkit.",
+  "description": "Openfarm v0.8.8 project initializer (/openfarm-initialize), openfarm-grill-me alignment, multi-provider Frontier ACP OAuth & Driver mode (Claude, Antigravity, Codex), deterministic wave orchestrator, multi-member swarm coordination, stdlib TUI, and recursive harness efficiency toolkit.",
   "repository": "openfarm"
 }

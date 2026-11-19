@@ -4,5 +4,5 @@ The core holds no project's assumptions. Everything project-specific is in
 `.openfarm/config.toml` and the adapters it names.
 """
 
-__version__ = "0.8.7"
+__version__ = "0.8.8"
 SCHEMA_VERSION = 1
