@@ -1707,28 +1707,55 @@ def cmd_review(ctx: Context, args) -> int:
 
     for card in cards:
         branch = f"openfarm/{card.id}-{card.slug()}"
-        candidates = sorted(ctx.state.cards.glob(f"{card.id}/*/dossier.json"))
-        dossier_path = candidates[-1] if candidates else None
-        dossier = read_json(dossier_path) if dossier_path and dossier_path.exists() else {}
+        candidates = sorted(ctx.state.cards.glob(f"{card.id}/*/card-record.json"))
+        record_path = candidates[-1] if candidates else None
+        dossier_path = (record_path.parent / "dossier.md") if record_path else None
+        record = read_json(record_path) if record_path and record_path.exists() else {}
         diff_stat = ""
         if git.ref_exists(f"refs/heads/{base}") and git.branch_exists(branch):
             diff_text_out = git.diff(ref=f"{base}...{branch}")
             added = sum(1 for ln in diff_text_out.splitlines() if ln.startswith("+") and not ln.startswith("+++"))
             removed = sum(1 for ln in diff_text_out.splitlines() if ln.startswith("-") and not ln.startswith("---"))
             diff_stat = f"+{added} / -{removed}"
+        gates_list: list[dict] = []
+        if record_path is not None:
+            gates_dir = record_path.parent / "gates"
+            if gates_dir.is_dir():
+                for gp in sorted(gates_dir.rglob("*.json")):
+                    gdata = read_json(gp)
+                    if isinstance(gdata, dict) and "result" in gdata:
+                        gates_list.append(gdata)
+        if not gates_list and isinstance(record, dict) and isinstance(record.get("gates"), list):
+            gates_list = [g for g in record["gates"] if isinstance(g, dict)]
+        gates_pass = sum(1 for g in gates_list if g.get("result") == "pass")
+        gates_fail = sum(1 for g in gates_list if g.get("result") == "fail")
+        findings = []
+        if isinstance(record, dict):
+            mm = record.get("micromanager") or {}
+            if isinstance(mm, dict):
+                pr = mm.get("pre_review") or {}
+                if isinstance(pr, dict) and isinstance(pr.get("findings"), list):
+                    findings = [str(f) for f in pr["findings"][:5]]
         entry: dict = {
             "card": card.id,
             "title": card.title,
             "state": card.state,
             "branch": branch,
             "diff_stat": diff_stat,
+            "gates": {"pass": gates_pass, "fail": gates_fail},
+            "findings": findings,
             "dossier_path": str(dossier_path) if dossier_path else "",
             "verdict": "",
         }
         chosen = preset_verdict
         note = preset_note
-        if chosen is None and not ctx.json and sys.stdin.isatty():
+        import os
+        in_tui_capture = bool(os.environ.get("OPENFARM_TUI_CAPTURE"))
+        if chosen is None and not ctx.json and sys.stdin.isatty() and not in_tui_capture:
             print(f"\n=== {card.id}: {card.title} ({branch}, {diff_stat or 'no diff'}) ===")
+            print(f"    Gates: {gates_pass} pass, {gates_fail} fail | Dossier: {entry['dossier_path'] or 'none'}")
+            for finding in findings:
+                print(f"    Finding: {finding}")
             try:
                 ans = input("Verdict [a]pprove(clean) / [m]inor-fix / [b]ounce / [s]kip / [q]uit: ").strip().lower()
             except EOFError:
@@ -2507,10 +2534,10 @@ def cmd_swarm(ctx: Context, args) -> int:
 # -- the parser ----------------------------------------------------------------
 
 _CLI_EPILOG = """\
-Command groups (22 commands):
+Command groups (24 commands):
   Setup & Auth         init, adopt, install-skill, acp
   Run & Monitor        check, run, status, pause, resume, stop, tui
-  Review & Harness     dossier, verdict, done, release, escape, supervise, harness
+  Review & Harness     review, land, dossier, verdict, done, release, escape, supervise, harness
   Swarm, Board & Bench swarm, board, drive, bench
 
 Common workflows:
