@@ -385,8 +385,14 @@ def main(argv: list[str] | None = None) -> int:
             continue
         originals[rel] = data
         mtimes[rel] = (info.st_atime_ns, info.st_mtime_ns)
-        lines = set(wanted.get(rel) or ()) if wanted is not None else None
-        mutants = make(data.decode("utf-8", errors="replace"), lines or None)
+        if wanted is not None:
+            if rel in wanted and not wanted[rel]:
+                # Delete-only diff: 0 added/changed lines in this file -> 0 mutants.
+                continue
+            lines = set(wanted.get(rel) or ()) or None
+        else:
+            lines = None
+        mutants = make(data.decode("utf-8", errors="replace"), lines)
         plan.extend((rel, m) for m in mutants)
     total_found = len(plan)
     plan = spread(plan, args.max)
@@ -434,7 +440,8 @@ def main(argv: list[str] | None = None) -> int:
     counts = {k: sum(1 for r in results if r["outcome"] == k)
               for k in ("caught", "missed", "timeout", "unviable")}
     payload = {"tool": "openfarm-mutate", "lang": args.lang, "total": len(results),
-               "found": total_found, "capped": total_found > len(results), **counts,
+               "found": total_found, "capped": total_found > len(results),
+               "scoped": wanted is not None, **counts,
                "outcomes": results}
     (out_dir / "outcomes.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
     for r in results:
@@ -473,6 +480,7 @@ def read_outcomes(out_dir: Path | None, stdout: str, stderr: str, exit_code: int
     return {"killed": caught, "survived": missed, "timeout": int(payload.get("timeout", 0)),
             "unviable": int(payload.get("unviable", 0)), "total": int(payload.get("total", 0)),
             "judged": caught + missed, "capped": bool(payload.get("capped", False)),
+            "scoped": bool(payload.get("scoped", False)),
             "source": "openfarm-mutate"}
 
 

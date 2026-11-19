@@ -4139,6 +4139,10 @@ class CardRun:
         ext = self._extension()
         # Python test files are found by their `test_` prefix, TypeScript ones by
         # their `.test` suffix (the pack's own test-file rule).
+        if ext == ".go":
+            pkg_dir = unit.strip("/") if unit and unit != "." and (self.worktree / unit).is_dir() else ""
+            fname = f"openfarm_counter_{index}_test.go"
+            return f"{pkg_dir}/{fname}" if pkg_dir else fname
         stem = (f"test_openfarm_counter_{index}" if ext == ".py"
                 else f"openfarm_counter_{index}.test" if ext == ".ts"
                 else f"openfarm_counter_{index}")

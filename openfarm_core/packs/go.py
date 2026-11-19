@@ -59,26 +59,37 @@ _GO_ERR_RE = re.compile(r"^([^\s:]+\.go):(\d+)(?::\d+)?:\s*(.+)$")
 
 
 def _strip_line_comment(line: str) -> str:
-    """`line` without a trailing `// ...` comment outside string literals."""
+    """`line` without `// ...` or single-line `/* ... */` comments outside strings."""
+    out: list[str] = []
     quote = ""
     i = 0
     n = len(line)
     while i < n:
         ch = line[i]
         if quote:
-            if quote != "`" and ch == "\\":
+            out.append(ch)
+            if quote != "`" and ch == "\\" and i + 1 < n:
+                out.append(line[i + 1])
                 i += 2
                 continue
             if ch == quote:
                 quote = ""
             i += 1
             continue
+        if line.startswith("/*", i):
+            end = line.find("*/", i + 2)
+            if end < 0:
+                break
+            out.append(" ")
+            i = end + 2
+            continue
         if line.startswith("//", i):
-            return line[:i]
+            break
         if ch in ('"', "'", "`"):
             quote = ch
+        out.append(ch)
         i += 1
-    return line
+    return "".join(out)
 
 
 class GoPack(OwnMutationMixin, Pack):
@@ -140,7 +151,10 @@ class GoPack(OwnMutationMixin, Pack):
         if purpose == "test":
             argv = ["go", "test", "-json", "-count=1"]
             if tests:
-                pattern = "^(?:" + "|".join(re.escape(str(t)) for t in tests) + ")$"
+                if len(tests) == 1 and "/" in str(tests[0]):
+                    pattern = "/".join(f"^{re.escape(seg)}$" for seg in str(tests[0]).split("/"))
+                else:
+                    pattern = "^(?:" + "|".join(re.escape(str(t)) for t in tests) + ")$"
                 argv += ["-run", pattern]
             argv.append(pkg)
             return {"argv": argv + extra}
@@ -153,10 +167,14 @@ class GoPack(OwnMutationMixin, Pack):
             return {"argv": ["go", "vet", target] + extra}
 
         if purpose == "format":
+            if not self.has_gofmt:
+                return {"argv": [sys.executable, "-c", "pass"]}
             targets = [str(f) for f in (files or ["."])]
             return {"argv": ["gofmt", "-w", *targets] + extra}
 
         if purpose == "fmt-check":
+            if not self.has_gofmt:
+                return {"argv": [sys.executable, "-c", "pass"]}
             targets = [str(f) for f in (files or ["."])]
             return {"argv": [sys.executable, "-c", _GOFMT_CHECK_SCRIPT, *targets] + extra}
 

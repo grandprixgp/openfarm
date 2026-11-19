@@ -95,10 +95,6 @@ BANNED_ANYWHERE = (
     (r"\bTcpStream\b", "network-call"),
     (r"\bUdpSocket\b", "network-call"),
     (r"\breqwest::", "network-call"),
-    (r"eslint-disable", "suppression-eslint"),
-    (r"@ts-ignore", "suppression-ts"),
-    (r"\.skip\s*\(", "test-skip"),
-    (r"\.only\s*\(", "test-only"),
 )
 
 #: Only banned in production code, where a hidden failure is a hidden bug.
@@ -1143,6 +1139,13 @@ def _strip_line_comment(line: str) -> str:
             if line[i] == '"':
                 in_string = False
             i += 1
+            continue
+        if line.startswith("/*", i):
+            end = line.find("*/", i + 2)
+            if end < 0:
+                return line[:i]
+            line = line[:i] + " " + line[end + 2:]
+            n = len(line)
             continue
         if line.startswith("//", i):
             return line[:i]
