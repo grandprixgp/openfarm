@@ -164,6 +164,39 @@ class TuiModalsTests(unittest.TestCase):
         self.assertEqual(after["current_stage"]["id"], "wave")
         self.assertNotEqual(after["current_stage"]["action"], "grill")
 
+    def test_ensure_baseline_committed_handles_unborn_head_and_respects_user_edits(self) -> None:
+        from openfarm_core.automode import ensure_baseline_committed
+        from openfarm_core.git import Git
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "fresh-app"
+            repo.mkdir()
+            git = Git(repo)
+            git.init(branch="main")
+            git._run(["config", "user.name", "Test User"])
+            git._run(["config", "user.email", "test@example.invalid"])
+            (repo / ".openfarm").mkdir()
+            (repo / ".openfarm" / "PROJECT_SPEC.md").write_text("# Spec\n\nGoal\n")
+            (repo / "cards").mkdir()
+            (repo / "cards" / "W1-01.md").write_text("+++\nid = \"W1-01\"\n+++\n")
+            self.assertFalse(git.ref_exists("HEAD"))
+
+            # Unborn HEAD: commits initial baseline so `git rev-parse HEAD` works.
+            self.assertTrue(ensure_baseline_committed(repo))
+            self.assertTrue(git.ref_exists("HEAD"))
+            self.assertTrue(git.is_clean())
+
+            # Dirty only under .openfarm/ and cards/: auto-commits cleanly.
+            (repo / ".openfarm" / "GRILL_DECISIONS.md").write_text("# Decisions\n")
+            self.assertTrue(ensure_baseline_committed(repo))
+            self.assertTrue(git.is_clean())
+
+            # Dirty user source file when HEAD already exists: does NOT silently commit.
+            (repo / "src").mkdir()
+            (repo / "src" / "main.rs").write_text("fn main() {}\n")
+            self.assertFalse(ensure_baseline_committed(repo))
+            self.assertFalse(git.is_clean())
+
 
 if __name__ == "__main__":
     unittest.main()

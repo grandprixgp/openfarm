@@ -4453,7 +4453,7 @@ def _run_automode_step(stdscr, ctrl: TuiController, *, theme: dict[str, int] | N
         prov = (prov.strip().lower() or "claude")
         if prov not in ("claude", "codex", "antigravity"):
             prov = "claude"
-        cmd = f"init {shlex.quote(name)} --dir {shlex.quote(str(ctrl.repo))} --acp-provider {prov}"
+        cmd = f"init {shlex.quote(name)} --dir {shlex.quote(str(ctrl.repo))} --acp-provider {prov} --commit"
         if idea.strip():
             cmd += f" --idea {shlex.quote(idea.strip())}"
         ctrl.execute_command(cmd)
@@ -4493,6 +4493,9 @@ def _run_automode_step(stdscr, ctrl: TuiController, *, theme: dict[str, int] | N
         return True
 
     if action == "run":
+        from .automode import ensure_baseline_committed
+
+        ensure_baseline_committed(ctrl.repo)
         ctrl.execute_command("run --cards 3")
         return True
 
