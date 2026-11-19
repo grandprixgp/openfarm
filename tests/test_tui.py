@@ -927,7 +927,7 @@ class PrettifiedTuiThemeAndControllerTests(unittest.TestCase):
 
     def test_once_snapshots_include_unicode_chrome_bars_and_icons(self) -> None:
         ov_txt = render_snapshot(self.repo, view="overview")
-        self.assertIn("openfarm tui v0.8.6", ov_txt)
+        self.assertIn("openfarm tui v0.8.7", ov_txt)
         self.assertIn("╭─", ov_txt)
         self.assertIn("╰─", ov_txt)
         self.assertIn("█", ov_txt)
