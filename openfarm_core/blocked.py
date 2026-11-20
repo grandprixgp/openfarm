@@ -88,14 +88,19 @@ def triage(record: dict, earlier: list[dict] | None = None) -> dict:
     repeated = _same_way(record, list(earlier or []))
     # The reviewer's answer was lost (cut off, unreadable): the work was never judged, so no blame falls on it.
     unjudged = bool(counter.get("unreadable")) or "could not be read" in low
+    # The builder edited the tests it was given: its own slip, and a retry starts from the frozen tests again.
+    broke_tests = code == "refused" and low.startswith("changed:") and "test" in low
     if code in _CHECK_CODES or unjudged or (counter.get("failed") and code in ("checker-reject", "attempts")):
         kind = "check"
+    elif broke_tests and not repeated:
+        kind = "builder"
     elif code in _TASK_CODES or any(word in low for word in _TASK_WORDS) or repeated:
         kind = "task"
     else:
         kind = "builder"
     spec = KINDS[kind]
     plain = ("The reviewer's answer could not be read, so the work was never judged" if unjudged
+             else "The builder changed the tests it was given, which is not allowed" if broke_tests
              else _PLAIN.get(code, "The task stopped"))
     if repeated and kind == "task" and code not in _TASK_CODES:
         plain += ", the same way as last time"

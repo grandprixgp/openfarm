@@ -98,6 +98,11 @@ class FixTests(_Project):
         apply_fix_and_retry(self.store, "W1-01", fix)
         self.assertTrue(next(c for c in self.store.cards() if c.id == "W1-01").network)
 
+    def test_a_builder_that_edits_its_frozen_tests_gets_a_retry_not_a_task_fix(self) -> None:
+        got = triage({"stop_code": "refused", "detail": "changed: tests/server.test.ts", "attempts": 3})  # acceptance run
+        self.assertEqual((got["kind"], got["main_label"]), ("builder", "Retry"))
+        self.assertIn("changed the tests it was given", got["why"])
+
     def test_no_fix_is_said_plainly(self) -> None:
         self.store.change_card("W1-01", "create", header=_header("W1-01"), body=BODY)
         self.assertIsNone(propose_fix(self.root, self.cfg, self.store, "W1-01"))
