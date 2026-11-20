@@ -100,7 +100,7 @@ class CardRun:
                  log=None, micromanager=None,
                  harness_library: HarnessLibrary | None = None,
                  board=None, swarm=None, on_handback=None,
-                 on_struggling=None) -> None:
+                 on_struggling=None, on_event=None) -> None:
         self.card = card
         self.cfg = cfg
         self.state = state
@@ -114,7 +114,15 @@ class CardRun:
         self.telemetry = telemetry
         self.deps_done = deps_done
         self.conventions = conventions
-        self.log = log or (lambda message: None)
+        self._on_event = on_event
+        self._phase = "claim"
+        raw_log = log or (lambda message: None)
+
+        def _wrapped_log(message: str) -> None:
+            raw_log(message)
+            self._emit_event("log", message=str(message))
+
+        self.log = _wrapped_log
 
         self.budget = budget or Budget.from_config(cfg, card.frontier_estimate)
         self.roles = Roles(cfg, backend, card.id)
@@ -299,6 +307,43 @@ class CardRun:
         )
         self.harness_summary: dict = {}
         self.attempt_records: list[dict] = []
+
+    @property
+    def phase(self) -> str:
+        return self._phase
+
+    @phase.setter
+    def phase(self, value: str) -> None:
+        self._phase = str(value)
+        self._emit_event("phase", phase=self._phase)
+
+    def _emit_event(self, kind: str, **fields) -> None:
+        cb = getattr(self, "_on_event", None)
+        if not callable(cb):
+            return
+        budget = getattr(self, "budget", None)
+        mm_b = getattr(getattr(self, "micromanager", None), "budget", None)
+        payload = {
+            "kind": kind,
+            "card_id": self.card.id,
+            "phase": getattr(self, "_phase", ""),
+            "attempt": int(getattr(self, "attempt", 0) or 0),
+            "worker_tokens": (
+                int(getattr(budget, "tokens_in", 0) or 0) + int(getattr(budget, "tokens_out", 0) or 0)
+                if budget is not None else 0
+            ),
+            "supervisor_tokens": (
+                int(getattr(mm_b, "tokens_in", 0) or 0) + int(getattr(mm_b, "tokens_out", 0) or 0)
+                if mm_b is not None else 0
+            ),
+            "tokens_in_fresh": int(getattr(budget, "tokens_in_fresh", 0) or 0) if budget is not None else 0,
+            "tokens_in_cached": int(getattr(budget, "tokens_in_cached", 0) or 0) if budget is not None else 0,
+            **fields,
+        }
+        try:
+            cb(payload)
+        except Exception:
+            pass
 
     # -- helpers --------------------------------------------------------------
 

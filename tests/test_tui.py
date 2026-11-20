@@ -580,7 +580,7 @@ global_dir = "{self.global_harness}"
         self.assertEqual(parsed["data"]["run_id"], self.run_id)
 
         with mock.patch("curses.wrapper", return_value=0) as wrapped:
-            rc = run_tui(repo=self.repo, once=False, view="cards")
+            rc = run_tui(repo=self.repo, once=False, view="cards", force_curses=True)
         self.assertEqual(rc, 0)
         self.assertEqual(wrapped.call_count, 1)
 
@@ -747,7 +747,7 @@ global_dir = "{self.global_harness}"
         with mock.patch("curses.wrapper", side_effect=fake_wrapper), mock.patch(
             "curses.curs_set", return_value=0
         ):
-            rc = run_tui(repo=self.repo, once=False, view="overview")
+            rc = run_tui(repo=self.repo, once=False, view="overview", force_curses=True)
         self.assertEqual(rc, 0)
         joined = "\n".join(drawn)
         self.assertIn("openfarm tui", joined)
@@ -927,7 +927,7 @@ class PrettifiedTuiThemeAndControllerTests(unittest.TestCase):
 
     def test_once_snapshots_include_unicode_chrome_bars_and_icons(self) -> None:
         ov_txt = render_snapshot(self.repo, view="overview")
-        self.assertIn("openfarm tui v0.9.2", ov_txt)
+        self.assertIn("openfarm tui v0.10.0", ov_txt)
         self.assertIn("╭─", ov_txt)
         self.assertIn("╰─", ov_txt)
         self.assertIn("█", ov_txt)
@@ -1116,6 +1116,7 @@ class LivePtyCursesTuiTests(unittest.TestCase):
         master_fd, slave_fd = pty.openpty()
         fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", 32, 120, 0, 0))
         env = dict(os.environ)
+        env.setdefault("OPENFARM_TUI_ENGINE", "curses")
         for key in remove_env:
             env.pop(key, None)
         env.update(extra_env)

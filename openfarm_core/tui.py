@@ -4905,10 +4905,11 @@ def run_tui(
     view: str = "overview",
     json_output: bool = False,
     *,
+    force_curses: bool = False,
     out=None,
     **kwargs,
 ) -> int:
-    """Launch interactive curses TUI, or render a deterministic snapshot with ``once=True``."""
+    """Launch interactive TUI (Textual when installed, stdlib curses fallback), or render snapshot."""
     if view not in VIEWS:
         raise UsageError(f"unknown view {view!r}; choose from {', '.join(VIEWS)}")
     if once:
@@ -4923,6 +4924,18 @@ def run_tui(
         stream = out if out is not None else sys.stdout
         print(rendered, file=stream)
         return 0
+
+    use_curses = bool(force_curses) or os.environ.get("OPENFARM_TUI_ENGINE", "").strip().lower() == "curses"
+    if not use_curses:
+        run_textual = None
+        try:
+            from openfarm_tui import run_textual_tui, textual_available
+            if textual_available():
+                run_textual = run_textual_tui
+        except ImportError:
+            run_textual = None
+        if callable(run_textual):
+            return int(run_textual(repo=repo, config_path=config_path, run_id=run_id, initial_view=view))
 
     os.environ.setdefault("ESCDELAY", "25")
     ctrl = TuiController(

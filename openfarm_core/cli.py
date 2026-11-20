@@ -429,7 +429,7 @@ def _baseline_check(ctx: Context, source: FileCardSource, card: Card) -> dict:
         git.worktree_remove(worktree)
 
 
-def cmd_run(ctx: Context, args) -> int:
+def cmd_run(ctx: Context, args, *, on_event=None) -> int:
     """Start a run: claim, drive, and move each card."""
     if ctx.state.kill_requested(ctx.cfg.kill_switch):
         _emit_ctx(ctx, {"refused": True, "reason": "the kill switch exists"}, "run")
@@ -473,16 +473,19 @@ def cmd_run(ctx: Context, args) -> int:
               file=sys.stderr)
 
     try:
-        return _do_run(ctx, args, run_id)
+        return _do_run(ctx, args, run_id, on_event=on_event)
     finally:
         ctx.state.release_run_lock(run_id)
 
 
-def _do_run(ctx: Context, args, run_id: str) -> int:
+def _do_run(ctx: Context, args, run_id: str, *, on_event=None) -> int:
+    from .coordinator import RunEventBus
+
     ctx.state.check_disk_space(getattr(ctx.cfg, "min_free_mb", 0))
     source = ctx.cards()
     source.prepare()
     run_dir = ctx.state.create_run(run_id)
+    event_bus = RunEventBus(ctx.state, run_id, on_event=on_event)
     telemetry_raw = open_telemetry(ctx.cfg, run_dir)
     telemetry = TelemetrySink(telemetry_raw)
 
@@ -504,6 +507,12 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
     identifiers = ([_check_id(args.card, "card id")]
                    if args.card else source.next(cfg.lane,
                                                  limit=args.cards)["cards"])
+    event_bus.emit(
+        kind="run_start",
+        cards=list(identifiers),
+        dry_run=bool(args.dry_run),
+        message=f"Starting run {run_id} ({len(identifiers)} card(s))",
+    )
     # `--spend` may lower the night's cap but never raise the config's, because the
     # config is the operator's standing limit and the flag is one night's. A zero or
     # negative flag is a usage error rather than "no cap": silently turning a limit
@@ -722,14 +731,28 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
                     continue
                 ctx.state.check_disk_space(getattr(cfg, "min_free_mb", 0))
                 if args.dry_run:
-                    outcomes.append(_dry_run(ctx, source, card_id))
+                    dr = _dry_run(ctx, source, card_id)
+                    outcomes.append(dr)
+                    event_bus.emit(kind="card_done", card_id=card_id, final_state="dry-run", eligible=bool(dr.get("eligible")))
                     continue
 
                 outcome = _run_card(ctx, source, card_id, run_id, telemetry,
                                     run_dir, script_path, mm_script=mm_script_path,
                                     harness_library=harness_lib,
-                                    mm_budget=night_mm_budget, board=board)
+                                    mm_budget=night_mm_budget, board=board,
+                                    on_event=event_bus.emit)
                 outcomes.append(outcome)
+                event_bus.emit(
+                    kind="card_done",
+                    card_id=card_id,
+                    final_state=str(outcome.get("final_state") or ""),
+                    stop_code=str(outcome.get("stop_code") or ""),
+                    worker_tokens=int(outcome.get("tokens_in", 0) or 0) + int(outcome.get("tokens_out", 0) or 0),
+                    supervisor_tokens=int(outcome.get("micromanager_tokens_in", 0) or 0) + int(outcome.get("micromanager_tokens_out", 0) or 0),
+                    tokens_in_fresh=int(outcome.get("tokens_in_fresh", 0) or 0),
+                    tokens_in_cached=int(outcome.get("tokens_in_cached", 0) or 0),
+                    message=str(outcome.get("detail") or outcome.get("final_state") or ""),
+                )
                 final_state = outcome.get("final_state")
                 if final_state == "blocked":
                     code = outcome.get("stop_code", "")
@@ -778,6 +801,7 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
                         on_handback=on_handback,
                         on_struggling=on_struggling,
                         mm_seat=mm_seat,
+                        on_event=event_bus.emit,
                     )
                 finally:
                     if metered is not None and hasattr(metered, "close"):
@@ -842,6 +866,11 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
                 print(f"micromanager close error ignored: {exc}", file=sys.stderr)
         if board is not None:
             board.end_run("finished")
+        event_bus.emit(
+            kind="run_finish",
+            cards_count=len(outcomes),
+            message=f"Finished run {run_id} ({len(outcomes)} outcome(s))",
+        )
 
     notes: list[str] = []
     if not _backend_prices_spend(cfg, script_path):
@@ -1116,7 +1145,8 @@ def _run_card(ctx: Context, source: FileCardSource, card_id: str, run_id: str,
               mm_backend=None,
               on_handback=None,
               on_struggling=None,
-              mm_seat: _SharedAcpSupervisor | None = None) -> dict:
+              mm_seat: _SharedAcpSupervisor | None = None,
+              on_event=None) -> dict:
     """Claim one card and drive it. `backend` overrides the configured one."""
     cfg = ctx.cfg
     holder = f"openfarm:{run_id}"
@@ -1173,7 +1203,8 @@ def _run_card(ctx: Context, source: FileCardSource, card_id: str, run_id: str,
         log=lambda message: print(message, file=sys.stderr),
         micromanager=mm, harness_library=resolved_harness,
         board=board, swarm=getattr(cfg, "swarm", None),
-        on_handback=on_handback, on_struggling=on_struggling)
+        on_handback=on_handback, on_struggling=on_struggling,
+        on_event=on_event)
     run.card_source = source
     try:
         record = run.run(claim=claim)
@@ -2618,10 +2649,10 @@ def cmd_swarm(ctx: Context, args) -> int:
 # -- the parser ----------------------------------------------------------------
 
 _CLI_EPILOG = """\
-Command groups (27 commands):
-  Setup & Auth         init, adopt, install-skill, acp
+Command groups (29 commands):
+  Setup & Auth         init, adopt, install-skill, acp, providers
   Run & Monitor        auto, check, run, status, pause, resume, stop, tui
-  Review & Harness     triage, review, land, frontier-review, dossier, verdict, done, release, escape, supervise, harness
+  Review & Harness     triage, review, land, findings, frontier-review, dossier, verdict, done, release, escape, supervise, harness
   Swarm, Board & Bench swarm, board, drive, bench
 
 Common workflows:
@@ -2739,6 +2770,20 @@ def build_parser() -> argparse.ArgumentParser:
     land.add_argument("cards", nargs="+", help="card IDs to land serially onto base_branch")
     land.add_argument("--dry-run", action="store_true",
                       help="trial-merge and verify only, without modifying base_branch")
+
+    find_p = sub.add_parser(
+        "findings",
+        help="list, pick for next wave, dismiss, or fold worker-filed findings",
+        formatter_class=raw_fmt,
+        epilog="Examples:\n  openfarm findings list\n  openfarm findings pick FIND-1\n  openfarm findings dismiss FIND-2 --reason 'already fixed'\n  openfarm findings fold FIND-3 --into CARD-2",
+    )
+    find_p.add_argument("action", nargs="?", default="list", choices=("list", "pick", "dismiss", "fold"))
+    find_p.add_argument("finding_id", nargs="?", default="", help="finding id (e.g. FIND-1)")
+    find_p.add_argument("--state", default="waiting", choices=("waiting", "picked", "dismissed", "folded", "promoted", "all"))
+    find_p.add_argument("--from", dest="from_card", default="", help="filter findings filed by this card id")
+    find_p.add_argument("--query", default="", help="substring filter")
+    find_p.add_argument("--reason", default="", help="optional one-line reason when dismissing")
+    find_p.add_argument("--into", dest="target_card", default="", help="target card id when folding")
 
     dossier = sub.add_parser(
         "dossier",
@@ -2960,6 +3005,8 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--dir", default=None,
                       help="target directory (default: <repo>/<project_slug> or current repo)")
     init.add_argument("--idea", default="", help="plain-English project idea")
+    init.add_argument("--lang", choices=("rust", "python", "typescript", "go", "auto"), default="rust",
+                      help="project language stack (default: rust)")
     init.add_argument("--profile", choices=PROFILES, default="auto",
                       help="micromanager profile (default: auto)")
     init.add_argument("--acp-provider", choices=("claude", "antigravity", "codex"),
@@ -3037,6 +3084,22 @@ def build_parser() -> argparse.ArgumentParser:
     acp.add_argument("--setup-token", action="store_true",
                      help="run `claude setup-token` for long-lived CLAUDE_CODE_OAUTH_TOKEN")
 
+    prov_p = sub.add_parser(
+        "providers",
+        help="inspect, configure, or probe global Frontier & Worker providers",
+        formatter_class=raw_fmt,
+        epilog="Examples:\n  openfarm providers status\n  openfarm providers set --preset openrouter --model qwen/qwen3-coder\n  openfarm providers probe",
+    )
+    prov_p.add_argument("action", nargs="?", default="status", choices=("status", "set", "probe"))
+    prov_p.add_argument("--frontier", choices=("claude", "codex", "antigravity"), default=None)
+    prov_p.add_argument("--preset", choices=("openrouter", "fireworks", "together", "ollama", "custom"), default=None)
+    prov_p.add_argument("--endpoint", default="")
+    prov_p.add_argument("--model", default="")
+    prov_p.add_argument("--key-file", default=None)
+    prov_p.add_argument("--api-key", default="")
+    prov_p.add_argument("--no-zdr", action="store_true")
+    prov_p.add_argument("--timeout", type=float, default=5.0)
+
     auto_p = sub.add_parser(
         "auto",
         help="context-aware automode landing & command palette (default when running bare `openfarm` on a TTY)",
@@ -3046,12 +3109,13 @@ def build_parser() -> argparse.ArgumentParser:
     auto_p.add_argument("--run", dest="run_id", default=None)
     auto_p.add_argument("--refresh", type=float, default=1.0)
     auto_p.add_argument("--view", default="overview")
+    auto_p.add_argument("--curses", action="store_true", help="force stdlib curses TUI instead of Textual")
 
     tui_p = sub.add_parser(
         "tui",
         help="open interactive terminal UI or render one snapshot",
         formatter_class=raw_fmt,
-        epilog="Examples:\n  openfarm tui\n  openfarm tui --once --view overview\n  openfarm tui --once --view board --run RUN_ID",
+        epilog="Examples:\n  openfarm tui\n  openfarm tui --curses\n  openfarm tui --once --view overview\n  openfarm tui --once --view board --run RUN_ID",
     )
     tui_p.add_argument("--run", dest="run_id", default=None,
                        help="pin TUI to a specific run id")
@@ -3061,6 +3125,8 @@ def build_parser() -> argparse.ArgumentParser:
                        help="render a single view snapshot and exit")
     tui_p.add_argument("--view", choices=TUI_VIEWS, default="overview",
                        help="initial TUI view (default: overview)")
+    tui_p.add_argument("--curses", action="store_true",
+                       help="force stdlib curses TUI instead of Textual")
 
     drive_p = sub.add_parser(
         "drive",
@@ -3253,6 +3319,7 @@ def cmd_init(args) -> int:
         directory=directory,
         repo_base=repo_base,
         idea=args.idea,
+        language=getattr(args, "lang", "rust"),
         profile=args.profile,
         acp_provider=args.acp_provider,
         state_dir=Path(args.state_dir) if args.state_dir else None,
@@ -3379,6 +3446,7 @@ def cmd_tui(args) -> int:
         once=bool(args.once),
         view=args.view,
         json_output=bool(getattr(args, "json", False)),
+        force_curses=bool(getattr(args, "curses", False)),
     )
 
 
@@ -3412,6 +3480,66 @@ def cmd_drive(ctx: Context, args) -> int:
     return EXIT_OK if payload.get("ok") else EXIT_TROUBLE
 
 
+def cmd_providers(args) -> int:
+    from .providers import load_global_providers, probe_worker_endpoint, save_global_providers
+
+    action = str(getattr(args, "action", "status") or "status")
+    if action == "status":
+        data = load_global_providers()
+        if args.json:
+            print(json.dumps(data, indent=2))
+        else:
+            wk = data["worker"]
+            print(f"Global providers: {data['path']} ({'configured' if data['configured'] else 'unconfigured'})")
+            print(f"  Frontier: {data['frontier']['provider']}")
+            print(f"  Worker:   preset={wk['preset']} endpoint={wk['endpoint'] or '(unset)'} model={wk['model'] or '(unset)'}")
+            print(f"  Key file: {wk['key_file']} ({'ready' if wk['key_present'] else 'missing'})  zdr={wk['zdr']}")
+        return EXIT_OK
+
+    if action == "set":
+        cur = load_global_providers()
+        res = save_global_providers(
+            frontier_provider=args.frontier or cur["frontier"]["provider"],
+            worker_preset=args.preset or cur["worker"]["preset"],
+            endpoint=args.endpoint or ("" if args.preset else cur["worker"]["endpoint"]),
+            model=args.model or ("" if args.preset else cur["worker"]["model"]),
+            key_file=Path(args.key_file) if args.key_file else Path(cur["worker"]["key_file"]),
+            api_key=args.api_key or "",
+            zdr=(False if args.no_zdr else None),
+        )
+        if args.json:
+            print(json.dumps(res, indent=2))
+        else:
+            wk = res["worker"]
+            print(f"Saved global providers to {res['path']} (preset={wk['preset']}, endpoint={wk['endpoint']}, model={wk['model']})")
+        return EXIT_OK
+
+    if action == "probe":
+        cur = load_global_providers()
+        wk = cur["worker"]
+        ep = args.endpoint or wk["endpoint"]
+        mdl = args.model or wk["model"]
+        kf = Path(args.key_file) if args.key_file else (Path(wk["key_file"]) if wk.get("key_file") else None)
+        res = probe_worker_endpoint(
+            ep,
+            key_file=kf,
+            api_key=args.api_key or "",
+            model=mdl,
+            zdr=not bool(args.no_zdr) and bool(wk.get("zdr", True)),
+            timeout_s=float(args.timeout or 5.0),
+        )
+        if args.json:
+            print(json.dumps(res, indent=2))
+        else:
+            if res["ok"]:
+                print(f"✓ Connected ({res['latency_ms']}ms · HTTP {res['status']} · zdr={res['zdr_sent']} · models={res['models_count']})")
+            else:
+                print(f"✗ Probe failed: {res['error']} (HTTP {res['status']})")
+        return EXIT_OK if res["ok"] else EXIT_TROUBLE
+
+    raise UsageError(f"unknown providers subcommand: {action}")
+
+
 PRE_CONFIG_COMMANDS = {
     "adopt": cmd_adopt,
     "auto": cmd_auto,
@@ -3419,8 +3547,53 @@ PRE_CONFIG_COMMANDS = {
     "init": cmd_init,
     "install-skill": cmd_install_skill,
     "acp": cmd_acp,
+    "providers": cmd_providers,
     "tui": cmd_tui,
 }
+
+
+def cmd_findings(ctx: Context, args) -> int:
+    from .findings import decide_finding, list_findings
+
+    action = str(getattr(args, "action", "list") or "list")
+    if action == "list":
+        res = list_findings(
+            ctx.repo,
+            ctx.cfg,
+            state_filter=getattr(args, "state", "waiting"),
+            from_card=getattr(args, "from_card", ""),
+            query=getattr(args, "query", ""),
+        )
+        if getattr(args, "json", False):
+            print(json.dumps(res, indent=2))
+        else:
+            c = res["counts"]
+            print(f"Findings: {c['waiting']} waiting · {c['new_since_last_run']} new · {c['picked']} picked for next wave ({c['total']} total)")
+            for item in res["findings"]:
+                tag = " [new]" if item["is_new"] else ""
+                print(f"  {item['id']:<8}  {item['from_card']:<10}  {item['title']}{tag}")
+        return EXIT_OK
+
+    fid = str(getattr(args, "finding_id", "") or "").strip()
+    if not fid:
+        raise UsageError(f"findings {action} requires a finding id (e.g. FIND-1)")
+    if action == "pick":
+        res = decide_finding(ctx.repo, ctx.cfg, fid, "next-wave")
+    elif action == "dismiss":
+        res = decide_finding(ctx.repo, ctx.cfg, fid, "dismissed", reason=getattr(args, "reason", ""))
+    elif action == "fold":
+        target = str(getattr(args, "target_card", "") or "").strip()
+        if not target:
+            raise UsageError("findings fold requires --into <CARD-ID>")
+        res = decide_finding(ctx.repo, ctx.cfg, fid, "folded", target_card=target)
+    else:
+        raise UsageError(f"unknown findings subcommand: {action}")
+
+    if getattr(args, "json", False):
+        print(json.dumps(res, indent=2))
+    else:
+        print(f"{res['id']}: {res['decision']} ({res['state']})")
+    return EXIT_OK
 
 
 COMMANDS = {
@@ -3433,6 +3606,7 @@ COMMANDS = {
     "done": cmd_done,
     "review": cmd_review,
     "land": cmd_land,
+    "findings": cmd_findings,
     "triage": cmd_triage,
     "frontier-review": cmd_frontier_review,
     "dossier": cmd_dossier,

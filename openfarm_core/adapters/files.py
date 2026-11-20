@@ -480,6 +480,66 @@ class FileCardSource:
             self._write(card_id, header, body_md, f"{card_id}: finding from {from_card}")
             return {"id": card_id}
 
+    def decide_finding(
+        self,
+        finding_id: str,
+        decision: str,
+        *,
+        reason: str = "",
+        target_card: str = "",
+        promoted_card: str = "",
+    ) -> dict:
+        """Record a durable decision on a finding (`next-wave`, `dismissed`, `folded`, `promoted`)."""
+        dec = str(decision or "").strip().lower()
+        if dec not in ("next-wave", "dismissed", "folded", "promoted"):
+            raise Invalid("bad-finding-decision", f"unknown finding decision {decision!r}")
+        with self._lock:
+            header, body, _ = self._read_raw(finding_id)
+            if not (str(finding_id).startswith("FIND-") or header.get("from_card")):
+                raise Refused("not-a-finding", f"{finding_id} is not a finding card")
+            decided_at = utc_now()
+            cleaned_reason = str(reason or "").strip()
+            folded_into = ""
+
+            if dec == "folded":
+                target_id = str(target_card or "").strip()
+                if not target_id or target_id == finding_id:
+                    raise Refused("bad-fold-target", "fold requires a distinct existing target card id")
+                t_header, t_body, _ = self._read_raw(target_id)
+                note = f"\n\n### Finding {finding_id}: {header.get('title', finding_id)}\n\n"
+                if body.strip():
+                    note += body.strip() + "\n"
+                else:
+                    note += "(no additional detail)\n"
+                new_t_body = (t_body.rstrip() + note).lstrip("\n")
+                self._write(target_id, t_header, new_t_body, f"{target_id}: fold finding {finding_id}")
+                folded_into = target_id
+                header["state"] = "folded"
+                header["folded_into"] = target_id
+            elif dec == "dismissed":
+                header["state"] = "dismissed"
+                if cleaned_reason:
+                    header["finding_reason"] = cleaned_reason
+            elif dec == "next-wave":
+                header["state"] = "finding-picked"
+            elif dec == "promoted":
+                header["state"] = "promoted"
+                if promoted_card:
+                    header["promoted_card"] = str(promoted_card).strip()
+
+            header["finding_decision"] = dec
+            header["finding_decided_at"] = decided_at
+            self._write(finding_id, header, body, f"{finding_id}: decision={dec}")
+            return {
+                "id": finding_id,
+                "decision": dec,
+                "state": header["state"],
+                "reason": cleaned_reason,
+                "folded_into": folded_into,
+                "promoted_card": str(header.get("promoted_card") or ""),
+                "decided_at": decided_at,
+            }
+
     # -- test helpers --------------------------------------------------------
 
     def add_card(self, card: Card, commit: bool = True) -> Path:
