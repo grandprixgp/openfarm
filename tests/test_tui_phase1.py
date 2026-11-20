@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from openfarm_core.adapters.files import FileCardSource
 from openfarm_core.config import load_config
@@ -263,6 +266,239 @@ class NewCardIdTests(_RegistryIsolation):
         self.assertEqual([states[cid] for cid in ids], ["done"] * 4)
         self.assertEqual([c["id"] for c in res["cards"]], ["W1-07", "W1-08"])
         self.assertEqual((toy.root / ".openfarm" / "GRILL_DECISIONS.md").read_text().count("more"), 1)
+
+
+class _Architect:
+    """A stand-in Architect: each call takes the next reply; an exception is raised instead."""
+
+    def __init__(self, *replies) -> None:
+        self.replies = list(replies)
+        self.prompts: list[str] = []
+        self.on_chunk = None
+
+    def ask(self, prompt: str, **_kw) -> str:
+        self.prompts.append(prompt)
+        reply = self.replies.pop(0)
+        if isinstance(reply, Exception):
+            raise reply
+        if self.on_chunk is not None:
+            for i in range(0, len(reply), 40):
+                self.on_chunk(reply[i:i + 40])
+        return reply
+
+    def stream_to(self, on_chunk) -> None:
+        self.on_chunk = on_chunk
+
+    def close(self) -> None:
+        pass
+
+
+def _git_state(root: Path) -> tuple[str, str]:
+    def run(*args: str) -> str:
+        return subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True).stdout
+    return run("rev-parse", "HEAD"), run("status", "--porcelain", "--", "cards")
+
+
+@unittest.skipUnless(textual_available(), "textual optional extra not installed")
+class ArchitectFailureTests(_RegistryIsolation):
+    """R1.4, R1.19: an Architect that can't be asked, or doesn't answer, is a failure on screen."""
+
+    def _toy(self):
+        toy = build_python_toy()
+        self.addCleanup(toy.cleanup)
+        toy.write("pyproject.toml", '[project]\nname = "toy"\nversion = "0"\n')  # so the Studio doesn't re-init it
+        toy.commit("pyproject")
+        return toy
+
+    def _drive(self, toy, body, **patches) -> None:
+        from textual.widgets import TextArea
+
+        from openfarm_tui.app import OpenfarmApp
+
+        async def _run() -> None:
+            app = OpenfarmApp(repo=toy.root, initial_view="studio")
+            async with app.run_test(size=(140, 44)) as pilot:
+                await pilot.pause(0.15)
+                app.query_one("#ta-idea", TextArea).text = "A photo of the day site"
+                said: list[str] = []
+                real = app._set_drafting_state
+                app._set_drafting_state = lambda active, message="": (said.append(message), real(active, message))[1]
+
+                async def settle() -> None:
+                    await app.workers.wait_for_complete()
+                    await pilot.pause(0.15)
+
+                await body(app, settle, said)
+
+        with mock.patch.multiple("openfarm_tui.app", **patches):
+            asyncio.run(_run())
+
+    def _assert_failure_shown(self, app, reason: str) -> None:
+        self.assertIn(reason, str(app.query_one("#grill-status").render()))
+        self.assertFalse(app.query_one("#btn-arch-retry").has_class("hidden"))
+        self.assertFalse(app.query_one("#btn-arch-template").has_class("hidden"))
+        self.assertFalse(app._drafting_plan)
+
+    def test_a_backend_that_cannot_open_shows_the_reason_and_retry(self) -> None:
+        toy = self._toy()
+        before = _git_state(toy.root)
+
+        async def body(app, settle, said) -> None:
+            for press in (app._grill_ask_clicked, app._chunk_to_cards_clicked):
+                press()
+                await settle()
+                self._assert_failure_shown(app, "Claude isn't signed in")
+                self.assertEqual(_git_state(toy.root), before)
+            self.assertEqual((app._grill_pending_question, app._grill_history), ("", []))
+            self.assertFalse([m for m in said if "sking" in m], "nobody was asked, so nothing may say so")
+
+        self._drive(toy, body,
+                    open_architect_backend=mock.Mock(return_value=(None, "Claude isn't signed in")))
+
+    def test_a_turn_that_times_out_is_a_failure_and_the_template_is_a_choice(self) -> None:
+        from openfarm_core.errors import Infra
+
+        toy = self._toy()
+        before = _git_state(toy.root)
+        timeout = Infra("acp-timeout", "ACP prompt turn timed out after 600.0s")
+
+        async def body(app, settle, said) -> None:
+            app._chunk_to_cards_clicked()
+            await settle()
+            self._assert_failure_shown(app, "timed out after 600.0s")
+            self.assertEqual(_git_state(toy.root), before)
+            self.assertFalse(list((toy.root / "cards").glob("W*.md")), "no template card by itself")
+
+            app._arch_template_clicked()
+            await settle()
+            self.assertTrue((toy.root / "cards" / "W1-01.md").is_file())
+            self.assertTrue(app.query_one("#btn-arch-retry").has_class("hidden"))
+            self.assertIn("Plan ready (basic template)", " | ".join(n.message for n in app._notifications))
+            self.assertIn("Basic template (the Architect is not asked): splitting chunk C1 into cards...", said)
+
+        self._drive(toy, body,
+                    open_architect_backend=mock.Mock(return_value=(_Architect(timeout), "Claude")))
+
+    def test_retry_asks_again_and_shows_the_real_question(self) -> None:
+        from openfarm_core.errors import Infra
+
+        toy = self._toy()
+        question = json.dumps({"ready_to_plan": False, "question": "Whose photos?", "options": ["Mine", "NASA's"]})
+        opened = mock.Mock(side_effect=[(_Architect(Infra("acp-timeout", "no answer in time")), "Claude"),
+                                        (_Architect(question), "Claude")])
+
+        async def body(app, settle, said) -> None:
+            app._grill_ask_clicked()
+            await settle()
+            self._assert_failure_shown(app, "no answer in time")
+            app._arch_retry_clicked()
+            await settle()
+            shown = str(app.query_one("#grill-transcript").render())
+            self.assertIn("Questions from the Architect", shown)
+            self.assertIn("Whose photos?", shown)
+            self.assertTrue(app.query_one("#btn-arch-retry").has_class("hidden"))
+            self.assertEqual(opened.call_count, 2)
+            self.assertIn("Claude: asking about your idea...", said)
+
+        self._drive(toy, body, open_architect_backend=opened)
+
+    def test_the_switch_says_what_off_means_and_off_asks_nobody(self) -> None:
+        from textual.widgets import Switch
+
+        toy = self._toy()
+        opened = mock.Mock()
+
+        async def body(app, settle, said) -> None:
+            words = app.query_one("#sw-architect-words")
+            self.assertIn("on: the Architect writes", str(words.render()))
+            app.query_one("#sw-use-architect", Switch).value = False
+            await settle()
+            self.assertIn("off: the plan comes from a basic template", str(words.render()))
+            self.assertIn("The plan will come from a basic template", " | ".join(n.message for n in app._notifications))
+            app._grill_ask_clicked()
+            await settle()
+            self.assertEqual(opened.call_count, 0)
+            self.assertIn("Basic questions (the Architect was not asked)", str(app.query_one("#grill-transcript").render()))
+            self.assertFalse([m for m in said if "Asking" in m or "Connecting" in m])
+
+        self._drive(toy, body, open_architect_backend=opened)
+
+
+class ArchitectBackendTests(_RegistryIsolation):
+    """R1.4, R1.5, R1.13: the core side of asking the Architect."""
+
+    def test_an_empty_folder_uses_the_global_providers_and_the_full_timeout(self) -> None:
+        from types import SimpleNamespace
+
+        from openfarm_core.automode import open_architect_backend
+
+        empty = self.tmp / "empty"
+        empty.mkdir()
+        worker = SimpleNamespace(timeout_s=600.0, close=lambda: None)
+        with mock.patch("openfarm_core.automode.inspect_acp_status", return_value={"oauth_ready": True}), \
+                mock.patch("openfarm_core.adapters.claude_worker.open_acp_worker", return_value=worker) as opened:
+            backend, name = open_architect_backend(empty)
+        self.assertIsNotNone(backend, name)
+        self.assertEqual(name, "Claude")
+        self.assertEqual(opened.call_args.kwargs["provider"], "claude")
+        self.assertEqual(worker.timeout_s, 600.0, "no 180 s cap unless one is asked for")
+
+    def test_a_reply_that_cannot_be_read_is_an_error_not_a_template(self) -> None:
+        from openfarm_core.automode import architect_grill_turn, draft_spec_and_chunks, draft_wave_plan
+        from openfarm_core.errors import Infra
+
+        toy = build_python_toy()
+        self.addCleanup(toy.cleanup)
+        before = _git_state(toy.root)
+        with self.assertRaises(Infra):
+            architect_grill_turn(toy.root, idea="x", backend=_Architect("sorry, I can't"))
+        with self.assertRaises(Infra):
+            draft_spec_and_chunks(toy.root, idea="x", backend=_Architect("{}"))
+        with self.assertRaises(Infra):
+            draft_wave_plan(toy.root, idea="x", backend=_Architect('{"files": {}}'), verify_baseline=False)
+        self.assertEqual(_git_state(toy.root), before)
+        self.assertFalse(list((toy.root / "cards").glob("*.md")))
+
+    def test_a_slow_split_reports_each_file_as_it_is_written(self) -> None:
+        from openfarm_core.automode import draft_wave_plan
+
+        toy = build_python_toy()
+        self.addCleanup(toy.cleanup)
+        answer = json.loads(_CardsBackend("W1-01", "W1-02").answer)
+        answer["files"] = {".openfarm/PROJECT_SPEC.md": "# Spec\n", **answer["files"]}
+        said: list[str] = []
+        draft_wave_plan(toy.root, idea="x", backend=_Architect(json.dumps(answer)), verify_baseline=False,
+                        on_progress=said.append)
+        writing = [m for m in said if m.startswith("Writing")]
+        self.assertEqual(writing, ["Writing .openfarm/PROJECT_SPEC.md...", "Writing card 1: W1-01...",
+                                   "Writing card 2: W1-02..."])
+
+    def test_the_worker_hands_text_on_as_it_arrives(self) -> None:
+        from types import SimpleNamespace
+
+        from openfarm_core.adapters.claude_worker import ClaudeAcpWorkerBackend
+
+        class _Acp:
+            _initialized = True
+
+            def new_session(self, **_kw):
+                return "s"
+
+            def prompt(self, session_id, text, timeout_s, on_chunk=None):
+                for part in ("he", "llo"):
+                    on_chunk(part)
+                return SimpleNamespace(text="hello", tokens_in=1, tokens_out=1, vendor_cost_usd=0.0,
+                                       stop_reason="end_turn", latency_s=0.0)
+
+            def close(self) -> None:
+                pass
+
+        backend = ClaudeAcpWorkerBackend(adapter=_Acp())
+        self.addCleanup(backend.close)
+        got: list[str] = []
+        backend.on_chunk = got.append
+        backend.complete("architect", "", 0.2, [{"role": "user", "content": "hi"}])
+        self.assertEqual(got, ["he", "llo"])
 
 
 if __name__ == "__main__":

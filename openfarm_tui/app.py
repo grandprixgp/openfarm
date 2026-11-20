@@ -102,6 +102,16 @@ from .modals import (
 )
 
 
+ARCHITECT_ON_WORDS = "on: the Architect writes the questions, the spec and the cards"
+ARCHITECT_OFF_WORDS = "off: the plan comes from a basic template, the Architect is not asked"
+STEP_BUTTONS = {
+    "grill": "#btn-grill-ask",
+    "spec": "#btn-draft-spec",
+    "split": "#btn-chunk-to-cards",
+    "plan": "#btn-draft-plan",
+}
+
+
 class OpenfarmPaletteProvider(Provider):
     """Fuzzy Command Palette wired to all guided & power actions."""
 
@@ -271,7 +281,8 @@ class OpenfarmApp(App):
         padding: 0 2;
         margin-bottom: 1;
     }
-    #studio-findings-banner.hidden { display: none; }
+    .hidden { display: none; }
+    #architect-switch-row { height: 3; align: left middle; }
 
     /* Providers View */
     #prov-card { width: 100%; max-width: 118; height: 1fr; }
@@ -397,6 +408,11 @@ class OpenfarmApp(App):
         self._draft_last_heartbeat = 0
         self._active_architect_backend: object | None = None
         self._architect_cancelled = False
+        self._architect_failure: dict | None = None  # the step to offer Retry for
+        self._busy_button = ""  # only the running step's button shows a spinner
+        self._draft_asked = True  # False while a basic template stands in for the Architect
+        self._draft_doing = ""
+        self._grill_from_template = False
         self._last_baseline_ok: bool | None = None
         self._last_baseline_error = ""
         self._worker_tokens = 0
@@ -511,6 +527,8 @@ class OpenfarmApp(App):
                 with Vertical(id="architect-panel", classes="hidden"):
                     with Horizontal(id="architect-panel-head"):
                         yield Static("", id="architect-banner")
+                        yield Button("Retry", classes="primary-cta hidden", id="btn-arch-retry")
+                        yield Button("Use a basic template instead", classes="soft-btn hidden", id="btn-arch-template")
                         yield Button("Cancel", classes="soft-btn hidden", id="btn-arch-cancel")
                         yield Button("Hide Log", classes="soft-btn", id="btn-arch-hide")
                     yield RichLog(id="architect-log", markup=True, wrap=True, min_width=0)
@@ -547,8 +565,10 @@ class OpenfarmApp(App):
                             yield Button("Flesh Out Spec & Chunks", classes="approve-btn", id="btn-draft-spec")
                             yield Button("Quick: Draft Cards Now", classes="soft-btn", id="btn-draft-plan")
                             yield Button("Configure Providers", classes="soft-btn", id="btn-open-providers")
-                            yield Static("  Frontier Architect: ", classes="inline-label")
+                        with Horizontal(id="architect-switch-row"):
+                            yield Static("Architect: ", classes="inline-label")
                             yield Switch(value=True, id="sw-use-architect")
+                            yield Static(ARCHITECT_ON_WORDS, id="sw-architect-words", classes="inline-label")
                         yield Static("", id="grill-status", classes="hidden")
 
                     # 1A-2: Living Spec & Ordered Chunks (Idea -> Grill -> Spec -> Chunks -> Cards)
@@ -1635,14 +1655,19 @@ class OpenfarmApp(App):
             chat_box.add_class("hidden")
             return
         chat_box.remove_class("hidden")
-        lines: list[str] = ["[bold #38bdf8]Frontier Architect Grill[/]"]
+        if self._grill_from_template:
+            lines = ["[bold #f59e0b]Basic questions (the Architect was not asked)[/]"]
+            asker = "Question:"
+        else:
+            lines = ["[bold #38bdf8]Questions from the Architect[/]"]
+            asker = "Architect:"
         for turn in self._grill_history:
-            lines.append(f"[bold #cbd5e1]Architect:[/] {esc(str(turn.get('question') or ''))}")
+            lines.append(f"[bold #cbd5e1]{asker}[/] {esc(str(turn.get('question') or ''))}")
             lines.append(f"[bold #4ade80]You:[/]       {esc(str(turn.get('answer') or ''))}")
         if self._grill_pending_question:
-            lines.append(f"\n[bold #fbbf24]Architect:[/] {esc(self._grill_pending_question)}")
+            lines.append(f"\n[bold #fbbf24]{asker}[/] {esc(self._grill_pending_question)}")
         else:
-            lines.append("\n[bold #4ade80]✓ Architect has enough context — click Draft Plan Now (or ask another question).[/]")
+            lines.append("\n[bold #4ade80]✓ That's enough to go on. Next: Flesh Out Spec & Chunks, or ask another question.[/]")
         self.query_one("#grill-transcript", Static).update("\n".join(lines))
         opt_row = self.query_one("#grill-options-row", Horizontal)
         if self._grill_options and self._grill_pending_question:
@@ -1707,9 +1732,12 @@ class OpenfarmApp(App):
             try:
                 b = self.query_one(bid, Button)
                 b.disabled = active
-                b.label = busy_lbl if active else idle_lbl
+                b.label = busy_lbl if (active and bid == self._busy_button) else idle_lbl
             except Exception:
                 pass
+        self._architect_failure = None
+        for bid in ("#btn-arch-retry", "#btn-arch-template"):
+            self.query_one(bid, Button).add_class("hidden")
         try:
             cancel_btn = self.query_one("#btn-arch-cancel", Button)
             if active:
@@ -1758,7 +1786,7 @@ class OpenfarmApp(App):
             else:
                 status_box.add_class("hidden")
                 if was_active:
-                    banner.update("[bold #4ade80]✓ Architect step finished[/]  [#94a3b8](click Hide Log to close)[/]")
+                    banner.update("[bold #4ade80]✓ Step finished[/]  [#94a3b8](Hide Log closes this)[/]")
 
     def _render_draft_status(self) -> None:
         if not self._drafting_plan:
@@ -1772,13 +1800,15 @@ class OpenfarmApp(App):
         self.query_one("#architect-banner", Static).update(head)
         self.query_one("#grill-status", Static).update(
             f"{head}\n"
-            f"[#94a3b8]Frontier ACP typically takes 15–120s to grill, synthesize spec/chunks, or split cards "
-            f"(live log above; turn off Frontier Architect switch for instant local templates).[/]"
+            + ("[#94a3b8]The Architect usually answers in 15 seconds to a few minutes. "
+               "The log above shows what it is writing. Cancel stops it.[/]"
+               if self._draft_asked else
+               "[#94a3b8]Using a basic template. The Architect is not asked.[/]")
         )
-        if elapsed >= 15 and elapsed - self._draft_last_heartbeat >= 15:
+        if self._draft_asked and elapsed >= 15 and elapsed - self._draft_last_heartbeat >= 15:
             self._draft_last_heartbeat = elapsed
             self._log_architect(
-                f"Still waiting on Frontier ACP response ({mins:02d}:{secs:02d} elapsed)...",
+                f"Still waiting for the Architect's answer ({mins:02d}:{secs:02d} so far)...",
                 style="#94a3b8",
             )
 
@@ -1786,18 +1816,70 @@ class OpenfarmApp(App):
         if self._drafting_plan:
             self._render_draft_status()
 
-    @on(Button.Pressed, "#btn-grill-ask")
-    def _grill_ask_clicked(self) -> None:
+    def _architect_on(self) -> bool:
+        return bool(self.query_one("#sw-use-architect", Switch).value)
+
+    @on(Switch.Changed, "#sw-use-architect")
+    def _architect_switch_changed(self, event: Switch.Changed) -> None:
+        self.query_one("#sw-architect-words", Static).update(
+            ARCHITECT_ON_WORDS if event.value else ARCHITECT_OFF_WORDS)
+        if not event.value:
+            self.notify(
+                "Architect off. The plan will come from a basic template, not from the Architect.",
+                severity="warning")
+
+    def _start_architect_step(self, step: str, *, chunk_id: str | None = None, template: bool = False) -> None:
+        """Start a grill, spec, split or plan step. `template` skips the Architect on purpose."""
         if self._drafting_plan:
-            self.notify("Architect is busy right now...")
+            self.notify("Another step is still running.")
             return
         idea = self.query_one("#ta-idea", TextArea).text.strip()
-        if not idea:
+        if step in ("grill", "spec") and not idea:
             self.notify("Describe what you want to build first.", severity="warning")
             self.query_one("#ta-idea", TextArea).focus()
             return
-        self._set_drafting_state(True, "Asking Frontier Architect to clarify your idea...")
-        self._grill_ask_bg(idea)
+        asked = self._architect_on() and not template
+        self._busy_button = STEP_BUTTONS[step]
+        self._draft_asked = asked
+        self._draft_doing = {
+            "grill": "asking about your idea",
+            "spec": "writing the spec and its chunks",
+            "split": f"splitting chunk {chunk_id or 'C1'} into cards",
+            "plan": "drafting cards",
+        }[step]
+        # Nothing says the Architect is being asked until it has really been opened.
+        self._set_drafting_state(
+            True,
+            "Connecting to the Architect..." if asked
+            else f"Basic template (the Architect is not asked): {self._draft_doing}...")
+        if step == "grill":
+            self._grill_ask_bg(idea, template)
+        elif step == "spec":
+            self._draft_spec_bg(idea, template)
+        else:
+            self._draft_plan_bg(chunk_id, template, step)
+
+    def _architect_failed(self, step: str, reason: str, chunk_id: str | None = None) -> None:
+        """The Architect could not be asked or did not answer: say why, offer Retry. Nothing is drafted."""
+        self._set_drafting_state(False, f"[bold #fb7185]✗ The Architect didn't answer:[/] {esc(reason)}")
+        self._architect_failure = {"step": step, "chunk_id": chunk_id}
+        for bid in ("#btn-arch-retry", "#btn-arch-template"):
+            self.query_one(bid, Button).remove_class("hidden")
+        self.notify(f"The Architect didn't answer: {reason}", severity="error")
+
+    @on(Button.Pressed, "#btn-arch-retry")
+    def _arch_retry_clicked(self) -> None:
+        if self._architect_failure:
+            self._start_architect_step(**self._architect_failure)
+
+    @on(Button.Pressed, "#btn-arch-template")
+    def _arch_template_clicked(self) -> None:
+        if self._architect_failure:
+            self._start_architect_step(**self._architect_failure, template=True)
+
+    @on(Button.Pressed, "#btn-grill-ask")
+    def _grill_ask_clicked(self) -> None:
+        self._start_architect_step("grill")
 
     @on(Button.Pressed, "#btn-grill-opt-0")
     @on(Button.Pressed, "#btn-grill-opt-1")
@@ -1829,8 +1911,7 @@ class OpenfarmApp(App):
         self._render_grill_chat()
         idea = self.query_one("#ta-idea", TextArea).text.strip()
         if idea and len(self._grill_history) < 3:
-            self._set_drafting_state(True, "Architect reviewing your answer...")
-            self._grill_ask_bg(idea)
+            self._start_architect_step("grill", template=self._grill_from_template)
 
     @on(Button.Pressed, "#btn-grill-reset")
     def _grill_reset_clicked(self) -> None:
@@ -1839,22 +1920,39 @@ class OpenfarmApp(App):
         self._grill_options = []
         self._render_grill_chat()
 
+    def _open_backend_for_step(self, step: str, template: bool, chunk_id: str | None = None):
+        """Open the Architect for a worker thread. Returns (backend, name, go_on).
+
+        `go_on` is False when the Architect was wanted but could not be opened: the
+        failure is on screen and the step must stop without drafting anything.
+        """
+        if template or not self._architect_on():
+            return None, "basic template", True
+        backend, reason = open_architect_backend(self.repo, self._safe_cfg())
+        if backend is None:
+            self.call_from_thread(self._architect_failed, step, reason, chunk_id)
+            return None, reason, False
+        self._active_architect_backend = backend
+        self.call_from_thread(self._set_drafting_state, True, f"{reason}: {self._draft_doing}...")
+        return backend, reason, True
+
+    def _close_backend(self, backend) -> None:
+        if self._active_architect_backend is backend:
+            self._active_architect_backend = None
+        if backend is not None and hasattr(backend, "close"):
+            try:
+                backend.close()
+            except Exception as close_exc:
+                self.log.warning(f"architect close error: {close_exc}")
+
     @work(thread=True)
-    def _grill_ask_bg(self, idea: str) -> None:
-        use_architect = bool(self.query_one("#sw-use-architect", Switch).value)
+    def _grill_ask_bg(self, idea: str, template: bool = False) -> None:
         self._architect_cancelled = False
         backend = None
         try:
-            cfg = self._safe_cfg()
-            if use_architect:
-                backend, reason = open_architect_backend(self.repo, cfg)
-                self._active_architect_backend = backend
-                if backend is not None:
-                    self.call_from_thread(
-                        self._set_drafting_state,
-                        True,
-                        f"Grilling with {reason}...",
-                    )
+            backend, _name, go_on = self._open_backend_for_step("grill", template)
+            if not go_on:
+                return
             turn = architect_grill_turn(
                 self.repo,
                 idea=idea,
@@ -1864,10 +1962,15 @@ class OpenfarmApp(App):
             )
             if self._architect_cancelled:
                 return
+            self._grill_from_template = backend is None
             if turn.get("ready_to_plan") or not str(turn.get("question") or "").strip():
                 self._grill_pending_question = ""
                 self._grill_options = []
-                msg = "[bold #4ade80]✓ Architect is ready — click Draft Plan Now.[/]"
+                msg = (
+                    "[bold #4ade80]✓ The Architect has what it needs. Next: Flesh Out Spec & Chunks.[/]"
+                    if backend is not None else
+                    "[bold #f59e0b]✓ Basic questions done (the Architect was not asked). Next: Flesh Out Spec & Chunks.[/]"
+                )
             else:
                 self._grill_pending_question = str(turn["question"]).strip()
                 self._grill_options = [str(o) for o in (turn.get("options") or [])[:3]]
@@ -1879,46 +1982,32 @@ class OpenfarmApp(App):
         except Exception as exc:
             if self._architect_cancelled:
                 return
-            self.call_from_thread(
-                self._set_drafting_state,
-                False,
-                f"[bold #fb7185]✗ Grill error:[/] {esc(str(exc))}",
-            )
+            if backend is not None:
+                self.call_from_thread(self._architect_failed, "grill", str(exc))
+            else:
+                self.call_from_thread(
+                    self._set_drafting_state,
+                    False,
+                    f"[bold #fb7185]✗ Question error:[/] {esc(str(exc))}",
+                )
         finally:
-            if self._active_architect_backend is backend:
-                self._active_architect_backend = None
-            if backend is not None and hasattr(backend, "close"):
-                try:
-                    backend.close()
-                except Exception as close_exc:
-                    self.log.warning(f"grill backend close error: {close_exc}")
+            self._close_backend(backend)
 
     @on(Button.Pressed, "#btn-draft-spec")
     def _draft_spec_clicked(self) -> None:
-        if self._drafting_plan:
-            self.notify("Architect is busy right now...")
-            return
-        idea = self.query_one("#ta-idea", TextArea).text.strip()
-        if not idea:
-            self.notify("Describe what you want to build first.", severity="warning")
-            self.query_one("#ta-idea", TextArea).focus()
-            return
-        self._set_drafting_state(True, "Fleshing out living spec & splitting into chunks...")
-        self._draft_spec_bg(idea)
+        self._start_architect_step("spec")
 
     @work(thread=True)
-    def _draft_spec_bg(self, idea: str) -> None:
-        use_architect = bool(self.query_one("#sw-use-architect", Switch).value)
+    def _draft_spec_bg(self, idea: str, template: bool = False) -> None:
         self._architect_cancelled = False
         backend = None
         try:
+            # The Architect is opened before anything is set up, so a failure leaves the folder as it was.
+            backend, name, go_on = self._open_backend_for_step("spec", template)
+            if not go_on:
+                return
             self._ensure_workspace_initialized_for_studio(idea)
-            cfg = self._safe_cfg()
-            if use_architect:
-                backend, reason = open_architect_backend(self.repo, cfg)
-                self._active_architect_backend = backend
-                if backend is not None:
-                    self.call_from_thread(self._set_drafting_state, True, f"Fleshing out spec & chunks with {reason}...")
+
             def _on_spec_prog(msg: str) -> None:
                 if not self._architect_cancelled:
                     self.call_from_thread(self._set_drafting_state, True, msg)
@@ -1933,10 +2022,11 @@ class OpenfarmApp(App):
             )
             if self._architect_cancelled:
                 return
+            made_by = "" if backend is not None else " (basic template, the Architect was not asked)"
             self.call_from_thread(
                 self._set_drafting_state,
                 False,
-                f"[bold #4ade80]✓ Spec & {len(res['chunks'])} chunk(s) ready — review or split into cards[/]",
+                f"[bold #4ade80]✓ Spec & {len(res['chunks'])} chunk(s) ready{made_by}. Review it, or split a chunk into cards.[/]",
             )
             self.call_from_thread(self.refresh_all_views)
             self.call_from_thread(
@@ -1947,25 +2037,22 @@ class OpenfarmApp(App):
             )
             self.call_from_thread(
                 self.notify,
-                f"Spec ready with {len(res['chunks'])} chunk(s) — review or split into cards.",
+                f"Spec ready{made_by}: {len(res['chunks'])} chunk(s). Review it, or split a chunk into cards.",
             )
         except Exception as exc:
             if self._architect_cancelled:
                 return
-            self.call_from_thread(
-                self._set_drafting_state,
-                False,
-                f"[bold #fb7185]✗ Spec error:[/] {esc(str(exc))}",
-            )
-            self.call_from_thread(self.notify, f"Spec error: {exc}", severity="error")
+            if backend is not None:
+                self.call_from_thread(self._architect_failed, "spec", str(exc))
+            else:
+                self.call_from_thread(
+                    self._set_drafting_state,
+                    False,
+                    f"[bold #fb7185]✗ Spec error:[/] {esc(str(exc))}",
+                )
+                self.call_from_thread(self.notify, f"Spec error: {exc}", severity="error")
         finally:
-            if self._active_architect_backend is backend:
-                self._active_architect_backend = None
-            if backend is not None and hasattr(backend, "close"):
-                try:
-                    backend.close()
-                except Exception as close_exc:
-                    self.log.warning(f"spec backend close error: {close_exc}")
+            self._close_backend(backend)
 
     @on(DataTable.RowHighlighted, "#chunks-table")
     def _chunk_row_changed(self, event: DataTable.RowHighlighted) -> None:
@@ -2009,9 +2096,7 @@ class OpenfarmApp(App):
         if spec_txt:
             sp.parent.mkdir(parents=True, exist_ok=True)
             sp.write_text(spec_txt + "\n", encoding="utf-8")
-        cid = self._selected_chunk_id or None
-        self._set_drafting_state(True, f"Splitting chunk {cid or 'C1'} into scoped Wave cards...")
-        self._draft_plan_bg(chunk_id=cid)
+        self._start_architect_step("split", chunk_id=self._selected_chunk_id or None)
 
     @on(Button.Pressed, "#btn-spec-back")
     def _spec_back_clicked(self) -> None:
@@ -2029,11 +2114,7 @@ class OpenfarmApp(App):
 
     @on(Button.Pressed, "#btn-draft-plan")
     def _draft_plan_clicked(self) -> None:
-        if self._drafting_plan:
-            self.notify("Architect is already drafting your plan...")
-            return
-        self._set_drafting_state(True, "Preparing workspace & connecting to Frontier Architect...")
-        self._draft_plan_bg()
+        self._start_architect_step("plan")
 
     def _ensure_workspace_initialized_for_studio(self, idea: str) -> None:
         existing_cfg = self._safe_cfg()
@@ -2103,38 +2184,19 @@ class OpenfarmApp(App):
         return False
 
     @work(thread=True)
-    def _draft_plan_bg(self, chunk_id: str | None = None) -> None:
+    def _draft_plan_bg(self, chunk_id: str | None = None, template: bool = False, step: str = "plan") -> None:
         idea = self.query_one("#ta-idea", TextArea).text.strip() or DEFAULT_GRILL_QUESTIONS[0]["default"]
-        use_architect = bool(self.query_one("#sw-use-architect", Switch).value)
         self._architect_cancelled = False
         backend = None
         try:
+            backend, name, go_on = self._open_backend_for_step(step, template, chunk_id)
+            if not go_on:
+                return
             self._ensure_workspace_initialized_for_studio(idea)
-            cfg = self._safe_cfg()
-            arch_note = "local template"
-            if use_architect:
-                backend, reason = open_architect_backend(self.repo, cfg)
-                self._active_architect_backend = backend
-                if backend is not None:
-                    arch_note = reason
-                    self.call_from_thread(
-                        self._set_drafting_state,
-                        True,
-                        f"Designing runnable app & Wave cards with {reason}...",
-                    )
-                else:
-                    arch_note = f"local fallback ({reason})"
-                    self.call_from_thread(
-                        self._set_drafting_state,
-                        True,
-                        f"Drafting local Wave plan ({reason})...",
-                    )
-            else:
-                self.call_from_thread(self._set_drafting_state, True, "Drafting instant local Wave plan...")
 
             def _on_prog(msg: str) -> None:
                 if not self._architect_cancelled:
-                    self.call_from_thread(self._set_drafting_state, True, f"{msg} ({arch_note})")
+                    self.call_from_thread(self._set_drafting_state, True, f"{msg} ({name})")
 
             try:
                 plan = draft_wave_plan(
@@ -2152,22 +2214,9 @@ class OpenfarmApp(App):
                     return
                 if backend is None:
                     raise
-                arch_note = f"local fallback (architect error: {arch_exc})"
-                self.call_from_thread(
-                    self._set_drafting_state,
-                    True,
-                    f"Architect failed ({arch_exc}) — generating local fallback plan...",
-                )
-                plan = draft_wave_plan(
-                    self.repo,
-                    idea=idea,
-                    grill_history=list(self._grill_history),
-                    chunk_id=chunk_id,
-                    backend=None,
-                    include_picked_findings=True,
-                    verify_baseline=True,
-                    on_progress=_on_prog,
-                )
+                # A failed Architect turn is a failure. It never turns into a template by itself.
+                self.call_from_thread(self._architect_failed, step, str(arch_exc), chunk_id)
+                return
             if self._architect_cancelled:
                 return
             self._last_baseline_ok = bool(plan.get("baseline_ok", True))
@@ -2180,11 +2229,17 @@ class OpenfarmApp(App):
                 "current",
                 "studio-plan",
             )
-            base_tag = " · baseline ✓" if self._last_baseline_ok else f" · baseline ✗ ({self._last_baseline_error[:60]})"
+            cards = plan["cards"]
+            can_build = sum(1 for c in cards if c.get("eligible"))
+            parts = [f"Plan ready ({name}): {len(cards)} card(s), {can_build} can be built"]
+            if plan.get("retired_cards"):
+                parts.append(f"replaced unbuilt {', '.join(plan['retired_cards'])}")
+            parts.append("baseline tests pass" if self._last_baseline_ok
+                         else f"baseline tests fail ({self._last_baseline_error[:60]})")
             self.call_from_thread(
                 self.notify,
-                f"Wave plan ready ({arch_note}): {len(plan['cards'])} eligible card(s){base_tag}",
-                severity=("warning" if not self._last_baseline_ok else "information"),
+                " · ".join(parts),
+                severity=("warning" if not self._last_baseline_ok or can_build < len(cards) else "information"),
             )
         except Exception as exc:
             if self._architect_cancelled:
@@ -2196,13 +2251,7 @@ class OpenfarmApp(App):
             )
             self.call_from_thread(self.notify, f"Plan error: {exc}", severity="error")
         finally:
-            if self._active_architect_backend is backend:
-                self._active_architect_backend = None
-            if backend is not None and hasattr(backend, "close"):
-                try:
-                    backend.close()
-                except Exception as close_exc:
-                    self.log.warning(f"architect close error: {close_exc}")
+            self._close_backend(backend)
 
     @on(DataTable.RowHighlighted, "#projects-table")
     def _project_row_changed(self, event: DataTable.RowHighlighted) -> None:
