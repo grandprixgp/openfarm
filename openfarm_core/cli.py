@@ -508,11 +508,23 @@ def _do_run(ctx: Context, args, run_id: str, *, on_event=None) -> int:
     identifiers = ([_check_id(args.card, "card id")]
                    if args.card else source.next(cfg.lane,
                                                  limit=args.cards)["cards"])
+    # Say why the run takes fewer cards than are ready, or none: a card behind an
+    # unfinished one is waiting, and `--cards` caps how many one run starts.
+    why: list[str] = []
+    if not args.card and hasattr(source, "all_cards"):
+        from .cards import waiting_on, waiting_text
+        everything = source.all_cards()
+        waiting = waiting_on(everything)
+        if waiting:
+            why.append(waiting_text(waiting))
+        left = sum(1 for c in everything if c.state == "ready" and c.id not in waiting) - len(identifiers)
+        if left > 0 and len(identifiers) >= int(args.cards or 0):
+            why.append(f"{left} more ready card(s) left for the next wave (one wave starts up to {args.cards})")
     event_bus.emit(
         kind="run_start",
         cards=list(identifiers),
         dry_run=bool(args.dry_run),
-        message=f"Starting run {run_id} ({len(identifiers)} card(s))",
+        message=f"Starting run {run_id} ({len(identifiers)} card(s))" + ("; " + "; ".join(why) if why else ""),
     )
     # `--spend` may lower the night's cap but never raise the config's, because the
     # config is the operator's standing limit and the flag is one night's. A zero or

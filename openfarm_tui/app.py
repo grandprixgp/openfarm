@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-import io
 import json
+import os
+import subprocess
+import sys
+import tempfile
 import time
-from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
-from types import SimpleNamespace
 
 from rich.markup import escape as rich_escape
 from rich.syntax import Syntax
@@ -53,7 +54,7 @@ from openfarm_core.automode import (
     update_card_with_eligibility,
 )
 from openfarm_core.bootstrap import initialize_project
-from openfarm_core.cli import Context, cmd_run, main as cli_main
+import openfarm_core
 from openfarm_core.config import CONFIG_PATH, load_config
 from openfarm_core.daemon import daemon_status, start_daemon, stop_daemon
 from openfarm_core.doctor import compute_touches_conflict_matrix, run_doctor
@@ -433,6 +434,9 @@ class OpenfarmApp(App):
         self._findings_query: str = ""
         self._approved_to_land: list[str] = []
         self._card_phases: dict[str, str] = {}
+        self._cards_finished: set[str] = set()
+        self._run_start_note = ""  # what the run said when it picked its cards
+        self._busy_labels: dict[str, str] = {}  # buttons of slow actions still running
         self._projects_items: list[dict] = []
         self._selected_project_id: str = ""
 
@@ -623,14 +627,14 @@ class OpenfarmApp(App):
                         right_r.border_title = "Live Activity Stream"
                         with right_r:
                             yield RichLog(id="activity-log", markup=True, wrap=True, min_width=0)
-                            with Horizontal(classes="action-row"):
-                                yield Button("Launch Wave", classes="primary-cta", id="btn-run-start")
+                            with Horizontal(classes="action-row", id="run-controls"):
+                                yield Button("Back to Plan", classes="primary-cta", id="btn-run-back")
+                                yield Button("Pause \\[p]", classes="soft-btn hidden", id="btn-pause")
+                                yield Button("Stop \\[s]", classes="soft-btn hidden", id="btn-stop")
+                                yield Button("Hint \\[h]", classes="soft-btn hidden", id="btn-hint")
+                                yield Button("Resume", classes="soft-btn hidden", id="btn-resume")
                                 yield Button("Start Detached", classes="soft-btn", id="btn-daemon-start")
-                                yield Button("Stop Daemon", classes="soft-btn", id="btn-daemon-stop")
-                                yield Button("Pause \\[p]", classes="soft-btn", id="btn-pause")
-                                yield Button("Resume", classes="soft-btn", id="btn-resume")
-                                yield Button("Stop \\[s]", classes="soft-btn", id="btn-stop")
-                                yield Button("Hint \\[h]", classes="soft-btn", id="btn-hint")
+                                yield Button("Stop Daemon", classes="soft-btn hidden", id="btn-daemon-stop")
                                 yield Button("Open Review [2]", classes="approve-btn", id="btn-jump-review")
 
             # ── VIEW 2: SPLIT-PANE REVIEW & LAND INBOX ───────────────────────
@@ -643,10 +647,11 @@ class OpenfarmApp(App):
                 right_rev = Vertical(classes="card-focused split-right")
                 right_rev.border_title = "Card Dossier"
                 with right_rev:
-                    with TabbedContent():
-                        with TabPane("Summary & Diff"):
+                    with TabbedContent(id="review-tabs"):
+                        with TabPane("Summary & Diff", id="rev-tab-summary"):
                             yield Static("Select a card from the queue.", id="review-gates")
                             yield Static("No findings filed by this card.", id="review-card-findings")
+                            yield Static("", id="review-status", classes="subtext")
                             with VerticalScroll(id="diff-scroll"):
                                 yield Static("(no diff preview)", id="review-diff")
                             with Horizontal(classes="action-row"):
@@ -654,11 +659,12 @@ class OpenfarmApp(App):
                                 yield Button("Land Locally \\[L]", classes="primary-cta", id="btn-land")
                                 yield Button("Merge Integration → Main", classes="soft-btn", id="btn-promote-int")
                                 yield Button("Bounce \\[b]", classes="soft-btn", id="btn-bounce")
+                                yield Button("Accept Blocked...", classes="soft-btn hidden", id="btn-accept-blocked")
                                 yield Button("Frontier Review \\[m]", classes="soft-btn", id="btn-freview")
                                 yield Button("Next Chunk / Iterate", classes="soft-btn", id="btn-next-iter")
-                        with TabPane("Tests & Spec"):
+                        with TabPane("Tests & Spec", id="rev-tab-tests"):
                             yield VerticalScroll(Static("(select a card)", id="review-tests"))
-                        with TabPane("Frontier Review"):
+                        with TabPane("Frontier Review", id="rev-tab-frontier"):
                             yield VerticalScroll(Static("Press \\[m] to run Mixture-of-Frontiers review.", id="review-frontier-out"))
 
             # ── VIEW 3: FINDINGS INBOX ───────────────────────────────────────
@@ -983,6 +989,7 @@ class OpenfarmApp(App):
         # Populate Engine diagnostics
         self._refresh_engine_widgets(cfg, gp)
         self._update_token_widgets(ws.get("economics") if isinstance(ws, dict) else None)
+        self._refresh_run_controls()
 
     def _set_step(self, selector: str, label: str, state: str) -> None:
         w = self.query_one(selector, Static)
@@ -1042,9 +1049,17 @@ class OpenfarmApp(App):
             f"[bold #38bdf8]TESTS[/]\n{tests_lines}"
         )
 
+    def _frontier_review_path(self, cfg, card_id: str) -> Path:
+        return Path(cfg.state_dir) / "cards" / card_id / "frontier-review.txt"
+
     def _render_review_card(self, card, cfg) -> None:
         self._selected_review_id = card.id
         st = str(card.state).lower().replace("_", "-")
+        self.query_one("#btn-accept-blocked", Button).set_class(st != "blocked", "hidden")
+        saved = self._frontier_review_path(cfg, card.id) if cfg is not None else None
+        self.query_one("#review-frontier-out", Static).update(
+            esc(saved.read_text(encoding="utf-8", errors="replace")) if saved is not None and saved.is_file()
+            else esc(f"No Frontier Review of {card.id} yet. Press [m] to run one."))
         self.query_one("#review-gates", Static).update(
             f"[bold #f8fafc]{esc(card.id)} · {esc(card.title)}[/]   "
             f"[bold #38bdf8 on #12384d] {esc(st)} [/]   "
@@ -1275,6 +1290,10 @@ class OpenfarmApp(App):
         sw = self.query_one("#main-switcher", ContentSwitcher)
         if view in ("projects", "providers", "studio", "review", "findings", "engine"):
             sw.current = view
+        if view == "studio" and not self._wave_active():
+            studio_sw = self.query_one("#studio-switcher", ContentSwitcher)
+            if studio_sw.current == "studio-run":
+                self._back_to_plan()
         for vid, bid in (
             ("projects", "nav-projects"),
             ("studio", "nav-studio"),
@@ -1524,15 +1543,24 @@ class OpenfarmApp(App):
                 self._run_frontier_review_bg()
                 event.stop()
         elif cur_view == "studio":
-            if event.key == "p":
-                self._run_cli_quick(["pause"])
-                event.stop()
-            elif event.key == "s":
-                self._run_cli_quick(["stop"])
-                event.stop()
-            elif event.key == "h":
-                self._open_hint_modal()
-                event.stop()
+            sub = self.query_one("#studio-switcher", ContentSwitcher).current
+            if sub == "studio-run" and self._wave_active():
+                if event.key == "p":
+                    self._pause_btn()
+                    event.stop()
+                elif event.key == "s":
+                    self._stop_btn()
+                    event.stop()
+                elif event.key == "h":
+                    self._open_hint_modal()
+                    event.stop()
+            elif sub == "studio-plan" and self._selected_plan_id:
+                if event.key == "e":
+                    self._open_card_editor_modal()
+                    event.stop()
+                elif event.key == "x":
+                    self._open_split_card_modal()
+                    event.stop()
 
     # ── Widget Event Handlers ────────────────────────────────────────────────
 
@@ -1574,7 +1602,7 @@ class OpenfarmApp(App):
         gp = load_global_providers()
         prov = gp["frontier"]["provider"]
         with self.suspend():
-            cli_main(["--repo", str(self.repo), "acp", "login", "--provider", prov])
+            subprocess.run(self._cli_argv("acp", "login", "--provider", prov), env=self._cli_env())
         self._load_providers_into_form()
 
     @on(RadioSet.Changed, "#worker-presets")
@@ -2550,71 +2578,182 @@ class OpenfarmApp(App):
         except Refused as exc:
             self.notify(str(exc), severity="warning")
 
+    # -- openfarm commands run in their own process ----------------------------------
+    # The CLI is never called inside this process with stdout swapped out: two actions
+    # at once swap each other's streams back in the wrong order, and a stray print then
+    # lands in the terminal Textual is drawing on.
+
+    def _cli_argv(self, *argv: str) -> list[str]:
+        base = [sys.executable, "-m", "openfarm_core.cli", "--repo", str(self.repo)]
+        if self.config_path is not None:
+            base += ["--config", str(self.config_path)]
+        return [*base, *argv]
+
+    @staticmethod
+    def _cli_env() -> dict:
+        # The child must import this same openfarm, wherever the TUI was started from.
+        src = str(Path(openfarm_core.__file__).resolve().parent.parent)
+        env = dict(os.environ)
+        env["PYTHONPATH"] = src + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+        return env
+
+    def _cli(self, *argv: str) -> tuple[int, str]:
+        """Run one openfarm command; return its exit code and everything it printed."""
+        proc = subprocess.run(self._cli_argv(*argv), capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL, env=self._cli_env())
+        return proc.returncode, "\n".join(t for t in (proc.stdout.strip(), proc.stderr.strip()) if t)
+
+    @staticmethod
+    def _last_line(out: str, fallback: str) -> str:
+        return out.strip().splitlines()[-1] if out.strip() else fallback
+
+    def _wave_active(self) -> bool:
+        """A wave is running here, or the detached daemon is running one."""
+        if self._running_wave:
+            return True
+        try:
+            return bool(daemon_status(self.repo, config_path=self.config_path).get("running"))
+        except Exception:
+            return False
+
+    def _run_refusal(self) -> str:
+        """Why a wave can't start right now ('' when it can): the checks `openfarm run` makes first."""
+        cfg = self._safe_cfg()
+        if cfg is None:
+            return "this folder isn't set up for openfarm yet"
+        state = StateDir(cfg.state_dir)
+        if state.kill_requested(cfg.kill_switch):
+            return "the kill switch exists (Stop was pressed)"
+        if state.is_paused():
+            return "the queue is paused"
+        if state.read_breaker().get("tripped"):
+            return "the circuit breaker is tripped"
+        return ""
+
+    def _refresh_run_controls(self) -> None:
+        """Show only the run buttons that can do something right now."""
+        cfg = self._safe_cfg()
+        daemon_up = False
+        if cfg is not None:
+            try:
+                daemon_up = bool(daemon_status(self.repo, config_path=self.config_path).get("running"))
+            except Exception:
+                daemon_up = False
+        running = self._running_wave or daemon_up
+        held = cfg is not None and bool(self._run_refusal())
+        for bid, shown in (
+            ("#btn-pause", running), ("#btn-stop", running), ("#btn-hint", running),
+            ("#btn-resume", held),
+            ("#btn-daemon-start", cfg is not None and not running),
+            ("#btn-daemon-stop", daemon_up),
+        ):
+            self.query_one(bid, Button).set_class(not shown, "hidden")
+
+    def _back_to_plan(self) -> None:
+        has_cards = bool(self._plan_cards or self._review_cards)
+        self.query_one("#studio-switcher", ContentSwitcher).current = "studio-plan" if has_cards else "studio-grill"
+
+    @on(Button.Pressed, "#btn-run-back")
+    def _run_back_clicked(self) -> None:
+        self._back_to_plan()
+
+    def _show_run_refusal(self, reason: str) -> None:
+        self._append_activity(f"[bold #fb7185]✗ The wave didn't start:[/] {rich_escape(reason)}")
+        low = reason.lower()
+        if "paused" in low or "kill switch" in low or "breaker" in low:
+            self._append_activity("[#fbbf24]Press Resume below to clear it, then launch the wave from the plan.[/]")
+        elif "key" in low or "endpoint" in low or "api.example.invalid" in low:
+            self._append_activity("[#fbbf24]Open Providers (Ctrl+K, then Providers) to set the worker's endpoint and API key.[/]")
+        self.notify(f"The wave didn't start: {reason[:100]}", severity="error")
+        self._refresh_run_controls()
+
     @on(Button.Pressed, "#btn-launch-wave")
-    @on(Button.Pressed, "#btn-run-start")
     def start_nonblocking_wave(self) -> None:
+        self.query_one("#studio-switcher", ContentSwitcher).current = "studio-run"
         if self._running_wave:
             self.notify("A wave is already running")
             return
-        self.query_one("#studio-switcher", ContentSwitcher).current = "studio-run"
+        if not self._drafting_plan:
+            self.query_one("#architect-panel", Vertical).add_class("hidden")
+        refusal = self._run_refusal()
+        if refusal:
+            self._show_run_refusal(refusal)
+            return
+        self._card_phases.clear()
+        self._cards_finished.clear()
+        self._run_start_note = ""
+        self.query_one("#run-queue-view", Static).update("Starting...")
+        self._running_wave = True
         self._run_wave_bg()
+
+    def _forward_run_events(self, events_path: Path, seen: int) -> int:
+        """Hand the run's new events to the screen; returns how far the file has been read."""
+        try:
+            with events_path.open("rb") as handle:
+                handle.seek(seen)
+                data = handle.read()
+        except OSError:
+            return seen
+        whole = data[: data.rfind(b"\n") + 1]
+        for line in whole.splitlines():
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(event, dict):
+                self.call_from_thread(self._handle_run_event, event)
+        return seen + len(whole)
 
     @work(thread=True)
     def _run_wave_bg(self) -> None:
         self._running_wave = True
         self.call_from_thread(self._set_running_badge, True)
-        self.call_from_thread(self._append_activity, "[#94a3b8]Preparing baseline and launching wave...[/]")
+        self.call_from_thread(self._append_activity, "[#94a3b8]Committing the baseline and starting the wave...[/]")
         try:
             ensure_baseline_committed(self.repo)
-            ctx = Context(self.repo, self.config_path, json_output=True)
-            args = SimpleNamespace(
-                cards=3, spend=None, for_duration=None, until=None, dry_run=False, card=None,
-                run_id=None, profile=None, learn_from=None, script=None, mm_script=None, json=True,
-            )
-
-            def _on_ev(ev: dict) -> None:
-                self.call_from_thread(self._handle_run_event, ev)
-
-            buf = io.StringIO()
-            with redirect_stdout(buf), redirect_stderr(buf):
-                rc = cmd_run(ctx, args, on_event=_on_ev)
-            raw_out = buf.getvalue().strip()
+            cfg = self._safe_cfg()
+            run_id = "run-" + time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+            events_path = StateDir(cfg.state_dir).run_dir(run_id) / "events.jsonl"
+            # Output goes to files, not pipes: nothing reads a pipe while the run is going.
+            with tempfile.TemporaryFile("w+") as out, tempfile.TemporaryFile("w+") as err:
+                proc = subprocess.Popen(
+                    self._cli_argv("--json", "run", "--cards", "3", "--run-id", run_id),
+                    stdout=out, stderr=err, stdin=subprocess.DEVNULL, env=self._cli_env())
+                seen = 0
+                while True:
+                    finished = proc.poll() is not None
+                    seen = self._forward_run_events(events_path, seen)
+                    if finished:
+                        break
+                    time.sleep(0.25)
+                out.seek(0)
+                err.seek(0)
+                raw_out, raw_err = out.read().strip(), err.read().strip()
+            rc = proc.returncode
             parsed: dict = {}
-            if raw_out:
-                try:
-                    obj = json.loads(raw_out)
-                    if isinstance(obj, dict):
-                        parsed = obj
-                except ValueError:
-                    parsed = {}
+            try:
+                obj = json.loads(raw_out) if raw_out else {}
+                if isinstance(obj, dict):
+                    parsed = obj
+            except ValueError:
+                parsed = {}
             if rc != 0 or parsed.get("refused") or parsed.get("error"):
-                reason = str(parsed.get("reason") or parsed.get("error") or raw_out.splitlines()[-1] if raw_out else f"run exited {rc}")
-                self.call_from_thread(
-                    self._append_activity,
-                    f"[bold #fb7185]✗ Wave refused/stopped (exit {rc}):[/] {rich_escape(reason)}",
-                )
-                if "paused" in reason.lower():
-                    self.call_from_thread(
-                        self._append_activity,
-                        "[#fbbf24]Tip: click [Resume] below (or run `openfarm resume`) to clear the stale pause, then click Launch Wave.[/]",
-                    )
-                elif "key" in reason.lower() or "endpoint" in reason.lower() or "api.example.invalid" in reason.lower():
-                    self.call_from_thread(
-                        self._append_activity,
-                        "[#fbbf24]Tip: press Ctrl+K → Providers to configure your Worker endpoint & API key.[/]",
-                    )
-                self.call_from_thread(self.notify, f"Wave stopped: {reason[:100]}", severity="error")
+                reason = str(parsed.get("reason") or parsed.get("error")
+                             or self._last_line(raw_err or raw_out, f"the run ended with exit code {rc}"))
+                self.call_from_thread(self._show_run_refusal, reason)
             else:
                 outcomes = parsed.get("outcomes") if isinstance(parsed.get("outcomes"), list) else []
                 if not outcomes:
+                    why = f" {self._run_start_note}" if self._run_start_note else ""
                     self.call_from_thread(
                         self._append_activity,
-                        "[#fbbf24]○ Wave finished with 0 cards claimed (check card states in Plan / Review).[/]",
+                        f"[#fbbf24]○ The wave ended without starting a card.{rich_escape(why)}[/]",
                     )
                 else:
+                    ends = ", ".join(f"{o.get('card_id') or o.get('card')}: {o.get('final_state')}" for o in outcomes)
                     self.call_from_thread(
                         self._append_activity,
-                        f"[bold #4ade80]✓ Wave finished:[/] {len(outcomes)} card(s) processed.",
+                        f"[bold #4ade80]✓ Wave finished:[/] {len(outcomes)} card(s) ({rich_escape(ends)}).",
                     )
         except Exception as exc:
             self.call_from_thread(self._append_activity, f"[bold #fb7185]✗ Run error:[/] {rich_escape(str(exc))}")
@@ -2633,6 +2772,7 @@ class OpenfarmApp(App):
         else:
             pill.add_class("status-ready")
             pill.update("○ READY")
+        self._refresh_run_controls()
 
     def _append_activity(self, markup_line: str) -> None:
         self.query_one("#activity-log", RichLog).write(markup_line)
@@ -2643,7 +2783,6 @@ class OpenfarmApp(App):
         phase = str(ev.get("phase") or "")
         msg = str(ev.get("message") or "")
         ts = str(ev.get("ts") or "")[11:19]
-
         if ev.get("worker_tokens") or ev.get("supervisor_tokens"):
             self._worker_tokens = max(self._worker_tokens, int(ev.get("worker_tokens") or 0))
             self._supervisor_tokens = max(self._supervisor_tokens, int(ev.get("supervisor_tokens") or 0))
@@ -2651,24 +2790,34 @@ class OpenfarmApp(App):
             self._tokens_cached = max(self._tokens_cached, int(ev.get("tokens_in_cached") or 0))
             self._spark_points.append(float(self._worker_tokens + self._supervisor_tokens))
             self._update_token_widgets()
-
-        if cid and phase:
+        same_phase = bool(cid) and self._card_phases.get(cid) == phase
+        if kind == "card_done" and cid:
+            self._cards_finished.add(cid)
+            self._card_phases[cid] = str(ev.get("final_state") or "finished")
+        elif cid and phase and cid not in self._cards_finished:
             self._card_phases[cid] = phase
+        if cid:
             q_lines = [
-                f"[bold #38bdf8]▶ {esc(k)}[/]  [#cbd5e1]{esc(v)}[/]"
+                (f"[bold #4ade80]●[/] {esc(k)} [#cbd5e1]finished: {esc(v)}[/]" if k in self._cards_finished
+                 else f"[bold #38bdf8]▶ {esc(k)}[/] [#cbd5e1]{esc(v)}[/]")
                 for k, v in self._card_phases.items()
             ]
             self.query_one("#run-queue-view", Static).update("\n".join(q_lines))
-
         if kind == "phase":
-            self._append_activity(f"[#94a3b8]{ts}[/]  [bold #38bdf8]▶[/]  {rich_escape(cid)} → [bold]{rich_escape(phase)}[/]")
+            if not same_phase:  # the same phase is announced more than once by the run
+                self._append_activity(f"[#94a3b8]{ts}[/] [bold #38bdf8]▶[/] {rich_escape(cid)} → [bold]{rich_escape(phase)}[/]")
         elif kind == "card_done":
             st = str(ev.get("final_state") or "")
             col = "#4ade80" if st == "in-review" else "#fb7185"
-            self._append_activity(f"[#94a3b8]{ts}[/]  [bold {col}]●[/]  {rich_escape(cid)} finished: {rich_escape(st)} {rich_escape(msg)}")
+            self._append_activity(f"[#94a3b8]{ts}[/] [bold {col}]●[/] {rich_escape(cid)} finished: {rich_escape(st)} {rich_escape(msg)}")
             self.refresh_all_views()
         elif msg:
-            self._append_activity(f"[#94a3b8]{ts}[/]  {rich_escape(msg)}")
+            if kind == "run_start":
+                self._run_start_note = msg.partition("; ")[2]
+                if not self._card_phases:
+                    self.query_one("#run-queue-view", Static).update(
+                        esc("No card running." + (f" {self._run_start_note}" if self._run_start_note else "")))
+            self._append_activity(f"[#94a3b8]{ts}[/] {rich_escape(msg)}")
 
     # ── Review & Findings Buttons + Modals ───────────────────────────────────
 
@@ -2716,25 +2865,53 @@ class OpenfarmApp(App):
         cid = self._selected_review_id
         if not cid:
             return
-        buf = io.StringIO()
-        with redirect_stdout(buf), redirect_stderr(buf):
-            rc = cli_main(["--repo", str(self.repo), "verdict", cid, "clean", "--review-tokens", "0"])
+        rc, out = self._cli("verdict", cid, "clean")
         if rc != 0:
-            err = buf.getvalue().strip().splitlines()[-1] if buf.getvalue().strip() else f"verdict exited {rc}"
-            self.notify(f"Approve failed: {err[:100]}", severity="error")
+            self.notify(f"Approve failed: {self._last_line(out, f'verdict exited {rc}')[:100]}", severity="error")
             return
         if cid not in self._approved_to_land:
             self._approved_to_land.append(cid)
         self.query_one("#approved-queue-label", Static).update(
             esc(f"Approved to land: {', '.join(self._approved_to_land)}")
         )
-        self.notify(f"Approved {cid} — press [L] to Land Locally")
+        self.notify(f"Approved {cid}. Press [L] or Land Locally to merge it.")
+        self.refresh_all_views()
+
+    # -- slow review actions: say it's running, run it off the UI thread, show how it ended --
+
+    def _start_review_action(self, button_id: str, doing: str, argv: list[str], on_done=None) -> None:
+        if button_id in self._busy_labels:
+            self.notify(f"{doing} is still running")
+            return
+        btn = self.query_one(button_id, Button)
+        self._busy_labels[button_id] = str(btn.label)
+        btn.loading = True
+        self.query_one("#review-status", Static).update(f"[bold #38bdf8]⏳ {esc(doing)}...[/]")
+        self._review_action_bg(button_id, doing, argv, on_done)
+
+    @work(thread=True)
+    def _review_action_bg(self, button_id: str, doing: str, argv: list[str], on_done) -> None:
+        try:
+            rc, out = self._cli(*argv)
+        except Exception as exc:  # noqa: BLE001 - the button must come back whatever happened
+            rc, out = 1, str(exc)
+        self.call_from_thread(self._finish_review_action, button_id, doing, rc, out, on_done)
+
+    def _finish_review_action(self, button_id: str, doing: str, rc: int, out: str, on_done) -> None:
+        self._busy_labels.pop(button_id, None)
+        self.query_one(button_id, Button).loading = False
+        last = self._last_line(out, f"exit code {rc}")
+        colour = "#4ade80" if rc == 0 else "#fb7185"
+        self.query_one("#review-status", Static).update(
+            f"[bold {colour}]{'✓' if rc == 0 else '✗'} {esc(doing)}:[/] {esc(last[:200])}")
+        self.notify(f"{doing}: {last[:120]}", severity=("error" if rc != 0 else "information"))
+        if on_done is not None:
+            on_done(rc, out)
         self.refresh_all_views()
 
     @on(Button.Pressed, "#btn-promote-int")
     def _promote_integration_btn(self) -> None:
-        self._run_cli_quick(["land", "--promote-integration"])
-        self.refresh_all_views()
+        self._start_review_action("#btn-promote-int", "Merging the integration branch", ["land", "--promote-integration"])
 
     @on(Button.Pressed, "#btn-land")
     def _land_approved_queue(self) -> None:
@@ -2742,10 +2919,35 @@ class OpenfarmApp(App):
         if not targets:
             self.notify("No cards queued to land")
             return
-        self._run_cli_quick(["land", *targets])
-        self._approved_to_land.clear()
-        self.query_one("#approved-queue-label", Static).update("Approved queue: (none)")
-        self.refresh_all_views()
+
+        def _landed(rc: int, _out: str) -> None:
+            if rc == 0:
+                self._approved_to_land.clear()
+                self.query_one("#approved-queue-label", Static).update("Approved queue: (none)")
+
+        self._start_review_action("#btn-land", f"Landing {', '.join(targets)}", ["land", *targets], _landed)
+
+    @on(Button.Pressed, "#btn-accept-blocked")
+    def _open_accept_blocked_modal(self) -> None:
+        card = next((c for c in self._review_cards if c.id == self._selected_review_id), None)
+        if card is None or str(card.state).lower() != "blocked":
+            return
+
+        def _done(note: str | None) -> None:
+            if note is None:
+                return
+            if not note.strip():
+                self.notify("A note saying what you checked is required.", severity="warning")
+                return
+            self._start_review_action(
+                "#btn-accept-blocked", f"Accepting {card.id}",
+                ["land", card.id, "--accept-blocked", "--note", note.strip()])
+
+        self.push_screen(BounceNoteModal(
+            card.id, card.title,
+            heading=f"I've checked {card.id}, accept it",
+            sub="The farm blocked this card. Say what you checked; your name and this note are recorded, then it merges like Land.",
+            ok_label="Accept and Land"), _done)
 
     @on(Button.Pressed, "#btn-bounce")
     def _open_bounce_modal(self) -> None:
@@ -2755,37 +2957,50 @@ class OpenfarmApp(App):
 
         def _done(note: str | None) -> None:
             if note is not None:
-                self._run_cli_quick(["verdict", card.id, "bounced", "--review-tokens", "0"])
+                self._run_cli_quick(["verdict", card.id, "bounced", *(["--note", note] if note else [])])
                 self.refresh_all_views()
 
         self.push_screen(BounceNoteModal(card.id, card.title), _done)
 
     @on(Button.Pressed, "#btn-freview")
     def _run_frontier_review_bg(self) -> None:
-        self._frontier_review_worker()
-
-    @work(thread=True)
-    def _frontier_review_worker(self) -> None:
         cid = self._selected_review_id
-        buf = io.StringIO()
-        argv = ["--repo", str(self.repo), "frontier-review", "--scope", "card", cid] if cid else ["--repo", str(self.repo), "frontier-review", "--scope", "diff"]
-        with redirect_stdout(buf), redirect_stderr(buf):
-            cli_main(argv)
-        out = buf.getvalue().strip() or "(no frontier-review output)"
-        self.call_from_thread(self.query_one("#review-frontier-out", Static).update, esc(out))
+        if not cid:
+            # One card at a time: without a choice nothing is reviewed, least of all the whole diff.
+            self.notify("Which card? Select one in the list, then press Frontier Review.", severity="warning")
+            self.query_one("#review-table", DataTable).focus()
+            return
+        cfg = self._safe_cfg()
+
+        def _reviewed(rc: int, out: str) -> None:
+            text = out or "(the review printed nothing)"
+            if rc == 0 and cfg is not None:
+                path = self._frontier_review_path(cfg, cid)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text + "\n", encoding="utf-8")
+            if self._selected_review_id == cid:
+                self.query_one("#review-frontier-out", Static).update(esc(text))
+            self.query_one("#review-tabs", TabbedContent).active = "rev-tab-frontier"
+
+        self._start_review_action(
+            "#btn-freview", f"Reviewing {cid} with Claude and Codex",
+            ["frontier-review", "--scope", "card", cid], _reviewed)
 
     @on(Button.Pressed, "#btn-pause")
     def _pause_btn(self) -> None:
         self._run_cli_quick(["pause"])
+        self._refresh_run_controls()
 
     @on(Button.Pressed, "#btn-resume")
     def _resume_btn(self) -> None:
-        self._run_cli_quick(["resume", "--clear-breaker", "--clear-kill"])
-        self._append_activity("[bold #4ade80]✓ Queue resumed (pause/breaker/kill cleared).[/]")
+        if self._run_cli_quick(["resume", "--clear-breaker", "--clear-kill"]) == 0:
+            self._append_activity("[bold #4ade80]✓ Resumed: pause, breaker and kill switch are cleared.[/]")
+        self._refresh_run_controls()
 
     @on(Button.Pressed, "#btn-stop")
     def _stop_btn(self) -> None:
         self._run_cli_quick(["stop"])
+        self._refresh_run_controls()
 
     @on(Button.Pressed, "#btn-hint")
     def _open_hint_modal(self) -> None:
@@ -2798,9 +3013,8 @@ class OpenfarmApp(App):
         self.push_screen(HintModal(active_cid), _done)
 
     def _run_cli_quick(self, argv: list[str]) -> int:
-        buf = io.StringIO()
-        with redirect_stdout(buf), redirect_stderr(buf):
-            rc = cli_main(["--repo", str(self.repo), *argv])
-        msg = buf.getvalue().strip().splitlines()[-1] if buf.getvalue().strip() else f"{argv[0]} exited {rc}"
-        self.notify(msg[:120], severity=("error" if rc != 0 else "information"))
+        """A quick openfarm command (pause, release, verdict...): run it and toast its last line."""
+        rc, out = self._cli(*argv)
+        self.notify(self._last_line(out, f"{argv[0]} exited {rc}")[:120],
+                    severity=("error" if rc != 0 else "information"))
         return rc

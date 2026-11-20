@@ -182,19 +182,23 @@ class BounceNoteModal(ModalScreen[str | None]):
 
     CSS = _MODAL_CSS + "\nTextArea { height: 7; background: #0b1019; border: round #38bdf8; }"
 
-    def __init__(self, card_id: str, title: str) -> None:
+    def __init__(self, card_id: str, title: str, *, heading: str = "", sub: str = "",
+                 ok_label: str = "Bounce Card") -> None:
         super().__init__()
         self._cid = card_id
         self._title = title
+        self._heading = heading or f"Bounce {card_id} With Feedback"
+        self._sub = sub or title
+        self._ok_label = ok_label
 
     def compose(self) -> ComposeResult:
         with Vertical(classes="modal-box"):
-            yield Static(f"Bounce {self._cid} With Feedback", classes="modal-title", markup=False)
-            yield Static(self._title, classes="modal-sub", markup=False)
+            yield Static(self._heading, classes="modal-title", markup=False)
+            yield Static(self._sub, classes="modal-sub", markup=False)
             yield TextArea("", id="bounce-note")
             with Horizontal(classes="modal-actions"):
                 yield Button("Cancel \\[Esc]", id="cancel", classes="btn-cancel")
-                yield Button("Bounce Card", id="ok", classes="btn-ok")
+                yield Button(esc(self._ok_label), id="ok", classes="btn-ok")
 
     def on_mount(self) -> None:
         self.query_one("#bounce-note", TextArea).focus()

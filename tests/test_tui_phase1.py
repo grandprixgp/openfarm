@@ -524,5 +524,236 @@ class ArchitectBackendTests(_RegistryIsolation):
         self.assertEqual(got, ["he", "llo"])
 
 
+def _log_text(app) -> str:
+    """The activity log as one line of text (the log wraps long lines)."""
+    return " ".join(" ".join(str(line.text) for line in app.query_one("#activity-log").lines).split())
+
+
+@unittest.skipUnless(textual_available(), "textual optional extra not installed")
+class RunPanelTests(_RegistryIsolation):
+    """R1.7, R1.10, R1.11, R1.14, R1.16: the wave, its panel and the way back."""
+
+    def _blocked_first_card(self):
+        toy, src = _two_card_toy(self)
+        claim = src.claim("CARD-1", holder="test-lane")
+        src.move("CARD-1", claim["lease_id"], "blocked", stop_code="tests-unprovable")
+        return toy, src
+
+    def _drive(self, toy, body, view: str = "studio") -> None:
+        from openfarm_tui.app import OpenfarmApp
+
+        async def _run() -> None:
+            app = OpenfarmApp(repo=toy.root, initial_view=view)
+            async with app.run_test(size=(140, 44)) as pilot:
+                await pilot.pause(0.15)
+
+                async def settle() -> None:
+                    await app.workers.wait_for_complete()
+                    await pilot.pause(0.15)
+
+                await body(app, pilot, settle)
+
+        asyncio.run(_run())
+
+    def test_the_tui_never_swaps_stdout_to_call_the_cli(self) -> None:
+        import openfarm_tui.app as app_module
+
+        source = Path(app_module.__file__).read_text()
+        self.assertNotIn("redirect_stdout", source)
+        self.assertNotIn("cli_main", source)
+
+    def test_a_wave_runs_in_its_own_process_and_says_why_it_started_nothing(self) -> None:
+        import sys
+
+        toy, _src = self._blocked_first_card()
+
+        async def body(app, pilot, settle) -> None:
+            streams = (sys.stdout, sys.stderr)
+            with mock.patch("openfarm_tui.app.subprocess.Popen", wraps=subprocess.Popen) as popen:
+                app.start_nonblocking_wave()
+                app._run_cli_quick(["status"])  # a second action while the wave is going
+                await settle()
+            cli_calls = [c.args[0] for c in popen.call_args_list if "openfarm_core.cli" in c.args[0]]
+            self.assertTrue(any("run" in argv for argv in cli_calls), cli_calls)
+            self.assertTrue(any("status" in argv for argv in cli_calls), cli_calls)
+            self.assertEqual((sys.stdout, sys.stderr), streams)
+            self.assertFalse(app._running_wave)
+            log = _log_text(app)
+            self.assertIn("CARD-2 waits for CARD-1 (blocked)", log)
+            self.assertIn("ended without starting a card", log)
+            self.assertNotIn("0 cards claimed", log)
+            self.assertIn("CARD-2 waits for CARD-1 (blocked)", str(app.query_one("#run-queue-view").render()))
+
+            # The way back: the button, and coming back to the Studio tab.
+            self.assertEqual(app.query_one("#studio-switcher").current, "studio-run")
+            self.assertTrue(app.query_one("#btn-run-back").display)
+            app._run_back_clicked()
+            self.assertEqual(app.query_one("#studio-switcher").current, "studio-plan")
+            app.query_one("#studio-switcher").current = "studio-run"
+            app.action_switch_view("review")
+            app.action_switch_view("studio")
+            self.assertEqual(app.query_one("#studio-switcher").current, "studio-plan")
+
+        self._drive(toy, body)
+
+    def test_run_only_buttons_and_keys_do_nothing_when_nothing_runs(self) -> None:
+        from openfarm_core.state import StateDir
+
+        toy, _src = self._blocked_first_card()
+        state = StateDir(load_config(toy.root).state_dir)
+
+        async def body(app, pilot, settle) -> None:
+            for bid in ("#btn-pause", "#btn-stop", "#btn-hint", "#btn-resume", "#btn-daemon-stop"):
+                self.assertTrue(app.query_one(bid).has_class("hidden"), bid)
+            self.assertEqual(len(app.query("#btn-run-start")), 0, "Launch Wave is not repeated in the run panel")
+            app.query_one("#plan-table").focus()
+            await pilot.press("p", "s", "h")
+            await settle()
+            self.assertFalse(state.is_paused())
+            self.assertFalse(state.kill_requested(load_config(toy.root).kill_switch))
+            self.assertEqual(len(app.screen_stack), 1, "no Hint dialog")
+
+            state.pause("left over")
+            app.start_nonblocking_wave()
+            await settle()
+            self.assertIn("the queue is paused", _log_text(app))
+            self.assertFalse(app.query_one("#btn-resume").has_class("hidden"))
+
+        self._drive(toy, body)
+
+    def test_a_phase_is_logged_once_and_a_finished_card_stops_looking_busy(self) -> None:
+        toy, _src = self._blocked_first_card()
+
+        async def body(app, pilot, settle) -> None:
+            app.query_one("#studio-switcher").current = "studio-run"  # the log draws once it is on screen
+            await pilot.pause(0.1)
+            for _ in range(2):
+                app._handle_run_event({"kind": "phase", "card_id": "CARD-9", "phase": "claim", "ts": "2026-11-20T10:00:00Z"})
+            await pilot.pause(0.1)
+            self.assertEqual(_log_text(app).count("CARD-9 → claim"), 1)
+            app._handle_run_event({"kind": "card_done", "card_id": "CARD-9", "final_state": "in-review"})
+            await pilot.pause(0.1)
+            queue = str(app.query_one("#run-queue-view").render())
+            self.assertIn("CARD-9 finished: in-review", queue)
+            self.assertNotIn("▶", queue)
+
+        self._drive(toy, body)
+
+
+@unittest.skipUnless(textual_available(), "textual optional extra not installed")
+class ReviewActionTests(_RegistryIsolation):
+    """R1.9, R1.17: slow review actions show they run and how they end; a blocked card can be accepted."""
+
+    def _drive(self, toy, body) -> None:
+        from openfarm_tui.app import OpenfarmApp
+
+        async def _run() -> None:
+            app = OpenfarmApp(repo=toy.root, initial_view="review")
+            async with app.run_test(size=(140, 44)) as pilot:
+                await pilot.pause(0.15)
+
+                async def settle() -> None:
+                    await app.workers.wait_for_complete()
+                    await pilot.pause(0.15)
+
+                await body(app, pilot, settle)
+
+        asyncio.run(_run())
+
+    def _blocked_and_ready(self):
+        toy, src = _two_card_toy(self)
+        claim = src.claim("CARD-1", holder="test-lane")
+        src.move("CARD-1", claim["lease_id"], "blocked", stop_code="tests-unprovable")
+        return toy
+
+    def test_frontier_review_shows_it_runs_opens_its_tab_and_is_kept(self) -> None:
+        import threading
+
+        toy = self._blocked_and_ready()
+        release = threading.Event()
+        calls: list[tuple] = []
+
+        def fake_cli(*argv):
+            calls.append(argv)
+            release.wait(5)
+            return 0, "Frontier review (card): agreed=clean (consensus=2/2)\n  [claude] clean: fine"
+
+        async def body(app, pilot, settle) -> None:
+            app._cli = fake_cli
+            app._selected_review_id = ""
+            app._run_frontier_review_bg()
+            await pilot.pause(0.1)
+            self.assertEqual(calls, [], "no card chosen: nothing is reviewed")
+            self.assertIn("Which card?", " | ".join(n.message for n in app._notifications))
+
+            app._selected_review_id = "CARD-1"
+            app._run_frontier_review_bg()
+            await pilot.pause(0.2)
+            self.assertIn("Reviewing CARD-1 with Claude and Codex", str(app.query_one("#review-status").render()))
+            self.assertTrue(app.query_one("#btn-freview").loading)
+            release.set()
+            await settle()
+            self.assertEqual(calls, [("frontier-review", "--scope", "card", "CARD-1")])
+            self.assertFalse(app.query_one("#btn-freview").loading)
+            self.assertEqual(app.query_one("#review-tabs").active, "rev-tab-frontier")
+            self.assertIn("agreed=clean", str(app.query_one("#review-frontier-out").render()))
+
+        self._drive(toy, body)
+
+        async def after_restart(app, pilot, settle) -> None:
+            self.assertEqual(app._selected_review_id, "CARD-1")
+            self.assertIn("agreed=clean", str(app.query_one("#review-frontier-out").render()))
+
+        self._drive(toy, after_restart)
+
+    def test_accepting_a_blocked_card_needs_a_note_and_lands_it(self) -> None:
+        from textual.widgets import TextArea
+
+        toy = self._blocked_and_ready()
+        calls: list[tuple] = []
+
+        def fake_cli(*argv):
+            calls.append(argv)
+            return 0, "CARD-1: merged into main and marked done"
+
+        async def body(app, pilot, settle) -> None:
+            app._cli = fake_cli
+            accept = app.query_one("#btn-accept-blocked")
+            self.assertEqual(app._selected_review_id, "CARD-1")
+            self.assertFalse(accept.has_class("hidden"))
+
+            app._open_accept_blocked_modal()
+            await pilot.pause(0.1)
+            app.screen._ok()  # no note
+            await settle()
+            self.assertEqual(calls, [])
+
+            app._open_accept_blocked_modal()
+            await pilot.pause(0.1)
+            app.screen.query_one("#bounce-note", TextArea).text = "ran its tests by hand"
+            app.screen._ok()
+            await settle()
+            self.assertEqual(calls, [("land", "CARD-1", "--accept-blocked", "--note", "ran its tests by hand")])
+            self.assertIn("merged into main", str(app.query_one("#review-status").render()))
+
+            app._render_review_card(next(c for c in app._review_cards if c.id == "CARD-2"), app._safe_cfg())
+            self.assertTrue(accept.has_class("hidden"), "only a blocked card can be accepted this way")
+
+        self._drive(toy, body)
+
+    def test_a_failed_land_says_why_and_keeps_the_queue(self) -> None:
+        toy = self._blocked_and_ready()
+
+        async def body(app, pilot, settle) -> None:
+            app._cli = lambda *argv: (2, "CARD-2 is in state 'ready', not 'in_review'")
+            app._approved_to_land.append("CARD-2")
+            app._land_approved_queue()
+            await settle()
+            self.assertIn("not 'in_review'", str(app.query_one("#review-status").render()))
+            self.assertEqual(app._approved_to_land, ["CARD-2"])
+
+        self._drive(toy, body)
+
+
 if __name__ == "__main__":
     unittest.main()
