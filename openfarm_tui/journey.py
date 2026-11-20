@@ -659,6 +659,12 @@ class Journey(App):
                   "board": "#col-needs"}.get(self.screen_name, "#go")
         if self.screen_name == "questions" and not self.query_one("#q-options", OptionList).option_count:
             target = "#q-own" if self.facts["session"]["pending"] else "#go"
+        if self.screen_name == "build":  # start on the task that needs the user, not the first row
+            needs = self._first("in_review") or next((t for t in self.facts["tasks"] if self.facts["questions"]
+                                                      and t["id"] == self.facts["questions"][0]["from_card"]), None) \
+                or self._first("blocked")
+            if needs:
+                self.query_one("#build-tasks", OptionList).highlighted = [t["id"] for t in self.facts["tasks"]].index(needs["id"])
         if self.screen_name == "board":
             target = next((f"#col-{key}" for key in ("needs", "building", "waiting", "done")
                            if self.query_one(f"#col-{key}", OptionList).option_count), "#go")
@@ -1178,7 +1184,10 @@ class Journey(App):
             others.append(("open_blocked", f"See why {blocked['id']} stopped"))
         cfg = facts["cfg"]
         held = cfg is not None and (StateDir(cfg.state_dir).is_paused() or StateDir(cfg.state_dir).kill_requested(cfg.kill_switch))
-        others.append(("resume", "Resume") if held else ("pause", "Pause"))
+        if held:
+            others.append(("resume", "Resume"))
+        elif facts["running"] or self._following:  # nothing to pause when nothing runs
+            others.append(("pause", "Pause"))
         verb = primary[1].split()[0].lower() if primary else ""
         return primary, others, (f"Enter {verb} · " if verb else "") + "↑↓ task · Space details · b board · l log"
 

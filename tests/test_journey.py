@@ -664,6 +664,8 @@ class FlowTests(_Folder):
     def test_a_wrong_task_offers_its_fix_as_a_diff_and_apply_puts_it_back(self) -> None:
         async def body(app, pilot) -> None:
             self.assertEqual(self.label(app), "▶ See why W1-04 stopped")
+            self.assertEqual(app.query_one("#build-tasks").highlighted, 3)  # starts on the task that needs you
+            self.assertNotIn("Pause", [str(b.label) for b in app.query("#actions Button") if b.display])
             from openfarm_core.store import Store
 
             store = Store(app.repo, app.facts["cfg"])
