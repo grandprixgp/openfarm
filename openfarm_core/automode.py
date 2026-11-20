@@ -16,7 +16,7 @@ from pathlib import Path
 from . import adopt
 from .acp_setup import inspect_acp_status
 from .config import CONFIG_PATH, load_config
-from .errors import AdapterError, ConfigError, Refused
+from .errors import AdapterError, ConfigError, Infra, Refused
 from .globs import resolves_within
 from .state import StateDir
 
@@ -440,17 +440,63 @@ class _AcpArchitectBackend:
         )
         return str(comp.content or "")
 
+    def stream_to(self, on_chunk) -> None:
+        """Send the answer's text to `on_chunk` as it arrives (None stops it)."""
+        self._worker.on_chunk = on_chunk
+
     def close(self) -> None:
         self._worker.close()
+
+
+_FILE_KEY = re.compile(r'"([^"\s\\]+\.[A-Za-z0-9]+)"\s*:')
+
+
+def _stream_file_progress(backend, on_progress) -> None:
+    """Report each file the Architect starts writing, so a slow answer is visibly moving.
+
+    The answer is one JSON object keyed by file path; a new key means a new file.
+    The number of cards to come is not known until the answer ends, so there is no "of N".
+    """
+    if not callable(on_progress) or not hasattr(backend, "stream_to"):
+        return
+    text: list[str] = []
+    seen: list[str] = []
+    scanned = 0
+
+    def _on_chunk(chunk: str) -> None:
+        nonlocal scanned
+        text.append(chunk)
+        whole = "".join(text)
+        for match in _FILE_KEY.finditer(whole, scanned):
+            scanned = match.end()
+            path = match.group(1)
+            if path in seen:
+                continue
+            seen.append(path)
+            cards = [p for p in seen if p.startswith("cards/")]
+            try:
+                on_progress(f"Writing card {len(cards)}: {Path(path).stem}..."
+                            if path.startswith("cards/") else f"Writing {path}...")
+            except Exception:  # noqa: BLE001 - a progress line must never end the Architect's turn
+                pass
+
+    backend.stream_to(_on_chunk)
 
 
 def open_architect_backend(
     repo: Path,
     cfg=None,
     *,
-    timeout_s: float = 180.0,
+    timeout_s: float = 0.0,
 ) -> tuple[object | None, str]:
-    """Open a live Frontier ACP Architect backend if OAuth is ready (returns `(backend, reason)`)."""
+    """Open a live Architect backend if its sign-in is ready (returns `(backend, reason)`).
+
+    With no backend, `reason` says why in words a person can act on. A folder with no
+    `.openfarm/config.toml` yet uses the global provider profile. `timeout_s` above 0
+    shortens the configured answer timeout (`[micromanager] timeout_s`, 600 s by default).
+    """
+    from types import SimpleNamespace
+
     from .adapters.acp import is_acp_adapter, normalize_acp_provider
     from .adapters.claude_worker import open_acp_worker
     from .providers import load_global_providers
@@ -459,8 +505,8 @@ def open_architect_backend(
     if cfg is None:
         try:
             cfg = load_config(root)
-        except (ConfigError, OSError) as exc:
-            return None, f"config unavailable: {exc}"
+        except (ConfigError, OSError):
+            cfg = SimpleNamespace()  # a new folder: the global provider profile decides
 
     mm_adapter = str(getattr(cfg, "micromanager_adapter", "") or "")
     if is_acp_adapter(mm_adapter):
@@ -469,24 +515,25 @@ def open_architect_backend(
         gp = load_global_providers()
         provider = str(gp.get("frontier", {}).get("provider") or "claude").strip().lower()
 
+    name = provider.capitalize()
     if provider == "antigravity":
-        return None, "antigravity architect requires explicit interactive run"
+        return None, "Antigravity only runs when a person starts it. Choose another provider for planning."
 
     try:
         status = inspect_acp_status(root, provider=provider)
     except Exception as exc:
-        return None, f"{provider} status check failed: {exc}"
+        return None, f"couldn't check the {name} sign-in: {exc}"
     if not (status.get("oauth_ready") or status.get("ok")):
-        return None, f"{provider} ACP OAuth is not signed in"
+        return None, f"{name} isn't signed in"
 
     try:
         worker = open_acp_worker(cfg, provider=provider)
         if timeout_s and timeout_s > 0:
             worker.timeout_s = min(float(getattr(worker, "timeout_s", timeout_s)), float(timeout_s))
         mm_model = str(getattr(getattr(cfg, "micromanager", None), "model", "") or "")
-        return _AcpArchitectBackend(worker, model=mm_model), f"{provider} ACP"
+        return _AcpArchitectBackend(worker, model=mm_model), name
     except Exception as exc:
-        return None, f"{provider} ACP unavailable: {exc}"
+        return None, f"couldn't start {name}: {exc}"
 
 
 def _fix_typescript_relative_js_imports(root: Path) -> int:
@@ -655,7 +702,9 @@ def architect_grill_turn(
         f"Conversation so far:\n{hist_text}\n"
     )
     raw = str(backend.ask(prompt) if hasattr(backend, "ask") else backend(prompt))
-    parsed = _extract_json_dict(raw) or {}
+    parsed = _extract_json_dict(raw)
+    if not isinstance(parsed, dict) or not parsed:
+        raise Infra("architect-no-answer", "the Architect's reply could not be read")
     ready = bool(parsed.get("ready_to_plan", False)) or not str(parsed.get("question") or "").strip()
     options = [str(o).strip() for o in (parsed.get("options") or []) if str(o).strip()][:4]
     return {
@@ -914,6 +963,8 @@ def draft_spec_and_chunks(
                         "goal": str(item.get("goal") or "").strip(),
                         "status": "active" if idx == 1 else "pending",
                     })
+        if not spec_md or not chunks:
+            raise Infra("architect-no-answer", "the Architect's reply had no spec and steps in it")
 
     if not spec_md:
         qa_block = "\n".join(
@@ -1121,12 +1172,19 @@ def run_grill_and_architect(
         )
         if callable(on_progress):
             on_progress(f"Sending {len(prompt):,} char prompt to Frontier Architect ({lang})...")
-        raw = str(backend.ask(prompt) if hasattr(backend, "ask") else backend(prompt))
+        _stream_file_progress(backend, on_progress)
+        try:
+            raw = str(backend.ask(prompt) if hasattr(backend, "ask") else backend(prompt))
+        finally:
+            if hasattr(backend, "stream_to"):
+                backend.stream_to(None)
         if callable(on_progress):
             on_progress(f"Architect responded ({len(raw):,} chars) — extracting files...")
         from .frontier_review import _extract_json_dict
         parsed = _extract_json_dict(raw) or {}
         files = parsed.get("files") if isinstance(parsed, dict) else None
+        if not isinstance(files, dict) or not files:
+            raise Infra("architect-no-answer", "the Architect's reply had no files in it")
         if isinstance(files, dict):
             # A card the Architect numbered like an existing one gets the next free ID instead.
             renamed: dict[str, str] = {}
@@ -1192,7 +1250,11 @@ def run_grill_and_architect(
     cards_dir = root / "cards"
     cards_dir.mkdir(parents=True, exist_ok=True)
     existing_md = [p for p in cards_dir.glob("*.md") if p.is_file() and not p.stem.upper().startswith("FIND-")]
-    should_write_fallback = not existing_md
+    # The template card is for the template path only. An Architect that answered
+    # without cards is a failure the caller shows; it never turns into a template.
+    should_write_fallback = not existing_md and backend is None
+    if backend is not None and not existing_md:
+        raise Infra("architect-no-answer", "the Architect's reply had no cards in it")
     if not should_write_fallback and backend is None and len(existing_md) == 1 and existing_md[0].name == "W1-01.md":
         # Only the untouched starter card is rewritten; one the farm has started keeps its file.
         should_write_fallback = on_record.get("W1-01") in ("ready", "backlog")

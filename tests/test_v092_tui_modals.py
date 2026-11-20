@@ -224,7 +224,7 @@ class TuiModalsTests(unittest.TestCase):
         src.release("W1-01", lease_id=claim["lease_id"], reason="released in test")
         self.assertEqual(src.read("W1-01")["card"]["state"], "ready")
 
-    def test_grill_scaffolded_card_passes_real_eligibility_gate(self) -> None:
+    def test_grill_scaffolded_card_keeps_the_owners_words_and_says_why(self) -> None:
         from openfarm_core.adapters.files import parse_card_file
         from openfarm_core.automode import run_grill_and_architect
         from openfarm_core.bootstrap import initialize_project
@@ -270,7 +270,10 @@ class TuiModalsTests(unittest.TestCase):
             )
             cfg = load_config(root)
             elig = check_eligibility(card, cfg, worktree=root)
-            self.assertTrue(elig.ok, f"eligibility failed: {elig.failures}")
+            # The template card is well formed. The owner's words stay as typed, so the
+            # only failures are the ones about those words.
+            self.assertIn("handles uploads properly with robust layout", body)
+            self.assertEqual({f["rule"] for f in elig.failures}, {"vague-done", "design-left"}, elig.failures)
 
     def test_worker_modal_configures_placeholder_endpoint_and_model_in_tui(self) -> None:
         from openfarm_core.automode import compute_pipeline_stages, save_worker_key_atomic

@@ -1999,6 +1999,7 @@ class ClaudeAcpAdapter:
         text: str,
         timeout_s: float = 180.0,
         cancel_check: Callable[[], bool] | None = None,
+        on_chunk: Callable[[str], None] | None = None,
     ) -> AcpResult:
         if not self._turn_lock.acquire(blocking=False):
             raise Refused(
@@ -2011,6 +2012,7 @@ class ClaudeAcpAdapter:
                 text=text,
                 timeout_s=timeout_s,
                 cancel_check=cancel_check,
+                on_chunk=on_chunk,
             )
         finally:
             self._turn_lock.release()
@@ -2022,6 +2024,7 @@ class ClaudeAcpAdapter:
         text: str,
         timeout_s: float,
         cancel_check: Callable[[], bool] | None,
+        on_chunk: Callable[[str], None] | None = None,
     ) -> AcpResult:
         self.last_usage = AcpUsage()
         if self._proc is None or self._proc.poll() is not None:
@@ -2227,6 +2230,8 @@ class ClaudeAcpAdapter:
                             )
                             if chunk:
                                 chunks.append(chunk)
+                                if on_chunk is not None:
+                                    on_chunk(chunk)
                         elif upd_kind == "usage_update":
                             in_tok = _first_present(
                                 update, ("inputTokens", "tokensIn", "promptTokens")
