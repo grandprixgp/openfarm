@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 from pathlib import Path
 
@@ -263,7 +264,6 @@ def is_placeholder_endpoint(url: str) -> bool:
 
 def configure_worker_endpoint(config_path: Path, endpoint: str, model: str = "") -> Path:
     """Update `[model]` endpoint, allowed_endpoints, and optional role models in `.openfarm/config.toml`."""
-    import re
 
     ep = str(endpoint or "").strip().rstrip("/")
     if not (ep.startswith("https://") or ep.startswith("http://")) or is_placeholder_endpoint(ep):
@@ -495,7 +495,6 @@ def _fix_typescript_relative_js_imports(root: Path) -> int:
     Node's native `node --test` runs TypeScript directly with ESM type-stripping, so
     `from "../src/foo.js"` fails with `ERR_MODULE_NOT_FOUND` unless `.ts` is used.
     """
-    import re
 
     pattern = re.compile(r"""((?:from|import)\s*\(?\s*['"])(\.\.?/[^'"]+?)\.js(['"])""")
     changed_files = 0
@@ -737,6 +736,105 @@ def set_chunk_status(repo: Path, chunk_id: str, status: str) -> list[dict]:
     return chunks
 
 
+def _record_decisions(root: Path, items: list[tuple[str, str]]) -> tuple[Path, str]:
+    """Add questions and answers to `.openfarm/GRILL_DECISIONS.md`, keeping what is there.
+
+    The first idea stays at the top. Answers not yet in the file go below it under a
+    dated heading. Returns the path and the file's full text.
+    """
+    from .state import utc_now
+
+    path = root / ".openfarm" / "GRILL_DECISIONS.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    old = path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
+    sections = [f"## {q}\n\n{a}\n" for q, a in items if a and a not in old]
+    if not old.strip():
+        text = "\n".join(["# Architect Grill Decisions\n", *sections])
+    elif sections:
+        text = old.rstrip("\n") + "\n\n" + "\n".join([f"# Follow-up, {utc_now()[:10]}\n", *sections])
+    else:
+        text = old
+    if text != old:
+        path.write_text(text, encoding="utf-8")
+    return path, text
+
+
+def _cards_on_record(root: Path, cfg) -> dict[str, str]:
+    """Card IDs in use on the base branch's `cards/` or on the cards branch, with each one's state.
+
+    The cards branch holds the farm's real state, so its state wins.
+    """
+    from .adapters.files import parse_card_file
+    from .git import Git
+
+    found: dict[str, str] = {}
+
+    def _note(stem: str, text: str) -> None:
+        try:
+            header, _ = parse_card_file(text)
+        except (AdapterError, ValueError):
+            header = {}
+        state = str(header.get("state") or "ready").lower()
+        found[stem.upper()] = state
+        found[str(header.get("id") or stem).upper()] = state
+
+    cards_dir = root / "cards"
+    if cards_dir.is_dir():
+        for path in sorted(cards_dir.glob("*.md")):
+            _note(path.stem, path.read_text(encoding="utf-8", errors="replace"))
+    if (root / ".git").exists():
+        git = Git(root)
+        ref = f"refs/heads/{getattr(cfg, 'cards_branch', 'openfarm-cards')}"
+        ls = git._run(["ls-tree", "--name-only", ref, "cards/"], check=False)
+        for rel in (ls.stdout.splitlines() if ls.returncode == 0 else []):
+            blob = git._run(["show", f"{ref}:{rel}"], check=False) if rel.endswith(".md") else None
+            if blob is not None and blob.returncode == 0:
+                _note(Path(rel).stem, blob.stdout)
+    return found
+
+
+def _retire_replaced_cards(root: Path, cfg, new_ids: list[str]) -> list[str]:
+    """Drop the never-started cards of a wave that a new split just replaced.
+
+    New cards get fresh IDs, so without this the earlier, unbuilt cards of the same
+    wave (and the starter card from init) would be built next to their replacements.
+    A card that was ever claimed, or is past `ready`, is left alone.
+    """
+    from .adapters.files import open_file_source, parse_card_file, render_card_file
+    from .state import utc_now
+
+    waves = {m.group(1) for cid in new_ids if (m := re.match(r"W(\d+)-", cid, re.IGNORECASE))}
+    if not waves:
+        return []
+    fresh = {cid.upper() for cid in new_ids}
+    src = None
+    if (root / ".git").exists() and cfg is not None:
+        src = open_file_source(cfg, cfg.state_dir)
+        src.prepare()
+    retired: list[str] = []
+    for cid, state in sorted(_cards_on_record(root, cfg).items()):
+        m = re.match(r"W(\d+)-", cid)
+        if m is None or m.group(1) not in waves or cid in fresh or state not in ("ready", "backlog"):
+            continue
+        base_path = root / "cards" / f"{cid}.md"
+        if src is not None:
+            try:
+                header, body, _path = src._read_raw(cid)
+            except Refused:
+                header = None
+            if header is not None:
+                if header.get("claimed_at") or header.get("holder"):
+                    continue
+                header.update(state="dropped", dropped_at=utc_now(), drop_reason="replaced by a new split")
+                src._write(cid, header, body, f"{cid}: dropped (replaced by a new split)")
+        if base_path.is_file():
+            b_header, b_body = parse_card_file(base_path.read_text(encoding="utf-8", errors="replace"))
+            b_header["state"] = "dropped"
+            base_path.write_text(render_card_file(b_header, b_body), encoding="utf-8")
+        retired.append(cid)
+    return retired
+
+
 def draft_spec_and_chunks(
     repo: Path,
     *,
@@ -766,15 +864,11 @@ def draft_spec_and_chunks(
     if callable(on_progress):
         on_progress("Fleshing out living spec & splitting into chunks...")
 
-    decisions_path = root / ".openfarm" / "GRILL_DECISIONS.md"
-    decisions_path.parent.mkdir(parents=True, exist_ok=True)
-    dec_lines = ["# Architect Grill Decisions\n", f"## What we are building\n\n{clean_idea}\n"]
-    for turn in hist:
-        q = str(turn.get("question") or "Clarification").strip()
-        a = str(turn.get("answer") or "").strip()
-        if a:
-            dec_lines.append(f"## {q}\n\n{a}\n")
-    decisions_path.write_text("\n".join(dec_lines), encoding="utf-8")
+    dec_items = [("What we are building", clean_idea)] if str(idea or "").strip() else []
+    dec_items += [(str(turn.get("question") or "Clarification").strip(), str(turn.get("answer") or "").strip())
+                  for turn in hist]
+    decisions_path, decisions_text = _record_decisions(root, dec_items or [("What we are building", clean_idea)])
+    dec_lines = [decisions_text]
 
     spec_md = ""
     chunks: list[dict] = []
@@ -899,14 +993,17 @@ def run_grill_and_architect(
     if not normalized_answers:
         normalized_answers.append({"id": "goal", "question": "What we are building", "answer": f"Build {root.name}"})
 
+    given = bool(idea.strip() or answers or any(str(t.get("answer") or "").strip() for t in (grill_history or [])))
     decisions_path = root / ".openfarm" / "GRILL_DECISIONS.md"
-    decisions_path.parent.mkdir(parents=True, exist_ok=True)
-    lines = ["# Architect Grill Decisions\n"]
-    for item in normalized_answers:
-        q = str(item.get("question") or item.get("id") or "Context")
-        a = str(item.get("answer") or "").strip()
-        lines.append(f"## {q}\n\n{a}\n")
-    decisions_path.write_text("\n".join(lines), encoding="utf-8")
+    if given or not decisions_path.is_file():
+        decisions_path, decisions_text = _record_decisions(root, [
+            (str(item.get("question") or item.get("id") or "Context"), str(item.get("answer") or "").strip())
+            for item in normalized_answers])
+    else:
+        decisions_text = decisions_path.read_text(encoding="utf-8", errors="replace")
+    lines = [decisions_text]
+    on_record = _cards_on_record(root, cfg)
+    new_cards: list[str] = []
 
     written: list[str] = [".openfarm/GRILL_DECISIONS.md"]
     existing_chunks = load_project_chunks(root)
@@ -955,6 +1052,9 @@ def run_grill_and_architect(
                 if ch.get("id") == active_chunk.get("id"):
                     wave_num = idx
                     break
+        next_seq = 1 + max((int(m.group(2)) for cid in on_record
+                            if (m := re.match(r"W(\d+)-(\d+)", cid)) and int(m.group(1)) == wave_num), default=0)
+        first_card = f"W{wave_num}-{next_seq:02d}"
 
         chunk_section = ""
         if active_chunk is not None:
@@ -963,7 +1063,7 @@ def run_grill_and_architect(
                 f"  - ID: {active_chunk['id']}\n"
                 f"  - Title: {active_chunk['title']}\n"
                 f"  - Goal: {active_chunk.get('goal', '')}\n"
-                f"  (Do NOT delete completed chunks; split THIS active chunk into 2 to 4 concise cards under `cards/W{wave_num}-01.md`..)\n"
+                f"  (Do NOT delete completed chunks; split THIS active chunk into 2 to 4 concise cards under `cards/{first_card}.md`..)\n"
             )
         spec_section = (
             f"\nExisting Living Spec (`.openfarm/PROJECT_SPEC.md`):\n{existing_spec_text[:2400]}\n"
@@ -985,12 +1085,16 @@ def run_grill_and_architect(
                 f"- A COMPACT runnable {lang} vertical slice (1 to 3 small files totaling ~80-180 lines) plus 1 concise passing baseline test file"
             )
         include_lines.append(
-            f"- 2 to 4 scoped, non-overlapping Wave cards under `cards/W{wave_num}-01.md`.. (~35-55 lines each) using TOML +++ headers "
+            f"- 2 to 4 scoped, non-overlapping Wave cards under `cards/{first_card}.md`.. (~35-55 lines each) using TOML +++ headers "
             f"(id, title, state=\"ready\", category=\"small-feature\", wave={wave_num}, touches, reference, new_symbols=true, depends, tests=[{{name, file, asserts}}]) "
             "and concrete `## Done` sections without vague adjectives. "
             "Prefer exported functions (e.g. `export function neutralTheme()`) over non-function module constants for newly introduced symbols so TDD scaffolds compile cleanly."
         )
         omit_rules: list[str] = ["Never modify `.openfarm/config.toml` or `never_touch` files."]
+        if on_record:
+            omit_rules.append(
+                f"These card IDs are taken; never reuse or re-emit them: {sorted(on_record)}. Number new cards from {first_card}."
+            )
         if has_spec_and_chunks:
             omit_rules.append(
                 "DO NOT re-emit `.openfarm/PROJECT_SPEC.md` or `.openfarm/CHUNKS.json` — they are already saved on disk."
@@ -1024,8 +1128,27 @@ def run_grill_and_architect(
         parsed = _extract_json_dict(raw) or {}
         files = parsed.get("files") if isinstance(parsed, dict) else None
         if isinstance(files, dict):
+            # A card the Architect numbered like an existing one gets the next free ID instead.
+            renamed: dict[str, str] = {}
+            used = set(on_record)
+            for rel in files:
+                stem_m = re.fullmatch(r"cards/([^/]+)\.md", str(rel).strip().lstrip("/"))
+                if stem_m is None:
+                    continue
+                stem = stem_m.group(1)
+                if stem.upper() in used:
+                    while f"W{wave_num}-{next_seq:02d}" in used:
+                        next_seq += 1
+                    renamed[stem] = f"W{wave_num}-{next_seq:02d}"
+                used.add(renamed.get(stem, stem).upper())
+            renames_re = re.compile(r"\b(" + "|".join(re.escape(k) for k in renamed) + r")\b") if renamed else None
             for rel, content in files.items():
                 rel_s = str(rel).strip().lstrip("/")
+                stem_m = re.fullmatch(r"cards/([^/]+)\.md", rel_s)
+                if stem_m is not None:
+                    if renames_re is not None:
+                        content = renames_re.sub(lambda m: renamed[m.group(1)], str(content))
+                    rel_s = f"cards/{renamed.get(stem_m.group(1), stem_m.group(1))}.md"
                 if not rel_s or rel_s in (".openfarm/config.toml",) or rel_s.startswith(".git/"):
                     continue
                 if lang != "rust" and (rel_s.endswith(".rs") or rel_s.endswith("Cargo.toml") or rel_s.endswith("Cargo.lock")):
@@ -1039,6 +1162,8 @@ def run_grill_and_architect(
                 text_out = str(content)
                 target.write_text(text_out, encoding="utf-8")
                 written.append(rel_s)
+                if stem_m is not None:
+                    new_cards.append(Path(rel_s).stem)
                 if callable(on_progress):
                     on_progress(f"Wrote {rel_s} ({len(text_out.splitlines())} lines)")
     else:
@@ -1069,13 +1194,8 @@ def run_grill_and_architect(
     existing_md = [p for p in cards_dir.glob("*.md") if p.is_file() and not p.stem.upper().startswith("FIND-")]
     should_write_fallback = not existing_md
     if not should_write_fallback and backend is None and len(existing_md) == 1 and existing_md[0].name == "W1-01.md":
-        try:
-            from .adapters.files import parse_card_file
-            hdr, _ = parse_card_file(existing_md[0].read_text(encoding="utf-8", errors="replace"))
-            if str(hdr.get("state") or "ready").lower() in ("ready", "backlog"):
-                should_write_fallback = True
-        except (OSError, ValueError):
-            should_write_fallback = False
+        # Only the untouched starter card is rewritten; one the farm has started keeps its file.
+        should_write_fallback = on_record.get("W1-01") in ("ready", "backlog")
     if should_write_fallback:
         from .adapters.files import render_card_file
 
@@ -1142,7 +1262,6 @@ def run_grill_and_architect(
         if cfg is not None and category in (getattr(cfg, "require_reference", ()) or ()):
             header["reference"] = touch
 
-        import re
         from .gates.eligibility import DESIGN_WORDS, VAGUE_WORDS
 
         def _clean_done_prose(text: str) -> str:
@@ -1165,12 +1284,11 @@ def run_grill_and_architect(
         card_path.write_text(render_card_file(header, body), encoding="utf-8")
         written.append("cards/W1-01.md")
 
-    return {"written": written, "decisions_path": str(decisions_path)}
+    return {"written": written, "decisions_path": str(decisions_path), "new_cards": new_cards}
 
 
 def _default_touch_and_test(root: Path, lang: str, card_id: str) -> tuple[str, dict]:
     """Choose a non-invariant default touch file and valid named test entry for `lang`."""
-    import re
 
     slug = re.sub(r"[^a-z0-9]+", "_", str(card_id or "wave1").lower()).strip("_") or "wave1"
     if lang == "rust":
@@ -1211,7 +1329,6 @@ def _default_touch_and_test(root: Path, lang: str, card_id: str) -> tuple[str, d
 
 
 def _sanitize_done_prose(text: str) -> str:
-    import re
     from .gates.eligibility import DESIGN_WORDS, VAGUE_WORDS
 
     cleaned = str(text or "").strip()
@@ -1410,6 +1527,10 @@ def draft_wave_plan(
     cfg = load_config(root)
     cards_dir = root / "cards"
     cards_dir.mkdir(parents=True, exist_ok=True)
+    retired = _retire_replaced_cards(root, cfg, list(res.get("new_cards") or []))
+    if retired:
+        written.extend(f"cards/{cid}.md" for cid in retired)
+        _emit_progress(f"Replaced {len(retired)} unbuilt task(s) from the earlier split: {', '.join(retired)}")
     lang = (cfg.languages[0] if cfg.languages else "rust").lower()
     if lang == "typescript":
         fixed_imports = _fix_typescript_relative_js_imports(root)
@@ -1471,6 +1592,8 @@ def draft_wave_plan(
     repaired_count = 0
     all_ok = True
 
+    # The base branch's copy always says "ready"; the cards branch knows what was built.
+    on_record = _cards_on_record(root, cfg)
     for md in sorted(cards_dir.glob("*.md")):
         try:
             header, body = parse_card_file(md.read_text(encoding="utf-8", errors="replace"))
@@ -1479,7 +1602,7 @@ def draft_wave_plan(
         cid = str(header.get("id") or md.stem)
         if is_finding_id_or_header(cid, header):
             continue
-        if str(header.get("state") or "ready").lower() not in ("ready", "backlog"):
+        if on_record.get(cid.upper(), "ready") not in ("ready", "backlog"):
             continue
 
         repaired_this = False
@@ -1563,6 +1686,8 @@ def draft_wave_plan(
         "baseline_error": baseline_error,
         "repaired_count": repaired_count,
         "promoted_findings": promoted_findings,
+        "new_cards": list(res.get("new_cards") or []),
+        "retired_cards": retired,
     }
 
 
@@ -1747,6 +1872,9 @@ def split_card_into_two(
     orig_hdr, orig_body = parse_card_file(orig_path.read_text(encoding="utf-8"))
 
     id_a, id_b = f"{card_id}a", f"{card_id}b"
+    taken = [cid for cid in (id_a, id_b) if cid.upper() in _cards_on_record(root, cfg)]
+    if taken:
+        raise Refused("card-exists", f"{' and '.join(taken)} already exist; {card_id} was split before")
     out_cards: list[dict] = []
     written_rel: list[str] = []
     for cid, ctitle, ctouches, cdeps in (
