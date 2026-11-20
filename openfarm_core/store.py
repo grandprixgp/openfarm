@@ -394,6 +394,19 @@ def open_store(root: Path, cfg) -> Store:
     return Store(root, cfg)
 
 
+def record(src, root: Path, card_id: str, kind: str, why: str, changed: dict, by: str = "") -> None:
+    """Add one line to a card's history for a change the farm's own commands just made."""
+    worktree = getattr(src, "worktree", None)
+    if worktree is None:
+        return  # a card source without a branch of its own keeps no history
+    path = Path(worktree) / "history" / f"{card_id}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    entry = {"at": utc_now(), "by": by or person(root), "kind": kind, "why": why, "changed": changed}
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(entry, sort_keys=True) + "\n")
+    Git(worktree).commit_all(f"{card_id}: {kind} ({why or 'no reason given'})")
+
+
 def store_or_none(root: Path, cfg) -> Store | None:
     """The store, for a folder that is a git repository with an openfarm config."""
     if cfg is None or not (Path(root) / ".git").exists():

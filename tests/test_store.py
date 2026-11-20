@@ -206,5 +206,66 @@ class MigrationTests(_Project):
         self.assertIn("The old spec.", read_doc(self.root, self.cfg, "spec"))
 
 
+class CommandLineTests(_Project):
+    """`openfarm card` reaches the same store, and the farm's own commands leave history too."""
+
+    def _cli(self, *argv: str) -> tuple[int, str]:
+        import contextlib
+        import io
+
+        from openfarm_core.cli import main
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            code = main(["--repo", str(self.root), *argv])
+        return code, out.getvalue()
+
+    def test_add_show_history_and_skip(self) -> None:
+        card = self.root.parent / "task.md"
+        card.write_text(render_card_file(_header("W1-01"), BODY))
+        code, out = self._cli("card", "add", str(card), "--why", "first task")
+        self.assertEqual((code, out.strip()), (0, "W1-01: added, ready"))
+        self.assertEqual(_git(self.root, "status", "--porcelain").strip(), "")  # nothing landed on main
+
+        code, out = self._cli("card", "add", str(card))  # the same file again gets the next number
+        self.assertIn("W1-02: added", out)
+        self.assertIn('title = "Task W1-01"', self._cli("card", "show", "W1-02")[1])
+
+        self.assertEqual(self._cli("card", "skip", "W1-02", "--why", "a copy")[0], 0)
+        history = self._cli("card", "history", "W1-02")[1]
+        self.assertIn("person/Ada  create  added by hand", history)
+        self.assertIn("person/Ada  skip  a copy", history)
+        self.assertEqual(self.store.read("W1-02")[0]["state"], "dropped")
+
+    def test_a_task_that_fails_the_checks_says_why_when_added(self) -> None:
+        card = self.root.parent / "task.md"
+        card.write_text(render_card_file(_header("W1-01", depends=["W1-77"]), BODY))
+        code, out = self._cli("card", "add", str(card))
+        self.assertIn("W1-01: added, backlog", out)
+        self.assertIn("not ready (depends): it waits for W1-77, which doesn't exist", out)
+
+    def test_release_is_in_the_history(self) -> None:
+        self.store.change_card("W1-01", "create", header=_header("W1-01"), body=BODY)
+        claim = self.store.src.claim("W1-01", holder="lane")
+        self.store.src.move("W1-01", claim["lease_id"], "blocked", stop_code="attempts")
+        self.assertEqual(self._cli("release", "W1-01", "--reason", "try again")[0], 0)
+        last = self.store.history("W1-01")[-1]
+        self.assertEqual((last["kind"], last["why"], last["by"]), ("release", "try again", "person/Ada"))
+
+
+class MigrateCommandTests(MigrationTests):
+    def test_the_command_shows_both_versions_and_waits_for_a_choice(self) -> None:
+        code, out = CommandLineTests._cli(self, "card", "migrate")
+        self.assertNotEqual(code, 0)
+        self.assertIn("W1-02 differs.", out)
+        self.assertIn("--- on main ---", out)
+        self.assertIn("Edited on main", out)
+        self.assertIn("--take W1-02=main|state", out)
+        self.assertTrue((self.root / "cards").is_dir())
+        self.assertEqual(CommandLineTests._cli(self, "card", "migrate", "--take", "W1-02=state")[0], 0)
+        self.assertFalse((self.root / "cards").exists())
+        self.assertEqual(Store(self.root, self.cfg).read("W1-02")[0]["title"], "Task W1-02")
+
+
 if __name__ == "__main__":
     unittest.main()
