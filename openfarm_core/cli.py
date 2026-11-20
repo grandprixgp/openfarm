@@ -23,6 +23,7 @@ import getpass
 import inspect
 import io
 import json
+import os
 import re
 import sys
 import threading
@@ -716,9 +717,45 @@ def _do_run(ctx: Context, args, run_id: str, *, on_event=None) -> int:
         else None
     )
 
+    def _queue():
+        """The run's cards: those it started with, then (`--follow`) each one that can
+        start once the card it waits for is accepted, so one build covers every layer."""
+        from .cards import waiting_on as _waiting_on
+
+        started: set[str] = set()
+        batch = list(identifiers)
+        while True:
+            for cid in batch:
+                started.add(cid)
+                yield cid
+            if not getattr(args, "follow", False) or args.card or args.dry_run:
+                return
+            told = False
+            while True:
+                if (ctx.state.kill_requested(cfg.kill_switch) or ctx.state.is_paused() or night.exhausted()
+                        or (deadline is not None and _time.monotonic() >= deadline)):
+                    return
+                batch = [c for c in source.next(cfg.lane, limit=args.cards)["cards"] if c not in started]
+                if batch:
+                    event_bus.emit(kind="run_more", cards=list(batch),
+                                   message=f"{', '.join(batch)} can start now")
+                    break
+                cards = source.all_cards()
+                in_review = {c.id for c in cards if c.state in ("in_review", "in-review")}
+                held = {cid: [dep for dep, _state in unmet if dep in in_review]
+                        for cid, unmet in _waiting_on(cards).items()}
+                held = {cid: deps for cid, deps in held.items() if deps}
+                if not held:
+                    return
+                if not told:
+                    told = True
+                    event_bus.emit(kind="run_waiting", cards=sorted(held), message="; ".join(
+                        f"{cid} starts when {', '.join(deps)} is accepted" for cid, deps in sorted(held.items())))
+                _time.sleep(float(os.environ.get("OPENFARM_FOLLOW_POLL_S", "2")))
+
     try:
         if not swarm_parallel:
-            for card_id in identifiers:
+            for card_id in _queue():
                 if ctx.state.kill_requested(cfg.kill_switch):
                     # Cards in flight were stopped by CardRun itself, which blocks them with
                     # `killed`. A card not yet claimed is simply left alone.
@@ -2752,6 +2789,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--cards", type=int, default=3,
                      help="most cards to claim")
+    run.add_argument("--follow", action="store_true",
+                     help="keep going: start tasks as the ones they wait for are accepted, "
+                          "until none is left that could start")
     run.add_argument("--spend", type=float, default=None,
                      help="cap for this run, never above the config's")
     run.add_argument("--for", dest="for_duration", default=None,

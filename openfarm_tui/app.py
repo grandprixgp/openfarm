@@ -19,6 +19,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.command import Hit, Hits, Provider
 from textual.containers import Container, Horizontal, ItemGrid, Vertical, VerticalScroll
+from textual.worker import get_current_worker
 from textual.widgets import (
     Button,
     ContentSwitcher,
@@ -57,7 +58,7 @@ from openfarm_core.automode import (
 from openfarm_core.bootstrap import initialize_project
 import openfarm_core
 from openfarm_core.config import CONFIG_PATH, load_config
-from openfarm_core.daemon import daemon_status, start_daemon, stop_daemon
+from openfarm_core.daemon import daemon_status, read_daemon_logs, start_daemon, stop_daemon
 from openfarm_core.doctor import compute_touches_conflict_matrix, run_doctor
 from openfarm_core.routing import compute_routing_recommendations
 from openfarm_core.errors import AdapterError, ConfigError, Refused
@@ -771,6 +772,7 @@ class OpenfarmApp(App):
         self._load_providers_into_form()
         self.refresh_all_views()
         self.set_interval(1.0, self._tick_draft_timer)
+        self._attach_running_build()
 
         # Choose initial screen cleanly
         gp = load_global_providers()
@@ -2846,63 +2848,77 @@ class OpenfarmApp(App):
         return seen + len(whole)
 
     @work(thread=True)
-    def _run_wave_bg(self) -> None:
+    def _run_wave_bg(self, attach_run_id: str = "") -> None:
+        """Start a build in the background service and follow it, or follow one that is already running.
+
+        The build belongs to the service, not to this window: closing or crashing
+        the app leaves it running, and opening the app again picks it up here.
+        """
         self._running_wave = True
         self.call_from_thread(self._set_running_badge, True)
-        self.call_from_thread(self._append_activity, "[#94a3b8]Committing the baseline and starting the wave...[/]")
         try:
-            ensure_baseline_committed(self.repo)
             cfg = self._safe_cfg()
-            run_id = "run-" + time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-            events_path = StateDir(cfg.state_dir).run_dir(run_id) / "events.jsonl"
-            # Output goes to files, not pipes: nothing reads a pipe while the run is going.
-            with tempfile.TemporaryFile("w+") as out, tempfile.TemporaryFile("w+") as err:
-                proc = subprocess.Popen(
-                    self._cli_argv("--json", "run", "--cards", "3", "--run-id", run_id),
-                    stdout=out, stderr=err, stdin=subprocess.DEVNULL, env=self._cli_env())
-                seen = 0
-                while True:
-                    finished = proc.poll() is not None
-                    seen = self._forward_run_events(events_path, seen)
-                    if finished:
-                        break
-                    time.sleep(0.25)
-                out.seek(0)
-                err.seek(0)
-                raw_out, raw_err = out.read().strip(), err.read().strip()
-            rc = proc.returncode
-            parsed: dict = {}
-            try:
-                obj = json.loads(raw_out) if raw_out else {}
-                if isinstance(obj, dict):
-                    parsed = obj
-            except ValueError:
-                parsed = {}
-            if rc != 0 or parsed.get("refused") or parsed.get("error"):
-                reason = str(parsed.get("reason") or parsed.get("error")
-                             or self._last_line(raw_err or raw_out, f"the run ended with exit code {rc}"))
-                self.call_from_thread(self._show_run_refusal, reason)
+            run_id = attach_run_id
+            if run_id:
+                self.call_from_thread(self._append_activity, "[#94a3b8]A build is already running; showing its progress...[/]")
             else:
-                outcomes = parsed.get("outcomes") if isinstance(parsed.get("outcomes"), list) else []
-                if not outcomes:
-                    why = f" {self._run_start_note}" if self._run_start_note else ""
-                    self.call_from_thread(
-                        self._append_activity,
-                        f"[#fbbf24]○ The wave ended without starting a card.{rich_escape(why)}[/]",
-                    )
-                else:
-                    ends = ", ".join(f"{o.get('card_id') or o.get('card')}: {o.get('final_state')}" for o in outcomes)
-                    self.call_from_thread(
-                        self._append_activity,
-                        f"[bold #4ade80]✓ Wave finished:[/] {len(outcomes)} card(s) ({rich_escape(ends)}).",
-                    )
+                self.call_from_thread(self._append_activity, "[#94a3b8]Committing the baseline and starting the build...[/]")
+                ensure_baseline_committed(self.repo)
+                run_id = "run-" + time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+                start_daemon(self.repo, cards=24, run_id=run_id, follow=True, config_path=self.config_path)
+            events_path = StateDir(cfg.state_dir).run_dir(run_id) / "events.jsonl"
+            seen = 0
+            worker = get_current_worker()
+            while True:
+                if worker.is_cancelled:
+                    return  # the app is closing; the build carries on in the service
+                running = bool(daemon_status(self.repo, config_path=self.config_path).get("running"))
+                seen = self._forward_run_events(events_path, seen)
+                if not running:
+                    break
+                time.sleep(0.25)
+            ended: list[str] = []
+            try:
+                for line in events_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                    event = json.loads(line)
+                    if event.get("kind") == "card_done":
+                        ended.append(f"{event.get('card_id')}: {event.get('final_state')}")
+                started = True
+            except (OSError, ValueError):
+                started = False
+            if not started:
+                log = read_daemon_logs(self.repo, tail=12, config_path=self.config_path)
+                lines = [ln for ln in (log.get("lines") or []) if ln.strip() and not ln.startswith("===")]
+                self.call_from_thread(self._show_run_refusal, lines[-1] if lines else "the build ended before it began")
+            elif not ended:
+                why = f" {self._run_start_note}" if self._run_start_note else ""
+                self.call_from_thread(
+                    self._append_activity,
+                    f"[#fbbf24]○ The build ended without starting a task.{rich_escape(why)}[/]",
+                )
+            else:
+                self.call_from_thread(
+                    self._append_activity,
+                    f"[bold #4ade80]✓ Build finished:[/] {len(ended)} task(s) ({rich_escape(', '.join(ended))}).",
+                )
         except Exception as exc:
             self.call_from_thread(self._append_activity, f"[bold #fb7185]✗ Run error:[/] {rich_escape(str(exc))}")
             self.call_from_thread(self.notify, f"Run error: {str(exc)[:100]}", severity="error")
         finally:
             self._running_wave = False
-            self.call_from_thread(self._set_running_badge, False)
-            self.call_from_thread(self.refresh_all_views)
+            if not get_current_worker().is_cancelled:
+                self.call_from_thread(self._set_running_badge, False)
+                self.call_from_thread(self.refresh_all_views)
+
+    def _attach_running_build(self) -> None:
+        """On opening: a build the service is already running shows up as running here."""
+        try:
+            status = daemon_status(self.repo, config_path=self.config_path)
+        except Exception:
+            return
+        if status.get("running") and status.get("run_id") and not self._running_wave:
+            self._running_wave = True
+            self._run_wave_bg(str(status["run_id"]))
 
     def _set_running_badge(self, active: bool) -> None:
         pill = self.query_one("#status-badge", Static)

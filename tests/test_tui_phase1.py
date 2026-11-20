@@ -581,7 +581,7 @@ class RunPanelTests(_RegistryIsolation):
             self.assertFalse(app._running_wave)
             log = _log_text(app)
             self.assertIn("CARD-2 waits for CARD-1 (blocked)", log)
-            self.assertIn("ended without starting a card", log)
+            self.assertIn("ended without starting a task", log)
             self.assertNotIn("0 cards claimed", log)
             self.assertIn("CARD-2 waits for CARD-1 (blocked)", str(app.query_one("#run-queue-view").render()))
 

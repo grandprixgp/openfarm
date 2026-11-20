@@ -109,6 +109,7 @@ def daemon_status(repo: Path, *, config_path: Path | None = None) -> dict:
         "started_at": str(meta.get("started_at") or ""),
         "log_path": str(meta.get("log_path") or lp),
         "cmd": list(meta.get("cmd") or []),
+        "run_id": str(meta.get("run_id") or ""),
     }
 
 
@@ -121,8 +122,14 @@ def start_daemon(
     card_ids: list[str] | None = None,
     config_path: Path | None = None,
     command_override: list[str] | None = None,
+    run_id: str = "",
+    follow: bool = False,
 ) -> dict:
-    """Spawn a detached background `openfarm run` worker session."""
+    """Spawn a detached background `openfarm run` worker session.
+
+    `run_id` names the run, so anything that opens later (the TUI, the web page)
+    can find its events; `follow` keeps the run going through dependent tasks.
+    """
     root, cfg = _load_cfg(repo, config_path)
     cur = daemon_status(root, config_path=config_path)
     if cur["running"]:
@@ -150,14 +157,23 @@ def start_daemon(
         for cid in (card_ids or ()):
             if str(cid).strip():
                 cmd += ["--card", str(cid).strip()]
+        if run_id:
+            cmd += ["--run-id", run_id]
+        if follow:
+            cmd += ["--follow"]
 
     log_handle = lp.open("a", encoding="utf-8")
     try:
         log_handle.write(f"\n=== openfarm daemon started at {_utc_now()} ===\n")
         log_handle.flush()
+        # The child must import this same openfarm, wherever the caller was started from.
+        env = dict(os.environ)
+        src = str(Path(__file__).resolve().parent.parent)
+        env["PYTHONPATH"] = src + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
         proc = subprocess.Popen(
             cmd,
             cwd=str(root),
+            env=env,
             stdin=subprocess.DEVNULL,
             stdout=log_handle,
             stderr=subprocess.STDOUT,
@@ -172,6 +188,7 @@ def start_daemon(
         "started_at": _utc_now(),
         "log_path": str(lp),
         "cmd": cmd,
+        "run_id": run_id,
     }
     _meta_path(cfg.state_dir).write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
     return {"ok": True, "running": True, **meta}
