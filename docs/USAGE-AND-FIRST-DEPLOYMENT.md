@@ -1,7 +1,8 @@
-# Openfarm v0.9.1 Usage, Operations Guide & First-Deployment Runbook
+# Openfarm v0.14.0 Usage, Operations Guide & First-Deployment Runbook
 
-> **Audience**: Human operators and autonomous frontier agents bringing up **Openfarm v0.9.1** on a Rust, Python, TypeScript, or Go (or polyglot) repository. Part 2 and Part 3 walk through a first deployment on a Rust example crate.  
-> **Local-only guarantee**: Openfarm has **no `git push` code path**. Every passing card ends on a local branch (`openfarm/<card-id>-<slug>`) for human/frontier review (`openfarm review`) and opt-in local landing (`openfarm land`).
+> **Audience**: Human operators and autonomous frontier agents bringing up **Openfarm v0.14.0** on a Rust, Python, TypeScript, or Go (or polyglot) repository. Part 2 and Part 3 walk through a first deployment on a Rust example crate.  
+> **Local-only guarantee**: Openfarm has **no `git push` code path**. Every passing card ends on a local branch (`openfarm/<card-id>-<slug>`) for review in the Textual TUI (`openfarm`), CLI (`openfarm review`), or Tailscale Web Companion (`openfarm web --tailscale`) and opt-in local landing (`openfarm land`).  
+> **Quick v0.10–v0.14 additions**: Bare `openfarm` launches the Textual Workbench (`0 Projects`, `1 Studio` with **Idea → Conversational Grill → Living Spec & Chunks (`.openfarm/CHUNKS.json`) → Split Chunk into Cards → Live Architect Log → Run**, `2 Review`, `3 Findings`, `4 Engine`). New CLI commands since v0.9 (`37` total): `providers`, `projects`, `doctor`, `plan`, `replay`, `routing`, `timeline`, `daemon`, `web [--tailscale|--bind tailscale]`, `findings`, `triage`, `frontier-review`, `review`, `land`, `auto`. New optional config tables (`20` total): `[units.*]`, `[factory]`, `[invariants]`, `[acceptance]`, `[notifications]`. See [README.md](../README.md) and [HANDOFF.md](HANDOFF.md) for the concise v0.14.0 overview.
 
 ---
 

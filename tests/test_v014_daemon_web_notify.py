@@ -154,6 +154,42 @@ class DaemonWebNotifyV014Tests(unittest.TestCase):
             snap = build_web_state(repo)
             self.assertTrue(snap["configured"])
 
+    def test_web_companion_tailscale_helpers_and_bind(self) -> None:
+        from types import SimpleNamespace
+        from openfarm_core.web import expose_via_tailscale_serve, resolve_tailscale_ipv4
+
+        calls: list[list[str]] = []
+
+        def fake_run(argv, **_kwargs):
+            calls.append(list(argv))
+            if argv[1:3] == ["ip", "-4"]:
+                return SimpleNamespace(returncode=0, stdout="127.0.0.1\n", stderr="")
+            if argv[1:3] == ["serve", "--bg"]:
+                return SimpleNamespace(returncode=0, stdout="Serve started\n", stderr="")
+            if argv[1:3] == ["status", "--self"]:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({"Self": {"DNSName": "devbox.tail123.ts.net."}}),
+                    stderr="",
+                )
+            return SimpleNamespace(returncode=1, stdout="", stderr="unexpected")
+
+        self.assertEqual(resolve_tailscale_ipv4(runner=fake_run), "127.0.0.1")
+        ts = expose_via_tailscale_serve(8787, runner=fake_run)
+        self.assertTrue(ts["ok"])
+        self.assertEqual(ts["url"], "https://devbox.tail123.ts.net:8787/")
+        self.assertEqual(ts["disable_cmd"], "tailscale serve --https=8787 off")
+        self.assertTrue(any(c[1:4] == ["serve", "--bg", "--https=8787"] for c in calls))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "ts-app"
+            repo.mkdir()
+            srv = create_web_server(repo, bind="tailscale", port=0, tailscale_runner=fake_run)
+            try:
+                self.assertEqual(srv.server_address[0], "127.0.0.1")
+            finally:
+                srv.server_close()
+
     def test_notifications_webhook_and_event_filtering(self) -> None:
         received: list[dict] = []
 
