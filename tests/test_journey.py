@@ -664,6 +664,14 @@ class FlowTests(_Folder):
     def test_a_wrong_task_offers_its_fix_as_a_diff_and_apply_puts_it_back(self) -> None:
         async def body(app, pilot) -> None:
             self.assertEqual(self.label(app), "▶ See why W1-04 stopped")
+            from openfarm_core.store import Store
+
+            store = Store(app.repo, app.facts["cfg"])
+            header, text = store.read("W1-03")
+            store.src._write("W1-03", dict(header, depends=["W1-04"]), text, "W1-03: waits for the stopped one")
+            app.refresh_screen()
+            await pilot.pause(0.1)
+            self.assertIn("waits for W1-04 (stopped)", str(app.query_one("#build-tasks").get_option_at_index(2).prompt))
             await pilot.press("enter")
             await pilot.pause(0.2)
             self.assertEqual(app.screen_name, "blocked")

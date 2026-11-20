@@ -1111,7 +1111,9 @@ class Journey(App):
         if state == "backlog":
             return "✗", "$error", "can't be built yet (Space: why)"
         if task["waits"]:
-            return "◌", "$foreground-muted", "waits for " + ", ".join(task["waits"])
+            stopped = {t["id"] for t in self.facts["all_tasks"] if t["state"] == "blocked"}
+            return "◌", "$foreground-muted", "waits for " + ", ".join(
+                f"{dep} (stopped)" if dep in stopped else dep for dep in task["waits"])
         return "◌", "$foreground-muted", "next in line" if self.facts["running"] else "not started"
 
     def _draw_build(self) -> None:
