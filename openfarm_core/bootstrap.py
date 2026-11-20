@@ -6,6 +6,7 @@ can deploy frontier agent skills and scaffold verified project skeletons offline
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -282,6 +283,43 @@ def _render_config_toml(
         mm_binary=mm_binary)
 
 
+def _state_dir_belongs_to_other_repo(state_dir: Path, target_dir: Path) -> bool:
+    """True when `state_dir` already exists and holds state for a different repository."""
+    if not state_dir.exists():
+        return False
+    resolved_target = target_dir.expanduser().resolve()
+    marker = state_dir / "repo.path"
+    if marker.is_file() and not marker.is_symlink():
+        try:
+            recorded = Path(marker.read_text(encoding="utf-8").strip()).expanduser().resolve()
+            return recorded != resolved_target
+        except OSError:
+            return True
+    cs_git = state_dir / "cards-source" / ".git"
+    if cs_git.is_file() and not cs_git.is_symlink():
+        try:
+            first = cs_git.read_text(encoding="utf-8", errors="replace").splitlines()[0].strip()
+            if first.startswith("gitdir:"):
+                gd = (cs_git.parent / first[len("gitdir:"):].strip()).resolve()
+                target_git = (resolved_target / ".git").resolve()
+                if not (gd == target_git or gd.is_relative_to(target_git)):
+                    return True
+        except (OSError, IndexError):
+            return True
+    for sentinel in ("runs", "config.lock.toml", "paused", "breaker.json", "cards-source"):
+        if (state_dir / sentinel).exists():
+            return True
+    return False
+
+
+def _default_state_dir_for_repo(project_slug: str, target_dir: Path) -> Path:
+    base = (Path.home() / ".openfarm" / project_slug).resolve()
+    if not _state_dir_belongs_to_other_repo(base, target_dir):
+        return base
+    suffix = hashlib.sha256(str(target_dir.expanduser().resolve()).encode("utf-8")).hexdigest()[:8]
+    return (Path.home() / ".openfarm" / f"{project_slug}-{suffix}").resolve()
+
+
 def initialize_project(
     name: str,
     *,
@@ -340,7 +378,7 @@ def initialize_project(
     resolved_state = (
         Path(state_dir).expanduser().resolve()
         if state_dir is not None
-        else (Path.home() / ".openfarm" / project_slug).resolve()
+        else _default_state_dir_for_repo(project_slug, target_dir)
     )
     resolved_secrets = (
         Path(secrets_dir).expanduser().resolve()
@@ -396,6 +434,7 @@ def initialize_project(
     ):
         folder.mkdir(parents=True, exist_ok=True)
     os.chmod(resolved_state, 0o700)
+    (resolved_state / "repo.path").write_text(f"{target_dir}\n", encoding="utf-8")
     key_parent = resolved_key.parent.resolve()
     if str(key_parent) not in ("/", "/tmp", "/var/tmp"):
         os.chmod(key_parent, 0o700)
@@ -725,6 +764,19 @@ def initialize_project(
     except (OSError, Refused):
         registered_project = False
 
+    verify_cmd_by_lang = {
+        "typescript": "Verify `node --test tests/*.test.ts` (or `npm test`).",
+        "python": "Verify `python3 -m unittest discover -s tests` (or `pytest`).",
+        "go": "Verify `go test ./...` and `go vet ./...`.",
+        "rust": "Verify `cargo test`, `cargo clippy --all-targets -- -D warnings`, and `rustfmt --edition 2021 --check`.",
+    }
+    baseline_test_by_lang = {
+        "typescript": "tests/baseline.test.ts",
+        "python": "tests/test_baseline.py",
+        "go": "baseline_test.go",
+        "rust": "tests/baseline_tests.rs",
+    }
+
     return {
         "ok": True,
         "project": project_slug,
@@ -749,8 +801,8 @@ def initialize_project(
         "next_steps": [
             f"Ensure Frontier {acp_label} OAuth is signed in ({acp_cmd_hint}).",
             f"Place your Worker ZDR model API key in {resolved_key} (chmod 600).",
-            "Expand .openfarm/PROJECT_SPEC.md, src/invariants.rs, a golden slice, and tests/baseline_tests.rs.",
-            "Verify `cargo test`, `cargo clippy --all-targets -- -D warnings`, and `rustfmt --edition 2021 --check`.",
-            "Author cards/CARD-001.md.. under cards/, commit on main, then run `openfarm check <ID>` and `openfarm run --dry-run`.",
+            f"Expand .openfarm/PROJECT_SPEC.md, {inv_rel}, a golden slice, and {baseline_test_by_lang.get(resolved_lang, 'tests/baseline_tests.rs')}.",
+            verify_cmd_by_lang.get(resolved_lang, verify_cmd_by_lang["rust"]),
+            f"Author cards/W1-01.md.. under cards/, commit on {branch}, then run `openfarm check <ID>` and `openfarm run --dry-run`.",
         ],
     }
