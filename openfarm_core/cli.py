@@ -2662,10 +2662,10 @@ def cmd_swarm(ctx: Context, args) -> int:
 # -- the parser ----------------------------------------------------------------
 
 _CLI_EPILOG = """\
-Command groups (32 commands):
+Command groups (33 commands):
   Setup & Auth         init, adopt, install-skill, acp, providers, projects, doctor
   Run & Monitor        auto, plan, check, run, status, pause, resume, stop, tui
-  Review & Harness     triage, review, land, findings, frontier-review, dossier, verdict, done, release, escape, supervise, harness
+  Review & Harness     triage, review, land, findings, replay, frontier-review, dossier, verdict, done, release, escape, supervise, harness
   Swarm, Board & Bench swarm, board, drive, bench
 
 Common workflows:
@@ -2809,6 +2809,20 @@ def build_parser() -> argparse.ArgumentParser:
     find_p.add_argument("--query", default="", help="substring filter")
     find_p.add_argument("--reason", default="", help="optional one-line reason when dismissing")
     find_p.add_argument("--into", dest="target_card", default="", help="target card id when folding")
+
+    rep_p = sub.add_parser(
+        "replay",
+        help="manage and run golden regression replays under .openfarm/replays/",
+        formatter_class=raw_fmt,
+        epilog="Examples:\n  openfarm replay list\n  openfarm replay run\n  openfarm replay add BUG-1 --title 'reject blank' --cmd 'python3 -c ...'",
+    )
+    rep_p.add_argument("action", nargs="?", default="list", choices=("list", "add", "run"))
+    rep_p.add_argument("replay_id", nargs="?", default="", help="replay id (e.g. BUG-1)")
+    rep_p.add_argument("--title", default="", help="short description")
+    rep_p.add_argument("--cmd", default="", help="command string to execute (shlex-split)")
+    rep_p.add_argument("--stdin", default="", help="optional stdin text")
+    rep_p.add_argument("--expect-exit", type=int, default=0, help="expected exit code")
+    rep_p.add_argument("--expect-contains", default="", help="required stdout substring")
 
     dossier = sub.add_parser(
         "dossier",
@@ -3706,6 +3720,55 @@ def cmd_doctor(args) -> int:
     return EXIT_OK if report["ok"] else EXIT_TROUBLE
 
 
+def cmd_replay(args) -> int:
+    import shlex
+    from .replay import add_replay, list_replays, run_replays
+
+    repo = Path(args.repo) if getattr(args, "repo", None) else Path.cwd()
+    action = str(getattr(args, "action", "list") or "list")
+    if action == "list":
+        items = list_replays(repo)
+        if args.json:
+            print(json.dumps({"replays": items, "count": len(items)}, indent=2))
+        else:
+            if not items:
+                print("No golden replays stored under .openfarm/replays/.")
+            for item in items:
+                print(f"  {item['id']:<16} {item.get('title', '')}")
+        return EXIT_OK
+    if action == "add":
+        rid = str(getattr(args, "replay_id", "") or "").strip()
+        cmd = shlex.split(str(getattr(args, "cmd", "") or ""))
+        if not rid or not cmd:
+            raise UsageError("replay add requires <REPLAY-ID> and --cmd '<command>'")
+        rec = add_replay(
+            repo,
+            rid,
+            title=args.title or rid,
+            cmd=cmd,
+            stdin=args.stdin or "",
+            expect_exit=int(args.expect_exit),
+            expect_stdout_contains=args.expect_contains or "",
+        )
+        if args.json:
+            print(json.dumps(rec, indent=2))
+        else:
+            print(f"Added golden replay {rec['id']} ({rec['title']})")
+        return EXIT_OK
+    if action == "run":
+        res = run_replays(repo, replay_id=str(getattr(args, "replay_id", "") or "").strip())
+        if args.json:
+            print(json.dumps(res, indent=2))
+        else:
+            print(f"Golden Replays: {res['passed']} passed, {res['failed']} failed")
+            for r in res["results"]:
+                ic = "✓" if r["ok"] else "✗"
+                err = f" — {r['error']}" if r.get("error") else ""
+                print(f"  {ic} {r['id']} ({r['latency_ms']}ms){err}")
+        return EXIT_OK if res["ok"] else EXIT_TROUBLE
+    raise UsageError(f"unknown replay subcommand: {action}")
+
+
 PRE_CONFIG_COMMANDS = {
     "adopt": cmd_adopt,
     "auto": cmd_auto,
@@ -3716,6 +3779,7 @@ PRE_CONFIG_COMMANDS = {
     "acp": cmd_acp,
     "providers": cmd_providers,
     "projects": cmd_projects,
+    "replay": cmd_replay,
     "tui": cmd_tui,
 }
 

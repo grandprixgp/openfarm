@@ -279,9 +279,9 @@ class InstallSkillMultiHarnessTests(unittest.TestCase):
                 cli_main(["--help"])
         self.assertEqual(caught.exception.code, 0)
         help_text = out.getvalue()
-        self.assertIn("32 commands", help_text)
+        self.assertIn("33 commands", help_text)
         self.assertIn("drive", help_text)
-        self.assertIn("32 commands", error_hint("usage error", "no subcommand specified"))
+        self.assertIn("33 commands", error_hint("usage error", "no subcommand specified"))
 
 
 class DriverAgentUnitTests(unittest.TestCase):

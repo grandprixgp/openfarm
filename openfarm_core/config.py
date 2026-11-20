@@ -25,7 +25,7 @@ CONFIG_PATH = Path(".openfarm") / "config.toml"
 KNOWN_TABLES = {
     "project", "adapters", "model", "policy", "eligibility", "brief",
     "runner", "budget", "gates", "cards", "micromanager", "state", "harness",
-    "swarm", "tiers", "units", "factory",
+    "swarm", "tiers", "units", "factory", "invariants", "acceptance",
 }
 
 _UNIT_LANGUAGES = ("rust", "python", "typescript", "go")
@@ -93,6 +93,8 @@ _TABLE_KEYS = {
     "units": {"language"},
     "factory": {"auto_land", "integration_branch", "auto_land_profiles",
                 "require_zero_findings", "require_frontier_consensus"},
+    "invariants": {"forbidden_imports", "max_file_bytes", "require_exports"},
+    "acceptance": {"checks"},
 }
 _ROLE_MODEL_KEYS = {"model", "temperature", "vary_seed", "effort", "retry_effort", "effort_ladder"}
 _HEADER_NAME = re.compile(r"^[A-Za-z0-9!#$%&'*+.^_`|~-]+$")
@@ -249,6 +251,26 @@ class RoleModel:
                 "vary_seed": self.vary_seed, "effort": self.effort,
                 "retry_effort": self.retry_effort,
                 "effort_ladder": list(self.effort_ladder)}
+
+
+@dataclasses.dataclass
+class InvariantsConfig:
+    """Declarative structural rules checked deterministically under `[invariants]`."""
+
+    forbidden_imports: tuple[dict, ...] = ()
+    max_file_bytes: tuple[dict, ...] = ()
+    require_exports: tuple[dict, ...] = ()
+
+    @property
+    def has_rules(self) -> bool:
+        return bool(self.forbidden_imports or self.max_file_bytes or self.require_exports)
+
+
+@dataclasses.dataclass
+class AcceptanceConfig:
+    """Declarative runtime smoke checks under `[acceptance]`."""
+
+    checks: tuple[dict, ...] = ()
 
 
 @dataclasses.dataclass
@@ -729,6 +751,8 @@ class Config:
         self.unit_languages = self._parse_units(self._data.get("units"))
         self.swarm = self._parse_swarm(self._table("swarm"))
         self.factory = self._parse_factory(self._table("factory"))
+        self.invariants = self._parse_invariants(self._table("invariants"))
+        self.acceptance = self._parse_acceptance(self._table("acceptance"))
         self.effort_ladder: tuple[str, ...] = tuple(
             _as_str_list(self._table("model").get("effort_ladder", []), "[model] effort_ladder")
         )
@@ -760,6 +784,28 @@ class Config:
                             f"[model] {role_name}.{key} {value!r} is not "
                             f"in tier {tier.name!r} efforts {list(tier.efforts)!r}"
                         )
+
+    def _parse_invariants(self, inv: dict) -> InvariantsConfig:
+        def _dict_list(raw, what: str) -> tuple[dict, ...]:
+            if raw is None:
+                return ()
+            if not isinstance(raw, list) or any(not isinstance(x, dict) for x in raw):
+                raise ConfigError(f"{what}: expected a list of tables")
+            return tuple(dict(x) for x in raw)
+
+        return InvariantsConfig(
+            forbidden_imports=_dict_list(inv.get("forbidden_imports"), "[invariants] forbidden_imports"),
+            max_file_bytes=_dict_list(inv.get("max_file_bytes"), "[invariants] max_file_bytes"),
+            require_exports=_dict_list(inv.get("require_exports"), "[invariants] require_exports"),
+        )
+
+    def _parse_acceptance(self, acc: dict) -> AcceptanceConfig:
+        raw = acc.get("checks")
+        if raw is None:
+            return AcceptanceConfig()
+        if not isinstance(raw, list) or any(not isinstance(x, dict) for x in raw):
+            raise ConfigError("[acceptance] checks: expected a list of tables")
+        return AcceptanceConfig(checks=tuple(dict(x) for x in raw))
 
     def _parse_factory(self, f: dict) -> FactoryConfig:
         auto_land = _as_bool(f.get("auto_land"), "[factory] auto_land", False)
