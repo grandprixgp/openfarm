@@ -21,9 +21,9 @@
 <rect x="40" y="80" width="282" height="128" rx="12" fill="#fbbf24" fill-opacity="0.08" stroke="#fbbf24" stroke-opacity="0.75" stroke-width="1.5"/>
 <circle cx="70" cy="112" r="15" fill="#fbbf24"/>
 <text x="70" y="117.5" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="15" font-weight="800" fill="#0b1220" text-anchor="middle" >1</text>
-<text x="96" y="118" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="17" font-weight="700" fill="#f1f5f9" text-anchor="start" >Claim + eligibility</text>
-<text x="60" y="158" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="400" fill="#9fb0c8" text-anchor="start" >Card hashed and checked</text>
-<text x="60" y="179" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="400" fill="#9fb0c8" text-anchor="start" >before any model call.</text>
+<text x="96" y="118" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="17" font-weight="700" fill="#f1f5f9" text-anchor="start" >Claim + DAG check</text>
+<text x="60" y="158" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="400" fill="#9fb0c8" text-anchor="start" >Card hashed, deps &amp; rules</text>
+<text x="60" y="179" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="400" fill="#9fb0c8" text-anchor="start" >checked before any model call.</text>
 <rect x="346" y="80" width="282" height="128" rx="12" fill="#fbbf24" fill-opacity="0.08" stroke="#fbbf24" stroke-opacity="0.75" stroke-width="1.5"/>
 <circle cx="376" cy="112" r="15" fill="#fbbf24"/>
 <text x="376" y="117.5" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="15" font-weight="800" fill="#0b1220" text-anchor="middle" >2</text>
@@ -58,14 +58,14 @@
 <circle cx="376" cy="280" r="15" fill="#fbbf24"/>
 <text x="376" y="285.5" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="15" font-weight="800" fill="#0b1220" text-anchor="middle" >7</text>
 <text x="402" y="286" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="17" font-weight="700" fill="#f1f5f9" text-anchor="start" >End gates</text>
-<text x="366" y="326" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="400" fill="#9fb0c8" text-anchor="start" >Revert check, lint, full suite,</text>
-<text x="366" y="347" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="400" fill="#9fb0c8" text-anchor="start" >counter-tests, mutation.</text>
+<text x="366" y="326" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#9fb0c8" text-anchor="start" >Revert, invariants, HTTP/CLI</text>
+<text x="366" y="347" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#9fb0c8" text-anchor="start" >smoke, replays, counter-tests.</text>
 <rect x="40" y="248" width="282" height="128" rx="12" fill="#fbbf24" fill-opacity="0.08" stroke="#fbbf24" stroke-opacity="0.75" stroke-width="1.5"/>
 <circle cx="70" cy="280" r="15" fill="#fbbf24"/>
 <text x="70" y="285.5" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="15" font-weight="800" fill="#0b1220" text-anchor="middle" >8</text>
-<text x="96" y="286" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="17" font-weight="700" fill="#f1f5f9" text-anchor="start" >Catch-up + capture</text>
-<text x="60" y="326" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#9fb0c8" text-anchor="start" >Trial merge with base; saves</text>
-<text x="60" y="347" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#9fb0c8" text-anchor="start" >project + global harness cues.</text>
+<text x="96" y="286" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="17" font-weight="700" fill="#f1f5f9" text-anchor="start" >Rebase + capture</text>
+<text x="60" y="326" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#9fb0c8" text-anchor="start" >Trial-rebase / auto-land; logs</text>
+<text x="60" y="347" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#9fb0c8" text-anchor="start" >harness cues + routing stats.</text>
 <line x1="324" y1="144" x2="343" y2="144" stroke="#9fb0c8" stroke-width="2" marker-end="url(#ah)"/>
 <line x1="630" y1="144" x2="649" y2="144" stroke="#9fb0c8" stroke-width="2" marker-end="url(#ah)"/>
 <line x1="936" y1="144" x2="955" y2="144" stroke="#9fb0c8" stroke-width="2" marker-end="url(#ah)"/>

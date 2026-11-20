@@ -19,8 +19,8 @@
 <rect x="570" y="142" width="140" height="24" rx="12" fill="#fbbf24" fill-opacity="0.18"/>
 <text x="640" y="158" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="11.5" font-weight="700" fill="#fbbf24" text-anchor="middle" letter-spacing="1">ORCHESTRATOR</text>
 <text x="640" y="196" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="23" font-weight="800" fill="#f1f5f9" text-anchor="middle">openfarm core</text>
-<text x="640" y="225" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="14" font-weight="400" fill="#9fb0c8" text-anchor="middle">Python 3.11+ stdlib, one config file</text>
-<text x="640" y="248" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="400" fill="#9fb0c8" text-anchor="middle">gates, budgets, swarm board + TUI</text>
+<text x="640" y="225" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="14" font-weight="400" fill="#9fb0c8" text-anchor="middle">Python 3.11+ stdlib, 20-table config</text>
+<text x="640" y="248" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="400" fill="#9fb0c8" text-anchor="middle">gates, DAG, daemon, TUI + Tailscale Web</text>
 <rect x="506" y="272" width="268" height="36" rx="10" fill="#0b1220" fill-opacity="0.55" stroke="#fbbf24" stroke-opacity="0.4"/>
 <text x="640" y="295" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="13" font-weight="600" fill="#fbbf24" text-anchor="middle">{"openfarm": 1, ...} stdio</text>
 
@@ -31,11 +31,11 @@
 
 <rect x="40" y="184" width="360" height="86" rx="12" fill="#38bdf8" fill-opacity="0.10" stroke="#38bdf8" stroke-opacity="0.75" stroke-width="1.5"/>
 <text x="62" y="217" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="17.5" font-weight="700" fill="#f1f5f9" text-anchor="start">Runner</text>
-<text x="62" y="245" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="12.5" font-weight="600" fill="#38bdf8" text-anchor="start">direct<tspan fill="#9fb0c8" font-weight="400"> (cargo, python, node; bwrap opt-in)</tspan></text>
+<text x="62" y="245" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="12" font-weight="600" fill="#38bdf8" text-anchor="start">direct<tspan fill="#9fb0c8" font-weight="400"> (cargo, py, node, go; bwrap)</tspan></text>
 
 <rect x="40" y="286" width="360" height="86" rx="12" fill="#38bdf8" fill-opacity="0.10" stroke="#38bdf8" stroke-opacity="0.75" stroke-width="1.5"/>
-<text x="62" y="319" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="17.5" font-weight="700" fill="#f1f5f9" text-anchor="start">Language pack</text>
-<text x="62" y="347" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="13.5" font-weight="600" fill="#38bdf8" text-anchor="start">rust, python, typescript</text>
+<text x="62" y="319" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="17.5" font-weight="700" fill="#f1f5f9" text-anchor="start">Language pack (polyglot)</text>
+<text x="62" y="347" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="13" font-weight="600" fill="#38bdf8" text-anchor="start">rust, python, typescript, go</text>
 
 <!-- Right column: 3 adapter cards -->
 <rect x="880" y="82" width="360" height="86" rx="12" fill="#34d399" fill-opacity="0.10" stroke="#34d399" stroke-opacity="0.75" stroke-width="1.5"/>

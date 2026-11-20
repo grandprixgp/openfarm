@@ -27,27 +27,27 @@
 <text x="50" y="458" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#9fb0c8" text-anchor="start" >stateless roles</text>
 <text x="50" y="476" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#5b6b85" text-anchor="start" >per tier + effort</text>
 <rect x="240" y="104" width="180" height="72" rx="12" fill="#a78bfa" fill-opacity="0.12" stroke="#a78bfa" stroke-opacity="0.75" stroke-width="1.5"/>
-<text x="330.0" y="134" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="16" font-weight="650" fill="#f1f5f9" text-anchor="middle" >Grill + Architect</text>
-<text x="330.0" y="156" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#9fb0c8" text-anchor="middle" >invariants + golden slice</text>
+<text x="330.0" y="134" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="16" font-weight="650" fill="#f1f5f9" text-anchor="middle" >Grill + Spec</text>
+<text x="330.0" y="156" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#9fb0c8" text-anchor="middle" >living spec + chunks</text>
 <rect x="440" y="104" width="200" height="72" rx="12" fill="#a78bfa" fill-opacity="0.12" stroke="#a78bfa" stroke-opacity="0.75" stroke-width="1.5"/>
-<text x="540.0" y="134" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="16" font-weight="650" fill="#f1f5f9" text-anchor="middle" >Decompose / Adopt</text>
-<text x="540.0" y="156" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#9fb0c8" text-anchor="middle" >checked cards on base</text>
+<text x="540.0" y="134" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="16" font-weight="650" fill="#f1f5f9" text-anchor="middle" >Chunks → Cards</text>
+<text x="540.0" y="156" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#9fb0c8" text-anchor="middle" >DAG-checked cards on base</text>
 <rect x="660" y="104" width="180" height="72" rx="12" fill="#38bdf8" fill-opacity="0.10" stroke="#38bdf8" stroke-opacity="0.70" stroke-width="1.5" stroke-dasharray="6 5"/>
-<text x="750.0" y="134" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="15.5" font-weight="650" fill="#f1f5f9" text-anchor="middle" >TUI + External</text>
-<text x="750.0" y="156" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="11.5" font-weight="400" fill="#38bdf8" text-anchor="middle" >tui · swarm · board</text>
+<text x="750.0" y="134" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="15.5" font-weight="650" fill="#f1f5f9" text-anchor="middle" >TUI + Web</text>
+<text x="750.0" y="156" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="11.5" font-weight="400" fill="#38bdf8" text-anchor="middle" >tui · web · daemon</text>
 <rect x="860" y="104" width="180" height="72" rx="12" fill="#a78bfa" fill-opacity="0.12" stroke="#a78bfa" stroke-opacity="0.75" stroke-width="1.5"/>
 <text x="950.0" y="134" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="16" font-weight="650" fill="#f1f5f9" text-anchor="middle" >Review</text>
-<text x="950.0" y="156" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#9fb0c8" text-anchor="middle" >dossier + diff + verdict</text>
+<text x="950.0" y="156" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#9fb0c8" text-anchor="middle" >dossier + findings + diff</text>
 <rect x="1060" y="104" width="180" height="72" rx="12" fill="#a78bfa" fill-opacity="0.12" stroke="#a78bfa" stroke-opacity="0.75" stroke-width="1.5"/>
-<text x="1150.0" y="134" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="16" font-weight="650" fill="#f1f5f9" text-anchor="middle" >Merge locally</text>
-<text x="1150.0" y="156" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#9fb0c8" text-anchor="middle" >by you, never by openfarm</text>
-<text x="240" y="204" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#5b6b85" text-anchor="start" >Frontier context holds design and review only. Inspect live runs anytime in openfarm tui.</text>
+<text x="1150.0" y="134" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="16" font-weight="650" fill="#f1f5f9" text-anchor="middle" >Land locally</text>
+<text x="1150.0" y="156" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#9fb0c8" text-anchor="middle" >openfarm land (zero push)</text>
+<text x="240" y="204" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#5b6b85" text-anchor="start" >Frontier context holds design and review only. Inspect live runs anytime in Textual TUI or Tailscale Web Companion.</text>
 <rect x="440" y="264" width="200" height="72" rx="12" fill="#fbbf24" fill-opacity="0.12" stroke="#fbbf24" stroke-opacity="0.75" stroke-width="1.5"/>
-<text x="540.0" y="294" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="16" font-weight="650" fill="#f1f5f9" text-anchor="middle" >Claim + eligibility</text>
-<text x="540.0" y="316" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#9fb0c8" text-anchor="middle" >parallel non-colliding cards</text>
+<text x="540.0" y="294" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="16" font-weight="650" fill="#f1f5f9" text-anchor="middle" >DAG + eligibility</text>
+<text x="540.0" y="316" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#9fb0c8" text-anchor="middle" >parallel non-colliding waves</text>
 <rect x="660" y="264" width="180" height="72" rx="12" fill="#fbbf24" fill-opacity="0.12" stroke="#fbbf24" stroke-opacity="0.75" stroke-width="1.5"/>
 <text x="750.0" y="294" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="16" font-weight="650" fill="#f1f5f9" text-anchor="middle" >Board + every gate</text>
-<text x="750.0" y="316" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#9fb0c8" text-anchor="middle" >tests, lint, revert, lock</text>
+<text x="750.0" y="316" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#9fb0c8" text-anchor="middle" >tests, invariants, smoke</text>
 <rect x="860" y="264" width="180" height="72" rx="12" fill="#fbbf24" fill-opacity="0.12" stroke="#fbbf24" stroke-opacity="0.75" stroke-width="1.5"/>
 <text x="950.0" y="294" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="16" font-weight="650" fill="#f1f5f9" text-anchor="middle" >Branch + dossier</text>
 <text x="950.0" y="316" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#9fb0c8" text-anchor="middle" >or handed-back / block</text>

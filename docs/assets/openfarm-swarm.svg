@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1280" height="360" viewBox="0 0 1280 360" role="img" aria-labelledby="swarm-t swarm-d">
-<title id="swarm-t">v0.8.5 swarm architecture: multi-provider ACP &amp; driver seats, shared run board, parallel cards, and stdlib TUI</title>
-<desc id="swarm-d">When [swarm] enabled is false, runs match v0.7 exactly. When enabled, coordinator seats (code, tier:&lt;name&gt;, external via openfarm drive claude|agy|codex), supervisor seats (config across claude/agy/codex-acp, tier:&lt;name&gt;, external, off), and code StallMonitor communicate over the append-only file-locked board.jsonl while non-colliding cards execute in parallel worktrees bounded by globs_overlap and BuildLimiter and inspected live through the 7-view stdlib TUI and humanized CLI.</desc>
+<title id="swarm-t">openfarm v0.14.0 swarm &amp; factory architecture: ACP &amp; drive seats, shared board, parallel DAG cards, TUI and Tailscale Web</title>
+<desc id="swarm-d">When [swarm] enabled is false, runs follow sequential DAG execution. When enabled, coordinator seats (code, tier:&lt;name&gt;, external via openfarm drive claude|agy|codex), supervisor seats (config across claude/agy/codex-acp, tier:&lt;name&gt;, external, off), and code StallMonitor communicate over the append-only file-locked board.jsonl while non-colliding cards execute in parallel worktrees bounded by globs_overlap and BuildLimiter and inspected live through the Textual/curses TUI, Tailscale Web Companion, and CLI.</desc>
 <defs>
   <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
     <stop offset="0" stop-color="#0b1220"/><stop offset="1" stop-color="#17233d"/>
@@ -9,7 +9,7 @@
 <rect x="0" y="0" width="1280" height="360" rx="18" fill="url(#bg)"/>
 <rect x="0.5" y="0.5" width="1279" height="359" rx="18" fill="none" stroke="#ffffff" stroke-opacity="0.08"/>
 
-<text x="40" y="46" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="20" font-weight="700" fill="#f1f5f9" text-anchor="start">v0.8.5 swarm: ACP &amp; drive seats, shared board, parallel cards, TUI</text>
+<text x="40" y="46" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="20" font-weight="700" fill="#f1f5f9" text-anchor="start">Swarm &amp; Factory: ACP &amp; drive seats, shared board, DAG cards, TUI + Web</text>
 
 <rect x="888" y="24" width="352" height="28" rx="14" fill="#fbbf24" fill-opacity="0.12" stroke="#fbbf24" stroke-opacity="0.6"/>
 <text x="1064" y="42" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="12" font-weight="600" fill="#fbbf24" text-anchor="middle">[swarm] enabled = false -&gt; exact v0.7 behaviour</text>
