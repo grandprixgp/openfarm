@@ -104,6 +104,43 @@ def retire_card_members(board: Board, card_id: str, *, reason: str = "card finis
     return removed
 
 
+class RunEventBus:
+    """Thread-safe streaming run event bus writing `<state_dir>/runs/<run_id>/events.jsonl`
+    and notifying an optional live `on_event` callback (used by non-blocking TUI runs)."""
+
+    def __init__(self, state, run_id: str, on_event: Callable[[dict], None] | None = None) -> None:
+        self.state = state
+        self.run_id = str(run_id)
+        self._on_event = on_event
+        self._lock = threading.Lock()
+        self.events_path = Path(state.run_dir(self.run_id)) / "events.jsonl"
+        self.events_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def emit(self, event: dict | None = None, **fields) -> dict:
+        from .state import utc_now
+
+        payload: dict = {}
+        if isinstance(event, dict):
+            payload.update(event)
+        payload.update(fields)
+        payload.setdefault("ts", utc_now())
+        payload.setdefault("run_id", self.run_id)
+        payload.setdefault("kind", "event")
+        line = json.dumps(payload, ensure_ascii=False)
+        with self._lock:
+            try:
+                with self.events_path.open("a", encoding="utf-8") as handle:
+                    handle.write(line + "\n")
+            except OSError:
+                pass
+        if callable(self._on_event):
+            try:
+                self._on_event(dict(payload))
+            except Exception:
+                pass
+        return payload
+
+
 class CoordinatorRuntime:
     """Shared mutable run state controlled by SwarmRunner under a lock."""
 

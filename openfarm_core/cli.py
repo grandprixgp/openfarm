@@ -429,7 +429,7 @@ def _baseline_check(ctx: Context, source: FileCardSource, card: Card) -> dict:
         git.worktree_remove(worktree)
 
 
-def cmd_run(ctx: Context, args) -> int:
+def cmd_run(ctx: Context, args, *, on_event=None) -> int:
     """Start a run: claim, drive, and move each card."""
     if ctx.state.kill_requested(ctx.cfg.kill_switch):
         _emit_ctx(ctx, {"refused": True, "reason": "the kill switch exists"}, "run")
@@ -473,16 +473,19 @@ def cmd_run(ctx: Context, args) -> int:
               file=sys.stderr)
 
     try:
-        return _do_run(ctx, args, run_id)
+        return _do_run(ctx, args, run_id, on_event=on_event)
     finally:
         ctx.state.release_run_lock(run_id)
 
 
-def _do_run(ctx: Context, args, run_id: str) -> int:
+def _do_run(ctx: Context, args, run_id: str, *, on_event=None) -> int:
+    from .coordinator import RunEventBus
+
     ctx.state.check_disk_space(getattr(ctx.cfg, "min_free_mb", 0))
     source = ctx.cards()
     source.prepare()
     run_dir = ctx.state.create_run(run_id)
+    event_bus = RunEventBus(ctx.state, run_id, on_event=on_event)
     telemetry_raw = open_telemetry(ctx.cfg, run_dir)
     telemetry = TelemetrySink(telemetry_raw)
 
@@ -504,6 +507,12 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
     identifiers = ([_check_id(args.card, "card id")]
                    if args.card else source.next(cfg.lane,
                                                  limit=args.cards)["cards"])
+    event_bus.emit(
+        kind="run_start",
+        cards=list(identifiers),
+        dry_run=bool(args.dry_run),
+        message=f"Starting run {run_id} ({len(identifiers)} card(s))",
+    )
     # `--spend` may lower the night's cap but never raise the config's, because the
     # config is the operator's standing limit and the flag is one night's. A zero or
     # negative flag is a usage error rather than "no cap": silently turning a limit
@@ -722,14 +731,28 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
                     continue
                 ctx.state.check_disk_space(getattr(cfg, "min_free_mb", 0))
                 if args.dry_run:
-                    outcomes.append(_dry_run(ctx, source, card_id))
+                    dr = _dry_run(ctx, source, card_id)
+                    outcomes.append(dr)
+                    event_bus.emit(kind="card_done", card_id=card_id, final_state="dry-run", eligible=bool(dr.get("eligible")))
                     continue
 
                 outcome = _run_card(ctx, source, card_id, run_id, telemetry,
                                     run_dir, script_path, mm_script=mm_script_path,
                                     harness_library=harness_lib,
-                                    mm_budget=night_mm_budget, board=board)
+                                    mm_budget=night_mm_budget, board=board,
+                                    on_event=event_bus.emit)
                 outcomes.append(outcome)
+                event_bus.emit(
+                    kind="card_done",
+                    card_id=card_id,
+                    final_state=str(outcome.get("final_state") or ""),
+                    stop_code=str(outcome.get("stop_code") or ""),
+                    worker_tokens=int(outcome.get("tokens_in", 0) or 0) + int(outcome.get("tokens_out", 0) or 0),
+                    supervisor_tokens=int(outcome.get("micromanager_tokens_in", 0) or 0) + int(outcome.get("micromanager_tokens_out", 0) or 0),
+                    tokens_in_fresh=int(outcome.get("tokens_in_fresh", 0) or 0),
+                    tokens_in_cached=int(outcome.get("tokens_in_cached", 0) or 0),
+                    message=str(outcome.get("detail") or outcome.get("final_state") or ""),
+                )
                 final_state = outcome.get("final_state")
                 if final_state == "blocked":
                     code = outcome.get("stop_code", "")
@@ -778,6 +801,7 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
                         on_handback=on_handback,
                         on_struggling=on_struggling,
                         mm_seat=mm_seat,
+                        on_event=event_bus.emit,
                     )
                 finally:
                     if metered is not None and hasattr(metered, "close"):
@@ -842,6 +866,11 @@ def _do_run(ctx: Context, args, run_id: str) -> int:
                 print(f"micromanager close error ignored: {exc}", file=sys.stderr)
         if board is not None:
             board.end_run("finished")
+        event_bus.emit(
+            kind="run_finish",
+            cards_count=len(outcomes),
+            message=f"Finished run {run_id} ({len(outcomes)} outcome(s))",
+        )
 
     notes: list[str] = []
     if not _backend_prices_spend(cfg, script_path):
@@ -1116,7 +1145,8 @@ def _run_card(ctx: Context, source: FileCardSource, card_id: str, run_id: str,
               mm_backend=None,
               on_handback=None,
               on_struggling=None,
-              mm_seat: _SharedAcpSupervisor | None = None) -> dict:
+              mm_seat: _SharedAcpSupervisor | None = None,
+              on_event=None) -> dict:
     """Claim one card and drive it. `backend` overrides the configured one."""
     cfg = ctx.cfg
     holder = f"openfarm:{run_id}"
@@ -1173,7 +1203,8 @@ def _run_card(ctx: Context, source: FileCardSource, card_id: str, run_id: str,
         log=lambda message: print(message, file=sys.stderr),
         micromanager=mm, harness_library=resolved_harness,
         board=board, swarm=getattr(cfg, "swarm", None),
-        on_handback=on_handback, on_struggling=on_struggling)
+        on_handback=on_handback, on_struggling=on_struggling,
+        on_event=on_event)
     run.card_source = source
     try:
         record = run.run(claim=claim)
