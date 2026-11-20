@@ -67,6 +67,8 @@ from openfarm_core.findings import (
     is_finding_id_or_header,
     list_findings,
 )
+from openfarm_core.cards import waiting_on, waiting_text
+from openfarm_core.gates.eligibility import check_eligibility
 from openfarm_core.git import Git
 from openfarm_core.projects import (
     _is_ephemeral_tmp_path,
@@ -596,7 +598,7 @@ class OpenfarmApp(App):
                     # 1B: Pre-Verified Wave Plan Approval
                     with Horizontal(id="studio-plan"):
                         left_p = Vertical(classes="card-focused split-left")
-                        left_p.border_title = "Wave Plan (all cards eligible)"
+                        left_p.border_title = "Wave Plan"
                         with left_p:
                             yield DataTable(id="plan-table")
                             yield Static("", id="plan-preflight", classes="subtext")
@@ -727,7 +729,7 @@ class OpenfarmApp(App):
 
         pt = self.query_one("#plan-table", DataTable)
         pt.cursor_type = "row"
-        pt.add_columns("ID", "Title", "St", "Prof")
+        pt.add_columns("ID", "Title", "State", "Needs", "Prof")
 
         cht = self.query_one("#chunks-table", DataTable)
         cht.cursor_type = "row"
@@ -830,6 +832,7 @@ class OpenfarmApp(App):
         in_review = [c for c in non_findings if str(c.state).lower().replace("-", "_") == "in_review"]
         ready_cards = [c for c in non_findings if str(c.state).lower() == "ready"]
         blocked_cards = [c for c in non_findings if str(c.state).lower() == "blocked"]
+        startable = [c for c in ready_cards if c.id not in waiting_on(non_findings)]
 
         # Update daemon pill when not actively drafting/running in-process
         if not self._running_wave and not self._drafting_plan:
@@ -856,7 +859,7 @@ class OpenfarmApp(App):
         self._set_step("#st-plan", "Plan", "done" if plan_ok else ("current" if prov_ok else "pending"))
         self._set_step(
             "#st-run",
-            f"Run ({len(ready_cards)})" if ready_cards else "Run",
+            f"Run ({len(startable)})" if startable else "Run",
             "current" if self._running_wave else ("done" if in_review else ("current" if plan_ok else "pending")),
         )
         self._set_step(
@@ -922,9 +925,27 @@ class OpenfarmApp(App):
         pt = self.query_one("#plan-table", DataTable)
         pt.clear()
         self._plan_cards = []
+        # A ready card behind an unfinished one is waiting, and one that fails the
+        # eligibility check can't be built: the plan shows both instead of "ready".
+        waiting = waiting_on(non_findings)
+        states = {str(c.id): str(c.state).lower() for c in non_findings}
         for c in ready_cards + blocked_cards:
             tri = triage_card_heuristic(c)
-            st_short = "rdy" if str(c.state).lower() == "ready" else "blk"
+            failures: list[str] = []
+            if str(c.state).lower() == "blocked":
+                st_short = "blocked"
+            elif c.id in waiting:
+                st_short = "waits"
+            else:
+                st_short = "ready"
+                if cfg is not None:
+                    try:
+                        failures = [str(f.get("detail") or f.get("rule"))
+                                    for f in check_eligibility(c, cfg, worktree=self.repo).failures]
+                    except Exception as exc:  # noqa: BLE001 - one odd card must not blank the plan
+                        failures = [f"could not be checked: {exc}"]
+                if failures:
+                    st_short = "fix"
             entry = {
                 "id": c.id,
                 "title": c.title,
@@ -935,10 +956,15 @@ class OpenfarmApp(App):
                 "tests": [t.as_dict() for t in c.tests],
                 "done_text": c.done_text,
                 "profile": str(tri.get("recommended_profile") or "balanced"),
-                "eligible": True,
+                "eligible": not failures,
+                "failures": failures,
+                "plan_state": st_short,
+                "waits_for": waiting.get(c.id, []),
+                "depends_states": [(d, states.get(d, "missing")) for d in c.deps],
             }
             self._plan_cards.append(entry)
-            pt.add_row(Text(c.id), Text(c.title[:18]), st_short, Text(entry["profile"][:4]), key=c.id)
+            pt.add_row(Text(c.id), Text(c.title[:18]), st_short, Text(", ".join(c.deps) or "-"),
+                       Text(entry["profile"][:4]), key=c.id)
         if self._plan_cards:
             if self._selected_plan_id not in {e["id"] for e in self._plan_cards}:
                 self._selected_plan_id = self._plan_cards[0]["id"]
@@ -957,9 +983,19 @@ class OpenfarmApp(App):
             base_line = "\n[bold #4ade80]✓[/] Baseline tests passed"
         elif self._last_baseline_ok is False:
             base_line = f"\n[bold #fb7185]✗ Baseline failed:[/] {esc(self._last_baseline_error[:120])}"
+        counts = {k: sum(1 for e in self._plan_cards if e["plan_state"] == k)
+                  for k in ("ready", "waits", "blocked", "fix")}
+        tally = f"{counts['ready']} can start now"
+        if counts["waits"]:
+            tally += f"  ·  {counts['waits']} waiting"
+        if counts["blocked"]:
+            tally += f"  ·  {counts['blocked']} blocked"
+        if counts["fix"]:
+            tally += f"  ·  {counts['fix']} can't be built yet"
+        waits_line = f"\n[bold #fbbf24]⏳[/] {esc(waiting_text(waiting))}" if waiting else ""
         self.query_one("#plan-preflight", Static).update(
-            f"[bold #4ade80]✓[/] {len(ready_cards)} ready card(s)  ·  "
-            f"{self._findings_counts['picked']} picked finding(s)\n"
+            f"[bold {'#4ade80' if counts['ready'] else '#fbbf24'}]{'✓' if counts['ready'] else '○'}[/] {tally}  ·  "
+            f"{self._findings_counts['picked']} picked finding(s){waits_line}\n"
             f"[bold #38bdf8]✓[/] Worker: {esc(gp['worker'].get('model') or '(repo config)')}"
             f"{conflict_line}{base_line}"
         )
@@ -1039,13 +1075,27 @@ class OpenfarmApp(App):
             f"    [#94a3b8]{esc(t.get('asserts', ''))}[/]"
             for t in (entry.get("tests") or [])
         ) or "  (none)"
+        plan_state = entry.get("plan_state", "ready")
+        if plan_state == "waits":
+            waits = ", ".join(f"{d} ({st.replace('_', ' ')})" for d, st in entry.get("waits_for") or [])
+            status = f"[bold #fbbf24 on #3a2c0a] ⏳ waits for {esc(waits)} [/]"
+        elif plan_state == "blocked":
+            status = "[bold #fb7185 on #3b1219] ✗ blocked: edit it, then Release Blocked to retry [/]"
+        elif plan_state == "fix":
+            status = "[bold #fb7185 on #3b1219] ✗ can't be built yet [/]\n" + "\n".join(
+                f"  [#fb7185]• {esc(why)}[/]" for why in entry.get("failures") or [])
+        else:
+            status = "[bold #4ade80 on #103623] ✓ can be built [/]"
+        dep_states = entry.get("depends_states") or []
+        depends = ("Depends on: " + esc(", ".join(f"{d} ({st.replace('_', ' ')})" for d, st in dep_states)) + "\n"
+                   if dep_states else "Depends on: nothing\n")
         self.query_one("#plan-detail", Static).update(
             f"[bold #f8fafc]{esc(entry['id'])}  ·  {esc(entry['title'])}[/]\n"
             f"[bold #c084fc on #2f1b47] {esc(entry['category'])} [/]  "
             f"[bold #4ade80 on #103623] profile: {esc(entry['profile'])} [/]  "
-            f"[bold #4ade80 on #103623] ✓ eligible [/]\n\n"
+            f"{status}\n{depends}\n"
             f"[bold #38bdf8]SCOPE[/]\nTouches: {esc(touches)}\n\n"
-            f"[bold #38bdf8]DONE SPEC[/]\n{esc(entry.get('done_text', '')[:500])}\n\n"
+            f"[bold #38bdf8]DONE SPEC[/]\n{esc(entry.get('done_text', ''))}\n\n"
             f"[bold #38bdf8]TESTS[/]\n{tests_lines}"
         )
 

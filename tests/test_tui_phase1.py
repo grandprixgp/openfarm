@@ -641,6 +641,62 @@ class RunPanelTests(_RegistryIsolation):
 
 
 @unittest.skipUnless(textual_available(), "textual optional extra not installed")
+class PlanViewTests(_RegistryIsolation):
+    """R1.14: the plan says which cards wait, on what, and which can be built."""
+
+    def test_a_card_behind_a_blocked_one_is_shown_waiting_with_its_dependency(self) -> None:
+        toy, src = _two_card_toy(self)
+        claim = src.claim("CARD-1", holder="test-lane")
+        src.move("CARD-1", claim["lease_id"], "blocked", stop_code="tests-unprovable")
+
+        async def body(app, pilot, settle) -> None:
+            app.query_one("#studio-switcher").current = "studio-plan"
+            await pilot.pause(0.1)
+            table = app.query_one("#plan-table")
+            rows = {str(table.get_row(k)[0]): [str(c) for c in table.get_row(k)]
+                    for k in ("CARD-1", "CARD-2")}
+            self.assertEqual(rows["CARD-1"][2], "blocked")
+            self.assertEqual(rows["CARD-2"][2:4], ["waits", "CARD-1"])
+            self.assertEqual(table.parent.border_title, "Wave Plan")
+
+            preflight = " ".join(str(app.query_one("#plan-preflight").render()).split())
+            self.assertIn("0 can start now", preflight)
+            self.assertIn("CARD-2 waits for CARD-1 (blocked)", preflight)
+
+            app._selected_plan_id = "CARD-2"
+            app.refresh_all_views()
+            await pilot.pause(0.1)
+            detail = " ".join(str(app.query_one("#plan-detail").render()).split())
+            self.assertIn("waits for CARD-1 (blocked)", detail)
+            self.assertIn("Depends on: CARD-1 (blocked)", detail)
+            self.assertNotIn("eligible", detail)
+
+        RunPanelTests._drive(self, toy, body)
+
+    def test_a_card_that_fails_the_check_is_not_called_buildable(self) -> None:
+        toy = build_python_toy()
+        self.addCleanup(toy.cleanup)
+        toy.write_card(
+            "CARD-3", title="Add part 3", category="not-a-category",
+            touches=["tally/bounded.py"],
+            tests=[{"name": "test_a", "file": "tests/test_a.py", "asserts": "returns 3"}],
+            done_text="## Done\n\n- `push` returns 3 for a full bundle.", depends=[])
+        toy.commit("add a card with a bad category")
+
+        async def body(app, pilot, settle) -> None:
+            app.query_one("#studio-switcher").current = "studio-plan"
+            app._selected_plan_id = "CARD-3"
+            app.refresh_all_views()
+            await pilot.pause(0.1)
+            self.assertEqual(str(app.query_one("#plan-table").get_row("CARD-3")[2]), "fix")
+            detail = " ".join(str(app.query_one("#plan-detail").render()).split())
+            self.assertIn("can't be built yet", detail)
+            self.assertIn("not-a-category", detail)
+            self.assertIn("1 can't be built yet", " ".join(str(app.query_one("#plan-preflight").render()).split()))
+
+        RunPanelTests._drive(self, toy, body)
+
+
 class ReviewActionTests(_RegistryIsolation):
     """R1.9, R1.17: slow review actions show they run and how they end; a blocked card can be accepted."""
 
