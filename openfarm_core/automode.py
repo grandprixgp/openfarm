@@ -1080,3 +1080,170 @@ def ensure_baseline_committed(repo: Path, *, extra_allowed: list[str] | None = N
         git.commit_all("chore: commit openfarm spec and cards")
         return True
     return False
+
+
+def update_card_with_eligibility(
+    repo: Path,
+    card_id: str,
+    *,
+    title: str | None = None,
+    category: str | None = None,
+    touches: list[str] | None = None,
+    depends: list[str] | None = None,
+    wave: int | None = None,
+    tests: list[dict] | None = None,
+    done_text: str | None = None,
+) -> dict:
+    """Edit a card under `cards/`, evaluate `check_eligibility` live, and sync to `openfarm-cards`."""
+    from .adapters.files import FileCardSource, parse_card_file, render_card_file
+    from .cards import Card
+    from .gates.eligibility import check_eligibility
+
+    root = Path(repo).expanduser().resolve()
+    cfg = load_config(root)
+    cards_dir = root / "cards"
+    card_path = cards_dir / f"{card_id}.md"
+    if not card_path.is_file():
+        for cand in sorted(cards_dir.glob("*.md")):
+            try:
+                h_c, _ = parse_card_file(cand.read_text(encoding="utf-8", errors="replace"))
+            except (OSError, ValueError):
+                continue
+            if str(h_c.get("id") or "") == card_id:
+                card_path = cand
+                break
+    if not card_path.is_file():
+        raise Refused("card-not-found", f"no card file found for {card_id!r}")
+
+    header, body = parse_card_file(card_path.read_text(encoding="utf-8"))
+    if title is not None and title.strip():
+        header["title"] = title.strip()
+    if category is not None and category.strip():
+        header["category"] = category.strip()
+    if touches is not None:
+        header["touches"] = [str(t).strip() for t in touches if str(t).strip()]
+        if header.get("reference") and header["touches"]:
+            header["reference"] = header["touches"][0]
+    if depends is not None:
+        header["depends"] = [str(d).strip() for d in depends if str(d).strip()]
+    if wave is not None:
+        header["wave"] = max(1, int(wave))
+    if tests is not None:
+        header["tests"] = list(tests)
+    if done_text is not None:
+        body = done_text.strip() + "\n"
+
+    card_path.write_text(render_card_file(header, body), encoding="utf-8")
+    card_obj = Card(
+        id=str(header.get("id") or card_id),
+        title=str(header.get("title") or card_id),
+        state=str(header.get("state") or "ready"),
+        done_text=body,
+        touches=[str(t) for t in (header.get("touches") or [])],
+        deps=[str(d) for d in (header.get("depends") or header.get("deps") or [])],
+        fields=dict(header),
+    )
+    elig = check_eligibility(card_obj, cfg, worktree=root)
+    if (root / ".git").exists():
+        ensure_baseline_committed(root, extra_allowed=[card_path.relative_to(root).as_posix()])
+        src = FileCardSource(root, "cards", worktree=cfg.state_dir / "cards-source", base_branch=cfg.base_branch)
+        src.sync_ready_cards_from_base()
+    return {
+        "card": {
+            "id": card_obj.id,
+            "title": card_obj.title,
+            "category": card_obj.category,
+            "touches": list(card_obj.touches),
+            "depends": list(card_obj.deps),
+            "wave": int(header.get("wave") or 1),
+            "tests": [t.as_dict() for t in card_obj.tests],
+            "done_text": body,
+        },
+        "eligible": bool(elig.ok),
+        "failures": list(elig.failures),
+    }
+
+
+def split_card_into_two(
+    repo: Path,
+    card_id: str,
+    *,
+    first_title: str,
+    first_touches: list[str],
+    second_title: str,
+    second_touches: list[str],
+) -> dict:
+    """Split an oversized card into `<card_id>a` and `<card_id>b` (chained via `depends`)."""
+    from .adapters.files import FileCardSource, parse_card_file, render_card_file
+    from .cards import Card
+    from .gates.eligibility import check_eligibility
+
+    root = Path(repo).expanduser().resolve()
+    cfg = load_config(root)
+    lang = (cfg.languages[0] if cfg.languages else "rust").lower()
+    cards_dir = root / "cards"
+    orig_path = cards_dir / f"{card_id}.md"
+    if not orig_path.is_file():
+        raise Refused("card-not-found", f"no card file found for {card_id!r}")
+    orig_hdr, orig_body = parse_card_file(orig_path.read_text(encoding="utf-8"))
+
+    id_a, id_b = f"{card_id}a", f"{card_id}b"
+    out_cards: list[dict] = []
+    written_rel: list[str] = []
+    for cid, ctitle, ctouches, cdeps in (
+        (id_a, first_title, first_touches, list(orig_hdr.get("depends") or [])),
+        (id_b, second_title, second_touches, [id_a]),
+    ):
+        _dt, dtest = _default_touch_and_test(root, lang, cid)
+        clean_touches = [str(t).strip() for t in ctouches if str(t).strip()] or [_dt]
+        hdr = {
+            "id": cid,
+            "title": str(ctitle or cid).strip(),
+            "state": "ready",
+            "category": str(orig_hdr.get("category") or "small-feature"),
+            "touches": clean_touches,
+            "depends": cdeps,
+            "tests": [dtest],
+            "wave": int(orig_hdr.get("wave") or 1),
+        }
+        if hdr["category"] not in ("pinned-bugfix", "test-backfill"):
+            hdr["new_symbols"] = True
+        if hdr["category"] in (getattr(cfg, "require_reference", ()) or ()):
+            hdr["reference"] = clean_touches[0]
+        body = (
+            "## Done\n\n"
+            f"- Implement `{clean_touches[0]}` for {hdr['title']}.\n"
+            f"- `{dtest['name']}` returns expected values and verifies an error on invalid input.\n"
+        )
+        hdr, body, _rep = _repair_card_for_eligibility(root, cfg, hdr, body)
+        cpath = cards_dir / f"{cid}.md"
+        cpath.write_text(render_card_file(hdr, body), encoding="utf-8")
+        written_rel.append(f"cards/{cid}.md")
+        cobj = Card(
+            id=cid,
+            title=hdr["title"],
+            state="ready",
+            done_text=body,
+            touches=list(hdr["touches"]),
+            deps=list(hdr["depends"]),
+            fields=dict(hdr),
+        )
+        elig = check_eligibility(cobj, cfg, worktree=root)
+        out_cards.append({
+            "id": cid,
+            "title": hdr["title"],
+            "touches": list(hdr["touches"]),
+            "depends": list(hdr["depends"]),
+            "eligible": bool(elig.ok),
+            "failures": list(elig.failures),
+        })
+
+    orig_hdr["state"] = "split"
+    orig_path.write_text(render_card_file(orig_hdr, orig_body), encoding="utf-8")
+    written_rel.append(f"cards/{card_id}.md")
+
+    if (root / ".git").exists():
+        ensure_baseline_committed(root, extra_allowed=written_rel)
+        src = FileCardSource(root, "cards", worktree=cfg.state_dir / "cards-source", base_branch=cfg.base_branch)
+        src.sync_ready_cards_from_base()
+    return {"split_from": card_id, "cards": out_cards}

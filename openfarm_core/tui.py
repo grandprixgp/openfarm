@@ -568,6 +568,7 @@ def _read_cards_readonly(ctx: TuiContext) -> tuple[list[Card], str]:
                         "depends": deps,
                         "tests": merged.get("tests") or [],
                         "fields": fields,
+                        "done_text": body,
                         "body": body,
                     }))
                 except (OSError, ValueError, KeyError, TypeError) as exc:

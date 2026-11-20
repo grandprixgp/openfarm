@@ -125,6 +125,7 @@ def list_findings(
     state_filter: str = "waiting",
     from_card: str = "",
     query: str = "",
+    deduplicate: bool = False,
 ) -> dict:
     """List findings newest-first with waiting / new / picked / dismissed / folded counts."""
     raw_cards = _read_raw_cards_readonly(repo, cfg)
@@ -216,6 +217,24 @@ def list_findings(
                 continue
         filtered.append(item)
 
+    if deduplicate:
+        deduped: list[dict] = []
+        by_sig: dict[tuple[str, str], dict] = {}
+        for item in filtered:
+            norm_title = re.sub(r"\s+", " ", str(item["title"]).strip().lower())
+            sig = (str(item["from_card"]).strip(), norm_title)
+            if sig in by_sig:
+                existing = by_sig[sig]
+                existing["duplicate_count"] += 1
+                existing["duplicate_ids"].append(item["id"])
+            else:
+                copy_item = dict(item)
+                copy_item["duplicate_count"] = 1
+                copy_item["duplicate_ids"] = [item["id"]]
+                by_sig[sig] = copy_item
+                deduped.append(copy_item)
+        filtered = deduped
+
     return {
         "findings": filtered,
         "counts": counts,
@@ -269,3 +288,27 @@ def decide_finding(
         target_card=target_card,
         promoted_card=promoted_card,
     )
+
+
+def bulk_decide_findings(
+    repo: Path,
+    cfg: Config,
+    *,
+    decision: str,
+    from_card: str = "",
+    finding_ids: list[str] | None = None,
+    reason: str = "",
+) -> dict:
+    """Apply `decision` (`next-wave` or `dismissed`) across matching waiting findings."""
+    if decision not in ("next-wave", "dismissed"):
+        raise Refused("bad-bulk-decision", f"bulk decision must be 'next-wave' or 'dismissed', got {decision!r}")
+    if finding_ids:
+        targets = [str(fid).strip() for fid in finding_ids if str(fid).strip()]
+    else:
+        waiting = list_findings(repo, cfg, state_filter="waiting", from_card=from_card)["findings"]
+        targets = [item["id"] for item in waiting]
+    src = _open_file_source(repo, cfg)
+    decided: list[dict] = []
+    for fid in targets:
+        decided.append(src.decide_finding(fid, decision, reason=reason))
+    return {"decision": decision, "count": len(decided), "findings": decided}
