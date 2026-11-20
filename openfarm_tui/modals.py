@@ -76,8 +76,8 @@ class DismissFindingModal(ModalScreen[str | None]):
             yield Static(self._title, classes="modal-sub", markup=False)
             yield Input(placeholder="Optional one-line reason (Enter to dismiss)", id="dismiss-reason")
             with Horizontal(classes="modal-actions"):
-                yield Button("Cancel [Esc]", id="cancel", classes="btn-cancel")
-                yield Button("Dismiss [Enter]", id="ok", classes="btn-ok")
+                yield Button("Cancel \\[Esc]", id="cancel", classes="btn-cancel")
+                yield Button("Dismiss \\[Enter]", id="ok", classes="btn-ok")
 
     def on_mount(self) -> None:
         self.query_one("#dismiss-reason", Input).focus()
@@ -116,8 +116,8 @@ class FoldFindingModal(ModalScreen[str | None]):
             opts = [Option(esc(f"{cid}  ·  {ctitle}"), id=cid) for cid, ctitle in self._cards]
             yield OptionList(*opts, id="fold-options")
             with Horizontal(classes="modal-actions"):
-                yield Button("Cancel [Esc]", id="cancel", classes="btn-cancel")
-                yield Button("Fold [Enter]", id="ok", classes="btn-ok")
+                yield Button("Cancel \\[Esc]", id="cancel", classes="btn-cancel")
+                yield Button("Fold \\[Enter]", id="ok", classes="btn-ok")
 
     def on_mount(self) -> None:
         ol = self.query_one("#fold-options", OptionList)
@@ -167,7 +167,7 @@ class FullFindingModal(ModalScreen[None]):
             with VerticalScroll(id="full-body"):
                 yield Static(f.get("body") or "(no explanation body)", markup=False)
             with Horizontal(classes="modal-actions"):
-                yield Button("Close [Esc]", id="close", classes="btn-ok")
+                yield Button("Close \\[Esc]", id="close", classes="btn-ok")
 
     @on(Button.Pressed, "#close")
     def _close(self) -> None:
@@ -193,7 +193,7 @@ class BounceNoteModal(ModalScreen[str | None]):
             yield Static(self._title, classes="modal-sub", markup=False)
             yield TextArea("", id="bounce-note")
             with Horizontal(classes="modal-actions"):
-                yield Button("Cancel [Esc]", id="cancel", classes="btn-cancel")
+                yield Button("Cancel \\[Esc]", id="cancel", classes="btn-cancel")
                 yield Button("Bounce Card", id="ok", classes="btn-ok")
 
     def on_mount(self) -> None:
@@ -225,8 +225,8 @@ class HintModal(ModalScreen[str | None]):
             yield Static(f"Send Hint for {self._cid or 'Active Run'}", classes="modal-title", markup=False)
             yield Input(placeholder="Short guidance for the active worker/supervisor...", id="hint-input")
             with Horizontal(classes="modal-actions"):
-                yield Button("Cancel [Esc]", id="cancel", classes="btn-cancel")
-                yield Button("Send [Enter]", id="ok", classes="btn-ok")
+                yield Button("Cancel \\[Esc]", id="cancel", classes="btn-cancel")
+                yield Button("Send \\[Enter]", id="ok", classes="btn-ok")
 
     def on_mount(self) -> None:
         self.query_one("#hint-input", Input).focus()
@@ -277,7 +277,7 @@ class NewProjectModal(ModalScreen[dict | None]):
                 yield Switch(value=False, id="np-init")
                 yield Static("Initialize new Openfarm scaffold if directory is empty", classes="switch-lbl")
             with Horizontal(classes="modal-actions"):
-                yield Button("Cancel [Esc]", id="cancel", classes="btn-cancel")
+                yield Button("Cancel \\[Esc]", id="cancel", classes="btn-cancel")
                 yield Button("Save Project", id="ok", classes="btn-ok")
 
     def on_mount(self) -> None:
@@ -329,7 +329,7 @@ class EditProjectModal(ModalScreen[dict | None]):
             yield Label("Idea / Notes", classes="field-lbl")
             yield Input(value=str(p.get("idea") or ""), id="ep-idea")
             with Horizontal(classes="modal-actions"):
-                yield Button("Cancel [Esc]", id="cancel", classes="btn-cancel")
+                yield Button("Cancel \\[Esc]", id="cancel", classes="btn-cancel")
                 yield Button("Save Changes", id="ok", classes="btn-ok")
 
     def on_mount(self) -> None:
@@ -391,7 +391,7 @@ class DeleteProjectModal(ModalScreen[dict | None]):
                 yield Switch(value=False, id="dp-clear-state")
                 yield Static("Also clear Openfarm's external state cache under ~/.openfarm/", classes="switch-lbl")
             with Horizontal(classes="modal-actions"):
-                yield Button("Cancel [Esc]", id="cancel", classes="btn-cancel")
+                yield Button("Cancel \\[Esc]", id="cancel", classes="btn-cancel")
                 yield Button("Remove From Openfarm", id="ok", classes="btn-danger")
 
     @on(Button.Pressed, "#ok")
@@ -432,7 +432,7 @@ class WorkspaceDiscoveryModal(ModalScreen[dict | None]):
             ]
             yield OptionList(*opts, id="disc-options")
             with Horizontal(classes="modal-actions"):
-                yield Button("Cancel [Esc]", id="cancel", classes="btn-cancel")
+                yield Button("Cancel \\[Esc]", id="cancel", classes="btn-cancel")
                 yield Button("Register Selected", id="register", classes="btn-ok")
                 yield Button("Adopt Selected", id="adopt", classes="btn-ok")
 
@@ -494,7 +494,7 @@ class CardEditorModal(ModalScreen[dict | None]):
             yield Label("Done Specification (Markdown)", classes="field-lbl")
             yield TextArea(str(c.get("done_text") or ""), id="ce-done")
             with Horizontal(classes="modal-actions"):
-                yield Button("Cancel [Esc]", id="cancel", classes="btn-cancel")
+                yield Button("Cancel \\[Esc]", id="cancel", classes="btn-cancel")
                 yield Button("Save & Check Eligibility", id="ok", classes="btn-ok")
 
     def on_mount(self) -> None:
@@ -544,7 +544,7 @@ class SplitCardModal(ModalScreen[dict | None]):
             yield Label("Part B Touches (comma-separated)", classes="field-lbl")
             yield Input(value=t2, id="sc-f2")
             with Horizontal(classes="modal-actions"):
-                yield Button("Cancel [Esc]", id="cancel", classes="btn-cancel")
+                yield Button("Cancel \\[Esc]", id="cancel", classes="btn-cancel")
                 yield Button("Split Card", id="ok", classes="btn-ok")
 
     def on_mount(self) -> None:

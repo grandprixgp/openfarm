@@ -95,6 +95,29 @@ class MarkupSafetyTests(_RegistryIsolation):
 
         asyncio.run(_run())
 
+    def test_key_hints_on_buttons_are_shown(self) -> None:
+        from textual.widgets import Button
+
+        from openfarm_tui.app import OpenfarmApp
+        from openfarm_tui.modals import BounceNoteModal
+
+        toy = build_python_toy()
+        self.addCleanup(toy.cleanup)
+
+        async def _run() -> None:
+            app = OpenfarmApp(repo=toy.root, initial_view="review")
+            async with app.run_test(size=(132, 42)) as pilot:
+                await pilot.pause(0.15)
+                for bid, hint in (("#btn-approve", "[a]"), ("#btn-land", "[L]"), ("#btn-plan-edit", "[e]"),
+                                  ("#btn-find-full", "[Enter]"), ("#btn-proj-scan", "[S]")):
+                    self.assertIn(hint, str(app.query_one(bid, Button).label))
+                self.assertIn("[m]", str(app.query_one("#review-frontier-out").render()))
+                app.push_screen(BounceNoteModal("CARD-1", "t"))
+                await pilot.pause(0.1)
+                self.assertIn("[Esc]", str(app.screen.query_one("#cancel", Button).label))
+
+        asyncio.run(_run())
+
     def test_escape_survives_textual_markup(self) -> None:
         from textual.content import Content
 

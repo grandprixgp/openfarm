@@ -472,11 +472,11 @@ class OpenfarmApp(App):
                     with VerticalScroll(id="project-detail-scroll"):
                         yield Static("No projects registered yet.", id="project-detail")
                     with Horizontal(classes="action-row"):
-                        yield Button("Switch Project [Enter]", classes="primary-cta", id="btn-proj-switch")
-                        yield Button("Add / New [n]", classes="approve-btn", id="btn-proj-new")
-                        yield Button("Scan ~/projects [S]", classes="soft-btn", id="btn-proj-scan")
-                        yield Button("Edit [e]", classes="soft-btn", id="btn-proj-edit")
-                        yield Button("Remove From Openfarm [d]", classes="soft-btn", id="btn-proj-delete")
+                        yield Button("Switch Project \\[Enter]", classes="primary-cta", id="btn-proj-switch")
+                        yield Button("Add / New \\[n]", classes="approve-btn", id="btn-proj-new")
+                        yield Button("Scan ~/projects \\[S]", classes="soft-btn", id="btn-proj-scan")
+                        yield Button("Edit \\[e]", classes="soft-btn", id="btn-proj-edit")
+                        yield Button("Remove From Openfarm \\[d]", classes="soft-btn", id="btn-proj-delete")
 
             # ── VIEW 0: GLOBAL PROVIDER SETUP ────────────────────────────────
             with Container(id="providers"):
@@ -487,7 +487,7 @@ class OpenfarmApp(App):
                     with Horizontal(id="frontier-row"):
                         yield Static("● Claude ACP (OAuth)", id="prov-frontier-status", classes="inline-label")
                         yield Static("", classes="spacer")
-                        yield Button("Login OAuth [l]", id="btn-acp-login", classes="soft-btn")
+                        yield Button("Login OAuth \\[l]", id="btn-acp-login", classes="soft-btn")
 
                     yield Static("WORKER     (Lesser Coding Model · ZDR Header x-cmd-zdr: 1)", classes="section-h")
                     with RadioSet(id="worker-presets"):
@@ -602,8 +602,8 @@ class OpenfarmApp(App):
                             yield Static("Select a card to inspect its scope and named tests.", id="plan-detail")
                             with Horizontal(classes="action-row"):
                                 yield Button("Commit Baseline & Launch Wave", classes="primary-cta", id="btn-launch-wave")
-                                yield Button("Edit Card [e]", classes="soft-btn", id="btn-plan-edit")
-                                yield Button("Split Card [x]", classes="soft-btn", id="btn-plan-split")
+                                yield Button("Edit Card \\[e]", classes="soft-btn", id="btn-plan-edit")
+                                yield Button("Split Card \\[x]", classes="soft-btn", id="btn-plan-split")
                                 yield Button("Spec & Chunks", classes="soft-btn", id="btn-open-spec")
                                 yield Button("Release Blocked", classes="soft-btn", id="btn-plan-release")
                                 yield Button("Iterate / New Idea", classes="soft-btn", id="btn-regrill")
@@ -627,10 +627,10 @@ class OpenfarmApp(App):
                                 yield Button("Launch Wave", classes="primary-cta", id="btn-run-start")
                                 yield Button("Start Detached", classes="soft-btn", id="btn-daemon-start")
                                 yield Button("Stop Daemon", classes="soft-btn", id="btn-daemon-stop")
-                                yield Button("Pause [p]", classes="soft-btn", id="btn-pause")
+                                yield Button("Pause \\[p]", classes="soft-btn", id="btn-pause")
                                 yield Button("Resume", classes="soft-btn", id="btn-resume")
-                                yield Button("Stop [s]", classes="soft-btn", id="btn-stop")
-                                yield Button("Hint [h]", classes="soft-btn", id="btn-hint")
+                                yield Button("Stop \\[s]", classes="soft-btn", id="btn-stop")
+                                yield Button("Hint \\[h]", classes="soft-btn", id="btn-hint")
                                 yield Button("Open Review [2]", classes="approve-btn", id="btn-jump-review")
 
             # ── VIEW 2: SPLIT-PANE REVIEW & LAND INBOX ───────────────────────
@@ -650,16 +650,16 @@ class OpenfarmApp(App):
                             with VerticalScroll(id="diff-scroll"):
                                 yield Static("(no diff preview)", id="review-diff")
                             with Horizontal(classes="action-row"):
-                                yield Button("Approve [a]", classes="approve-btn", id="btn-approve")
-                                yield Button("Land Locally [L]", classes="primary-cta", id="btn-land")
+                                yield Button("Approve \\[a]", classes="approve-btn", id="btn-approve")
+                                yield Button("Land Locally \\[L]", classes="primary-cta", id="btn-land")
                                 yield Button("Merge Integration → Main", classes="soft-btn", id="btn-promote-int")
-                                yield Button("Bounce [b]", classes="soft-btn", id="btn-bounce")
-                                yield Button("Frontier Review [m]", classes="soft-btn", id="btn-freview")
+                                yield Button("Bounce \\[b]", classes="soft-btn", id="btn-bounce")
+                                yield Button("Frontier Review \\[m]", classes="soft-btn", id="btn-freview")
                                 yield Button("Next Chunk / Iterate", classes="soft-btn", id="btn-next-iter")
                         with TabPane("Tests & Spec"):
                             yield VerticalScroll(Static("(select a card)", id="review-tests"))
                         with TabPane("Frontier Review"):
-                            yield VerticalScroll(Static("Press [m] to run Mixture-of-Frontiers review.", id="review-frontier-out"))
+                            yield VerticalScroll(Static("Press \\[m] to run Mixture-of-Frontiers review.", id="review-frontier-out"))
 
             # ── VIEW 3: FINDINGS INBOX ───────────────────────────────────────
             with Vertical(id="findings"):
@@ -676,12 +676,12 @@ class OpenfarmApp(App):
                         with VerticalScroll(id="finding-detail-scroll"):
                             yield Static("No waiting findings.", id="finding-detail")
                         with Horizontal(classes="action-row"):
-                            yield Button("Pick Next Wave [w]", classes="primary-cta", id="btn-find-pick")
-                            yield Button("Dismiss [x]", classes="soft-btn", id="btn-find-dismiss")
-                            yield Button("Bulk Dismiss Card [X]", classes="soft-btn", id="btn-find-bulk-dismiss")
-                            yield Button("Fold Into Card [c]", classes="soft-btn", id="btn-find-fold")
-                            yield Button("Synthesize Wave [W]", classes="approve-btn", id="btn-find-synth")
-                            yield Button("Open Full [Enter]", classes="soft-btn", id="btn-find-full")
+                            yield Button("Pick Next Wave \\[w]", classes="primary-cta", id="btn-find-pick")
+                            yield Button("Dismiss \\[x]", classes="soft-btn", id="btn-find-dismiss")
+                            yield Button("Bulk Dismiss Card \\[X]", classes="soft-btn", id="btn-find-bulk-dismiss")
+                            yield Button("Fold Into Card \\[c]", classes="soft-btn", id="btn-find-fold")
+                            yield Button("Synthesize Wave \\[W]", classes="approve-btn", id="btn-find-synth")
+                            yield Button("Open Full \\[Enter]", classes="soft-btn", id="btn-find-full")
 
             # ── VIEW 4: ENGINE DIAGNOSTICS ───────────────────────────────────
             with Container(id="engine"):
@@ -1244,7 +1244,7 @@ class OpenfarmApp(App):
         else:
             self._selected_project_id = ""
             self.query_one("#project-detail", Static).update(
-                "No projects registered yet.\n\nPress [bold #38bdf8][n][/] to add an existing folder or create a new project."
+                "No projects registered yet.\n\nPress [bold #38bdf8]\\[n][/] to add an existing folder or create a new project."
             )
 
     def _render_project_detail(self, item: dict) -> None:
