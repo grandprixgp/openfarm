@@ -427,31 +427,81 @@ def run_grill_and_architect(
     if not any(p.is_file() for p in cards_dir.glob("*.md")):
         from .adapters.files import render_card_file
 
+        cfg = None
+        try:
+            cfg = load_config(root)
+        except (ConfigError, OSError):
+            cfg = None
+        lang = (cfg.languages[0] if (cfg and cfg.languages) else "rust").lower()
+        allowed_cats = list(cfg.categories) if (cfg and cfg.categories) else ["small-feature"]
+        category = next(
+            (c for c in ("small-feature", "feature", "pattern", "test-backfill") if c in allowed_cats),
+            allowed_cats[0],
+        )
+
         by_id = {str(item.get("id") or ""): str(item.get("answer") or "").strip() for item in answers}
         goal_ans = by_id.get("goal") or "Deliver the core happy path cleanly with deterministic tests"
-        inv_ans = by_id.get("invariants") or "No silent data loss; deterministic error handling on invalid inputs"
+        inv_ans = by_id.get("invariants") or "No silent data loss; deterministic error responses on invalid inputs"
         slice_ans = by_id.get("slice") or "Core domain model + first end-to-end command with unit tests"
-        touches: list[str] = []
-        if (root / "src" / "lib.rs").is_file():
-            touches = ["src/lib.rs"]
-            if (root / "tests" / "baseline_tests.rs").is_file():
-                touches.append("tests/baseline_tests.rs")
-        elif (root / "main.go").is_file():
-            touches = ["main.go"]
-        header = {
+
+        if lang == "rust":
+            touch = "src/lib.rs" if (root / "src" / "lib.rs").is_file() else (
+                "src/main.rs" if (root / "src" / "main.rs").is_file() else "src/lib.rs"
+            )
+            test_entry = {
+                "name": "wave1_golden_slice_works",
+                "file": "tests/wave1_golden_slice.rs",
+                "asserts": "Core workflow returns expected output and rejects invalid input with an error",
+            }
+        elif lang in ("python", "py"):
+            py_files = [
+                p.relative_to(root).as_posix()
+                for p in sorted(root.rglob("*.py"))
+                if not p.name.startswith("test_")
+                and "tests/" not in p.relative_to(root).as_posix()
+                and ".openfarm" not in p.parts
+            ]
+            touch = py_files[0] if py_files else "app.py"
+            test_entry = {
+                "name": "test_wave1_golden_slice_works",
+                "file": "tests/test_wave1_golden_slice.py",
+                "asserts": "Core workflow returns expected output and rejects invalid input with an error",
+            }
+        elif lang == "go":
+            touch = "main.go"
+            test_entry = {
+                "name": "TestWave1GoldenSliceWorks",
+                "file": "wave1_golden_slice_test.go",
+                "asserts": "Core workflow returns expected output and rejects invalid input with an error",
+            }
+        else:
+            touch = "src/index.ts"
+            test_entry = {
+                "name": "wave1_golden_slice_works",
+                "file": "tests/wave1_golden_slice.test.ts",
+                "asserts": "Core workflow returns expected output and rejects invalid input with an error",
+            }
+
+        header: dict = {
             "id": "W1-01",
             "title": (slice_ans.splitlines()[0] if slice_ans else "Wave 1 golden slice")[:80],
             "state": "ready",
-            "touches": touches,
+            "touches": [touch],
             "depends": [],
-            "category": "new",
+            "category": category,
+            "tests": [test_entry],
         }
+        if category not in ("pinned-bugfix", "test-backfill"):
+            header["new_symbols"] = True
+        if cfg is not None and category in (getattr(cfg, "require_reference", ()) or ()):
+            header["reference"] = touch
+
         body = (
             "## Done\n\n"
-            f"- Core workflow: {goal_ans}\n"
-            f"- Golden slice: {slice_ans}\n"
-            f"- Preserve invariants: {inv_ans}\n"
-            "- All baseline and new unit tests pass.\n"
+            f"- Core workflow (`{touch}`): {goal_ans}\n"
+            f"- Golden slice returns expected values: {slice_ans}\n"
+            f"- Preserve invariants and return an error on invalid input: {inv_ans}\n"
+            f"- `{test_entry['name']}` passes alongside all baseline tests.\n"
         )
         card_path = cards_dir / "W1-01.md"
         card_path.write_text(render_card_file(header, body), encoding="utf-8")

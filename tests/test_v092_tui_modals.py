@@ -223,6 +223,50 @@ class TuiModalsTests(unittest.TestCase):
         src.release("W1-01", lease_id=claim["lease_id"], reason="released in test")
         self.assertEqual(src.read("W1-01")["card"]["state"], "ready")
 
+    def test_grill_scaffolded_card_passes_real_eligibility_gate(self) -> None:
+        from openfarm_core.adapters.files import parse_card_file
+        from openfarm_core.automode import run_grill_and_architect
+        from openfarm_core.bootstrap import initialize_project
+        from openfarm_core.cards import Card
+        from openfarm_core.config import load_config
+        from openfarm_core.gates.eligibility import check_eligibility
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "photo-app"
+            state_dir = Path(tmp) / "state"
+            secrets_dir = Path(tmp) / "secrets"
+            initialize_project(
+                "photo-app",
+                directory=root,
+                idea="Daily photo gallery",
+                state_dir=state_dir,
+                secrets_dir=secrets_dir,
+                no_git=True,
+            )
+            run_grill_and_architect(
+                root,
+                answers=[
+                    {"id": "goal", "question": "Core workflow", "answer": "Upload and browse daily photos"},
+                    {"id": "invariants", "question": "Invariants", "answer": "No data loss on invalid input"},
+                    {"id": "slice", "question": "Golden slice", "answer": "Add photo entry struct and list command"},
+                ],
+            )
+            card_path = root / "cards" / "W1-01.md"
+            self.assertTrue(card_path.is_file())
+            header, body = parse_card_file(card_path.read_text(encoding="utf-8"))
+            card = Card(
+                id=str(header["id"]),
+                title=str(header["title"]),
+                state=str(header["state"]),
+                done_text=body,
+                touches=list(header.get("touches") or []),
+                deps=list(header.get("depends") or []),
+                fields=dict(header),
+            )
+            cfg = load_config(root)
+            elig = check_eligibility(card, cfg, worktree=root)
+            self.assertTrue(elig.ok, f"eligibility failed: {elig.failures}")
+
 
 if __name__ == "__main__":
     unittest.main()
