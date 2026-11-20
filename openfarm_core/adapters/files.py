@@ -248,8 +248,11 @@ class FileCardSource:
                     f"openfarm: sync {updated} planned card(s) from base branch")
             return updated
 
-    def reset_non_finding_cards_from_base(self) -> int:
-        """Replace all non-finding cards on `openfarm-cards` with the base branch's `cards/` (used after re-init)."""
+    def reset_non_finding_cards_from_base(self, *, clear_findings: bool = False) -> int:
+        """Replace cards on `openfarm-cards` with the base branch's `cards/` (used after re-init).
+
+        Preserves `FIND-*.md` by default unless `clear_findings=True` (e.g. stack switch re-init).
+        """
         self.prepare()
         with self._lock:
             if self.worktree is None:
@@ -258,7 +261,7 @@ class FileCardSource:
             dst_dir.mkdir(parents=True, exist_ok=True)
             removed = 0
             for existing in sorted(dst_dir.glob("*.md")):
-                if existing.stem.upper().startswith("FIND-"):
+                if (not clear_findings) and existing.stem.upper().startswith("FIND-"):
                     continue
                 existing.unlink(missing_ok=True)
                 removed += 1
