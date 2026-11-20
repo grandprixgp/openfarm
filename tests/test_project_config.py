@@ -59,6 +59,8 @@ SPEC_KEYS = {
               "on_external_timeout", "stall_after"},
     "tiers": {"model", "efforts", "effort_param"},
     "units": {"language"},
+    "factory": {"auto_land", "integration_branch", "auto_land_profiles",
+                "require_zero_findings", "require_frontier_consensus"},
 }
 
 

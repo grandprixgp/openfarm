@@ -25,7 +25,7 @@ CONFIG_PATH = Path(".openfarm") / "config.toml"
 KNOWN_TABLES = {
     "project", "adapters", "model", "policy", "eligibility", "brief",
     "runner", "budget", "gates", "cards", "micromanager", "state", "harness",
-    "swarm", "tiers", "units",
+    "swarm", "tiers", "units", "factory",
 }
 
 _UNIT_LANGUAGES = ("rust", "python", "typescript", "go")
@@ -91,6 +91,8 @@ _TABLE_KEYS = {
               "on_external_timeout", "stall_after"},
     "tiers": set(_TIER_KEYS),
     "units": {"language"},
+    "factory": {"auto_land", "integration_branch", "auto_land_profiles",
+                "require_zero_findings", "require_frontier_consensus"},
 }
 _ROLE_MODEL_KEYS = {"model", "temperature", "vary_seed", "effort", "retry_effort", "effort_ladder"}
 _HEADER_NAME = re.compile(r"^[A-Za-z0-9!#$%&'*+.^_`|~-]+$")
@@ -247,6 +249,17 @@ class RoleModel:
                 "vary_seed": self.vary_seed, "effort": self.effort,
                 "retry_effort": self.retry_effort,
                 "effort_ladder": list(self.effort_ladder)}
+
+
+@dataclasses.dataclass
+class FactoryConfig:
+    """Opt-in `[factory]` settings for DAG auto-land onto a local integration branch."""
+
+    auto_land: bool = False
+    integration_branch: str = "openfarm/integration"
+    auto_land_profiles: tuple[str, ...] = ("lean",)
+    require_zero_findings: bool = True
+    require_frontier_consensus: bool = False
 
 
 @dataclasses.dataclass
@@ -715,6 +728,7 @@ class Config:
         )
         self.unit_languages = self._parse_units(self._data.get("units"))
         self.swarm = self._parse_swarm(self._table("swarm"))
+        self.factory = self._parse_factory(self._table("factory"))
         self.effort_ladder: tuple[str, ...] = tuple(
             _as_str_list(self._table("model").get("effort_ladder", []), "[model] effort_ladder")
         )
@@ -746,6 +760,23 @@ class Config:
                             f"[model] {role_name}.{key} {value!r} is not "
                             f"in tier {tier.name!r} efforts {list(tier.efforts)!r}"
                         )
+
+    def _parse_factory(self, f: dict) -> FactoryConfig:
+        auto_land = _as_bool(f.get("auto_land"), "[factory] auto_land", False)
+        branch = str(f.get("integration_branch") or "openfarm/integration").strip() or "openfarm/integration"
+        raw_profs = _as_str_list(f.get("auto_land_profiles", ["lean"]), "[factory] auto_land_profiles") or ["lean"]
+        for p in raw_profs:
+            if p not in SUPERVISION_PROFILES:
+                raise ConfigError(f"[factory] auto_land_profiles: {p!r} not in {list(SUPERVISION_PROFILES)}")
+        req_zero = _as_bool(f.get("require_zero_findings"), "[factory] require_zero_findings", True)
+        req_cons = _as_bool(f.get("require_frontier_consensus"), "[factory] require_frontier_consensus", False)
+        return FactoryConfig(
+            auto_land=auto_land,
+            integration_branch=branch,
+            auto_land_profiles=tuple(dict.fromkeys(raw_profs)),
+            require_zero_findings=req_zero,
+            require_frontier_consensus=req_cons,
+        )
 
     def _parse_harness(self, h: dict) -> HarnessConfig:
         enabled = _as_bool(h.get("enabled"), "[harness] enabled", True)

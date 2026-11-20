@@ -62,7 +62,7 @@ def _git_lock_for(cwd: Path) -> threading.RLock:
 #: Every git subcommand the core is allowed to run.
 ALLOWED_SUBCOMMANDS = frozenset({
     "init", "add", "commit", "status", "diff", "rev-parse", "rev-list",
-    "checkout", "switch", "branch", "worktree", "merge", "merge-base", "reset",
+    "checkout", "switch", "branch", "worktree", "merge", "merge-base", "rebase", "reset",
     "clean", "ls-files", "ls-tree", "show", "cat-file", "hash-object", "for-each-ref",
     "update-ref", "symbolic-ref", "log", "config", "stash", "rm", "mv",
     "describe", "tag", "apply", "restore",
@@ -392,6 +392,16 @@ class Git:
             output = (result.stdout or "") + (result.stderr or "")
             if result.returncode != 0:
                 self._run(["merge", "--abort"], check=False)
+                return False, output.strip()
+            return True, output.strip()
+
+    def rebase(self, onto: str) -> tuple[bool, str]:
+        """Deterministic rebase onto `onto`; aborts cleanly on any conflict."""
+        with _git_lock_for(self.cwd):
+            result = self._run(["rebase", onto], check=False)
+            output = (result.stdout or "") + (result.stderr or "")
+            if result.returncode != 0:
+                self._run(["rebase", "--abort"], check=False)
                 return False, output.strip()
             return True, output.strip()
 

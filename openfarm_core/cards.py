@@ -70,6 +70,7 @@ OPTIONAL_CARD_FIELDS = (
     "replan_if",
     "complexity",
     "profile",
+    "wave",
     "from_card",
     "created_at",
     "finding_decision",
