@@ -144,6 +144,41 @@ class EditModal(ModalScreen[str | None]):
         self.dismiss(self.query_one("#edit-text", TextArea).text)
 
 
+class ChoiceModal(ModalScreen[str | None]):
+    """A question with two or three answers, each a button. Used for the one-time move of tasks off main."""
+
+    BINDINGS = [Binding("escape", "dismiss(None)", "Not now")]
+    DEFAULT_CSS = """
+    ChoiceModal { align: center middle; }
+    ChoiceModal > Vertical { width: 110; max-width: 96%; height: auto; max-height: 90%; background: $surface;
+                             border: round $primary; padding: 1 2; }
+    ChoiceModal VerticalScroll { height: auto; max-height: 22; margin: 1 0; }
+    ChoiceModal Horizontal { height: 3; align: right middle; }
+    ChoiceModal Button { margin-left: 1; }
+    """
+
+    def __init__(self, title: str, text: str, choices: list[tuple[str, str]]) -> None:
+        super().__init__()
+        self._title, self._text, self._choices = title, text, choices
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Static(f"[b]{esc(self._title)}[/]")
+            with VerticalScroll():
+                yield Static(esc(self._text))
+            with Horizontal():
+                for index, (value, label) in enumerate(self._choices):
+                    yield Button(label, id=f"choice-{value}", variant="primary" if index == len(self._choices) - 1 else "default")
+
+    def on_mount(self) -> None:
+        self.query(Button).last().focus()
+
+    @on(Button.Pressed)
+    def _chosen(self, event: Button.Pressed) -> None:
+        event.stop()
+        self.dismiss(str(event.button.id)[7:])
+
+
 class Everything(Provider):
     """Ctrl+K: what is not on the screen in front of you."""
 
@@ -379,6 +414,54 @@ class Journey(App):
         self.refresh_screen(focus=True)
         self.set_interval(1.0, self._tick)
         self._attach_running_build()
+        try:
+            if self.facts["cfg"] is not None and open_store(self.repo, self.facts["cfg"]).migration()["needed"]:
+                self.call_after_refresh(self.offer_migration)
+        except Exception:  # noqa: BLE001 - not a repository yet
+            pass
+
+    # -- an older project: its tasks move off main once, and only when told to -----
+
+    def offer_migration(self) -> None:
+        cfg = self._cfg()
+        if cfg is None:
+            return
+        try:
+            store = open_store(self.repo, cfg)
+            status = store.migration()
+        except Exception:  # noqa: BLE001 - not a repository yet, or nothing to move
+            return
+        if not status["needed"]:
+            self.note = "This project's tasks already live in one place."
+            return self._draw_busy()
+        take: dict[str, str] = {}
+        waiting = list(status["differences"])
+
+        def ask_next(choice: str | None = "start") -> None:
+            if choice is None:
+                return self.say("The tasks stay on main for now (Ctrl+K: move them)")
+            if choice in ("main", "state"):
+                take[waiting.pop(0)["id"]] = choice
+            if waiting:
+                diff = waiting[0]
+                return self.push_screen(ChoiceModal(
+                    f"{diff['id']} is different in the two places. Which one is right?",
+                    f"ON MAIN\n{diff['main']}\n\nON THE CARDS BRANCH\n{diff['state']}",
+                    [("state", "Keep the cards branch's"), ("main", "Keep main's")]), ask_next)
+            try:
+                store.migrate(take)
+                self.say(f"{status['cards']} task(s) and the spec now live on the cards branch; main's cards/ was removed in one commit")
+            except Exception as exc:  # noqa: BLE001 - shown, and nothing was moved
+                self.say(f"The tasks could not be moved: {getattr(exc, 'message', exc)}")
+            self.refresh_screen(focus=True)
+
+        self.push_screen(ChoiceModal(
+            "This project keeps its tasks and spec on the main branch",
+            f"openfarm now keeps them in one place, the cards branch, so main holds only your code. Moving them is done "
+            f"once: {status['cards']} task(s) are compared with the cards branch"
+            + (f", {len(waiting)} differ and you choose which copy to keep" if waiting else ", none differ")
+            + ", then main's cards/ folder and spec files are removed in one commit. Nothing is pushed.",
+            [("later", "Not now"), ("start", "Move them")]), lambda choice: ask_next(None if choice in (None, "later") else "start"))
 
     # -- small helpers ----------------------------------------------------------
 
@@ -1753,6 +1836,7 @@ class Journey(App):
         if self.facts.get("spec"):
             items += [("Something's wrong: ask for fix tasks", self.do_something_wrong),
                       ("New feature: add a goal", self.do_new_feature)]
+        items.append(("Move this project's tasks and spec off the main branch (once)", self.offer_migration))
         items += [(label, lambda view=view: self.exit(("classic", view))) for label, view in (
             ("Projects: switch, add or remove a project", "projects"),
             ("Providers and sign-in", "providers"),

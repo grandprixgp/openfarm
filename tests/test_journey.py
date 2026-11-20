@@ -883,6 +883,51 @@ class FlowTests(_Folder):
         self.assertEqual(made.call_args.kwargs["initial_view"], "projects")
 
 
+from tests.test_store import MigrationTests as _OlderProject  # noqa: E402
+
+
+@unittest.skipUnless(textual_available(), "textual optional extra not installed")
+class MigrationScreenTests(_OlderProject):
+    """An older project: the screen offers the one-time move, shows both copies of a task that differs, and waits."""
+
+    for _name in [n for n in dir(_OlderProject) if n.startswith("test_")]:
+        locals()[_name] = None  # the store's own tests run in test_store
+    del _name
+
+    def test_the_move_is_offered_shows_both_copies_and_does_nothing_until_chosen(self) -> None:
+        from openfarm_tui.journey import ChoiceModal, Journey
+
+        async def run() -> None:
+            app = Journey(repo=self.root)
+            async with app.run_test(size=(120, 36)) as pilot:
+                await pilot.pause(0.3)
+                self.assertIsInstance(app.screen, ChoiceModal)
+                self.assertIn("removed in one commit", str(app.screen.query_one("VerticalScroll Static").render()))
+                self.assertEqual(str(app.focused.label), "Move them")
+                await pilot.press("escape")  # not now: nothing moves
+                await pilot.pause(0.1)
+                self.assertTrue((self.root / "cards" / "W1-02.md").is_file())
+                app.offer_migration()
+                await pilot.pause(0.1)
+                await pilot.press("enter")
+                await pilot.pause(0.2)
+                both = str(app.screen.query_one("VerticalScroll Static").render())
+                self.assertIn("W1-02 is different", str(app.screen.query("Static").first().render()))
+                self.assertIn("Edited on main", both)
+                self.assertIn("Task W1-02", both)
+                self.assertTrue((self.root / "cards").is_dir())  # still waiting for the choice
+                await pilot.press("enter")  # the last button: keep main's
+                await pilot.pause(0.3)
+                self.assertFalse((self.root / "cards").exists())
+                self.assertIn("now live on the cards branch", "\n".join(app.activity))
+
+        with mock.patch.dict(os.environ, {"OPENFARM_PROJECTS_FILE": str(self.root.parent / "projects.json")}):
+            asyncio.run(run())
+        from openfarm_core.store import Store
+
+        self.assertEqual(Store(self.root, self.cfg).read("W1-02")[0]["title"], "Edited on main")
+
+
 class ThemeTests(unittest.TestCase):
     def test_two_themes_and_no_colour_outside_them(self) -> None:
         import re
