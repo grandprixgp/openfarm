@@ -908,6 +908,23 @@ class TypeScriptPack(OwnMutationMixin, Pack):
                 "note": ("syntax only: node's type stripping parsed the code, no "
                          "types were checked (no tsc)")}
 
+    def try_it(self, worktree: Path) -> dict:
+        root = Path(worktree)
+        try:
+            scripts = json.loads((root / "package.json").read_text(encoding="utf-8")).get("scripts") or {}
+        except (OSError, ValueError, AttributeError):
+            scripts = {}
+        if isinstance(scripts, dict) and scripts.get("start"):
+            return {"kind": "web", "start": ["npm", "start", "--silent"], "port_env": "PORT"}
+        for rel in ("src/server.ts", "server.ts", "src/server.js", "server.js", "src/main.ts", "src/index.ts"):
+            try:
+                text = (root / rel).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if "createServer" in text or ".listen(" in text:
+                return {"kind": "web", "start": ["node", rel], "port_env": "PORT"}
+        return {}
+
     def tooling_summary(self) -> dict:
         """The runner, the type check and the formatter this pack decided on."""
         tooling = self.tooling or {}

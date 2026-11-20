@@ -240,6 +240,10 @@ class Store:
                     self._note(card_id, kind, by, why, {"state": [state, "ready"]})
                     self.src.release(card_id, reason=why)
                     header, body = self.read(card_id)
+                    parked, _checks = self._park_or_ready(header, body)
+                    if parked.get("state") != header.get("state"):  # still can't be built: don't queue it
+                        header = parked
+                        self.src._write(card_id, header, body, f"{card_id}: parked, it still fails the plan checks")
                 elif kind == "accept":
                     if not why.strip():
                         raise Refused("note-required", "accepting a blocked card needs a note saying what was checked")

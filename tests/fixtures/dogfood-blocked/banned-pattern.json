@@ -1,0 +1,10 @@
+{
+  "run_id": "run-fixture",
+  "card_id": "W1-02",
+  "claimed_at": "2026-11-20T12:56:45Z",
+  "final_state": "blocked",
+  "stop_code": "attempts",
+  "attempts": 5,
+  "counter_tests": {"written": 0, "dropped_uncompiled": 0, "passed": 0, "failed": 0, "not_run": 0},
+  "detail": "the change adds a banned pattern: `as any` at src/proxy.ts:12"
+}
