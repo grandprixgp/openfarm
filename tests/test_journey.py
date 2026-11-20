@@ -593,6 +593,7 @@ class FlowTests(_Folder):
             self.assertTrue(started[0]["follow"])
             self.assertEqual(app.screen_name, "build")
             self.assertIn("Building", str(app.query_one("#build-title").render()))
+            self.assertRegex(str(app.query_one("#where").render()), r"building · \d+ min")
 
         self.drive("plan", first)
         repo = self.base / "plan" / "iotd"
@@ -821,9 +822,11 @@ class FlowTests(_Folder):
             self.assertEqual(app.screen_name, "board")
             heads = [str(app.query_one(f"#head-{key}").render()) for key in ("waiting", "building", "needs", "done")]
             self.assertEqual(heads, ["WAITING  1", "BUILDING  0", "NEEDS YOU  1", "DONE  2"])
-            tile = str(app.query_one("#col-needs").get_option_at_index(0).prompt)
+            tile = str(app.query_one("#col-needs").get_option_at_index(1).prompt)
             self.assertIn("W1-04", tile)
             self.assertIn("the task is wrong", tile)
+            self.assertEqual(str(app.query_one("#col-needs").get_option_at_index(0).prompt), "Goal 1")  # grouped by goal
+            self.assertTrue(app.query_one("#col-needs").get_option_at_index(0).disabled)
             self.assertIn("Goals 2 and 3 have no tasks yet", str(app.query_one("#board-note").render()))
             self.assertEqual(self.label(app), "▶ Open W1-04")
             await pilot.press("right")

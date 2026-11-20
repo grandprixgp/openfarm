@@ -315,6 +315,7 @@ class Journey(App):
         self._app_url = ""
         self._last_step: tuple = ()
         self._template = False
+        self._build_started = 0.0  # when the build being shown began, for the top bar
         self._slots: dict[str, str] = {}  # button id -> the action it does now
         self._more: list[tuple] = []  # actions of this screen that had no room for a button
         self._auto_tried: set[str] = set()  # goals tried without being asked, so a try that can't be saved isn't repeated
@@ -496,10 +497,11 @@ class Journey(App):
         widget = self.query_one(f"#{list_id}", OptionList)
         at = widget.highlighted
         widget.clear_options()
-        widget.add_options([Option(prompt, id=option_id) for option_id, prompt in rows])
+        widget.add_options([Option(prompt, id=option_id or None, disabled=not option_id) for option_id, prompt in rows])
         widget.set_class(not rows, "hidden")
-        if rows:
-            widget.highlighted = min(at or 0, len(rows) - 1)
+        usable = [index for index, (option_id, _prompt) in enumerate(rows) if option_id]  # a row with no id is a heading
+        if usable:
+            widget.highlighted = min(usable, key=lambda index: abs(index - (at or 0)))
 
     def _picked(self, list_id: str) -> str:
         widget = self.query_one(f"#{list_id}", OptionList)
@@ -580,6 +582,8 @@ class Journey(App):
             text += f" · {needing} need{'s' if needing == 1 else ''} you"
         elif facts["running"]:
             text += " · building"
+        if facts["running"] and self._build_started:
+            text += f" · {max(1, int((time.time() - self._build_started) // 60))} min"
         return text
 
     def _draw_health(self) -> None:
@@ -1077,6 +1081,12 @@ class Journey(App):
             self.phases[task_id] = phase
             line = f"{task_id}  {PHASES.get(phase, phase)}"
         elif kind == "run_start":
+            import calendar
+
+            try:
+                self._build_started = calendar.timegm(time.strptime(str(event.get("ts"))[:19], "%Y-%m-%dT%H:%M:%S"))
+            except ValueError:
+                self._build_started = time.time()
             line = "Build started" + (": " + message.partition("; ")[2] if "; " in message else "")
         elif kind in ("run_more", "run_waiting", "question") and message:
             line = message.replace("card(s)", "task(s)")
@@ -1583,14 +1593,17 @@ class Journey(App):
                    "blocked": STOPPED[(task["triage"] or {}).get("kind", "builder")].split(",")[0],
                    "in_progress": f"try {task['tries'] + 1}", "backlog": "can't be built yet"}.get(
                        state, self._order(task))
-            columns[key].append((task["id"], f"[b]{esc(task['id'])}[/] [$foreground-muted]goal {task['goal_no']}[/]\n"
-                                             f"{esc(task['title'][:22])}\n[$foreground-muted]{esc(why)}[/]"))
+            goal = f"Goal {task['goal_no']}"
+            if goal not in [prompt for option_id, prompt in columns[key] if not option_id]:
+                columns[key].append(("", goal))
+            columns[key].append((task["id"], f"[b]{esc(task['id'])}[/]\n{esc(task['title'][:22])}\n"
+                                             f"[$foreground-muted]{esc(why)}[/]"))
         return columns
 
     def _draw_board(self) -> None:
         heads = {"waiting": "WAITING", "building": "BUILDING", "needs": "NEEDS YOU", "done": "DONE"}
         for key, rows in self._board_rows().items():
-            self.query_one(f"#head-{key}", Static).update(f"{heads[key]}  {len(rows)}")
+            self.query_one(f"#head-{key}", Static).update(f"{heads[key]}  {sum(1 for option_id, _p in rows if option_id)}")
             self._set_list(f"col-{key}", rows)
         planned = {t["goal_no"] for t in self.facts["all_tasks"]}
         later = [str(n) for n, g in enumerate(self.facts["goals"], start=1) if n not in planned and g["status"] != "done"]
