@@ -453,9 +453,9 @@ def run_grill_and_architect(
             f"- Preserve invariants: {inv_ans}\n"
             "- All baseline and new unit tests pass.\n"
         )
-        card_path = cards_dir / "W1-01-golden-slice.md"
+        card_path = cards_dir / "W1-01.md"
         card_path.write_text(render_card_file(header, body), encoding="utf-8")
-        written.append("cards/W1-01-golden-slice.md")
+        written.append("cards/W1-01.md")
 
     return {"written": written, "decisions_path": str(decisions_path)}
 

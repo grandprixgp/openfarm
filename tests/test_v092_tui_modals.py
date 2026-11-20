@@ -197,6 +197,32 @@ class TuiModalsTests(unittest.TestCase):
             self.assertFalse(ensure_baseline_committed(repo))
             self.assertFalse(git.is_clean())
 
+    def test_file_card_source_reads_and_claims_slugged_card_filename_by_header_id(self) -> None:
+        from openfarm_core.adapters.files import FileCardSource, render_card_file
+        from openfarm_core.git import Git
+
+        toy = build_python_toy()
+        self.addCleanup(toy.cleanup)
+        slugged = toy.root / "cards" / "W1-01-golden-slice.md"
+        slugged.parent.mkdir(parents=True, exist_ok=True)
+        slugged.write_text(
+            render_card_file(
+                {"id": "W1-01", "title": "Golden slice", "state": "ready", "touches": [], "depends": [], "category": "new"},
+                "## Done\n\n- Works\n",
+            ),
+            encoding="utf-8",
+        )
+        Git(toy.root).commit_all("add slugged card")
+        src = FileCardSource(toy.root, "cards", worktree=toy.root.parent / "cards-source-slugged")
+        src.prepare()
+        card = src.read("W1-01")
+        self.assertEqual(card["card"]["id"], "W1-01")
+        claim = src.claim("W1-01", holder="lane-1")
+        self.assertTrue(claim.get("lease_id"))
+        self.assertEqual(src.read("W1-01")["card"]["state"], "in_progress")
+        src.release("W1-01", lease_id=claim["lease_id"], reason="released in test")
+        self.assertEqual(src.read("W1-01")["card"]["state"], "ready")
+
 
 if __name__ == "__main__":
     unittest.main()

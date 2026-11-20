@@ -227,7 +227,17 @@ class FileCardSource:
         if (not cid or "/" in cid or "\\" in cid or "\x00" in cid
                 or cid in (".", "..") or ".." in cid):
             raise Invalid("bad-card-id", f"invalid card id {card_id!r}")
-        return self.cards_dir / f"{cid}.md"
+        direct = self.cards_dir / f"{cid}.md"
+        if direct.exists() or not self.cards_dir.is_dir():
+            return direct
+        for candidate in sorted(self.cards_dir.glob("*.md")):
+            try:
+                header, _body = parse_card_file(candidate.read_text(encoding="utf-8", errors="replace"))
+            except (Invalid, OSError):
+                continue
+            if str(header.get("id") or "") == cid:
+                return candidate
+        return direct
 
     def _read_raw(self, card_id: str) -> tuple[dict, str, Path]:
         path = self._path(card_id)
