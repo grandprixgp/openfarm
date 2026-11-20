@@ -6,7 +6,7 @@ from textual import on
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Button, Input, OptionList, Static, TextArea
+from textual.widgets import Button, Input, Label, OptionList, Static, Switch, TextArea
 from textual.widgets.option_list import Option
 
 
@@ -236,6 +236,167 @@ class HintModal(ModalScreen[str | None]):
     @on(Button.Pressed, "#ok")
     def _ok(self) -> None:
         self.dismiss(self.query_one("#hint-input", Input).value.strip())
+
+    @on(Button.Pressed, "#cancel")
+    def _cancel(self) -> None:
+        self.dismiss(None)
+
+    def key_escape(self) -> None:
+        self.dismiss(None)
+
+
+class NewProjectModal(ModalScreen[dict | None]):
+    """Add an existing directory or initialize a new project in Openfarm (`n` in Projects)."""
+
+    CSS = _MODAL_CSS + """
+    .modal-box { width: 82; }
+    .field-lbl { color: #94a3b8; margin-top: 1; }
+    .switch-row { height: 3; align: left middle; margin-top: 1; }
+    .switch-lbl { width: auto; color: #cbd5e1; margin-left: 1; }
+    """
+
+    def __init__(self, default_dir: str = "") -> None:
+        super().__init__()
+        self._default_dir = default_dir
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="modal-box"):
+            yield Static("Add / Register Project in Openfarm", classes="modal-title")
+            yield Static("Point to an existing repo folder or a new path to track in Openfarm.", classes="modal-sub")
+            yield Label("Project Name", classes="field-lbl")
+            yield Input(placeholder="e.g. photo-of-the-day", id="np-name")
+            yield Label("Directory Path", classes="field-lbl")
+            yield Input(value=self._default_dir, placeholder="/home/user/projects/my-app", id="np-repo")
+            yield Label("Language Stack (typescript | python | rust | go | auto)", classes="field-lbl")
+            yield Input(value="typescript", id="np-lang")
+            yield Label("Short Idea / Notes (optional)", classes="field-lbl")
+            yield Input(placeholder="What this project does...", id="np-idea")
+            with Horizontal(classes="switch-row"):
+                yield Switch(value=False, id="np-init")
+                yield Static("Initialize new Openfarm scaffold if directory is empty", classes="switch-lbl")
+            with Horizontal(classes="modal-actions"):
+                yield Button("Cancel [Esc]", id="cancel", classes="btn-cancel")
+                yield Button("Save Project", id="ok", classes="btn-ok")
+
+    def on_mount(self) -> None:
+        self.query_one("#np-name", Input).focus()
+
+    @on(Button.Pressed, "#ok")
+    def _ok(self) -> None:
+        self.dismiss({
+            "name": self.query_one("#np-name", Input).value.strip(),
+            "repo": self.query_one("#np-repo", Input).value.strip(),
+            "language": self.query_one("#np-lang", Input).value.strip() or "typescript",
+            "idea": self.query_one("#np-idea", Input).value.strip(),
+            "initialize": bool(self.query_one("#np-init", Switch).value),
+        })
+
+    @on(Button.Pressed, "#cancel")
+    def _cancel(self) -> None:
+        self.dismiss(None)
+
+    def key_escape(self) -> None:
+        self.dismiss(None)
+
+
+class EditProjectModal(ModalScreen[dict | None]):
+    """Edit registered Openfarm project metadata (`e` in Projects)."""
+
+    CSS = _MODAL_CSS + """
+    .modal-box { width: 82; }
+    .field-lbl { color: #94a3b8; margin-top: 1; }
+    """
+
+    def __init__(self, project: dict) -> None:
+        super().__init__()
+        self._project = dict(project)
+
+    def compose(self) -> ComposeResult:
+        p = self._project
+        with Vertical(classes="modal-box"):
+            yield Static(f"Edit Project: {p.get('id', '')}", classes="modal-title")
+            yield Static("Updates Openfarm registry (and [project] metadata in .openfarm/config.toml if present).", classes="modal-sub")
+            yield Label("Display Name", classes="field-lbl")
+            yield Input(value=str(p.get("name") or ""), id="ep-name")
+            yield Label("Repository Path", classes="field-lbl")
+            yield Input(value=str(p.get("repo") or ""), id="ep-repo")
+            yield Label("Language Stack", classes="field-lbl")
+            yield Input(value=str(p.get("language") or ""), id="ep-lang")
+            yield Label("Base Branch", classes="field-lbl")
+            yield Input(value=str(p.get("base_branch") or "main"), id="ep-branch")
+            yield Label("Idea / Notes", classes="field-lbl")
+            yield Input(value=str(p.get("idea") or ""), id="ep-idea")
+            with Horizontal(classes="modal-actions"):
+                yield Button("Cancel [Esc]", id="cancel", classes="btn-cancel")
+                yield Button("Save Changes", id="ok", classes="btn-ok")
+
+    def on_mount(self) -> None:
+        self.query_one("#ep-name", Input).focus()
+
+    @on(Button.Pressed, "#ok")
+    def _ok(self) -> None:
+        self.dismiss({
+            "name": self.query_one("#ep-name", Input).value.strip(),
+            "repo": self.query_one("#ep-repo", Input).value.strip(),
+            "language": self.query_one("#ep-lang", Input).value.strip(),
+            "base_branch": self.query_one("#ep-branch", Input).value.strip(),
+            "idea": self.query_one("#ep-idea", Input).value.strip(),
+        })
+
+    @on(Button.Pressed, "#cancel")
+    def _cancel(self) -> None:
+        self.dismiss(None)
+
+    def key_escape(self) -> None:
+        self.dismiss(None)
+
+
+class DeleteProjectModal(ModalScreen[dict | None]):
+    """Confirm removing a project from Openfarm without touching disk files (`d` in Projects)."""
+
+    CSS = _MODAL_CSS + """
+    .modal-box { width: 84; border: round #fbbf24; }
+    .safe-banner {
+        background: #0f2e1f;
+        border: round #4ade80;
+        color: #bbf7d0;
+        padding: 0 2;
+        margin-bottom: 1;
+    }
+    .switch-row { height: 3; align: left middle; margin-top: 1; }
+    .switch-lbl { width: auto; color: #cbd5e1; margin-left: 1; }
+    .btn-danger { background: #fb7185; color: #0b0f17; text-style: bold; }
+    """
+
+    def __init__(self, project: dict) -> None:
+        super().__init__()
+        self._project = dict(project)
+
+    def compose(self) -> ComposeResult:
+        p = self._project
+        state_dir = str(p.get("state_dir") or "(none)")
+        with Vertical(classes="modal-box"):
+            yield Static(f"Remove Project From Openfarm: {p.get('name', p.get('id', ''))}", classes="modal-title")
+            yield Static(
+                "SAFE & NON-DESTRUCTIVE: Your project directory and all files inside\n"
+                f"{p.get('repo', '')}\n"
+                "will NOT be deleted or modified on disk.",
+                classes="safe-banner",
+            )
+            yield Static(f"External Openfarm state cache: {state_dir}", classes="modal-sub")
+            with Horizontal(classes="switch-row"):
+                yield Switch(value=False, id="dp-clear-state")
+                yield Static("Also clear Openfarm's external state cache under ~/.openfarm/", classes="switch-lbl")
+            with Horizontal(classes="modal-actions"):
+                yield Button("Cancel [Esc]", id="cancel", classes="btn-cancel")
+                yield Button("Remove From Openfarm", id="ok", classes="btn-danger")
+
+    @on(Button.Pressed, "#ok")
+    def _ok(self) -> None:
+        self.dismiss({
+            "confirm": True,
+            "clear_state_dir": bool(self.query_one("#dp-clear-state", Switch).value),
+        })
 
     @on(Button.Pressed, "#cancel")
     def _cancel(self) -> None:

@@ -2649,8 +2649,8 @@ def cmd_swarm(ctx: Context, args) -> int:
 # -- the parser ----------------------------------------------------------------
 
 _CLI_EPILOG = """\
-Command groups (29 commands):
-  Setup & Auth         init, adopt, install-skill, acp, providers
+Command groups (30 commands):
+  Setup & Auth         init, adopt, install-skill, acp, providers, projects
   Run & Monitor        auto, check, run, status, pause, resume, stop, tui
   Review & Harness     triage, review, land, findings, frontier-review, dossier, verdict, done, release, escape, supervise, harness
   Swarm, Board & Bench swarm, board, drive, bench
@@ -3100,6 +3100,22 @@ def build_parser() -> argparse.ArgumentParser:
     prov_p.add_argument("--no-zdr", action="store_true")
     prov_p.add_argument("--timeout", type=float, default=5.0)
 
+    proj_p = sub.add_parser(
+        "projects",
+        help="list, add, edit, or remove Openfarm projects (non-destructive to project files)",
+        formatter_class=raw_fmt,
+        epilog="Examples:\n  openfarm projects list\n  openfarm projects add ~/projects/my-app --name 'My App'\n  openfarm projects edit my-app --name 'Renamed'\n  openfarm projects remove my-app",
+    )
+    proj_p.add_argument("action", nargs="?", default="list", choices=("list", "add", "edit", "remove"))
+    proj_p.add_argument("target", nargs="?", default="", help="project id (for edit/remove) or repo path (for add)")
+    proj_p.add_argument("--name", default=None, help="display name")
+    proj_p.add_argument("--dir", dest="project_dir", default=None, help="project directory path")
+    proj_p.add_argument("--lang", dest="project_lang", default=None, help="language stack")
+    proj_p.add_argument("--base-branch", dest="project_branch", default=None, help="git base branch")
+    proj_p.add_argument("--idea", default=None, help="short project summary/idea")
+    proj_p.add_argument("--clear-state", action="store_true",
+                        help="also remove Openfarm's external state dir under ~/.openfarm (never touches project files)")
+
     auto_p = sub.add_parser(
         "auto",
         help="context-aware automode landing & command palette (default when running bare `openfarm` on a TTY)",
@@ -3540,6 +3556,72 @@ def cmd_providers(args) -> int:
     raise UsageError(f"unknown providers subcommand: {action}")
 
 
+def cmd_projects(args) -> int:
+    from .projects import edit_project, list_projects, register_project, remove_project
+
+    action = str(getattr(args, "action", "list") or "list")
+    if action == "list":
+        items = list_projects()
+        if args.json:
+            print(json.dumps({"projects": items, "count": len(items)}, indent=2))
+        else:
+            if not items:
+                print("No Openfarm projects registered yet. Run `openfarm projects add <path>` or `openfarm init`.")
+            else:
+                for p in items:
+                    status = "configured" if p["configured"] else ("dir-only" if p["repo_exists"] else "missing-dir")
+                    lang = p.get("language") or "—"
+                    print(f"  {p['id']:<20}  {p['name']:<24}  {lang:<10}  {status:<11}  {p['repo']}")
+        return EXIT_OK
+
+    if action == "add":
+        target = str(getattr(args, "project_dir", "") or getattr(args, "target", "") or args.repo or ".").strip()
+        entry = register_project(
+            target,
+            name=args.name or "",
+            language=args.project_lang or "",
+            base_branch=args.project_branch or "",
+            idea=args.idea or "",
+        )
+        if args.json:
+            print(json.dumps(entry, indent=2))
+        else:
+            print(f"Registered project {entry['id']} ({entry['name']}) -> {entry['repo']}")
+        return EXIT_OK
+
+    if action == "edit":
+        pid = str(getattr(args, "target", "") or "").strip()
+        if not pid:
+            raise UsageError("projects edit requires a project id")
+        entry = edit_project(
+            pid,
+            name=args.name,
+            repo=args.project_dir,
+            language=args.project_lang,
+            base_branch=args.project_branch,
+            idea=args.idea,
+        )
+        if args.json:
+            print(json.dumps(entry, indent=2))
+        else:
+            print(f"Updated project {entry['id']} ({entry['name']}) -> {entry['repo']}")
+        return EXIT_OK
+
+    if action == "remove":
+        pid = str(getattr(args, "target", "") or "").strip()
+        if not pid:
+            raise UsageError("projects remove requires a project id")
+        res = remove_project(pid, clear_state_dir=bool(getattr(args, "clear_state", False)))
+        if args.json:
+            print(json.dumps(res, indent=2))
+        else:
+            extra = " (external state cache cleared)" if res["state_cleared"] else ""
+            print(f"Removed {res['id']} from Openfarm{extra}. Project files on disk were NOT touched.")
+        return EXIT_OK
+
+    raise UsageError(f"unknown projects subcommand: {action}")
+
+
 PRE_CONFIG_COMMANDS = {
     "adopt": cmd_adopt,
     "auto": cmd_auto,
@@ -3548,6 +3630,7 @@ PRE_CONFIG_COMMANDS = {
     "install-skill": cmd_install_skill,
     "acp": cmd_acp,
     "providers": cmd_providers,
+    "projects": cmd_projects,
     "tui": cmd_tui,
 }
 

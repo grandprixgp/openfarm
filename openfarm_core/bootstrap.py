@@ -708,6 +708,22 @@ def initialize_project(
         if commit:
             git.commit_all(f"chore: initialize {project_slug} openfarm skeleton")
 
+    registered_project = True
+    try:
+        from .projects import register_project
+
+        register_project(
+            target_dir,
+            project_id=project_slug,
+            name=project_slug,
+            state_dir=cfg.state_dir,
+            language=resolved_lang,
+            base_branch=cfg.base_branch,
+            idea=idea_text,
+        )
+    except (OSError, Refused):
+        registered_project = False
+
     return {
         "ok": True,
         "project": project_slug,

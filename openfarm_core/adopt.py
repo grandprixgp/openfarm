@@ -251,6 +251,20 @@ def adopt_project(
     with gitkeep_path.open("x", encoding="utf-8") as handle:
         handle.write("")
 
+    registered_project = True
+    try:
+        from .projects import register_project
+
+        register_project(
+            root,
+            name=name,
+            state_dir=resolved_state,
+            language=resolved_language,
+            base_branch=base_branch,
+        )
+    except (OSError, Refused):
+        registered_project = False
+
     result = {
         "ok": True,
         "language": resolved_language,

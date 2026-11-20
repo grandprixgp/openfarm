@@ -53,6 +53,13 @@ from openfarm_core.findings import (
     list_findings,
 )
 from openfarm_core.git import Git
+from openfarm_core.projects import (
+    edit_project,
+    get_project,
+    list_projects,
+    register_project,
+    remove_project,
+)
 from openfarm_core.providers import (
     WORKER_PRESETS,
     load_global_providers,
@@ -65,10 +72,13 @@ from openfarm_core.tui import _load_tui_context, _read_cards_readonly
 
 from .modals import (
     BounceNoteModal,
+    DeleteProjectModal,
     DismissFindingModal,
+    EditProjectModal,
     FoldFindingModal,
     FullFindingModal,
     HintModal,
+    NewProjectModal,
 )
 
 
@@ -76,6 +86,7 @@ class OpenfarmPaletteProvider(Provider):
     """Fuzzy Command Palette wired to all guided & power actions."""
 
     ENTRIES = (
+        ("Projects: Switch, Add, Edit or Remove Projects", "projects", "Manage all Openfarm projects across directories"),
         ("Studio: Grill & Draft Next Wave", "grill", "Open multi-line Grill & Frontier Architect"),
         ("Studio: Launch Wave (non-blocking run)", "run", "Commit baseline & run ready cards"),
         ("Review: Inspect Diffs & Local Land Inbox", "review", "Switch to Split-Pane Review & Land"),
@@ -110,6 +121,7 @@ class OpenfarmApp(App):
     COMMANDS = {OpenfarmPaletteProvider}
 
     BINDINGS = [
+        Binding("0", "switch_view('projects')", "0 Projects", show=True),
         Binding("1", "switch_view('studio')", "1 Studio", show=True),
         Binding("2", "switch_view('review')", "2 Review", show=True),
         Binding("3", "switch_view('findings')", "3 Findings", show=True),
@@ -292,10 +304,10 @@ class OpenfarmApp(App):
         height: 1; color: #fbbf24; text-style: bold; margin-bottom: 1;
     }
     #findings-filter { height: 3; margin-bottom: 1; }
-    #findings-table, #review-table, #plan-table, #board-table {
+    #projects-table, #findings-table, #review-table, #plan-table, #board-table {
         height: 1fr; background: #0b1019; border: round #26344a;
     }
-    #finding-detail-scroll {
+    #project-detail-scroll, #finding-detail-scroll {
         height: 1fr; background: #0b1019; border: round #26344a; padding: 1 2; margin-bottom: 1;
     }
     Footer { background: #131a26; color: #cbd5e1; }
@@ -333,6 +345,8 @@ class OpenfarmApp(App):
         self._findings_query: str = ""
         self._approved_to_land: list[str] = []
         self._card_phases: dict[str, str] = {}
+        self._projects_items: list[dict] = []
+        self._selected_project_id: str = ""
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="topbar"):
@@ -343,6 +357,7 @@ class OpenfarmApp(App):
             yield Static("○ READY", id="status-badge", classes="status-pill status-ready")
 
         with Horizontal(id="navstrip"):
+            yield Button("0 Projects", id="nav-projects", classes="nav-btn")
             yield Button("1 Studio", id="nav-studio", classes="nav-btn active")
             yield Button("2 Review", id="nav-review", classes="nav-btn")
             yield Button("3 Findings", id="nav-findings", classes="nav-btn")
@@ -357,6 +372,23 @@ class OpenfarmApp(App):
             yield Static("○ Review & Land", id="st-rev", classes="step-pend")
 
         with ContentSwitcher(initial="studio", id="main-switcher"):
+            # ── VIEW P: PROJECTS MANAGER (SWITCH / ADD / EDIT / NON-DESTRUCTIVE REMOVE) ──
+            with Horizontal(id="projects"):
+                left_pr = Vertical(classes="card-focused split-left")
+                left_pr.border_title = "Openfarm Projects"
+                with left_pr:
+                    yield DataTable(id="projects-table")
+                right_pr = Vertical(classes="card split-right")
+                right_pr.border_title = "Project Detail"
+                with right_pr:
+                    with VerticalScroll(id="project-detail-scroll"):
+                        yield Static("No projects registered yet.", id="project-detail")
+                    with Horizontal(classes="action-row"):
+                        yield Button("Switch Project [Enter]", classes="primary-cta", id="btn-proj-switch")
+                        yield Button("Add / New [n]", classes="approve-btn", id="btn-proj-new")
+                        yield Button("Edit [e]", classes="soft-btn", id="btn-proj-edit")
+                        yield Button("Remove From Openfarm [d]", classes="soft-btn", id="btn-proj-delete")
+
             # ── VIEW 0: GLOBAL PROVIDER SETUP ────────────────────────────────
             with Container(id="providers"):
                 prov = VerticalScroll(id="prov-card", classes="card-focused")
@@ -530,6 +562,10 @@ class OpenfarmApp(App):
 
     def on_mount(self) -> None:
         # Configure tables
+        prt = self.query_one("#projects-table", DataTable)
+        prt.cursor_type = "row"
+        prt.add_columns("", "Name", "Stack", "Status", "Path")
+
         pt = self.query_one("#plan-table", DataTable)
         pt.cursor_type = "row"
         pt.add_columns("ID", "Title", "Profile", "Elig")
@@ -545,6 +581,13 @@ class OpenfarmApp(App):
         bt = self.query_one("#board-table", DataTable)
         bt.cursor_type = "row"
         bt.add_columns("Seq", "Author", "Card", "Kind", "Summary")
+
+        # Register the current directory automatically once if it is already configured
+        if (self.repo / CONFIG_PATH).is_file():
+            try:
+                register_project(self.repo)
+            except (OSError, Refused) as exc:
+                self.log.warning(f"could not register current repo: {exc}")
 
         self._load_providers_into_form()
         self.refresh_all_views()
@@ -709,6 +752,9 @@ class OpenfarmApp(App):
 
         # Populate Findings Inbox table
         self._refresh_findings_widgets()
+
+        # Populate Projects Manager table
+        self._refresh_projects_widgets()
 
         # Populate Engine diagnostics
         self._refresh_engine_widgets(cfg, gp)
@@ -900,13 +946,74 @@ class OpenfarmApp(App):
                         )
                     break
 
+    def _refresh_projects_widgets(self) -> None:
+        self._projects_items = list_projects()
+        p_cnt = len(self._projects_items)
+        self.query_one("#nav-projects", Button).label = f"0 Projects ({p_cnt})" if p_cnt else "0 Projects"
+        prt = self.query_one("#projects-table", DataTable)
+        prt.clear()
+        for item in self._projects_items:
+            is_active = Path(item["repo"]).expanduser().resolve() == self.repo
+            mark = "●" if is_active else ""
+            status = "ready" if item["configured"] else ("dir" if item["repo_exists"] else "missing")
+            prt.add_row(
+                mark,
+                item["name"][:22],
+                (item.get("language") or "—")[:10],
+                status,
+                str(item["repo"])[-30:],
+                key=item["id"],
+            )
+        if self._projects_items:
+            if self._selected_project_id not in {p["id"] for p in self._projects_items}:
+                active = next(
+                    (p for p in self._projects_items if Path(p["repo"]).expanduser().resolve() == self.repo),
+                    self._projects_items[0],
+                )
+                self._selected_project_id = active["id"]
+            sel = next(p for p in self._projects_items if p["id"] == self._selected_project_id)
+            self._render_project_detail(sel)
+        else:
+            self._selected_project_id = ""
+            self.query_one("#project-detail", Static).update(
+                "No projects registered yet.\n\nPress [bold #38bdf8][n][/] to add an existing folder or create a new project."
+            )
+
+    def _render_project_detail(self, item: dict) -> None:
+        self._selected_project_id = item["id"]
+        is_active = Path(item["repo"]).expanduser().resolve() == self.repo
+        badge = "  [bold #4ade80 on #103623] ACTIVE [/]" if is_active else ""
+        status = (
+            "[bold #4ade80]configured (.openfarm/config.toml)[/]"
+            if item["configured"]
+            else ("[bold #fbbf24]directory exists (not yet initialized)[/]" if item["repo_exists"] else "[bold #fb7185]directory not found on disk[/]")
+        )
+        state_status = "present" if item.get("state_exists") else "none"
+        self.query_one("#project-detail", Static).update(
+            f"[bold #f8fafc]{rich_escape(item['name'])}[/]  [#94a3b8]({rich_escape(item['id'])})[/]{badge}\n\n"
+            f"[#94a3b8]Directory:[/]   {rich_escape(item['repo'])}\n"
+            f"[#94a3b8]Status:[/]      {status}\n"
+            f"[#94a3b8]Stack:[/]       {rich_escape(item.get('language') or 'auto')}\n"
+            f"[#94a3b8]Base branch:[/] {rich_escape(item.get('base_branch') or 'main')}\n"
+            f"[#94a3b8]State cache:[/] {rich_escape(item.get('state_dir') or '(none)')} ({state_status})\n"
+            f"[#94a3b8]Idea / Note:[/] {rich_escape(item.get('idea') or '(none)')}\n\n"
+            f"[#4ade80]Note:[/] Removing a project here only removes it from Openfarm — "
+            f"your project files on disk are NEVER deleted or modified."
+        )
+
     # ── Navigation & Palette Dispatch ────────────────────────────────────────
 
     def action_switch_view(self, view: str) -> None:
         sw = self.query_one("#main-switcher", ContentSwitcher)
-        if view in ("providers", "studio", "review", "findings", "engine"):
+        if view in ("projects", "providers", "studio", "review", "findings", "engine"):
             sw.current = view
-        for vid, bid in (("studio", "nav-studio"), ("review", "nav-review"), ("findings", "nav-findings"), ("engine", "nav-engine")):
+        for vid, bid in (
+            ("projects", "nav-projects"),
+            ("studio", "nav-studio"),
+            ("review", "nav-review"),
+            ("findings", "nav-findings"),
+            ("engine", "nav-engine"),
+        ):
             btn = self.query_one(f"#{bid}", Button)
             if vid == view:
                 btn.add_class("active")
@@ -917,7 +1024,7 @@ class OpenfarmApp(App):
         self.refresh_all_views()
 
     def dispatch_palette_action(self, action_id: str) -> None:
-        if action_id in ("providers", "review", "findings", "engine"):
+        if action_id in ("projects", "providers", "review", "findings", "engine"):
             self.action_switch_view(action_id)
         elif action_id == "grill":
             self.action_switch_view("studio")
@@ -982,6 +1089,103 @@ class OpenfarmApp(App):
         self.notify(f"{finding_id}: {decision}")
         return res
 
+    def switch_active_project(self, project_id: str) -> dict | None:
+        proj = get_project(project_id)
+        if proj is None:
+            return None
+        target = Path(proj["repo"]).expanduser().resolve()
+        self.repo = target
+        self.config_path = None
+        self._selected_review_id = ""
+        self._selected_finding_id = ""
+        self._approved_to_land.clear()
+        self._card_phases.clear()
+        self._worker_tokens = 0
+        self._supervisor_tokens = 0
+        self._tokens_fresh = 0
+        self._tokens_cached = 0
+        self._spark_points = [0.0, 0.0, 0.0, 0.0, 0.0]
+        try:
+            register_project(target, project_id=proj["id"])
+        except (OSError, Refused) as exc:
+            self.log.warning(f"could not update last_opened: {exc}")
+        self.refresh_all_views()
+        self.notify(f"Switched project → {proj['name']}")
+        return proj
+
+    def apply_project_add(
+        self,
+        *,
+        name: str,
+        repo: str,
+        language: str = "typescript",
+        idea: str = "",
+        initialize: bool = False,
+    ) -> dict:
+        target = Path(repo or str(self.repo)).expanduser().resolve()
+        if initialize and (not target.exists() or not any(target.iterdir())):
+            initialize_project(
+                name or target.name or "my-app",
+                directory=target,
+                language=language or "typescript",
+                idea=idea,
+                commit=True,
+            )
+            entry = register_project(target, name=name or target.name, language=language, idea=idea)
+        else:
+            entry = register_project(target, name=name or target.name, language=language, idea=idea)
+        self._selected_project_id = entry["id"]
+        self.refresh_all_views()
+        self.notify(f"Added project {entry['name']}")
+        return entry
+
+    def apply_project_edit(
+        self,
+        project_id: str,
+        *,
+        name: str | None = None,
+        repo: str | None = None,
+        language: str | None = None,
+        base_branch: str | None = None,
+        idea: str | None = None,
+    ) -> dict:
+        was_active = False
+        prev = get_project(project_id)
+        if prev is not None and Path(prev["repo"]).expanduser().resolve() == self.repo:
+            was_active = True
+        updated = edit_project(
+            project_id,
+            name=name,
+            repo=repo,
+            language=language,
+            base_branch=base_branch,
+            idea=idea,
+        )
+        if was_active and updated.get("repo"):
+            self.repo = Path(updated["repo"]).expanduser().resolve()
+            self.config_path = None
+        self.refresh_all_views()
+        self.notify(f"Updated project {updated['name']}")
+        return updated
+
+    def apply_project_remove(
+        self,
+        project_id: str,
+        *,
+        clear_state_dir: bool = False,
+    ) -> dict:
+        prev = get_project(project_id)
+        was_active = bool(prev is not None and Path(prev["repo"]).expanduser().resolve() == self.repo)
+        res = remove_project(project_id, clear_state_dir=clear_state_dir)
+        if was_active:
+            remaining = list_projects()
+            if remaining:
+                self.repo = Path(remaining[0]["repo"]).expanduser().resolve()
+                self.config_path = None
+        self.refresh_all_views()
+        self.notify(f"Removed {project_id} from Openfarm (project files on disk untouched)")
+        return res
+
     # ── Keyboard Shortcuts in Context ────────────────────────────────────────
 
     def on_key(self, event) -> None:
@@ -994,7 +1198,21 @@ class OpenfarmApp(App):
             return
 
         cur_view = self.query_one("#main-switcher", ContentSwitcher).current
-        if cur_view == "findings":
+        if cur_view == "projects":
+            if event.key == "enter" and self._selected_project_id:
+                self.switch_active_project(self._selected_project_id)
+                self.action_switch_view("studio")
+                event.stop()
+            elif event.key == "n":
+                self._open_new_project_modal()
+                event.stop()
+            elif event.key == "e" and self._selected_project_id:
+                self._open_edit_project_modal()
+                event.stop()
+            elif event.key == "d" and self._selected_project_id:
+                self._open_delete_project_modal()
+                event.stop()
+        elif cur_view == "findings":
             if event.key == "w" and self._selected_finding_id:
                 self.apply_finding_decision(self._selected_finding_id, "next-wave")
                 event.stop()
@@ -1035,6 +1253,10 @@ class OpenfarmApp(App):
                 event.stop()
 
     # ── Widget Event Handlers ────────────────────────────────────────────────
+
+    @on(Button.Pressed, "#nav-projects")
+    def _nav_projects(self) -> None:
+        self.action_switch_view("projects")
 
     @on(Button.Pressed, "#nav-studio")
     def _nav_studio(self) -> None:
@@ -1179,6 +1401,82 @@ class OpenfarmApp(App):
             )
         except Exception as exc:
             self.call_from_thread(self.notify, f"Plan error: {exc}", severity="error")
+
+    @on(DataTable.RowHighlighted, "#projects-table")
+    def _project_row_changed(self, event: DataTable.RowHighlighted) -> None:
+        if event.row_key and event.row_key.value:
+            pid = str(event.row_key.value)
+            match = next((p for p in self._projects_items if p["id"] == pid), None)
+            if match:
+                self._render_project_detail(match)
+
+    @on(Button.Pressed, "#btn-proj-switch")
+    def _proj_switch_btn(self) -> None:
+        if self._selected_project_id:
+            self.switch_active_project(self._selected_project_id)
+            self.action_switch_view("studio")
+
+    @on(Button.Pressed, "#btn-proj-new")
+    def _open_new_project_modal(self) -> None:
+        default_dir = str(self.repo.parent / "new-project")
+
+        def _done(data: dict | None) -> None:
+            if not data or not data.get("repo"):
+                return
+            try:
+                self.apply_project_add(
+                    name=data.get("name", ""),
+                    repo=data["repo"],
+                    language=data.get("language", "typescript"),
+                    idea=data.get("idea", ""),
+                    initialize=bool(data.get("initialize", False)),
+                )
+            except (OSError, Refused, ConfigError) as exc:
+                self.notify(f"Project error: {exc}", severity="error")
+
+        self.push_screen(NewProjectModal(default_dir=default_dir), _done)
+
+    @on(Button.Pressed, "#btn-proj-edit")
+    def _open_edit_project_modal(self) -> None:
+        item = next((p for p in self._projects_items if p["id"] == self._selected_project_id), None)
+        if item is None:
+            return
+
+        def _done(data: dict | None) -> None:
+            if not data:
+                return
+            try:
+                self.apply_project_edit(
+                    item["id"],
+                    name=data.get("name"),
+                    repo=data.get("repo"),
+                    language=data.get("language"),
+                    base_branch=data.get("base_branch"),
+                    idea=data.get("idea"),
+                )
+            except (OSError, Refused, ConfigError) as exc:
+                self.notify(f"Edit error: {exc}", severity="error")
+
+        self.push_screen(EditProjectModal(item), _done)
+
+    @on(Button.Pressed, "#btn-proj-delete")
+    def _open_delete_project_modal(self) -> None:
+        item = next((p for p in self._projects_items if p["id"] == self._selected_project_id), None)
+        if item is None:
+            return
+
+        def _done(data: dict | None) -> None:
+            if not data or not data.get("confirm"):
+                return
+            try:
+                self.apply_project_remove(
+                    item["id"],
+                    clear_state_dir=bool(data.get("clear_state_dir", False)),
+                )
+            except (OSError, Refused) as exc:
+                self.notify(f"Remove error: {exc}", severity="error")
+
+        self.push_screen(DeleteProjectModal(item), _done)
 
     @on(DataTable.RowHighlighted, "#plan-table")
     def _plan_row_changed(self, event: DataTable.RowHighlighted) -> None:
