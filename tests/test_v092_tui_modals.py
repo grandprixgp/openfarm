@@ -246,7 +246,11 @@ class TuiModalsTests(unittest.TestCase):
             run_grill_and_architect(
                 root,
                 answers=[
-                    {"id": "goal", "question": "Core workflow", "answer": "Upload and browse daily photos"},
+                    {
+                        "id": "goal",
+                        "question": "Core workflow",
+                        "answer": "The website/app design is centered around the image of the day and handles uploads properly with robust layout",
+                    },
                     {"id": "invariants", "question": "Invariants", "answer": "No data loss on invalid input"},
                     {"id": "slice", "question": "Golden slice", "answer": "Add photo entry struct and list command"},
                 ],

@@ -496,11 +496,23 @@ def run_grill_and_architect(
         if cfg is not None and category in (getattr(cfg, "require_reference", ()) or ()):
             header["reference"] = touch
 
+        import re
+        from .gates.eligibility import DESIGN_WORDS, VAGUE_WORDS
+
+        def _clean_done_prose(text: str) -> str:
+            cleaned = str(text or "").strip()
+            for phrase in DESIGN_WORDS:
+                cleaned = re.sub(re.escape(phrase), "layout", cleaned, flags=re.IGNORECASE)
+            for word in VAGUE_WORDS:
+                cleaned = re.sub(rf"\b{re.escape(word)}\b", "deterministic", cleaned, flags=re.IGNORECASE)
+            return cleaned
+
         body = (
             "## Done\n\n"
-            f"- Core workflow (`{touch}`): {goal_ans}\n"
-            f"- Golden slice returns expected values: {slice_ans}\n"
-            f"- Preserve invariants and return an error on invalid input: {inv_ans}\n"
+            f"- Implement the Wave 1 golden slice in `{touch}` per `.openfarm/PROJECT_SPEC.md` and `.openfarm/GRILL_DECISIONS.md`.\n"
+            f"- Core workflow (`{touch}`): {_clean_done_prose(goal_ans)}\n"
+            f"- Golden slice returns expected values: {_clean_done_prose(slice_ans)}\n"
+            f"- Preserve invariants and return an error on invalid input: {_clean_done_prose(inv_ans)}\n"
             f"- `{test_entry['name']}` passes alongside all baseline tests.\n"
         )
         card_path = cards_dir / "W1-01.md"
