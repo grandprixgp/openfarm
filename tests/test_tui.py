@@ -580,7 +580,7 @@ global_dir = "{self.global_harness}"
         self.assertEqual(parsed["data"]["run_id"], self.run_id)
 
         with mock.patch("curses.wrapper", return_value=0) as wrapped:
-            rc = run_tui(repo=self.repo, once=False, view="cards")
+            rc = run_tui(repo=self.repo, once=False, view="cards", force_curses=True)
         self.assertEqual(rc, 0)
         self.assertEqual(wrapped.call_count, 1)
 
@@ -1116,6 +1116,7 @@ class LivePtyCursesTuiTests(unittest.TestCase):
         master_fd, slave_fd = pty.openpty()
         fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", 32, 120, 0, 0))
         env = dict(os.environ)
+        env.setdefault("OPENFARM_TUI_ENGINE", "curses")
         for key in remove_env:
             env.pop(key, None)
         env.update(extra_env)

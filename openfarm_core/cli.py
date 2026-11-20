@@ -3109,12 +3109,13 @@ def build_parser() -> argparse.ArgumentParser:
     auto_p.add_argument("--run", dest="run_id", default=None)
     auto_p.add_argument("--refresh", type=float, default=1.0)
     auto_p.add_argument("--view", default="overview")
+    auto_p.add_argument("--curses", action="store_true", help="force stdlib curses TUI instead of Textual")
 
     tui_p = sub.add_parser(
         "tui",
         help="open interactive terminal UI or render one snapshot",
         formatter_class=raw_fmt,
-        epilog="Examples:\n  openfarm tui\n  openfarm tui --once --view overview\n  openfarm tui --once --view board --run RUN_ID",
+        epilog="Examples:\n  openfarm tui\n  openfarm tui --curses\n  openfarm tui --once --view overview\n  openfarm tui --once --view board --run RUN_ID",
     )
     tui_p.add_argument("--run", dest="run_id", default=None,
                        help="pin TUI to a specific run id")
@@ -3124,6 +3125,8 @@ def build_parser() -> argparse.ArgumentParser:
                        help="render a single view snapshot and exit")
     tui_p.add_argument("--view", choices=TUI_VIEWS, default="overview",
                        help="initial TUI view (default: overview)")
+    tui_p.add_argument("--curses", action="store_true",
+                       help="force stdlib curses TUI instead of Textual")
 
     drive_p = sub.add_parser(
         "drive",
@@ -3443,6 +3446,7 @@ def cmd_tui(args) -> int:
         once=bool(args.once),
         view=args.view,
         json_output=bool(getattr(args, "json", False)),
+        force_curses=bool(getattr(args, "curses", False)),
     )
 
 
