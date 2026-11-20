@@ -532,14 +532,14 @@ class Config:
         }
 
         # Inherit global provider profile (`~/.config/openfarm/providers.toml`) when the
-        # repo still carries the init/adopt placeholder endpoint.
+        # repo still carries the init/adopt placeholder endpoint (or ZDR header is needed).
         if self.model_adapter == "openai-compatible":
             from .providers import is_placeholder_endpoint, load_global_providers
 
+            gp = load_global_providers()
+            wk = gp.get("worker") if isinstance(gp, dict) else {}
+            g_ep = str((wk or {}).get("endpoint") or "").strip()
             if is_placeholder_endpoint(self.endpoint):
-                gp = load_global_providers()
-                wk = gp.get("worker") if isinstance(gp, dict) else {}
-                g_ep = str((wk or {}).get("endpoint") or "").strip()
                 if g_ep and not is_placeholder_endpoint(g_ep):
                     self.endpoint = g_ep
                     if g_ep not in self.allowed_endpoints:
@@ -562,6 +562,13 @@ class Config:
                                     effort=rm.effort,
                                     effort_ladder=rm.effort_ladder,
                                 )
+            if (
+                g_ep
+                and self.endpoint.rstrip("/") == g_ep.rstrip("/")
+                and bool((wk or {}).get("zdr", False))
+                and not any(k.lower() == "x-cmd-zdr" for k in self.model_headers)
+            ):
+                self.model_headers = {**self.model_headers, "x-cmd-zdr": "1"}
 
         policy = self._table("policy")
         self.never_touch = _as_str_list(policy.get("never_touch", []),

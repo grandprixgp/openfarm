@@ -40,11 +40,15 @@ from openfarm_core.acp_setup import inspect_acp_status
 from openfarm_core.adopt import adopt_project
 from openfarm_core.automode import (
     DEFAULT_GRILL_QUESTIONS,
+    architect_grill_turn,
     compute_pipeline_stages,
     detect_workspace_state,
+    draft_spec_and_chunks,
     draft_wave_plan,
     ensure_baseline_committed,
+    load_project_chunks,
     open_architect_backend,
+    set_chunk_status,
     split_card_into_two,
     update_card_with_eligibility,
 )
@@ -52,6 +56,7 @@ from openfarm_core.bootstrap import initialize_project
 from openfarm_core.cli import Context, cmd_run, main as cli_main
 from openfarm_core.config import CONFIG_PATH, load_config
 from openfarm_core.doctor import compute_touches_conflict_matrix, run_doctor
+from openfarm_core.routing import compute_routing_recommendations
 from openfarm_core.errors import AdapterError, ConfigError, Refused
 from openfarm_core.findings import (
     bulk_decide_findings,
@@ -291,9 +296,24 @@ class OpenfarmApp(App):
     .stack-chip.selected { background: #12384d; color: #38bdf8; text-style: bold; }
     TextArea { background: #0b1019; border: round #334663; color: #f8fafc; margin-top: 1; }
     TextArea:focus { border: round #38bdf8; }
-    #ta-workflow { height: 4; }
-    #ta-invariants { height: 3; }
-    #ta-slice { height: 3; }
+    #ta-idea { height: 5; }
+    #grill-chat-box {
+        height: auto;
+        background: #0d131d;
+        border: round #26344a;
+        padding: 1 2;
+        margin-top: 1;
+    }
+    #grill-chat-box.hidden { display: none; }
+    #grill-options-row { height: auto; margin-top: 1; }
+    #grill-options-row.hidden { display: none; }
+    .grill-opt-btn {
+        width: auto; min-width: 8; height: 1; margin-right: 1;
+        background: #12384d; color: #e0f2fe; border: none; padding: 0 2;
+    }
+    .grill-opt-btn.hidden { display: none; }
+    #grill-answer-row { height: 3; align: left middle; margin-top: 1; }
+    #inp-grill-answer { width: 1fr; margin-right: 1; }
     #grill-status {
         height: auto;
         background: #12283d;
@@ -303,6 +323,18 @@ class OpenfarmApp(App):
         margin-top: 1;
     }
     #grill-status.hidden { display: none; }
+    #architect-panel {
+        height: auto;
+        max-height: 11;
+        background: #0e1c2b;
+        border: round #38bdf8;
+        padding: 0 2;
+        margin-bottom: 1;
+    }
+    #architect-panel.hidden { display: none; }
+    #architect-panel-head { height: 1; align: left middle; }
+    #architect-banner { width: 1fr; color: #e0f2fe; }
+    #architect-log { height: 6; background: #09111b; border: round #1e334a; padding: 0 1; margin-top: 1; }
 
     /* Split Panes */
     .split-left  { width: 46; margin-right: 2; height: 1fr; }
@@ -326,9 +358,10 @@ class OpenfarmApp(App):
         height: 1; color: #fbbf24; text-style: bold; margin-bottom: 1;
     }
     #findings-filter { height: 3; margin-bottom: 1; }
-    #projects-table, #findings-table, #review-table, #plan-table, #board-table {
+    #projects-table, #findings-table, #review-table, #plan-table, #board-table, #chunks-table {
         height: 1fr; background: #0b1019; border: round #26344a;
     }
+    #ta-spec-editor { height: 1fr; }
     #project-detail-scroll, #finding-detail-scroll {
         height: 1fr; background: #0b1019; border: round #26344a; padding: 1 2; margin-bottom: 1;
     }
@@ -349,10 +382,17 @@ class OpenfarmApp(App):
         self.pinned_run_id = run_id
         self._initial_view = initial_view
         self._selected_stack = "typescript"
+        self._stack_user_override = False
+        self._grill_history: list[dict] = []
+        self._grill_pending_question = ""
+        self._grill_options: list[str] = []
+        self._chunks_items: list[dict] = []
+        self._selected_chunk_id = ""
         self._running_wave = False
         self._drafting_plan = False
         self._draft_started_at = 0.0
         self._draft_phase_msg = ""
+        self._draft_last_heartbeat = 0
         self._last_baseline_ok: bool | None = None
         self._last_baseline_error = ""
         self._worker_tokens = 0
@@ -461,13 +501,18 @@ class OpenfarmApp(App):
                         yield Static("  ZDR Strict: ", classes="inline-label")
                         yield Switch(value=True, id="sw-zdr")
 
-            # ── VIEW 1: STUDIO (GRILL / PLAN APPROVAL / LIVE RUN) ────────────
+            # ── VIEW 1: STUDIO (GRILL / SPEC & CHUNKS / PLAN / LIVE RUN) ────
             with Vertical(id="studio"):
                 yield Static("", id="studio-findings-banner", classes="hidden")
+                with Vertical(id="architect-panel", classes="hidden"):
+                    with Horizontal(id="architect-panel-head"):
+                        yield Static("", id="architect-banner")
+                        yield Button("Hide Log", classes="soft-btn", id="btn-arch-hide")
+                    yield RichLog(id="architect-log", markup=True, wrap=True, min_width=0)
                 with ContentSwitcher(initial="studio-grill", id="studio-switcher"):
-                    # 1A: New Project Studio & Multi-Line Grill
+                    # 1A: Single-Prompt Studio & Conversational Frontier Architect
                     with VerticalScroll(id="studio-grill", classes="card-focused") as sg:
-                        sg.border_title = "Project Studio  ·  Multi-Line Grill"
+                        sg.border_title = "Project Studio  ·  Frontier Architect"
                         with Horizontal(id="stack-bar"):
                             yield Static("Stack: ", classes="inline-label")
                             yield Button("● TypeScript / Web", id="stk-typescript", classes="stack-chip selected")
@@ -475,18 +520,49 @@ class OpenfarmApp(App):
                             yield Button("○ Rust", id="stk-rust", classes="stack-chip")
                             yield Button("○ Go", id="stk-go", classes="stack-chip")
                             yield Button("○ Auto-detect", id="stk-auto", classes="stack-chip")
-                        yield Static(f"1. {DEFAULT_GRILL_QUESTIONS[0]['question']}", classes="section-h-first")
-                        yield TextArea("", id="ta-workflow", show_line_numbers=True)
-                        yield Static(f"2. {DEFAULT_GRILL_QUESTIONS[1]['question']}", classes="section-h")
-                        yield TextArea(DEFAULT_GRILL_QUESTIONS[1]["default"], id="ta-invariants")
-                        yield Static(f"3. {DEFAULT_GRILL_QUESTIONS[2]['question']}", classes="section-h")
-                        yield TextArea(DEFAULT_GRILL_QUESTIONS[2]["default"], id="ta-slice")
+                        yield Static("What do you want to build?", classes="section-h-first")
+                        yield Static(
+                            "Describe a vague app idea, a full spec, or a feature in an existing repo. "
+                            "Frontier Architect will clarify key choices with you, then design the real runnable app, invariants & Wave 1 cards.",
+                            classes="subtext",
+                        )
+                        yield TextArea("", id="ta-idea", show_line_numbers=False)
+                        with Vertical(id="grill-chat-box", classes="hidden"):
+                            yield Static("", id="grill-transcript")
+                            with Horizontal(id="grill-options-row", classes="hidden"):
+                                yield Button("", id="btn-grill-opt-0", classes="grill-opt-btn hidden")
+                                yield Button("", id="btn-grill-opt-1", classes="grill-opt-btn hidden")
+                                yield Button("", id="btn-grill-opt-2", classes="grill-opt-btn hidden")
+                            with Horizontal(id="grill-answer-row"):
+                                yield Input(placeholder="Reply to Architect (or click an option above)...", id="inp-grill-answer")
+                                yield Button("Reply", classes="primary-cta", id="btn-grill-send")
+                                yield Button("Reset Chat", classes="soft-btn", id="btn-grill-reset")
                         with Horizontal(classes="action-row-tall"):
-                            yield Button("Draft Plan with Architect", classes="primary-cta", id="btn-draft-plan")
+                            yield Button("Ask Architect to Grill Me", classes="primary-cta", id="btn-grill-ask")
+                            yield Button("Flesh Out Spec & Chunks", classes="approve-btn", id="btn-draft-spec")
+                            yield Button("Quick: Draft Cards Now", classes="soft-btn", id="btn-draft-plan")
                             yield Button("Configure Providers", classes="soft-btn", id="btn-open-providers")
                             yield Static("  Frontier Architect: ", classes="inline-label")
                             yield Switch(value=True, id="sw-use-architect")
                         yield Static("", id="grill-status", classes="hidden")
+
+                    # 1A-2: Living Spec & Ordered Chunks (Idea -> Grill -> Spec -> Chunks -> Cards)
+                    with Horizontal(id="studio-spec"):
+                        left_sp = Vertical(classes="card-focused split-left")
+                        left_sp.border_title = "Spec Chunks (Milestones)"
+                        with left_sp:
+                            yield DataTable(id="chunks-table")
+                            yield Static("Select a chunk to inspect its goal and split it into cards.", id="chunk-goal-detail", classes="subtext")
+                        right_sp = Vertical(classes="card split-right")
+                        right_sp.border_title = "Living Spec (.openfarm/PROJECT_SPEC.md)"
+                        with right_sp:
+                            yield TextArea("", id="ta-spec-editor")
+                            yield Static("", id="spec-status", classes="subtext")
+                            with Horizontal(classes="action-row"):
+                                yield Button("Split Chunk into Cards", classes="primary-cta", id="btn-chunk-to-cards")
+                                yield Button("Mark Chunk Done", classes="approve-btn", id="btn-chunk-done")
+                                yield Button("Save Spec", classes="soft-btn", id="btn-spec-save")
+                                yield Button("Back to Grill / Iterate", classes="soft-btn", id="btn-spec-back")
 
                     # 1B: Pre-Verified Wave Plan Approval
                     with Horizontal(id="studio-plan"):
@@ -503,8 +579,9 @@ class OpenfarmApp(App):
                                 yield Button("Commit Baseline & Launch Wave", classes="primary-cta", id="btn-launch-wave")
                                 yield Button("Edit Card [e]", classes="soft-btn", id="btn-plan-edit")
                                 yield Button("Split Card [x]", classes="soft-btn", id="btn-plan-split")
+                                yield Button("Spec & Chunks", classes="soft-btn", id="btn-open-spec")
                                 yield Button("Release Blocked", classes="soft-btn", id="btn-plan-release")
-                                yield Button("Re-Grill", classes="soft-btn", id="btn-regrill")
+                                yield Button("Iterate / New Idea", classes="soft-btn", id="btn-regrill")
 
                     # 1C: Live Non-Blocking Factory Floor
                     with Horizontal(id="studio-run"):
@@ -551,6 +628,7 @@ class OpenfarmApp(App):
                                 yield Button("Merge Integration → Main", classes="soft-btn", id="btn-promote-int")
                                 yield Button("Bounce [b]", classes="soft-btn", id="btn-bounce")
                                 yield Button("Frontier Review [m]", classes="soft-btn", id="btn-freview")
+                                yield Button("Next Chunk / Iterate", classes="soft-btn", id="btn-next-iter")
                         with TabPane("Tests & Spec"):
                             yield VerticalScroll(Static("(select a card)", id="review-tests"))
                         with TabPane("Frontier Review"):
@@ -599,6 +677,10 @@ class OpenfarmApp(App):
                             with Horizontal(classes="action-row"):
                                 yield Button("Run Doctor", classes="primary-cta", id="btn-doc-run")
                                 yield Button("Run Safe Fix", classes="approve-btn", id="btn-doc-fix")
+                        with TabPane("Spec"):
+                            yield VerticalScroll(Static("(no .openfarm/PROJECT_SPEC.md yet)", id="engine-spec"))
+                        with TabPane("Routing"):
+                            yield VerticalScroll(Static("(no card history yet)", id="engine-routing"))
 
         yield Footer()
 
@@ -613,6 +695,10 @@ class OpenfarmApp(App):
         pt = self.query_one("#plan-table", DataTable)
         pt.cursor_type = "row"
         pt.add_columns("ID", "Title", "St", "Prof")
+
+        cht = self.query_one("#chunks-table", DataTable)
+        cht.cursor_type = "row"
+        cht.add_columns("ID", "St", "Chunk")
 
         rt = self.query_one("#review-table", DataTable)
         rt.cursor_type = "row"
@@ -744,19 +830,43 @@ class OpenfarmApp(App):
         else:
             banner.add_class("hidden")
 
-        # Sync Studio stack selector chip to the active project's configured language
-        if cfg is not None and getattr(cfg, "languages", None):
+        # Sync Studio stack selector chip to the active project's configured language (unless user picked one)
+        if not self._stack_user_override and cfg is not None and getattr(cfg, "languages", None):
             cfg_lang = str(cfg.languages[0]).strip().lower()
             if cfg_lang in ("typescript", "python", "rust", "go") and cfg_lang != self._selected_stack:
                 self._apply_stack_chip(cfg_lang)
 
         # Update Studio sub-mode (when not actively running)
         studio_sw = self.query_one("#studio-switcher", ContentSwitcher)
-        if not self._running_wave and studio_sw.current != "studio-run":
+        if not self._running_wave and studio_sw.current not in ("studio-run", "studio-spec"):
             if not non_findings:
                 studio_sw.current = "studio-grill"
             elif studio_sw.current == "studio-grill":
                 studio_sw.current = "studio-plan"
+
+        # Populate Spec & Chunks view
+        self._chunks_items = load_project_chunks(self.repo)
+        cht = self.query_one("#chunks-table", DataTable)
+        cht.clear()
+        for ch in self._chunks_items:
+            st_code = {"active": "act", "done": "✓", "pending": "pnd"}.get(ch["status"], ch["status"][:3])
+            cht.add_row(ch["id"], st_code, ch["title"][:28], key=ch["id"])
+        if self._chunks_items:
+            if self._selected_chunk_id not in {c["id"] for c in self._chunks_items}:
+                act = next((c for c in self._chunks_items if c["status"] == "active"), self._chunks_items[0])
+                self._selected_chunk_id = act["id"]
+            sel_ch = next(c for c in self._chunks_items if c["id"] == self._selected_chunk_id)
+            self.query_one("#chunk-goal-detail", Static).update(
+                f"[bold #38bdf8]{rich_escape(sel_ch['id'])}[/] ({rich_escape(sel_ch['status'])})\n"
+                f"{rich_escape(sel_ch['title'])}\n[#cbd5e1]{rich_escape(sel_ch.get('goal') or '')}[/]"
+            )
+        else:
+            self._selected_chunk_id = ""
+            self.query_one("#chunk-goal-detail", Static).update("No chunks yet — click Flesh Out Spec & Chunks from Studio.")
+        spec_ed = self.query_one("#ta-spec-editor", TextArea)
+        if self.focused is not spec_ed:
+            sp = self.repo / ".openfarm" / "PROJECT_SPEC.md"
+            spec_ed.text = sp.read_text(encoding="utf-8", errors="replace") if sp.is_file() else ""
 
         # Populate Plan table
         pt = self.query_one("#plan-table", DataTable)
@@ -984,7 +1094,48 @@ class OpenfarmApp(App):
         if cfg is None:
             self.query_one("#engine-harness", Static).update("(repository not initialized yet)")
             self.query_one("#engine-swarm", Static).update("(repository not initialized yet)")
+            self.query_one("#engine-spec", Static).update("(repository not initialized yet)")
+            self.query_one("#engine-routing", Static).update("(repository not initialized yet)")
             return
+        spec_path = self.repo / ".openfarm" / "PROJECT_SPEC.md"
+        spec_txt = spec_path.read_text(encoding="utf-8", errors="replace").strip() if spec_path.is_file() else "(no PROJECT_SPEC.md yet)"
+        nt_lines = "\n".join(f"  - {p}" for p in (getattr(cfg, "never_touch", ()) or ())) or "  (none)"
+        inv_cfg = getattr(cfg, "invariants", None)
+        inv_summary = (
+            f"forbidden_imports={len(getattr(inv_cfg, 'forbidden_imports', ()))} · "
+            f"max_file_bytes={getattr(inv_cfg, 'max_file_bytes', 0)} · "
+            f"require_exports={len(getattr(inv_cfg, 'require_exports', ()))}"
+            if inv_cfg is not None
+            else "(none)"
+        )
+        self.query_one("#engine-spec", Static).update(
+            f"[bold #38bdf8]Living Project Spec[/] (.openfarm/PROJECT_SPEC.md)\n\n"
+            f"{rich_escape(spec_txt[:3500])}\n\n"
+            f"[bold #fbbf24]Locked [policy] never_touch[/]\n{rich_escape(nt_lines)}\n\n"
+            f"[bold #4ade80]Architectural Invariants[/]\n  {rich_escape(inv_summary)}"
+        )
+        try:
+            rt = compute_routing_recommendations(self.repo)
+            recs = rt.get("recommendations") or []
+            if recs:
+                r_lines = [
+                    f"[bold #38bdf8]Adaptive Model Router[/]  ({rt.get('samples', 0)} historical card runs)\n"
+                ]
+                for rec in recs:
+                    r_lines.append(
+                        f"• [bold #f8fafc]{rich_escape(rec['language'])} / {rich_escape(rec['category'])}[/]  "
+                        f"pass={int(rec['pass_rate']*100)}% · first-try={int(rec['first_try_rate']*100)}% "
+                        f"(n={rec['samples']}, {rec['confidence']})\n"
+                        f"  Recommended: [bold #4ade80]{rich_escape(rec['recommended_model'] or 'default')}[/] · "
+                        f"effort={rich_escape(rec['recommended_effort'])} · profile={rich_escape(rec['recommended_profile'])}"
+                    )
+                self.query_one("#engine-routing", Static).update("\n".join(r_lines))
+            else:
+                self.query_one("#engine-routing", Static).update(
+                    "No completed card runs yet — empirical routing recommendations populate automatically after your first wave."
+                )
+        except Exception as rt_exc:
+            self.query_one("#engine-routing", Static).update(f"Routing telemetry unavailable: {rich_escape(str(rt_exc))}")
         state = StateDir(cfg.state_dir)
         self.query_one("#engine-swarm", Static).update(
             f"Micromanager: {cfg.micromanager_adapter} ({getattr(cfg.micromanager, 'mode', 'off')})\n"
@@ -1167,6 +1318,11 @@ class OpenfarmApp(App):
         target = Path(proj["repo"]).expanduser().resolve()
         self.repo = target
         self.config_path = None
+        self._stack_user_override = False
+        self._grill_history.clear()
+        self._grill_pending_question = ""
+        self._grill_options = []
+        self._render_grill_chat()
         self._selected_review_id = ""
         self._selected_finding_id = ""
         self._approved_to_land.clear()
@@ -1444,25 +1600,92 @@ class OpenfarmApp(App):
         bid = event.button.id or ""
         if not bid.startswith("stk-"):
             return
+        self._stack_user_override = True
         self._apply_stack_chip(bid[4:])
 
+    def _render_grill_chat(self) -> None:
+        chat_box = self.query_one("#grill-chat-box", Vertical)
+        if not self._grill_history and not self._grill_pending_question:
+            chat_box.add_class("hidden")
+            return
+        chat_box.remove_class("hidden")
+        lines: list[str] = ["[bold #38bdf8]Frontier Architect Grill[/]"]
+        for turn in self._grill_history:
+            lines.append(f"[bold #cbd5e1]Architect:[/] {rich_escape(str(turn.get('question') or ''))}")
+            lines.append(f"[bold #4ade80]You:[/]       {rich_escape(str(turn.get('answer') or ''))}")
+        if self._grill_pending_question:
+            lines.append(f"\n[bold #fbbf24]Architect:[/] {rich_escape(self._grill_pending_question)}")
+        else:
+            lines.append("\n[bold #4ade80]✓ Architect has enough context — click Draft Plan Now (or ask another question).[/]")
+        self.query_one("#grill-transcript", Static).update("\n".join(lines))
+        opt_row = self.query_one("#grill-options-row", Horizontal)
+        if self._grill_options and self._grill_pending_question:
+            opt_row.remove_class("hidden")
+            for idx in range(3):
+                btn = self.query_one(f"#btn-grill-opt-{idx}", Button)
+                if idx < len(self._grill_options):
+                    btn.label = self._grill_options[idx][:48]
+                    btn.remove_class("hidden")
+                else:
+                    btn.add_class("hidden")
+        else:
+            opt_row.add_class("hidden")
+
+    def _log_architect(self, message: str, *, style: str = "#cbd5e1") -> None:
+        if not message:
+            return
+        ts = time.strftime("%H:%M:%S")
+        try:
+            self.query_one("#architect-log", RichLog).write(
+                f"[#64748b][{ts}][/] [{style}]{rich_escape(message)}[/]"
+            )
+        except Exception:
+            pass
+
+    @on(Button.Pressed, "#btn-arch-hide")
+    def _arch_hide_clicked(self) -> None:
+        self.query_one("#architect-panel", Vertical).add_class("hidden")
+
     def _set_drafting_state(self, active: bool, message: str = "") -> None:
+        was_active = self._drafting_plan
         self._drafting_plan = bool(active)
         if active and not self._draft_started_at:
             self._draft_started_at = time.monotonic()
+            self._draft_last_heartbeat = 0
         elif not active:
             self._draft_started_at = 0.0
+            self._draft_last_heartbeat = 0
+        prev_msg = self._draft_phase_msg
         self._draft_phase_msg = message
-        btn = self.query_one("#btn-draft-plan", Button)
-        btn.disabled = active
-        btn.label = "⏳ Architecting..." if active else "Draft Plan with Architect"
+        for bid, busy_lbl, idle_lbl in (
+            ("#btn-grill-ask", "⏳ Grilling...", "Ask Architect to Grill Me"),
+            ("#btn-draft-spec", "⏳ Drafting Spec...", "Flesh Out Spec & Chunks"),
+            ("#btn-chunk-to-cards", "⏳ Splitting Chunk...", "Split Chunk into Cards"),
+            ("#btn-draft-plan", "⏳ Architecting...", "Quick: Draft Cards Now"),
+        ):
+            try:
+                b = self.query_one(bid, Button)
+                b.disabled = active
+                b.label = busy_lbl if active else idle_lbl
+            except Exception:
+                pass
         pill = self.query_one("#status-badge", Static)
+        panel = self.query_one("#architect-panel", Vertical)
+        banner = self.query_one("#architect-banner", Static)
         status_box = self.query_one("#grill-status", Static)
         if active:
             pill.remove_class("status-ready")
             pill.add_class("status-running")
             pill.update("● ARCHITECTING")
+            panel.remove_class("hidden")
             status_box.remove_class("hidden")
+            if not was_active:
+                try:
+                    self.query_one("#architect-log", RichLog).clear()
+                except Exception:
+                    pass
+            if message and message != prev_msg:
+                self._log_architect(message, style="#38bdf8")
             self._render_draft_status()
         else:
             if not self._running_wave:
@@ -1470,25 +1693,266 @@ class OpenfarmApp(App):
                 pill.add_class("status-ready")
                 pill.update("○ READY")
             if message:
+                panel.remove_class("hidden")
+                banner.update(message)
                 status_box.remove_class("hidden")
                 status_box.update(message)
+                plain = message.replace("[bold #4ade80]", "").replace("[bold #fb7185]", "").replace("[/]", "")
+                self._log_architect(plain, style=("#fb7185" if "✗" in plain else "#4ade80"))
             else:
                 status_box.add_class("hidden")
+                if was_active:
+                    banner.update("[bold #4ade80]✓ Architect step finished[/]  [#94a3b8](click Hide Log to close)[/]")
 
     def _render_draft_status(self) -> None:
         if not self._drafting_plan:
             return
         elapsed = int(max(0.0, time.monotonic() - self._draft_started_at)) if self._draft_started_at else 0
         mins, secs = divmod(elapsed, 60)
-        self.query_one("#grill-status", Static).update(
-            f"[bold #38bdf8]⏳ [{mins:02d}:{secs:02d}][/]  [bold #f8fafc]{rich_escape(self._draft_phase_msg or 'Working...')}[/]\n"
-            f"[#94a3b8]Frontier ACP typically takes 30–120s to design a full golden slice + cards "
-            f"(turn off the Frontier Architect switch for instant local templates).[/]"
+        head = (
+            f"[bold #38bdf8]⏳ [{mins:02d}:{secs:02d}][/]  "
+            f"[bold #f8fafc]{rich_escape(self._draft_phase_msg or 'Working...')}[/]"
         )
+        self.query_one("#architect-banner", Static).update(head)
+        self.query_one("#grill-status", Static).update(
+            f"{head}\n"
+            f"[#94a3b8]Frontier ACP typically takes 15–120s to grill, synthesize spec/chunks, or split cards "
+            f"(live log above; turn off Frontier Architect switch for instant local templates).[/]"
+        )
+        if elapsed >= 15 and elapsed - self._draft_last_heartbeat >= 15:
+            self._draft_last_heartbeat = elapsed
+            self._log_architect(
+                f"Still waiting on Frontier ACP response ({mins:02d}:{secs:02d} elapsed)...",
+                style="#94a3b8",
+            )
 
     def _tick_draft_timer(self) -> None:
         if self._drafting_plan:
             self._render_draft_status()
+
+    @on(Button.Pressed, "#btn-grill-ask")
+    def _grill_ask_clicked(self) -> None:
+        if self._drafting_plan:
+            self.notify("Architect is busy right now...")
+            return
+        idea = self.query_one("#ta-idea", TextArea).text.strip()
+        if not idea:
+            self.notify("Describe what you want to build first.", severity="warning")
+            self.query_one("#ta-idea", TextArea).focus()
+            return
+        self._set_drafting_state(True, "Asking Frontier Architect to clarify your idea...")
+        self._grill_ask_bg(idea)
+
+    @on(Button.Pressed, "#btn-grill-opt-0")
+    @on(Button.Pressed, "#btn-grill-opt-1")
+    @on(Button.Pressed, "#btn-grill-opt-2")
+    def _grill_opt_clicked(self, event: Button.Pressed) -> None:
+        bid = event.button.id or ""
+        try:
+            idx = int(bid.rsplit("-", 1)[-1])
+        except ValueError:
+            return
+        if 0 <= idx < len(self._grill_options):
+            self._submit_grill_answer(self._grill_options[idx])
+
+    @on(Button.Pressed, "#btn-grill-send")
+    @on(Input.Submitted, "#inp-grill-answer")
+    def _grill_send_clicked(self) -> None:
+        inp = self.query_one("#inp-grill-answer", Input)
+        ans = inp.value.strip()
+        if not ans:
+            return
+        inp.value = ""
+        self._submit_grill_answer(ans)
+
+    def _submit_grill_answer(self, answer: str) -> None:
+        q = self._grill_pending_question or "Clarification"
+        self._grill_history.append({"question": q, "answer": answer})
+        self._grill_pending_question = ""
+        self._grill_options = []
+        self._render_grill_chat()
+        idea = self.query_one("#ta-idea", TextArea).text.strip()
+        if idea and len(self._grill_history) < 3:
+            self._set_drafting_state(True, "Architect reviewing your answer...")
+            self._grill_ask_bg(idea)
+
+    @on(Button.Pressed, "#btn-grill-reset")
+    def _grill_reset_clicked(self) -> None:
+        self._grill_history.clear()
+        self._grill_pending_question = ""
+        self._grill_options = []
+        self._render_grill_chat()
+
+    @work(thread=True)
+    def _grill_ask_bg(self, idea: str) -> None:
+        use_architect = bool(self.query_one("#sw-use-architect", Switch).value)
+        backend = None
+        try:
+            cfg = self._safe_cfg()
+            if use_architect:
+                backend, reason = open_architect_backend(self.repo, cfg)
+                if backend is not None:
+                    self.call_from_thread(
+                        self._set_drafting_state,
+                        True,
+                        f"Grilling with {reason}...",
+                    )
+            turn = architect_grill_turn(
+                self.repo,
+                idea=idea,
+                history=list(self._grill_history),
+                language=self._selected_stack,
+                backend=backend,
+            )
+            if turn.get("ready_to_plan") or not str(turn.get("question") or "").strip():
+                self._grill_pending_question = ""
+                self._grill_options = []
+                msg = "[bold #4ade80]✓ Architect is ready — click Draft Plan Now.[/]"
+            else:
+                self._grill_pending_question = str(turn["question"]).strip()
+                self._grill_options = [str(o) for o in (turn.get("options") or [])[:3]]
+                msg = ""
+            self.call_from_thread(self._set_drafting_state, False, msg)
+            self.call_from_thread(self._render_grill_chat)
+            if self._grill_pending_question:
+                self.call_from_thread(self.query_one("#inp-grill-answer", Input).focus)
+        except Exception as exc:
+            self.call_from_thread(
+                self._set_drafting_state,
+                False,
+                f"[bold #fb7185]✗ Grill error:[/] {rich_escape(str(exc))}",
+            )
+        finally:
+            if backend is not None and hasattr(backend, "close"):
+                try:
+                    backend.close()
+                except Exception as close_exc:
+                    self.log.warning(f"grill backend close error: {close_exc}")
+
+    @on(Button.Pressed, "#btn-draft-spec")
+    def _draft_spec_clicked(self) -> None:
+        if self._drafting_plan:
+            self.notify("Architect is busy right now...")
+            return
+        idea = self.query_one("#ta-idea", TextArea).text.strip()
+        if not idea:
+            self.notify("Describe what you want to build first.", severity="warning")
+            self.query_one("#ta-idea", TextArea).focus()
+            return
+        self._set_drafting_state(True, "Fleshing out living spec & splitting into chunks...")
+        self._draft_spec_bg(idea)
+
+    @work(thread=True)
+    def _draft_spec_bg(self, idea: str) -> None:
+        use_architect = bool(self.query_one("#sw-use-architect", Switch).value)
+        backend = None
+        try:
+            self._ensure_workspace_initialized_for_studio(idea)
+            cfg = self._safe_cfg()
+            if use_architect:
+                backend, reason = open_architect_backend(self.repo, cfg)
+                if backend is not None:
+                    self.call_from_thread(self._set_drafting_state, True, f"Fleshing out spec & chunks with {reason}...")
+            def _on_spec_prog(msg: str) -> None:
+                self.call_from_thread(self._set_drafting_state, True, msg)
+
+            res = draft_spec_and_chunks(
+                self.repo,
+                idea=idea,
+                grill_history=list(self._grill_history),
+                language=self._selected_stack,
+                backend=backend,
+                on_progress=_on_spec_prog,
+            )
+            self.call_from_thread(
+                self._set_drafting_state,
+                False,
+                f"[bold #4ade80]✓ Spec & {len(res['chunks'])} chunk(s) ready — review or split into cards[/]",
+            )
+            self.call_from_thread(self.refresh_all_views)
+            self.call_from_thread(
+                setattr,
+                self.query_one("#studio-switcher", ContentSwitcher),
+                "current",
+                "studio-spec",
+            )
+            self.call_from_thread(
+                self.notify,
+                f"Spec ready with {len(res['chunks'])} chunk(s) — review or split into cards.",
+            )
+        except Exception as exc:
+            self.call_from_thread(
+                self._set_drafting_state,
+                False,
+                f"[bold #fb7185]✗ Spec error:[/] {rich_escape(str(exc))}",
+            )
+            self.call_from_thread(self.notify, f"Spec error: {exc}", severity="error")
+        finally:
+            if backend is not None and hasattr(backend, "close"):
+                try:
+                    backend.close()
+                except Exception as close_exc:
+                    self.log.warning(f"spec backend close error: {close_exc}")
+
+    @on(DataTable.RowHighlighted, "#chunks-table")
+    def _chunk_row_changed(self, event: DataTable.RowHighlighted) -> None:
+        if event.row_key and event.row_key.value:
+            cid = str(event.row_key.value)
+            match = next((c for c in self._chunks_items if c["id"] == cid), None)
+            if match:
+                self._selected_chunk_id = cid
+                self.query_one("#chunk-goal-detail", Static).update(
+                    f"[bold #38bdf8]{rich_escape(match['id'])}[/] ({rich_escape(match['status'])})\n"
+                    f"{rich_escape(match['title'])}\n[#cbd5e1]{rich_escape(match.get('goal') or '')}[/]"
+                )
+
+    @on(Button.Pressed, "#btn-spec-save")
+    def _spec_save_clicked(self) -> None:
+        sp = self.repo / ".openfarm" / "PROJECT_SPEC.md"
+        sp.parent.mkdir(parents=True, exist_ok=True)
+        sp.write_text(self.query_one("#ta-spec-editor", TextArea).text.rstrip() + "\n", encoding="utf-8")
+        self.query_one("#spec-status", Static).update("[bold #4ade80]✓ Saved .openfarm/PROJECT_SPEC.md[/]")
+        self.notify("Saved PROJECT_SPEC.md")
+
+    @on(Button.Pressed, "#btn-chunk-done")
+    def _chunk_done_clicked(self) -> None:
+        if not self._selected_chunk_id:
+            return
+        try:
+            set_chunk_status(self.repo, self._selected_chunk_id, "done")
+            self.refresh_all_views()
+            self.notify(f"Marked {self._selected_chunk_id} done")
+        except Refused as exc:
+            self.notify(str(exc), severity="error")
+
+    @on(Button.Pressed, "#btn-chunk-to-cards")
+    def _chunk_to_cards_clicked(self) -> None:
+        if self._drafting_plan:
+            self.notify("Architect is already drafting cards...")
+            return
+        # Save any user edits to the spec before splitting chunk into cards
+        sp = self.repo / ".openfarm" / "PROJECT_SPEC.md"
+        spec_txt = self.query_one("#ta-spec-editor", TextArea).text.strip()
+        if spec_txt:
+            sp.parent.mkdir(parents=True, exist_ok=True)
+            sp.write_text(spec_txt + "\n", encoding="utf-8")
+        cid = self._selected_chunk_id or None
+        self._set_drafting_state(True, f"Splitting chunk {cid or 'C1'} into scoped Wave cards...")
+        self._draft_plan_bg(chunk_id=cid)
+
+    @on(Button.Pressed, "#btn-spec-back")
+    def _spec_back_clicked(self) -> None:
+        self.query_one("#studio-switcher", ContentSwitcher).current = "studio-grill"
+
+    @on(Button.Pressed, "#btn-open-spec")
+    def _open_spec_clicked(self) -> None:
+        self.query_one("#studio-switcher", ContentSwitcher).current = "studio-spec"
+
+    @on(Button.Pressed, "#btn-next-iter")
+    def _next_iter_clicked(self) -> None:
+        self.action_switch_view("studio")
+        target_sub = "studio-spec" if self._chunks_items else "studio-grill"
+        self.query_one("#studio-switcher", ContentSwitcher).current = target_sub
 
     @on(Button.Pressed, "#btn-draft-plan")
     def _draft_plan_clicked(self) -> None:
@@ -1497,6 +1961,58 @@ class OpenfarmApp(App):
             return
         self._set_drafting_state(True, "Preparing workspace & connecting to Frontier Architect...")
         self._draft_plan_bg()
+
+    def _ensure_workspace_initialized_for_studio(self, idea: str) -> None:
+        existing_cfg = self._safe_cfg()
+        existing_lang = (
+            str(existing_cfg.languages[0]).strip().lower()
+            if (existing_cfg is not None and getattr(existing_cfg, "languages", None))
+            else ""
+        )
+        stack_changed_on_blank = (
+            self._stack_user_override
+            and self._selected_stack != "auto"
+            and existing_lang != ""
+            and existing_lang != self._selected_stack
+            and not any((self.repo / "cards").glob("W*.md"))
+        )
+        needs_init = (
+            (not (self.repo / CONFIG_PATH).is_file())
+            or self._skeleton_missing_for_cfg(self.repo, existing_cfg)
+            or stack_changed_on_blank
+        )
+        if needs_init:
+            self.call_from_thread(
+                self._set_drafting_state,
+                True,
+                f"Initializing {self._selected_stack} project scaffold...",
+            )
+            initialize_project(
+                self.repo.name or "my-app",
+                directory=self.repo,
+                idea=idea,
+                language=self._selected_stack,
+                force=True,
+                commit=True,
+            )
+            cards_dir = self.repo / "cards"
+            if cards_dir.is_dir():
+                for old_md in cards_dir.glob("*.md"):
+                    if not old_md.stem.upper().startswith("FIND-"):
+                        old_md.unlink(missing_ok=True)
+            fresh_cfg = self._safe_cfg()
+            if fresh_cfg is not None:
+                for flag_name in ("paused", "stop"):
+                    (fresh_cfg.state_dir / flag_name).unlink(missing_ok=True)
+                if (self.repo / ".git").exists():
+                    from openfarm_core.adapters.files import FileCardSource
+
+                    FileCardSource(
+                        self.repo,
+                        "cards",
+                        worktree=fresh_cfg.state_dir / "cards-source",
+                        base_branch=fresh_cfg.base_branch,
+                    ).reset_non_finding_cards_from_base()
 
     @staticmethod
     def _skeleton_missing_for_cfg(repo: Path, cfg) -> bool:
@@ -1514,50 +2030,12 @@ class OpenfarmApp(App):
         return False
 
     @work(thread=True)
-    def _draft_plan_bg(self) -> None:
-        wf = self.query_one("#ta-workflow", TextArea).text.strip() or DEFAULT_GRILL_QUESTIONS[0]["default"]
-        inv = self.query_one("#ta-invariants", TextArea).text.strip() or DEFAULT_GRILL_QUESTIONS[1]["default"]
-        slc = self.query_one("#ta-slice", TextArea).text.strip() or DEFAULT_GRILL_QUESTIONS[2]["default"]
+    def _draft_plan_bg(self, chunk_id: str | None = None) -> None:
+        idea = self.query_one("#ta-idea", TextArea).text.strip() or DEFAULT_GRILL_QUESTIONS[0]["default"]
         use_architect = bool(self.query_one("#sw-use-architect", Switch).value)
-        answers = [
-            {"id": "goal", "question": DEFAULT_GRILL_QUESTIONS[0]["question"], "answer": wf},
-            {"id": "invariants", "question": DEFAULT_GRILL_QUESTIONS[1]["question"], "answer": inv},
-            {"id": "slice", "question": DEFAULT_GRILL_QUESTIONS[2]["question"], "answer": slc},
-        ]
         backend = None
         try:
-            existing_cfg = self._safe_cfg()
-            needs_init = (not (self.repo / CONFIG_PATH).is_file()) or self._skeleton_missing_for_cfg(self.repo, existing_cfg)
-            if needs_init:
-                self.call_from_thread(
-                    self._set_drafting_state,
-                    True,
-                    f"Initializing {self._selected_stack} project scaffold...",
-                )
-                initialize_project(
-                    self.repo.name or "my-app",
-                    directory=self.repo,
-                    idea=wf,
-                    language=self._selected_stack,
-                    force=True,
-                    commit=True,
-                )
-                # Remove stale card files from any previous wiped skeleton before drafting fresh cards
-                cards_dir = self.repo / "cards"
-                if cards_dir.is_dir():
-                    for old_md in cards_dir.glob("*.md"):
-                        if not old_md.stem.upper().startswith("FIND-"):
-                            old_md.unlink(missing_ok=True)
-                fresh_cfg = self._safe_cfg()
-                if fresh_cfg is not None and (self.repo / ".git").exists():
-                    from openfarm_core.adapters.files import FileCardSource
-
-                    FileCardSource(
-                        self.repo,
-                        "cards",
-                        worktree=fresh_cfg.state_dir / "cards-source",
-                        base_branch=fresh_cfg.base_branch,
-                    ).reset_non_finding_cards_from_base()
+            self._ensure_workspace_initialized_for_studio(idea)
             cfg = self._safe_cfg()
             arch_note = "local template"
             if use_architect:
@@ -1567,7 +2045,7 @@ class OpenfarmApp(App):
                     self.call_from_thread(
                         self._set_drafting_state,
                         True,
-                        f"Designing golden slice & Wave cards with {reason}...",
+                        f"Designing runnable app & Wave cards with {reason}...",
                     )
                 else:
                     arch_note = f"local fallback ({reason})"
@@ -1585,7 +2063,9 @@ class OpenfarmApp(App):
             try:
                 plan = draft_wave_plan(
                     self.repo,
-                    answers=answers,
+                    idea=idea,
+                    grill_history=list(self._grill_history),
+                    chunk_id=chunk_id,
                     backend=backend,
                     include_picked_findings=True,
                     verify_baseline=True,
@@ -1602,7 +2082,9 @@ class OpenfarmApp(App):
                 )
                 plan = draft_wave_plan(
                     self.repo,
-                    answers=answers,
+                    idea=idea,
+                    grill_history=list(self._grill_history),
+                    chunk_id=chunk_id,
                     backend=None,
                     include_picked_findings=True,
                     verify_baseline=True,

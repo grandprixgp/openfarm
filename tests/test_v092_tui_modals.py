@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import stat
 import tempfile
 import unittest
@@ -280,37 +281,45 @@ class TuiModalsTests(unittest.TestCase):
             root = Path(tmp) / "photo-app"
             state_dir = Path(tmp) / "state"
             secrets_dir = Path(tmp) / "secrets"
-            initialize_project(
-                "photo-app",
-                directory=root,
-                idea="Daily photo gallery",
-                state_dir=state_dir,
-                secrets_dir=secrets_dir,
-                no_git=True,
-            )
-            cfg_before = load_config(root)
-            save_worker_key_atomic(Path(cfg_before.key_file), "sk-live-secret")
+            prev_prov = os.environ.get("OPENFARM_PROVIDERS_FILE")
+            os.environ["OPENFARM_PROVIDERS_FILE"] = str(Path(tmp) / "providers.toml")
+            try:
+                initialize_project(
+                    "photo-app",
+                    directory=root,
+                    idea="Daily photo gallery",
+                    state_dir=state_dir,
+                    secrets_dir=secrets_dir,
+                    no_git=True,
+                )
+                cfg_before = load_config(root)
+                save_worker_key_atomic(Path(cfg_before.key_file), "sk-live-secret")
 
-            # Even with key present, placeholder endpoint keeps worker_key stage current.
-            pipe_before = compute_pipeline_stages(root, acp_status={"oauth_ready": True})
-            self.assertEqual(pipe_before["current_stage"]["id"], "worker_key")
+                # Even with key present, placeholder endpoint keeps worker_key stage current.
+                pipe_before = compute_pipeline_stages(root, acp_status={"oauth_ready": True})
+                self.assertEqual(pipe_before["current_stage"]["id"], "worker_key")
 
-            ctrl = TuiController(root)
-            keys = (
-                [ord(c) for c in "https://openrouter.ai/api/v1"]
-                + [ord("\n")]
-                + [ord(c) for c in "qwen/qwen3-coder"]
-                + [ord("\n")]
-            )
-            scr = _FakeStdscr(keys)
-            _run_worker_key_modal(scr, ctrl)
+                ctrl = TuiController(root)
+                keys = (
+                    [ord(c) for c in "https://openrouter.ai/api/v1"]
+                    + [ord("\n")]
+                    + [ord(c) for c in "qwen/qwen3-coder"]
+                    + [ord("\n")]
+                )
+                scr = _FakeStdscr(keys)
+                _run_worker_key_modal(scr, ctrl)
 
-            cfg_after = load_config(root)
-            self.assertEqual(cfg_after.endpoint, "https://openrouter.ai/api/v1")
-            self.assertEqual(cfg_after.allowed_endpoints, ["https://openrouter.ai/api/v1"])
-            self.assertEqual(cfg_after.role_models["implementer"].model, "qwen/qwen3-coder")
-            pipe_after = compute_pipeline_stages(root, acp_status={"oauth_ready": True})
-            self.assertNotEqual(pipe_after["current_stage"]["id"], "worker_key")
+                cfg_after = load_config(root)
+                self.assertEqual(cfg_after.endpoint, "https://openrouter.ai/api/v1")
+                self.assertEqual(cfg_after.allowed_endpoints, ["https://openrouter.ai/api/v1"])
+                self.assertEqual(cfg_after.role_models["implementer"].model, "qwen/qwen3-coder")
+                pipe_after = compute_pipeline_stages(root, acp_status={"oauth_ready": True})
+                self.assertNotEqual(pipe_after["current_stage"]["id"], "worker_key")
+            finally:
+                if prev_prov is None:
+                    os.environ.pop("OPENFARM_PROVIDERS_FILE", None)
+                else:
+                    os.environ["OPENFARM_PROVIDERS_FILE"] = prev_prov
 
 
 if __name__ == "__main__":
