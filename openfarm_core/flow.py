@@ -3510,6 +3510,62 @@ class CardRun:
         if not final_banned.ok:
             raise GateFailure(StopCode.REFUSED, final_banned.detail)
 
+        # Architectural invariants, runtime acceptance, and golden replays (v0.12.0).
+        inv_cfg = getattr(self.cfg, "invariants", None)
+        if inv_cfg is not None and inv_cfg.has_rules:
+            from .invariants import check_architectural_invariants
+
+            inv_rep = check_architectural_invariants(self.worktree, self.cfg)
+            inv_detail = "; ".join(
+                f"{v['path']}: {v['detail']}" for v in (inv_rep.get("violations") or [])[:5]
+            )
+            inv_gate = self._record_gate(GateResult(
+                "invariants",
+                PASS if inv_rep["ok"] else FAIL,
+                inv_detail,
+                inv_rep,
+            ))
+            if not inv_gate.ok:
+                raise GateFailure(StopCode.REFUSED, inv_gate.detail)
+
+        acc_cfg = getattr(self.cfg, "acceptance", None)
+        if acc_cfg is not None and acc_cfg.checks:
+            from .acceptance import run_acceptance_checks
+
+            acc_ev = self.card_layout / "gates" / "acceptance.json"
+            acc_rep = run_acceptance_checks(self.worktree, list(acc_cfg.checks), evidence_path=acc_ev)
+            acc_detail = "; ".join(
+                f"{r['name']}: {r.get('error') or 'failed'}"
+                for r in (acc_rep.get("results") or [])
+                if not r.get("ok")
+            )
+            acc_gate = self._record_gate(GateResult(
+                "acceptance",
+                PASS if acc_rep["ok"] else FAIL,
+                acc_detail,
+                acc_rep,
+            ))
+            if not acc_gate.ok:
+                raise GateFailure(StopCode.EXTRA_GATE, acc_gate.detail)
+
+        from .replay import REPLAYS_REL, run_replays
+
+        if (self.worktree / REPLAYS_REL).is_dir() and any((self.worktree / REPLAYS_REL).glob("*.json")):
+            rep_res = run_replays(self.worktree)
+            rep_detail = "; ".join(
+                f"{r['id']}: {r.get('error') or 'failed'}"
+                for r in (rep_res.get("results") or [])
+                if not r.get("ok")
+            )
+            rep_gate = self._record_gate(GateResult(
+                "replays",
+                PASS if rep_res["ok"] else FAIL,
+                rep_detail,
+                rep_res,
+            ))
+            if not rep_gate.ok:
+                raise GateFailure(StopCode.EXTRA_GATE, rep_gate.detail)
+
         # No test loss, against the list taken on base.
         final_list_result = self._run(
             runner_kind("list"),

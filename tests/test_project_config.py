@@ -61,6 +61,8 @@ SPEC_KEYS = {
     "units": {"language"},
     "factory": {"auto_land", "integration_branch", "auto_land_profiles",
                 "require_zero_findings", "require_frontier_consensus"},
+    "invariants": {"forbidden_imports", "max_file_bytes", "require_exports"},
+    "acceptance": {"checks"},
 }
 
 
