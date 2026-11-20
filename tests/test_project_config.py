@@ -63,6 +63,7 @@ SPEC_KEYS = {
                 "require_zero_findings", "require_frontier_consensus"},
     "invariants": {"forbidden_imports", "max_file_bytes", "require_exports"},
     "acceptance": {"checks"},
+    "notifications": {"webhook_url", "desktop", "events"},
 }
 
 

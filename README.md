@@ -11,12 +11,12 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.9.2-16a34a?style=flat-square" alt="version 0.9.2">
+  <img src="https://img.shields.io/badge/version-0.14.0-16a34a?style=flat-square" alt="version 0.14.0">
   <img src="https://img.shields.io/badge/status-pre--release-d97706?style=flat-square" alt="status: pre-release">
   <img src="https://img.shields.io/badge/python-3.11%2B-7c3aed?style=flat-square" alt="Python 3.11+">
-  <img src="https://img.shields.io/badge/runtime%20deps-stdlib%20only-0284c7?style=flat-square" alt="runtime dependencies: standard library only">
+  <img src="https://img.shields.io/badge/runtime%20deps-stdlib%20only%20core-0284c7?style=flat-square" alt="runtime dependencies: standard library only core">
   <img src="https://img.shields.io/badge/language%20packs-Rust%20%7C%20Python%20%7C%20TypeScript%20%7C%20Go-ea580c?style=flat-square" alt="language packs: Rust, Python, TypeScript and Go">
-  <img src="https://img.shields.io/badge/UI-stdlib%20TUI%20%2B%20CLI-0ea5e9?style=flat-square" alt="UI: stdlib TUI + CLI">
+  <img src="https://img.shields.io/badge/UI-Textual%20%2B%20stdlib%20Web%20%2B%20CLI-0ea5e9?style=flat-square" alt="UI: Textual + stdlib Web + CLI">
 </p>
 
 <p align="center">
@@ -34,7 +34,12 @@
 </p>
 
 > [!IMPORTANT]
-> **Pre-release (v0.9.1).** v0.9.1 fixes all findings from the full-codebase v0.9.0 audit (git `hooksPath`, `single-pass` adjudicate crash, `openfarm land` state/verdict/worktree safety, ACP/bwrap isolation, `confine_network` polarity, Vitest/Jest `describe` filtering, polyglot eligibility, Go pack, TUI git race, wave-2 card sync, token accounting) and adds bare `openfarm` Automode TUI + command palette (`openfarm auto`), frontier card-complexity triage (`openfarm triage`), and mixture-of-frontiers review (`openfarm frontier-review`) ([`docs/v0.9.1-build-log.md`](docs/v0.9.1-build-log.md)). Live execution against real `go`, `vitest`, and `jest` binaries is untested on this machine. With `[swarm] enabled = false` a run behaves as in v0.7.
+> **Pre-release (v0.14.0).** `openfarm_core/` remains 100% Python 3.11+ stdlib-only (`dependencies = []`), with an optional Textual workbench (`pip install "openfarm[tui]"`, automatic fallback to stdlib `curses`) and 37 CLI commands. Highlights across `v0.10.0`–`v0.14.0`:
+> - **Iterative Studio & Conversational Frontier Architect (`v0.13.0`):** Single-prompt **Idea → Conversational Grill → Living Spec & Ordered Chunks (`.openfarm/CHUNKS.json`) → Split Chunk into Cards → Run → Review & Local Land → Iterate**, with stack-authentic prompts (no Rust boilerplate on TypeScript/Web apps) and an always-visible Live Architect Log.
+> - **Projects Registry & Factory Ergonomics (`v0.10.1`–`v0.10.2`):** Global `projects.toml` registry (`openfarm projects {list,add,edit,remove,discover}` + `0 Projects` TUI view, strictly non-destructive to disk), in-TUI Card Editor & Split, deduplicated Findings Inbox, Touches Conflict Matrix, and `openfarm doctor [--fix] [--probe]`.
+> - **DAG & Autonomous Integration (`v0.11.0`):** Cards-as-the-DAG (`openfarm plan`, cycle detection, topological waves), deterministic trial-rebase, and opt-in `[factory] auto_land` onto local `openfarm/integration` (`openfarm land --promote-integration`).
+> - **Verification & Memory (`v0.12.0`–`v0.13.0`):** Architectural Invariants (`[invariants]`), Runtime Acceptance CLI/HTTP checks (`[acceptance]`), Golden Replay Vault (`openfarm replay`), Adaptive Model Router (`openfarm routing`), and Attempt Timeline / Phase-B resume inspection (`openfarm timeline`).
+> - **Always-On Daemon, Stdlib Web Companion & Notifications (`v0.14.0`):** Detached background runs (`openfarm daemon {start,stop,status,logs}`), loopback-by-default stdlib Web Companion with SSE & CSRF tokens (`openfarm web`), and optional webhook/desktop alerts (`[notifications]`).
 
 ---
 

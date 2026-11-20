@@ -55,6 +55,7 @@ from openfarm_core.automode import (
 from openfarm_core.bootstrap import initialize_project
 from openfarm_core.cli import Context, cmd_run, main as cli_main
 from openfarm_core.config import CONFIG_PATH, load_config
+from openfarm_core.daemon import daemon_status, start_daemon, stop_daemon
 from openfarm_core.doctor import compute_touches_conflict_matrix, run_doctor
 from openfarm_core.routing import compute_routing_recommendations
 from openfarm_core.errors import AdapterError, ConfigError, Refused
@@ -600,6 +601,8 @@ class OpenfarmApp(App):
                             yield RichLog(id="activity-log", markup=True, wrap=True, min_width=0)
                             with Horizontal(classes="action-row"):
                                 yield Button("Launch Wave", classes="primary-cta", id="btn-run-start")
+                                yield Button("Start Detached", classes="soft-btn", id="btn-daemon-start")
+                                yield Button("Stop Daemon", classes="soft-btn", id="btn-daemon-stop")
                                 yield Button("Pause [p]", classes="soft-btn", id="btn-pause")
                                 yield Button("Resume", classes="soft-btn", id="btn-resume")
                                 yield Button("Stop [s]", classes="soft-btn", id="btn-stop")
@@ -793,6 +796,19 @@ class OpenfarmApp(App):
         in_review = [c for c in non_findings if str(c.state).lower().replace("-", "_") == "in_review"]
         ready_cards = [c for c in non_findings if str(c.state).lower() == "ready"]
         blocked_cards = [c for c in non_findings if str(c.state).lower() == "blocked"]
+
+        # Update daemon pill when not actively drafting/running in-process
+        if not self._running_wave and not self._drafting_plan:
+            d_st = daemon_status(self.repo, config_path=self.config_path)
+            pill = self.query_one("#status-badge", Static)
+            if d_st.get("running"):
+                pill.remove_class("status-ready")
+                pill.add_class("status-running")
+                pill.update(f"● DAEMON ({d_st['pid']})")
+            else:
+                pill.remove_class("status-running")
+                pill.add_class("status-ready")
+                pill.update("○ READY")
 
         # Update nav badges
         self.query_one("#nav-review", Button).label = f"2 Review ({len(in_review)})" if in_review else "2 Review"
@@ -2389,6 +2405,30 @@ class OpenfarmApp(App):
             self._refresh_findings_widgets()
 
     # ── Live Non-Blocking Wave Run ───────────────────────────────────────────
+
+    @on(Button.Pressed, "#btn-daemon-start")
+    def _daemon_start_btn(self) -> None:
+        try:
+            res = start_daemon(self.repo, config_path=self.config_path)
+            self.query_one("#activity-log", RichLog).write(
+                f"[bold #38bdf8]● Detached daemon started (pid {res['pid']})[/]  log: {rich_escape(res['log_path'])}"
+            )
+            self.refresh_all_views()
+            self.notify(f"Started detached daemon (pid {res['pid']})")
+        except Refused as exc:
+            self.notify(str(exc), severity="warning")
+
+    @on(Button.Pressed, "#btn-daemon-stop")
+    def _daemon_stop_btn(self) -> None:
+        try:
+            res = stop_daemon(self.repo, config_path=self.config_path)
+            self.query_one("#activity-log", RichLog).write(
+                f"[bold #fbbf24]■ Daemon stop requested[/]  (was_running={res['was_running']}, pid={res['pid']})"
+            )
+            self.refresh_all_views()
+            self.notify("Daemon stop requested")
+        except Refused as exc:
+            self.notify(str(exc), severity="warning")
 
     @on(Button.Pressed, "#btn-launch-wave")
     @on(Button.Pressed, "#btn-run-start")

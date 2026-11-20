@@ -44,8 +44,17 @@ class _Resp:
 
 class ModelHeadersTests(unittest.TestCase):
     def setUp(self) -> None:
+        import os
+
         self.tmp = Path(tempfile.mkdtemp(prefix="openfarm-"))
         self.addCleanup(shutil.rmtree, self.tmp, True)
+        prev_prov = os.environ.get("OPENFARM_PROVIDERS_FILE")
+        os.environ["OPENFARM_PROVIDERS_FILE"] = str(self.tmp / "providers.toml")
+        self.addCleanup(
+            lambda: os.environ.pop("OPENFARM_PROVIDERS_FILE", None)
+            if prev_prov is None
+            else os.environ.__setitem__("OPENFARM_PROVIDERS_FILE", prev_prov)
+        )
         self.repo = self.tmp / "repo"
         self.repo.mkdir()
         self.state = self.tmp / "state"

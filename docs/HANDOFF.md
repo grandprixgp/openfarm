@@ -1,10 +1,20 @@
-# Openfarm v0.9.2 Engineering Handoff
+# Openfarm v0.14.0 Engineering Handoff
 
-Concise entry point for engineers reviewing, testing, or extending Openfarm v0.9.2.
+Concise entry point for engineers reviewing, testing, or extending Openfarm v0.14.0.
 
 For greenfield empty-folder initialization (`"Read and install this skill <link>"` -> `/openfarm-grill-me` -> `"/openfarm-initialize calorie-log ..."`), see [docs/FROM-IDEA-TO-SHIPPED-APP.md](FROM-IDEA-TO-SHIPPED-APP.md). For step-by-step operator instructions, config table reference, provider setup, card authoring rules, and the executable `tallybox` first-deployment runbook on existing repos, see [docs/USAGE-AND-FIRST-DEPLOYMENT.md](USAGE-AND-FIRST-DEPLOYMENT.md). Module-level detail is in [docs/openfarm-internals.md](openfarm-internals.md).
 
-## Current State (v0.9.2, 19 Nov 2026)
+## Current State (v0.14.0, 20 Nov 2026)
+
+`v0.10.0`–`v0.14.0` turn Openfarm into a multi-project autonomous software factory while keeping `openfarm_core/` **100% Python 3.11+ stdlib-only** (`dependencies = []`, optional `openfarm_tui/` Textual extra with automatic `curses` fallback) and strictly local-only merges (zero `git push` in core, zero `$` spend displayed in TUI or Web UI):
+
+- **`v0.10.0`–`v0.10.2`:** Optional Textual workbench (`0 Projects`, `1 Studio`, `2 Review`, `3 Findings`, `4 Engine`), global Providers (`providers.toml` + `x-cmd-zdr`), global Projects Registry (`projects.toml` + workspace auto-discovery, non-destructive remove), In-TUI Card Editor & Split, deduplicated Findings Inbox + Wave Synthesis, Touches Conflict Matrix, and `openfarm doctor [--fix] [--probe]`.
+- **`v0.11.0`:** Cards-as-the-DAG (`openfarm_core/dag.py`, `openfarm plan`), deterministic trial-rebase (`openfarm_core/factory.py`), and opt-in `[factory] auto_land` onto local `openfarm/integration` (`openfarm land --promote-integration`).
+- **`v0.12.0`:** Architectural Invariants gate (`openfarm_core/invariants.py`, `[invariants]`), Runtime Acceptance CLI/HTTP smoke gate (`openfarm_core/acceptance.py`, `[acceptance]`), and Golden Replay Vault (`openfarm_core/replay.py`, `openfarm replay`).
+- **`v0.13.0`:** Iterative **Idea → Conversational Frontier Architect Grill → Living Spec & Ordered Chunks (`.openfarm/CHUNKS.json`) → Split Chunk into Cards → Run → Review & Land → Iterate** flow with stack-authentic prompts, shared Live Architect Log (`#architect-panel`), Adaptive Model Router (`openfarm_core/routing.py`, `openfarm routing`), and Attempt Timeline / Phase-B resume inspection (`openfarm_core/timeline.py`, `openfarm timeline`).
+- **`v0.14.0`:** Detached Factory Daemon (`openfarm_core/daemon.py`, `openfarm daemon {start,stop,status,logs}`), loopback-by-default stdlib Web Companion with SSE & per-session `X-Openfarm-Token` CSRF protection (`openfarm_core/web.py`, `openfarm web`), and optional webhook/desktop notifications (`openfarm_core/notify.py`, `[notifications]`).
+
+## Previous State (v0.9.2, 19 Nov 2026)
 
 v0.9.2 makes the TUI **high-contrast by default** (`OPENFARM_TUI_THEME=high-contrast`, optional `soft`) and turns bare `openfarm` Automode into an **in-TUI execution pipeline** handling workspace init/adopt, Frontier OAuth login, masked Worker API key setup (`0600` atomic or reuse from `~/.config/openfarm/*.key`), interactive Grill + spec expansion, and native in-TUI card review ([docs/v0.9.2-build-log.md](v0.9.2-build-log.md)).
 
