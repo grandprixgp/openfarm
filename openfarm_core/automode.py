@@ -126,8 +126,7 @@ def detect_workspace_state(root: Path, config_path: Path | None = None) -> dict:
         }
 
     entries = [p for p in root.iterdir() if not p.name.startswith(".")] if root.is_dir() else []
-    has_git = (root / ".git").exists()
-    if not has_git and not entries:
+    if not entries:
         return {
             "stage": "empty",
             "root": str(root),
