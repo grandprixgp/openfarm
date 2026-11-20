@@ -28,6 +28,15 @@ class AutomodeTuiTests(unittest.TestCase):
             self.assertEqual(st_empty["next_action"], "init")
             self.assertIn("Empty", render_automode_summary(st_empty))
 
+            # An empty directory that only has `git init` still needs `init`, not `adopt`.
+            empty_git = Path(tmp) / "empty-git"
+            empty_git.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=empty_git, check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            st_empty_git = detect_workspace_state(empty_git)
+            self.assertEqual(st_empty_git["stage"], "empty")
+            self.assertEqual(st_empty_git["next_action"], "init")
+
             unadopted = Path(tmp) / "goproj"
             unadopted.mkdir()
             subprocess.run(["git", "init", "-b", "main"], cwd=unadopted, check=True,
