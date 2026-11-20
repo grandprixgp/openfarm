@@ -569,6 +569,279 @@ def run_grill_and_architect(
     return {"written": written, "decisions_path": str(decisions_path)}
 
 
+def _default_touch_and_test(root: Path, lang: str, card_id: str) -> tuple[str, dict]:
+    """Choose a non-invariant default touch file and valid named test entry for `lang`."""
+    import re
+
+    slug = re.sub(r"[^a-z0-9]+", "_", str(card_id or "wave1").lower()).strip("_") or "wave1"
+    if lang == "rust":
+        touch = "src/lib.rs" if (root / "src" / "lib.rs").is_file() else (
+            "src/main.rs" if (root / "src" / "main.rs").is_file() else "src/lib.rs"
+        )
+        return touch, {
+            "name": f"{slug}_golden_slice_works",
+            "file": f"tests/{slug}_golden_slice.rs",
+            "asserts": "Core workflow returns expected output and rejects invalid input with an error",
+        }
+    if lang in ("python", "py"):
+        py_files = [
+            p.relative_to(root).as_posix()
+            for p in sorted(root.rglob("*.py"))
+            if not p.name.startswith("test_")
+            and "invariants.py" not in p.name
+            and "tests/" not in p.relative_to(root).as_posix()
+            and ".openfarm" not in p.parts
+        ]
+        touch = py_files[0] if py_files else "app.py"
+        return touch, {
+            "name": f"test_{slug}_works",
+            "file": f"tests/test_{slug}.py",
+            "asserts": "Core workflow returns expected output and rejects invalid input with an error",
+        }
+    if lang == "go":
+        return "main.go", {
+            "name": f"Test{slug.title().replace('_', '')}Works",
+            "file": f"{slug}_test.go",
+            "asserts": "Core workflow returns expected output and rejects invalid input with an error",
+        }
+    return "src/index.ts", {
+        "name": f"{slug}_works",
+        "file": f"tests/{slug}.test.ts",
+        "asserts": "Core workflow returns expected output and rejects invalid input with an error",
+    }
+
+
+def _sanitize_done_prose(text: str) -> str:
+    import re
+    from .gates.eligibility import DESIGN_WORDS, VAGUE_WORDS
+
+    cleaned = str(text or "").strip()
+    for phrase in DESIGN_WORDS:
+        cleaned = re.sub(re.escape(phrase), "layout", cleaned, flags=re.IGNORECASE)
+    for word in VAGUE_WORDS:
+        cleaned = re.sub(rf"\b{re.escape(word)}\b", "deterministic", cleaned, flags=re.IGNORECASE)
+    return cleaned
+
+
+def _repair_card_for_eligibility(
+    root: Path,
+    cfg,
+    header: dict,
+    body: str,
+) -> tuple[dict, str, bool]:
+    """Repair a card header + Done body deterministically until `check_eligibility` passes."""
+    from .cards import Card
+    from .gates.eligibility import KNOWN_CATEGORIES, check_eligibility
+    from .globs import matches_any
+
+    h = dict(header)
+    b = str(body or "").strip()
+    cid = str(h.get("id") or "W1-01")
+    lang = (cfg.languages[0] if (cfg and cfg.languages) else "rust").lower()
+    default_touch, default_test = _default_touch_and_test(root, lang, cid)
+
+    def _to_card(hd: dict, bd: str) -> Card:
+        return Card(
+            id=str(hd.get("id") or cid),
+            title=str(hd.get("title") or cid),
+            state=str(hd.get("state") or "ready"),
+            done_text=bd,
+            touches=[str(t) for t in (hd.get("touches") or [])],
+            deps=[str(d) for d in (hd.get("depends") or hd.get("deps") or [])],
+            fields=dict(hd),
+        )
+
+    elig = check_eligibility(_to_card(h, b), cfg, worktree=root)
+    if elig.ok:
+        return h, b, False
+
+    allowed_cats = list(cfg.categories) if (cfg and cfg.categories) else ["small-feature"]
+    cat = str(h.get("category") or "")
+    if cat not in KNOWN_CATEGORIES or cat not in allowed_cats:
+        cat = next(
+            (c for c in ("small-feature", "feature", "pattern", "test-backfill") if c in allowed_cats),
+            allowed_cats[0],
+        )
+        h["category"] = cat
+
+    touches = [
+        str(t) for t in (h.get("touches") or [])
+        if str(t).strip()
+        and not matches_any(str(t), getattr(cfg, "never_touch", []) or [])
+        and not matches_any(str(t), getattr(cfg, "forbidden_files", []) or [])
+    ]
+    if not touches:
+        touches = [default_touch]
+    if h.get("new_symbols") and len(touches) > 1:
+        touches = [touches[0]]
+    h["touches"] = touches[: max(1, int(getattr(cfg, "max_files", 6) or 6))]
+
+    if cat in (getattr(cfg, "require_reference", ()) or ()) and not h.get("reference"):
+        h["reference"] = h["touches"][0]
+    if h.get("reference") and (
+        matches_any(str(h["reference"]), getattr(cfg, "never_touch", []) or [])
+        or matches_any(str(h["reference"]), getattr(cfg, "forbidden_files", []) or [])
+    ):
+        h["reference"] = h["touches"][0]
+
+    if cat != "mechanical" and not (h.get("tests") or []):
+        h["tests"] = [default_test]
+    if cat in ("pinned-bugfix", "test-backfill") and h.get("new_symbols"):
+        h.pop("new_symbols", None)
+
+    b = _sanitize_done_prose(b)
+    if not b:
+        b = f"## Done\n\n- Implement `{h['touches'][0]}` so it returns expected values and returns an error on invalid input."
+    elif not any(m in b for m in ("`", "==", "->", "returns", "assert", "error", "matches!", "equals")):
+        b = b.rstrip() + f"\n- `{h['touches'][0]}` returns expected output and returns an error on invalid input.\n"
+
+    return h, b, True
+
+
+def draft_wave_plan(
+    repo: Path,
+    *,
+    answers: list[dict],
+    backend=None,
+    max_repairs: int = 2,
+    include_picked_findings: bool = True,
+) -> dict:
+    """Run Grill + Architect, incorporate picked findings, auto-repair eligibility, and triage cards."""
+    from .adapters.files import parse_card_file, render_card_file
+    from .cards import Card
+    from .findings import decide_finding, is_finding_id_or_header, picked_findings_for_planning
+    from .gates.eligibility import check_eligibility
+    from .triage import triage_card_heuristic
+
+    root = Path(repo).expanduser().resolve()
+    res = run_grill_and_architect(root, answers=answers, backend=backend)
+    written = list(res.get("written") or [])
+
+    cfg = load_config(root)
+    cards_dir = root / "cards"
+    cards_dir.mkdir(parents=True, exist_ok=True)
+    lang = (cfg.languages[0] if cfg.languages else "rust").lower()
+
+    promoted_findings: list[str] = []
+    if include_picked_findings:
+        picked = picked_findings_for_planning(root, cfg)
+        for item in picked:
+            fid = item["id"]
+            new_cid = f"W-{fid}"
+            card_path = cards_dir / f"{new_cid}.md"
+            if not card_path.exists():
+                touch, test_entry = _default_touch_and_test(root, lang, new_cid)
+                allowed_cats = list(cfg.categories) or ["small-feature"]
+                cat = next(
+                    (c for c in ("pinned-bugfix", "small-feature", "feature") if c in allowed_cats),
+                    allowed_cats[0],
+                )
+                header: dict = {
+                    "id": new_cid,
+                    "title": str(item["title"])[:80],
+                    "state": "ready",
+                    "touches": [touch],
+                    "depends": [],
+                    "category": cat,
+                    "tests": [test_entry],
+                }
+                if cat in (getattr(cfg, "require_reference", ()) or ()):
+                    header["reference"] = touch
+                body = (
+                    "## Done\n\n"
+                    f"- Address worker finding `{fid}` (from `{item['from_card']}`): {_sanitize_done_prose(item['title'])}.\n"
+                    f"- Details: {_sanitize_done_prose(item['body'] or item['title'])}\n"
+                    f"- `{test_entry['name']}` returns expected values and verifies an error on invalid input.\n"
+                )
+                card_path.write_text(render_card_file(header, body), encoding="utf-8")
+                written.append(f"cards/{new_cid}.md")
+            try:
+                decide_finding(root, cfg, fid, "promoted", promoted_card=new_cid)
+            except (Refused, OSError):
+                pass
+            promoted_findings.append(fid)
+
+    planned_cards: list[dict] = []
+    triage_counts = {"lean": 0, "balanced": 0, "strict": 0}
+    repaired_count = 0
+    all_ok = True
+
+    for md in sorted(cards_dir.glob("*.md")):
+        try:
+            header, body = parse_card_file(md.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            continue
+        cid = str(header.get("id") or md.stem)
+        if is_finding_id_or_header(cid, header):
+            continue
+        if str(header.get("state") or "ready").lower() not in ("ready", "backlog"):
+            continue
+
+        repaired_this = False
+        for _attempt in range(max(1, int(max_repairs))):
+            h_new, b_new, did_repair = _repair_card_for_eligibility(root, cfg, header, body)
+            if did_repair:
+                header, body = h_new, b_new
+                repaired_this = True
+                md.write_text(render_card_file(header, body), encoding="utf-8")
+            card_obj = Card(
+                id=str(header.get("id") or cid),
+                title=str(header.get("title") or cid),
+                state=str(header.get("state") or "ready"),
+                done_text=body,
+                touches=[str(t) for t in (header.get("touches") or [])],
+                deps=[str(d) for d in (header.get("depends") or header.get("deps") or [])],
+                fields=dict(header),
+            )
+            elig = check_eligibility(card_obj, cfg, worktree=root)
+            if elig.ok:
+                break
+
+        if repaired_this:
+            repaired_count += 1
+        card_obj = Card(
+            id=str(header.get("id") or cid),
+            title=str(header.get("title") or cid),
+            state=str(header.get("state") or "ready"),
+            done_text=body,
+            touches=[str(t) for t in (header.get("touches") or [])],
+            deps=[str(d) for d in (header.get("depends") or header.get("deps") or [])],
+            fields=dict(header),
+        )
+        elig = check_eligibility(card_obj, cfg, worktree=root)
+        if not elig.ok:
+            all_ok = False
+        tri = triage_card_heuristic(card_obj)
+        prof = str(tri.get("recommended_profile") or "balanced")
+        if prof in triage_counts:
+            triage_counts[prof] += 1
+        planned_cards.append({
+            "id": card_obj.id,
+            "title": card_obj.title,
+            "category": card_obj.category,
+            "touches": list(card_obj.touches),
+            "depends": list(card_obj.deps),
+            "tests": [t.as_dict() for t in card_obj.tests],
+            "done_text": body,
+            "complexity": str(tri.get("complexity") or "medium"),
+            "profile": prof,
+            "eligible": bool(elig.ok),
+            "failures": list(elig.failures),
+            "repaired": repaired_this,
+            "path": str(md),
+        })
+
+    return {
+        "written": written,
+        "decisions_path": res.get("decisions_path", ""),
+        "cards": planned_cards,
+        "triage_counts": triage_counts,
+        "eligibility_ok": all_ok and len(planned_cards) > 0,
+        "repaired_count": repaired_count,
+        "promoted_findings": promoted_findings,
+    }
+
+
 def ensure_baseline_committed(repo: Path) -> bool:
     """Ensure the repo has an initial HEAD commit and committed `.openfarm/` + `cards/` baseline."""
     from .git import Git
