@@ -3605,7 +3605,14 @@ class CardRun:
                 self.git.worktree_add(trial_wt, base_ref)
                 self._prepare_checkout(trial_wt)
                 try:
-                    overlay = sorted(set(self.frozen_tests) | set(self.phase_a_stub_files))
+                    # Everything the test writer committed, not only the test files
+                    # and stubs. A fixture left out makes the test file crash on load,
+                    # so the named tests never ran and a sound card was blocked.
+                    frozen_changed = self.git._run(
+                        ["diff", "--name-only", base_ref, self.frozen_commit],
+                        check=False).stdout.splitlines() if self.frozen_commit else []
+                    overlay = sorted(set(self.frozen_tests) | set(self.phase_a_stub_files)
+                                     | {p.strip() for p in frozen_changed if p.strip()})
                     for rel in overlay:
                         blob = self.git.show_blob(f"{self.frozen_commit}:{rel}")
                         if blob is not None:
@@ -3643,16 +3650,13 @@ class CardRun:
                                     "the revert-check run did not finish")
                     wrong = [n for n, st in r_failures.items() if st != "FAILED"]
                     if r_compile or wrong:
-                        detail = (
-                            "revert-check failed to reproduce red tests on base"
-                            if r_compile else
-                            "tests did not fail when implementation was reverted: "
-                            + ", ".join(wrong[:10])
-                        )
+                        detail = _revert_detail(r_failures, r_compile)
                         self._record_gate(GateResult(
                             "revert-check", FAIL, detail,
                             {"compile_errors": r_compile, "not_failing": wrong,
-                             "failures": r_failures}))
+                             "failures": r_failures,
+                             # the raw end of the run, so a person can overrule it
+                             "output_tail": (r_out + "\n" + r_err)[-3000:]}))
                         raise GateFailure(StopCode.TESTS_UNPROVABLE, detail)
                     self._record_gate(GateResult(
                         "revert-check", PASS,
@@ -5054,6 +5058,18 @@ def _named_failures(parsed: dict, named: list[str],
     """
     rows = _named_rows(parsed, named, files, row_file)
     return {name: combined_status(rows[name]) for name in named}
+
+
+def _revert_detail(failures: dict[str, str], compile_errors: list) -> str:
+    """Why the revert check failed, without calling a test that never ran a pass."""
+    if compile_errors:
+        return "revert-check failed to reproduce red tests on base"
+    wrong = [name for name, status in failures.items() if status != "FAILED"]
+    if wrong and all(failures[name] == "not-run" for name in wrong):
+        return ("the named tests did not run when the implementation was reverted "
+                "(their file may have failed to load): " + ", ".join(wrong[:10]))
+    return ("tests did not fail when implementation was reverted: "
+            + ", ".join(wrong[:10]))
 
 
 def _status_of(parsed: dict, name: str) -> str:

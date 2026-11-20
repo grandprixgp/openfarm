@@ -1,0 +1,6 @@
+openfarm-node-test {"e":"pass","file":"tests/baseline.test.ts","name":"tests/baseline.test.ts","nesting":0,"type":"test","skip":false,"todo":false}
+openfarm-node-test {"e":"fail","file":"tests/feed.test.ts","name":"tests/feed.test.ts","nesting":0,"type":"test","skip":false,"todo":false}
+openfarm-node-test {"e":"pass","file":"tests/slice.test.ts","name":"tests/slice.test.ts","nesting":0,"type":"test","skip":false,"todo":false}
+openfarm-node-test {"e":"pass","file":"tests/theme.test.ts","name":"tests/theme.test.ts","nesting":0,"type":"test","skip":false,"todo":false}
+openfarm-node-test {"e":"end","filtered":true}
+openfarm-node-test {"e":"exit","code":1}
