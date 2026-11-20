@@ -2662,10 +2662,10 @@ def cmd_swarm(ctx: Context, args) -> int:
 # -- the parser ----------------------------------------------------------------
 
 _CLI_EPILOG = """\
-Command groups (33 commands):
+Command groups (35 commands):
   Setup & Auth         init, adopt, install-skill, acp, providers, projects, doctor
   Run & Monitor        auto, plan, check, run, status, pause, resume, stop, tui
-  Review & Harness     triage, review, land, findings, replay, frontier-review, dossier, verdict, done, release, escape, supervise, harness
+  Review & Harness     triage, review, land, findings, replay, routing, timeline, frontier-review, dossier, verdict, done, release, escape, supervise, harness
   Swarm, Board & Bench swarm, board, drive, bench
 
 Common workflows:
@@ -2823,6 +2823,19 @@ def build_parser() -> argparse.ArgumentParser:
     rep_p.add_argument("--stdin", default="", help="optional stdin text")
     rep_p.add_argument("--expect-exit", type=int, default=0, help="expected exit code")
     rep_p.add_argument("--expect-contains", default="", help="required stdout substring")
+
+    sub.add_parser(
+        "routing",
+        help="show performance-aware adaptive model & effort routing recommendations from run history",
+        formatter_class=raw_fmt,
+    )
+
+    tl_p = sub.add_parser(
+        "timeline",
+        help="show attempt-by-attempt timeline and Phase-B resume availability for a card",
+        formatter_class=raw_fmt,
+    )
+    tl_p.add_argument("card", help="card id (e.g. W1-01)")
 
     dossier = sub.add_parser(
         "dossier",
@@ -3769,6 +3782,47 @@ def cmd_replay(args) -> int:
     raise UsageError(f"unknown replay subcommand: {action}")
 
 
+def cmd_routing(args) -> int:
+    from .routing import compute_routing_recommendations
+
+    repo = Path(args.repo) if getattr(args, "repo", None) else Path.cwd()
+    cfg_p = Path(args.config) if getattr(args, "config", None) else None
+    res = compute_routing_recommendations(repo, config_path=cfg_p)
+    if args.json:
+        print(json.dumps(res, indent=2))
+    else:
+        print(f"Adaptive Routing ({res['samples']} historical card run(s)):")
+        if not res["recommendations"]:
+            print(f"  {res.get('note') or 'No recommendations yet.'}")
+        for r in res["recommendations"]:
+            print(
+                f"  {r['language']}/{r['category']:<14}  pass={int(r['pass_rate']*100)}%  "
+                f"1st-try={int(r['first_try_rate']*100)}%  ->  {r['recommended_model']} "
+                f"({r['recommended_effort']}, {r['recommended_profile']}, conf={r['confidence']})"
+            )
+    return EXIT_OK
+
+
+def cmd_timeline(args) -> int:
+    from .timeline import build_card_timeline
+
+    repo = Path(args.repo) if getattr(args, "repo", None) else Path.cwd()
+    cfg_p = Path(args.config) if getattr(args, "config", None) else None
+    cid = _check_id(args.card, "card id")
+    res = build_card_timeline(repo, cid, config_path=cfg_p)
+    if args.json:
+        print(json.dumps(res, indent=2))
+    else:
+        print(f"Card Timeline: {cid} ({len(res['runs'])} run(s))")
+        if res["resume"].get("resumable"):
+            print(f"  Phase-B resume available on {res['resume']['branch']} ({res['resume']['commit'][:10]})")
+        for run in res["runs"]:
+            print(f"  Run {run['run_id']}: {run['final_state']} {run.get('stop_code', '')}")
+            for a in run["attempts"]:
+                print(f"    - {a['role']} #{a['attempt']} ({a['model']} {a['effort']}): {'ok' if a['ok'] else 'fail'}")
+    return EXIT_OK
+
+
 PRE_CONFIG_COMMANDS = {
     "adopt": cmd_adopt,
     "auto": cmd_auto,
@@ -3780,6 +3834,8 @@ PRE_CONFIG_COMMANDS = {
     "providers": cmd_providers,
     "projects": cmd_projects,
     "replay": cmd_replay,
+    "routing": cmd_routing,
+    "timeline": cmd_timeline,
     "tui": cmd_tui,
 }
 

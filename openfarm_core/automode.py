@@ -425,16 +425,17 @@ class _AcpArchitectBackend:
         self._worker = worker
         self._model = model
 
-    def ask(self, prompt: str) -> str:
+    def ask(self, prompt: str, *, system_prompt: str | None = None) -> str:
         comp = self._worker.complete(
             "architect",
             self._model,
             0.2,
             [{"role": "user", "content": prompt}],
             system_prompt=(
-                "You are a senior Frontier Software Architect inside Openfarm. "
-                "Return ONLY valid JSON of shape {\"files\": {\"<repo-relative-path>\": \"<content>\"}} "
-                "matching the repository's configured language stack. Never emit files for another language."
+                system_prompt
+                or "You are a senior Frontier Software Architect inside Openfarm. "
+                "Return ONLY valid JSON matching the exact schema requested in the user prompt. "
+                "Match the repository's configured language stack and never emit files for another language."
             ),
         )
         return str(comp.content or "")
@@ -550,11 +551,320 @@ def _verify_baseline_quick(root: Path, cfg) -> tuple[bool, str]:
         return False, str(exc)
 
 
+def _stack_authentic_guidance(lang: str) -> str:
+    """Idiomatic, runnable guidance per stack so non-Rust repos never receive Rust-shaped specs."""
+    low = str(lang or "typescript").strip().lower()
+    if low == "typescript":
+        return (
+            "Stack guidance (TypeScript / Web):\n"
+            "- Build an AUTHENTIC, RUNNABLE TypeScript application matching what the user asked for.\n"
+            "- If the user asks for a web app / visual experience / UI, design a real runnable local web app "
+            "(e.g. a zero-dependency Node `http.createServer` serving real HTML/CSS/client JS/TS so the user can open it in a browser) "
+            "plus pure testable helpers. NEVER force Rust-style `Result<T, DomainError>` or ban DOM/HTML/HTTP unless the user explicitly asked for an offline pure library!\n"
+            "- Node executes `.ts` directly via `node --test` (ESM type-stripping): ALWAYS use `.ts` extensions in relative imports (e.g. `from \"../src/foo.ts\"`), NEVER `.js`. Avoid TS `enum` or parameter properties.\n"
+        )
+    if low == "python":
+        return (
+            "Stack guidance (Python):\n"
+            "- Build an AUTHENTIC, RUNNABLE idiomatic Python application (CLI, local HTTP server, or package matching the user's request).\n"
+            "- Use standard Python exceptions, dataclasses, and stdlib modules; NEVER impose Rust-style `Result<T, E>` patterns.\n"
+        )
+    if low == "go":
+        return (
+            "Stack guidance (Go):\n"
+            "- Build an AUTHENTIC, RUNNABLE idiomatic Go application (`net/http`, CLI, or package matching the user's request) using standard `error` returns and `testing`.\n"
+        )
+    return (
+        "Stack guidance (Rust):\n"
+        "- Build an AUTHENTIC, RUNNABLE idiomatic Rust crate/binary matching the user's request with `Result`, unit/integration tests, and zero `.unwrap()` in library code.\n"
+    )
+
+
+def architect_grill_turn(
+    repo: Path,
+    *,
+    idea: str,
+    history: list[dict] | None = None,
+    language: str = "typescript",
+    backend=None,
+) -> dict:
+    """Run one conversational Grill turn with the Frontier Architect.
+
+    The user just describes what they want to build (from a vague app idea in an
+    empty folder to a targeted feature in an existing repo). The Architect asks ONE
+    concrete product/UX/architecture question at a time with recommended options,
+    or sets `ready_to_plan = True` once it has enough signal to design the runnable
+    vertical slice, internal invariants, and Wave 1 cards itself.
+    """
+    from .frontier_review import _extract_json_dict
+
+    root = Path(repo).expanduser().resolve()
+    hist = list(history or [])
+    clean_idea = str(idea or "").strip()
+    existing = [
+        p.relative_to(root).as_posix()
+        for p in sorted(root.rglob("*"))
+        if p.is_file()
+        and ".git" not in p.parts
+        and ".openfarm" not in p.parts
+        and "node_modules" not in p.parts
+        and "target" not in p.parts
+    ][:30]
+
+    if backend is None:
+        if len(hist) >= 1 or len(clean_idea.split()) >= 18:
+            return {
+                "ready_to_plan": True,
+                "question": "",
+                "options": [],
+                "recommended": "",
+                "summary": "Enough context collected — ready to draft the runnable vertical slice and Wave cards.",
+            }
+        return {
+            "ready_to_plan": False,
+            "question": f"For this {language} project, what should the user interact with first?",
+            "options": [
+                "Runnable local web app in browser (HTML/CSS/TS)",
+                "Interactive CLI command",
+                "Reusable library + API",
+            ],
+            "recommended": "Runnable local web app in browser (HTML/CSS/TS)" if language == "typescript" else "Interactive CLI command",
+            "summary": "",
+        }
+
+    hist_text = "\n".join(
+        f"Q: {h.get('question', '')}\nA: {h.get('answer', '')}" for h in hist
+    ) or "(none yet)"
+    prompt = (
+        f"You are the Frontier Software Architect grilling the owner before designing a {language} project.\n"
+        f"Existing repo files: {existing or '(empty workspace)'}\n"
+        f"{_stack_authentic_guidance(language)}\n"
+        "Your job:\n"
+        "- Decide if you need 1 more high-leverage product/UX/data-source clarification from the user, OR if you have enough to design the runnable app, internal invariants, and Wave 1 cards yourself.\n"
+        "- NEVER ask the user to invent 'invariants' or 'golden slices' — YOU solve for those.\n"
+        "- Ask at most 2-3 total questions across the whole conversation; if len(history) >= 3 or the prompt is already concrete, set ready_to_plan = true.\n"
+        "Return ONLY JSON:\n"
+        '{"ready_to_plan": false, "question": "...", "options": ["...", "..."], "recommended": "...", "summary": ""}\n\n'
+        f"Owner's request:\n{clean_idea}\n\n"
+        f"Conversation so far:\n{hist_text}\n"
+    )
+    raw = str(backend.ask(prompt) if hasattr(backend, "ask") else backend(prompt))
+    parsed = _extract_json_dict(raw) or {}
+    ready = bool(parsed.get("ready_to_plan", False)) or not str(parsed.get("question") or "").strip()
+    options = [str(o).strip() for o in (parsed.get("options") or []) if str(o).strip()][:4]
+    return {
+        "ready_to_plan": ready,
+        "question": str(parsed.get("question") or "").strip(),
+        "options": options,
+        "recommended": str(parsed.get("recommended") or (options[0] if options else "")).strip(),
+        "summary": str(parsed.get("summary") or "").strip(),
+    }
+
+
+CHUNKS_REL_PATH = ".openfarm/CHUNKS.json"
+
+
+def load_project_chunks(repo: Path) -> list[dict]:
+    """Load ordered project chunks/milestones from `.openfarm/CHUNKS.json`."""
+    p = Path(repo).expanduser().resolve() / CHUNKS_REL_PATH
+    if not p.is_file():
+        return []
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    raw = data.get("chunks") if isinstance(data, dict) else data
+    if not isinstance(raw, list):
+        return []
+    out: list[dict] = []
+    for idx, item in enumerate(raw, start=1):
+        if not isinstance(item, dict):
+            continue
+        cid = str(item.get("id") or f"C{idx}").strip()
+        title = str(item.get("title") or f"Chunk {idx}").strip()
+        goal = str(item.get("goal") or "").strip()
+        status = str(item.get("status") or ("active" if idx == 1 else "pending")).strip().lower()
+        if status not in ("active", "pending", "done"):
+            status = "pending"
+        out.append({"id": cid, "title": title, "goal": goal, "status": status})
+    return out
+
+
+def save_project_chunks(repo: Path, chunks: list[dict]) -> Path:
+    """Persist ordered project chunks to `.openfarm/CHUNKS.json`."""
+    p = Path(repo).expanduser().resolve() / CHUNKS_REL_PATH
+    p.parent.mkdir(parents=True, exist_ok=True)
+    cleaned: list[dict] = []
+    for idx, item in enumerate(chunks, start=1):
+        cleaned.append({
+            "id": str(item.get("id") or f"C{idx}").strip(),
+            "title": str(item.get("title") or f"Chunk {idx}").strip(),
+            "goal": str(item.get("goal") or "").strip(),
+            "status": str(item.get("status") or ("active" if idx == 1 else "pending")).strip().lower(),
+        })
+    p.write_text(json.dumps({"chunks": cleaned}, indent=2) + "\n", encoding="utf-8")
+    return p
+
+
+def set_chunk_status(repo: Path, chunk_id: str, status: str) -> list[dict]:
+    """Update a chunk's status (`active`, `pending`, `done`) and activate the next pending chunk if done."""
+    chunks = load_project_chunks(repo)
+    if not chunks:
+        return []
+    st = str(status).strip().lower()
+    if st not in ("active", "pending", "done"):
+        raise Refused("bad-chunk-status", f"invalid chunk status {status!r}")
+    found = False
+    for c in chunks:
+        if c["id"] == chunk_id:
+            c["status"] = st
+            found = True
+    if not found:
+        raise Refused("unknown-chunk", f"chunk {chunk_id!r} not found")
+    if st == "done" and not any(c["status"] == "active" for c in chunks):
+        for c in chunks:
+            if c["status"] == "pending":
+                c["status"] = "active"
+                break
+    save_project_chunks(repo, chunks)
+    return chunks
+
+
+def draft_spec_and_chunks(
+    repo: Path,
+    *,
+    idea: str,
+    grill_history: list[dict] | None = None,
+    language: str = "",
+    backend=None,
+    on_progress=None,
+) -> dict:
+    """Flesh out `.openfarm/PROJECT_SPEC.md` and split it into ordered chunks (`.openfarm/CHUNKS.json`).
+
+    Implements the middle stages of:
+      Idea -> grill -> spec fleshed out -> spec split into chunks -> chunks split into cards
+    """
+    from .frontier_review import _extract_json_dict
+
+    root = Path(repo).expanduser().resolve()
+    cfg = None
+    try:
+        cfg = load_config(root)
+    except (ConfigError, OSError):
+        cfg = None
+    lang = (language or (cfg.languages[0] if (cfg and cfg.languages) else "typescript")).strip().lower()
+    clean_idea = str(idea or "").strip() or f"Build {root.name}"
+    hist = list(grill_history or [])
+
+    if callable(on_progress):
+        on_progress("Fleshing out living spec & splitting into chunks...")
+
+    decisions_path = root / ".openfarm" / "GRILL_DECISIONS.md"
+    decisions_path.parent.mkdir(parents=True, exist_ok=True)
+    dec_lines = ["# Architect Grill Decisions\n", f"## What we are building\n\n{clean_idea}\n"]
+    for turn in hist:
+        q = str(turn.get("question") or "Clarification").strip()
+        a = str(turn.get("answer") or "").strip()
+        if a:
+            dec_lines.append(f"## {q}\n\n{a}\n")
+    decisions_path.write_text("\n".join(dec_lines), encoding="utf-8")
+
+    spec_md = ""
+    chunks: list[dict] = []
+    if backend is not None:
+        existing_spec = ""
+        sp = root / ".openfarm" / "PROJECT_SPEC.md"
+        if sp.is_file():
+            existing_spec = sp.read_text(encoding="utf-8", errors="replace").strip()[:2500]
+        existing_files = [
+            p.relative_to(root).as_posix()
+            for p in sorted(root.rglob("*"))
+            if p.is_file()
+            and ".git" not in p.parts
+            and ".openfarm" not in p.parts
+            and "node_modules" not in p.parts
+            and "target" not in p.parts
+        ][:30]
+        prompt = (
+            f"You are the Frontier Software Architect for this {lang} project (`{root.name}`).\n"
+            f"Existing repo files: {existing_files or '(empty workspace)'}\n"
+            f"{_stack_authentic_guidance(lang)}\n"
+            "Your job:\n"
+            "1. Flesh out a concrete, inspiring, runnable Product & Technical Specification in Markdown (`.openfarm/PROJECT_SPEC.md`):\n"
+            "   - Product Vision & User Experience (faithful to the owner's idea, whether a full app or a feature in an existing repo)\n"
+            "   - Architecture & How to Run It locally\n"
+            "   - Internal Safety Invariants (derived by YOU — never turn a visual web app into a pure offline library)\n"
+            "2. Split the spec into 2 to 4 ordered deliverable Chunks (milestones), where Chunk 1 delivers the core runnable experience end-to-end and subsequent chunks expand it iteratively.\n"
+            "Return ONLY valid JSON:\n"
+            '{"spec_markdown": "# ...", "chunks": [{"id": "C1", "title": "...", "goal": "..."}, ...]}\n\n'
+            + "\n".join(dec_lines)
+            + (f"\nExisting spec (if iterating):\n{existing_spec}\n" if existing_spec else "")
+        )
+        raw = str(backend.ask(prompt) if hasattr(backend, "ask") else backend(prompt))
+        parsed = _extract_json_dict(raw) or {}
+        spec_md = str(parsed.get("spec_markdown") or "").strip()
+        raw_chunks = parsed.get("chunks") if isinstance(parsed, dict) else None
+        if isinstance(raw_chunks, list):
+            for idx, item in enumerate(raw_chunks, start=1):
+                if isinstance(item, dict) and str(item.get("title") or "").strip():
+                    chunks.append({
+                        "id": str(item.get("id") or f"C{idx}").strip(),
+                        "title": str(item.get("title") or "").strip(),
+                        "goal": str(item.get("goal") or "").strip(),
+                        "status": "active" if idx == 1 else "pending",
+                    })
+
+    if not spec_md:
+        qa_block = "\n".join(
+            f"- **{t.get('question', 'Decision')}**: {t.get('answer', '')}" for t in hist if str(t.get("answer") or "").strip()
+        )
+        spec_md = (
+            f"# {root.name} — Product Specification ({lang})\n\n"
+            f"## Vision & Experience\n\n{clean_idea}\n\n"
+            + (f"## Clarifications\n\n{qa_block}\n\n" if qa_block else "")
+            + f"## Architecture ({lang})\n\n"
+            "- Runnable vertical slice with deterministic automated tests.\n"
+            "- Modular separation between presentation/entrypoint and core logic.\n"
+        )
+    if not chunks:
+        short_title = clean_idea.splitlines()[0][:64].strip() or f"{root.name} Core Experience"
+        chunks = [
+            {
+                "id": "C1",
+                "title": f"Core Runnable Slice: {short_title}",
+                "goal": f"Deliver the initial runnable {lang} experience end-to-end with passing baseline tests.",
+                "status": "active",
+            },
+            {
+                "id": "C2",
+                "title": "Interactive Depth & Polish",
+                "goal": "Expand interactive features, visual/UX richness, and edge-case handling per the spec.",
+                "status": "pending",
+            },
+        ]
+
+    spec_path = root / ".openfarm" / "PROJECT_SPEC.md"
+    spec_path.write_text(spec_md.rstrip() + "\n", encoding="utf-8")
+    chunks_path = save_project_chunks(root, chunks)
+    written = [".openfarm/GRILL_DECISIONS.md", ".openfarm/PROJECT_SPEC.md", CHUNKS_REL_PATH]
+    return {
+        "spec_path": str(spec_path),
+        "spec_text": spec_md.rstrip() + "\n",
+        "chunks_path": str(chunks_path),
+        "chunks": load_project_chunks(root),
+        "written": written,
+    }
+
+
 def run_grill_and_architect(
     repo: Path,
     *,
-    answers: list[dict],
+    answers: list[dict] | None = None,
+    idea: str = "",
+    grill_history: list[dict] | None = None,
+    chunk_id: str | None = None,
     backend=None,
+    on_progress=None,
 ) -> dict:
     """Write `.openfarm/GRILL_DECISIONS.md` and expand spec/cards via Frontier backend."""
     from .globs import matches_any
@@ -565,20 +875,49 @@ def run_grill_and_architect(
         cfg = load_config(root)
     except (ConfigError, OSError):
         cfg = None
-    lang = (cfg.languages[0] if (cfg and cfg.languages) else "rust").lower()
+    lang = (cfg.languages[0] if (cfg and cfg.languages) else "typescript").lower()
     never_touch = list(getattr(cfg, "never_touch", ()) or ()) if cfg else []
     forbidden = list(getattr(cfg, "forbidden_files", ()) or ()) if cfg else []
 
+    normalized_answers: list[dict] = []
+    if idea.strip():
+        normalized_answers.append({"id": "goal", "question": "What we are building", "answer": idea.strip()})
+    for turn in (grill_history or []):
+        q = str(turn.get("question") or "Clarification").strip()
+        a = str(turn.get("answer") or "").strip()
+        if a:
+            normalized_answers.append({"id": "grill", "question": q, "answer": a})
+    if answers:
+        normalized_answers.extend(answers)
+    if not normalized_answers:
+        normalized_answers.append({"id": "goal", "question": "What we are building", "answer": f"Build {root.name}"})
+
     decisions_path = root / ".openfarm" / "GRILL_DECISIONS.md"
     decisions_path.parent.mkdir(parents=True, exist_ok=True)
-    lines = ["# Grill Decisions\n"]
-    for item in answers:
-        q = str(item.get("question") or item.get("id") or "Question")
+    lines = ["# Architect Grill Decisions\n"]
+    for item in normalized_answers:
+        q = str(item.get("question") or item.get("id") or "Context")
         a = str(item.get("answer") or "").strip()
         lines.append(f"## {q}\n\n{a}\n")
     decisions_path.write_text("\n".join(lines), encoding="utf-8")
 
     written: list[str] = [".openfarm/GRILL_DECISIONS.md"]
+    existing_chunks = load_project_chunks(root)
+    active_chunk: dict | None = None
+    if existing_chunks:
+        if chunk_id:
+            active_chunk = next((c for c in existing_chunks if c["id"] == chunk_id), None)
+        if active_chunk is None:
+            active_chunk = next((c for c in existing_chunks if c.get("status") == "active"), None) or next(
+                (c for c in existing_chunks if c.get("status") != "done"), existing_chunks[0]
+            )
+    existing_spec_path = root / ".openfarm" / "PROJECT_SPEC.md"
+    existing_spec_text = (
+        existing_spec_path.read_text(encoding="utf-8", errors="replace").strip()
+        if existing_spec_path.is_file()
+        else ""
+    )
+
     if backend is not None:
         existing_files = [
             p.relative_to(root).as_posix()
@@ -589,29 +928,45 @@ def run_grill_and_architect(
             and "node_modules" not in p.parts
             and "target" not in p.parts
         ][:40]
-        ts_rule = (
-            "TypeScript rule: Node executes `.ts` directly via `node --test` (ESM type-stripping); "
-            "ALWAYS use `.ts` extensions in relative imports (e.g. `from \"../src/foo.ts\"`), NEVER `.js`.\n"
-            if lang == "typescript"
-            else ""
-        )
+        chunk_section = ""
+        if active_chunk is not None:
+            chunk_section = (
+                f"\nActive Chunk to split into cards now:\n"
+                f"  - ID: {active_chunk['id']}\n"
+                f"  - Title: {active_chunk['title']}\n"
+                f"  - Goal: {active_chunk.get('goal', '')}\n"
+                f"  (Do NOT delete completed chunks; split THIS active chunk into 2 to 5 concrete cards.)\n"
+            )
+        spec_section = f"\nExisting Living Spec (`.openfarm/PROJECT_SPEC.md`):\n{existing_spec_text[:3500]}\n" if existing_spec_text else ""
         prompt = (
-            f"Expand this {lang} Openfarm repository from the owner's Grill decisions.\n"
-            f"Language stack: {lang} (STRICT: generate ONLY {lang} source/test files — NEVER emit .rs or Cargo.toml in a non-Rust project).\n"
-            f"{ts_rule}"
+            f"You are the Frontier Software Architect for this {lang} Openfarm repository.\n"
+            f"Language stack: {lang} (STRICT: generate ONLY {lang} files — NEVER emit .rs or Cargo.toml in a non-Rust project).\n"
+            f"{_stack_authentic_guidance(lang)}"
             f"Locked never_touch files (DO NOT modify or list in card touches): {never_touch}\n"
             f"Existing repository files: {existing_files}\n"
+            f"{spec_section}{chunk_section}"
+            "YOU are responsible for deriving:\n"
+            "  - The full, faithful product architecture tailored directly to the owner's request (whether it's a whole new runnable app or a feature in an existing codebase)\n"
+            "  - Internal safety invariants (without turning a web app into a pure offline library)\n"
+            "  - A real, runnable vertical slice with passing baseline tests\n"
+            "  - 2 to 5 scoped, non-overlapping Wave cards that implement the active chunk (or Chunk 1)\n"
             "Return ONLY a JSON object: {\"files\": {\"<repo-relative-path>\": \"<content>\", ...}}.\n"
             "Include:\n"
-            "1. `.openfarm/PROJECT_SPEC.md` (concrete architecture & vertical slice)\n"
-            f"2. One clean {lang} golden reference vertical slice file and passing baseline test matching the stack\n"
-            "3. 2 to 5 scoped, non-overlapping Wave 1 cards under `cards/W1-01.md`.. using TOML +++ headers "
-            "(id, title, state=\"ready\", category=\"small-feature\", touches, reference, new_symbols=true, depends, tests=[{name, file, asserts}]) "
-            "and concrete `## Done` sections without vague adjectives.\n"
+            "1. `.openfarm/PROJECT_SPEC.md` (clear product spec, architecture, how to run it, and Chunks/Waves plan — preserve/refine existing spec if present)\n"
+            "2. `.openfarm/CHUNKS.json` (ordered milestone chunks `{\"chunks\": [{\"id\": \"C1\", \"title\": \"...\", \"goal\": \"...\", \"status\": \"active\"}, ...]}` if not already present)\n"
+            f"3. The runnable {lang} vertical slice file(s) and passing baseline test(s)\n"
+            "4. 2 to 5 scoped, non-overlapping Wave cards under `cards/W1-01.md`.. (or `W2-01.md` for later chunks) using TOML +++ headers "
+            "(id, title, state=\"ready\", category=\"small-feature\", wave=1, touches, reference, new_symbols=true, depends, tests=[{name, file, asserts}]) "
+            "and concrete `## Done` sections without vague adjectives. "
+            "Prefer exported functions (e.g. `export function neutralTheme()`) over non-function module constants for newly introduced symbols so TDD scaffolds compile cleanly.\n"
             "Never modify `.openfarm/config.toml` or `never_touch` files.\n\n"
             + "\n".join(lines)
         )
+        if callable(on_progress):
+            on_progress(f"Sending {len(prompt):,} char prompt to Frontier Architect ({lang})...")
         raw = str(backend.ask(prompt) if hasattr(backend, "ask") else backend(prompt))
+        if callable(on_progress):
+            on_progress(f"Architect responded ({len(raw):,} chars) — extracting files...")
         from .frontier_review import _extract_json_dict
         parsed = _extract_json_dict(raw) or {}
         files = parsed.get("files") if isinstance(parsed, dict) else None
@@ -628,17 +983,33 @@ def run_grill_and_architect(
                 if target is None:
                     continue
                 target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(str(content), encoding="utf-8")
+                text_out = str(content)
+                target.write_text(text_out, encoding="utf-8")
                 written.append(rel_s)
+                if callable(on_progress):
+                    on_progress(f"Wrote {rel_s} ({len(text_out.splitlines())} lines)")
     else:
-        spec_path = root / ".openfarm" / "PROJECT_SPEC.md"
-        spec_lines = [f"# {root.name} — Project Specification\n"]
-        for item in answers:
-            q = str(item.get("question") or item.get("id") or "")
-            a = str(item.get("answer") or "").strip()
-            spec_lines.append(f"## {q}\n\n{a}\n")
-        spec_path.write_text("\n".join(spec_lines), encoding="utf-8")
-        written.append(".openfarm/PROJECT_SPEC.md")
+        if not existing_spec_text:
+            spec_lines = [f"# {root.name} — Project Specification ({lang})\n"]
+            for item in normalized_answers:
+                q = str(item.get("question") or item.get("id") or "")
+                a = str(item.get("answer") or "").strip()
+                spec_lines.append(f"## {q}\n\n{a}\n")
+            existing_spec_path.write_text("\n".join(spec_lines), encoding="utf-8")
+            written.append(".openfarm/PROJECT_SPEC.md")
+    if not load_project_chunks(root):
+        short_goal = str(normalized_answers[0].get("answer") or f"Build {root.name}").splitlines()[0][:64]
+        save_project_chunks(
+            root,
+            [
+                {"id": "C1", "title": f"Core Runnable Slice: {short_goal}", "goal": short_goal, "status": "active"},
+                {"id": "C2", "title": "Iteration & Polish", "goal": "Expand capabilities and polish UX per spec", "status": "pending"},
+            ],
+        )
+        if CHUNKS_REL_PATH not in written:
+            written.append(CHUNKS_REL_PATH)
+
+    answers = normalized_answers
 
     cards_dir = root / "cards"
     cards_dir.mkdir(parents=True, exist_ok=True)
@@ -873,10 +1244,82 @@ def _repair_card_for_eligibility(
     return h, b, True
 
 
+def _ensure_card_touch_placeholders(root: Path, cfg, cards_dir: Path, written: list[str]) -> list[str]:
+    """Ensure every ready card's non-test production `touches` file exists on base.
+
+    Openfarm's deterministic `additions-only-new-file` guard permits the test writer
+    to append stubs only to production files that already exist on the base branch.
+    Creating minimal empty placeholder modules for newly introduced files before
+    committing the baseline prevents greenfield multi-module cards from deadlocking.
+    """
+    from .adapters.files import parse_card_file
+    from .findings import is_finding_id_or_header
+    from .globs import matches_any
+
+    never_touch = list(getattr(cfg, "never_touch", ()) or ()) if cfg else []
+    forbidden = list(getattr(cfg, "forbidden_files", ()) or ()) if cfg else []
+    created: list[str] = []
+
+    def _is_test_path(rel: str) -> bool:
+        low = rel.lower()
+        name = Path(rel).name.lower()
+        return (
+            low.startswith("tests/")
+            or "/tests/" in low
+            or low.startswith("test/")
+            or ".test." in name
+            or ".spec." in name
+            or name.startswith("test_")
+            or name.endswith("_test.go")
+            or name.endswith("_test.py")
+            or name.endswith("_tests.rs")
+        )
+
+    for md in sorted(cards_dir.glob("*.md")):
+        try:
+            header, _ = parse_card_file(md.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, ValueError):
+            continue
+        cid = str(header.get("id") or md.stem)
+        if is_finding_id_or_header(cid, header):
+            continue
+        if str(header.get("state") or "ready").lower() not in ("ready", "backlog"):
+            continue
+        for raw_touch in header.get("touches") or []:
+            rel = str(raw_touch or "").strip().lstrip("/")
+            if not rel or "*" in rel or _is_test_path(rel):
+                continue
+            if matches_any(rel, never_touch) or matches_any(rel, forbidden):
+                continue
+            target = resolves_within(root, rel)
+            if target is None or target.exists():
+                continue
+            suffix = target.suffix.lower()
+            if suffix in (".ts", ".tsx", ".mts", ".cts", ".js", ".mjs"):
+                stub = f"// Placeholder module for card {cid} — implemented by openfarm worker.\nexport {{}};\n"
+            elif suffix == ".py":
+                stub = f'"""Placeholder module for card {cid} — implemented by openfarm worker."""\n'
+            elif suffix == ".go":
+                stub = f"// Placeholder module for card {cid}.\npackage main\n"
+            elif suffix == ".rs":
+                stub = f"// Placeholder module for card {cid}.\n"
+            else:
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(stub, encoding="utf-8")
+            created.append(rel)
+            if rel not in written:
+                written.append(rel)
+    return created
+
+
 def draft_wave_plan(
     repo: Path,
     *,
-    answers: list[dict],
+    answers: list[dict] | None = None,
+    idea: str = "",
+    grill_history: list[dict] | None = None,
+    chunk_id: str | None = None,
     backend=None,
     max_repairs: int = 2,
     include_picked_findings: bool = True,
@@ -895,8 +1338,20 @@ def draft_wave_plan(
             on_progress(msg)
 
     root = Path(repo).expanduser().resolve()
-    _emit_progress("Designing spec, golden slice & Wave cards...")
-    res = run_grill_and_architect(root, answers=answers, backend=backend)
+    _emit_progress(
+        f"Splitting chunk {chunk_id} into scoped Wave cards..."
+        if chunk_id
+        else "Designing spec, chunks, runnable vertical slice & Wave cards..."
+    )
+    res = run_grill_and_architect(
+        root,
+        answers=answers,
+        idea=idea,
+        grill_history=grill_history,
+        chunk_id=chunk_id,
+        backend=backend,
+        on_progress=_emit_progress,
+    )
     written = list(res.get("written") or [])
 
     cfg = load_config(root)
@@ -904,7 +1359,12 @@ def draft_wave_plan(
     cards_dir.mkdir(parents=True, exist_ok=True)
     lang = (cfg.languages[0] if cfg.languages else "rust").lower()
     if lang == "typescript":
-        _fix_typescript_relative_js_imports(root)
+        fixed_imports = _fix_typescript_relative_js_imports(root)
+        if fixed_imports:
+            _emit_progress(f"Normalized .js -> .ts relative imports in {fixed_imports} file(s)")
+    placeholders = _ensure_card_touch_placeholders(root, cfg, cards_dir, written)
+    if placeholders:
+        _emit_progress(f"Prepared {len(placeholders)} placeholder module(s): {', '.join(placeholders[:4])}")
 
     baseline_ok = True
     baseline_error = ""
@@ -1042,6 +1502,7 @@ def draft_wave_plan(
     return {
         "written": written,
         "decisions_path": res.get("decisions_path", ""),
+        "chunks": load_project_chunks(root),
         "cards": planned_cards,
         "triage_counts": triage_counts,
         "eligibility_ok": all_ok and len(planned_cards) > 0,
@@ -1070,13 +1531,15 @@ def ensure_baseline_committed(repo: Path, *, extra_allowed: list[str] | None = N
         return False
     allowed_extra = {str(p).strip().lstrip("/") for p in (extra_allowed or ()) if str(p).strip()}
     paths = [line[3:].strip().split(" -> ")[-1].strip('"') for line in lines if len(line) > 3]
-    if paths and all(
-        p.startswith(".openfarm/")
-        or p.startswith("cards/")
-        or p in (".openfarm", "cards")
-        or p in allowed_extra
-        for p in paths
-    ):
+
+    def _path_is_allowed(p: str) -> bool:
+        if p.startswith(".openfarm/") or p.startswith("cards/") or p in (".openfarm", "cards") or p in allowed_extra:
+            return True
+        if p.endswith("/") and any(a.startswith(p) for a in allowed_extra):
+            return True
+        return False
+
+    if paths and all(_path_is_allowed(p) for p in paths):
         git.commit_all("chore: commit openfarm spec and cards")
         return True
     return False

@@ -266,6 +266,7 @@ def _render_config_toml(
     endpoint: str,
     key_file: Path,
     model: str,
+    model_headers: dict[str, str] | None = None,
     mm_adapter: str,
     mm_mode: str,
     mm_auth: str = "oauth",
@@ -276,6 +277,7 @@ def _render_config_toml(
     return render_config(
         name=project_slug, language=language, base_branch=base_branch,
         state_dir=state_dir, key_file=key_file, endpoint=endpoint, model=model,
+        model_headers=model_headers,
         never_touch=nt,
         test_conventions=".openfarm/test-conventions.md",
         cargo_flags=(["--locked"] if language == "rust" else []),
@@ -389,11 +391,15 @@ def initialize_project(
 
     gp = load_global_providers()
     gp_wk = gp.get("worker") if isinstance(gp, dict) else {}
+    inherited_headers: dict[str, str] = {}
     if is_placeholder_endpoint(endpoint) and not is_placeholder_endpoint(str((gp_wk or {}).get("endpoint") or "")):
-        endpoint = str(gp_wk["endpoint"])
+        endpoint = str(gp_wk["endpoint"]).strip()
+        ep = endpoint
+        if bool((gp_wk or {}).get("zdr", False)):
+            inherited_headers["x-cmd-zdr"] = "1"
         if model in ("", "lesser-coder") and str(gp_wk.get("model") or "").strip():
             model = str(gp_wk["model"]).strip()
-        if key_file is None and str(gp_wk.get("key_file") or "").strip():
+        if key_file is None and secrets_dir is None and str(gp_wk.get("key_file") or "").strip():
             cand_kf = Path(str(gp_wk["key_file"])).expanduser().resolve()
             if not cand_kf.is_relative_to(target_dir):
                 key_file = cand_kf
@@ -726,6 +732,7 @@ def initialize_project(
             endpoint=ep,
             key_file=resolved_key,
             model=str(model or "lesser-coder"),
+            model_headers=inherited_headers or None,
             mm_adapter=mm_adapter,
             mm_mode=mm_mode,
             mm_auth=mm_auth,

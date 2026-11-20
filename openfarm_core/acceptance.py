@@ -98,9 +98,8 @@ def _run_http_check(worktree: Path, check: dict) -> dict:
             proc = subprocess.Popen(
                 start_cmd,
                 cwd=str(worktree),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
                 start_new_session=True,
             )
         deadline = time.monotonic() + startup_timeout

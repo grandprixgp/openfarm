@@ -42,7 +42,8 @@ def known_failing_lines(proposed: list[str] | None, base_branch: str) -> list[st
 
 def render_config(*, name: str, language: str, base_branch: str, state_dir: Path,
                   key_file: Path, endpoint: str = "https://api.example.invalid/v1",
-                  model: str = "lesser-coder", never_touch: list[str] | None = None,
+                  model: str = "lesser-coder", model_headers: dict[str, str] | None = None,
+                  never_touch: list[str] | None = None,
                   test_conventions: str = "", cargo_flags: list[str] | None = None,
                   mutation: str = "off", mm_adapter: str = "claude-acp",
                   mm_mode: str = "active", mm_auth: str = "oauth",
@@ -94,6 +95,11 @@ def render_config(*, name: str, language: str, base_branch: str, state_dir: Path
     mutation_required = ["test-backfill"] if mutation != "off" else []
     state_dir = Path(state_dir)
 
+    hdr_lines: list[str] = []
+    if model_headers:
+        pairs = ", ".join(f"{toml_str(k)} = {toml_str(v)}" for k, v in model_headers.items())
+        hdr_lines.append(f"headers = {{ {pairs} }}")
+
     lines = [
         "[project]",
         f"name = {toml_str(name)}",
@@ -114,6 +120,7 @@ def render_config(*, name: str, language: str, base_branch: str, state_dir: Path
         f"endpoint = {toml_str(endpoint)}",
         f"allowed_endpoints = [{toml_str(endpoint)}]",
         f"key_file = {toml_str(str(key_file))}",
+        *hdr_lines,
         "# Reasoning models think before they answer, and that counts against this.",
         "max_tokens = 32768",
         "cost_per_1k_in = 0.0005",
