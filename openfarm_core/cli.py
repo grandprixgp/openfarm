@@ -2960,6 +2960,8 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--dir", default=None,
                       help="target directory (default: <repo>/<project_slug> or current repo)")
     init.add_argument("--idea", default="", help="plain-English project idea")
+    init.add_argument("--lang", choices=("rust", "python", "typescript", "go", "auto"), default="rust",
+                      help="project language stack (default: rust)")
     init.add_argument("--profile", choices=PROFILES, default="auto",
                       help="micromanager profile (default: auto)")
     init.add_argument("--acp-provider", choices=("claude", "antigravity", "codex"),
@@ -3269,6 +3271,7 @@ def cmd_init(args) -> int:
         directory=directory,
         repo_base=repo_base,
         idea=args.idea,
+        language=getattr(args, "lang", "rust"),
         profile=args.profile,
         acp_provider=args.acp_provider,
         state_dir=Path(args.state_dir) if args.state_dir else None,
