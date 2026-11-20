@@ -1148,7 +1148,7 @@ def run_grill_and_architect(
             "Include ONLY:\n"
             + "\n".join(include_lines)
             + "\nRules:\n- "
-            + "\n- ".join(omit_rules)
+            + "\n- ".join([*omit_rules, __import__("openfarm_core.blocked", fromlist=["BUILD_RULES"]).BUILD_RULES])
             + "\n\n"
             + "\n".join(lines)
         )

@@ -56,6 +56,15 @@ _PLAIN = {
 }
 
 
+#: What the build refuses in new code, said to whoever writes a task so the task doesn't ask for it.
+BUILD_RULES = (
+    "The build refuses new code that calls the network directly (a bare `fetch(` call, `XMLHttpRequest`, `WebSocket`), "
+    "starts a process, or runs code built at run time (`eval`, `Function(`, a computed `import(`), in any file, browser "
+    "code and code inside strings included. A task that needs the network says how: the function is passed in or held "
+    "in a value first (`const net = globalThis.fetch; await net(url)`), never called by its bare name."
+)
+
+
 def _same_way(record: dict, earlier: list[dict]) -> bool:
     key = (record.get("stop_code"), str(record.get("detail") or "")[:160])
     return any((r.get("stop_code"), str(r.get("detail") or "")[:160]) == key for r in earlier)
@@ -111,10 +120,48 @@ def records(state_dir: Path, card_id: str) -> list[dict]:
     return sorted(found, key=lambda r: str(r.get("claimed_at") or ""))
 
 
+_RULE_WORDS = {
+    "network-call": "the code calls the network directly",
+    "process-call": "the code starts another program",
+    "dynamic-exec": "the code builds and runs code at run time",
+    "swallowed-exception": "the code hides an error",
+    "leftover-stub": "a placeholder was left in",
+}
+
+
+def failed_checks(state_dir: Path, record: dict) -> list[str]:
+    """The checks that failed in a run, one plain line each, repeats folded (the stop reason often hides them)."""
+    folder = Path(state_dir) / "cards" / str(record.get("card_id")) / str(record.get("run_id")) / "gates"
+    lines: list[str] = []
+    for path in sorted(folder.glob("*/*.json")):
+        try:
+            gate = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if gate.get("result") != "fail" or str(gate.get("name", "")).startswith("micromanager"):
+            continue
+        labels = {str(b.get("pattern")) for b in (gate.get("evidence") or {}).get("banned") or [] if isinstance(b, dict)}
+        said = "; ".join(sorted(_RULE_WORDS.get(label, label) for label in labels))
+        line = (f"a build rule was broken: {said}" if said else f"{gate.get('name')}: {str(gate.get('detail') or '')[:200]}")
+        if line not in lines:
+            lines.append(line)
+    return lines
+
+
 def triage_card(state_dir: Path, card_id: str) -> dict | None:
     """`triage` for a task's latest run, or None when it has never run."""
     runs = records(state_dir, card_id)
-    return triage(runs[-1], runs[:-1]) if runs else None
+    if not runs:
+        return None
+    got = triage(runs[-1], runs[:-1])
+    checks = failed_checks(state_dir, runs[-1])
+    if checks and got["kind"] != "check":
+        got["why"] += " What failed on the way: " + "; ".join(checks) + "."
+        # Every try broke a rule the task's own text asks for: retrying the same task can't end differently.
+        if got["kind"] == "builder" and all(c.startswith("a build rule") for c in checks) and int(runs[-1].get("attempts") or 0) > 1:
+            got.update(triage(dict(runs[-1], stop_code="cannot-split")), why=got["why"])
+    got["checks"] = checks
+    return got
 
 
 def propose_fix(root: Path, cfg, store, card_id: str, why: str = "", backend=None) -> dict | None:
@@ -137,6 +184,7 @@ def propose_fix(root: Path, cfg, store, card_id: str, why: str = "", backend=Non
             "This openfarm task card could not be built. Rewrite the card so it can be, keeping what it delivers.\n"
             f"What the builder reported: {why or 'no diagnosis'}\n"
             "Rules: every file the text names is in `touches`; no parameter defaults in a signature.\n"
+            f"{BUILD_RULES}\n"
             'Return ONLY JSON: {"card": "<the whole card file, +++ TOML header and body>", "change": "<one sentence>"}\n\n'
             + before
         )

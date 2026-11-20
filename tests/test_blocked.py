@@ -45,6 +45,29 @@ class TriageTests(unittest.TestCase):
         self.assertTrue(got["why"].startswith("The reviewer's answer could not be read, so the work was never judged."))
         self.assertNotIn("turned the work down", got["why"])
 
+    def test_the_check_that_really_failed_is_named_when_the_stop_reason_hides_it(self) -> None:
+        # from the acceptance run: "planner step 1 failed twice" hid a build rule broken on every try
+        import tempfile
+        from pathlib import Path
+
+        from openfarm_core.blocked import BUILD_RULES, triage_card
+
+        state = Path(tempfile.mkdtemp())
+        run = state / "cards" / "W1-03" / "run-1"
+        for attempt, label in (("1", "network-call"), ("2", "dynamic-exec")):
+            (run / "gates" / attempt).mkdir(parents=True)
+            (run / "gates" / attempt / "banned-patterns.json").write_text(json.dumps({
+                "name": "banned-patterns", "result": "fail", "detail": f"1 banned pattern(s) introduced: src/page.ts:147 {label}",
+                "evidence": {"banned": [{"file": "src/page.ts", "pattern": label, "line": 147}]}}))
+        (run / "card-record.json").write_text(json.dumps({
+            "run_id": "run-1", "card_id": "W1-03", "claimed_at": "1", "stop_code": "cannot-split", "attempts": 4,
+            "detail": "planner step 1 failed twice"}))
+        got = triage_card(state, "W1-03")
+        self.assertEqual((got["kind"], got["main_label"]), ("task", "Apply fix and retry"))
+        self.assertIn("the code calls the network directly", got["why"])
+        self.assertIn("the code builds and runs code at run time", got["why"])
+        self.assertIn("calls the network directly", BUILD_RULES)
+
     def test_the_same_failure_twice_stops_being_the_builders_fault(self) -> None:
         record = _record("banned-pattern")
         self.assertEqual(triage(record, [dict(record)])["kind"], "task")
