@@ -513,6 +513,23 @@ class FileCardSource:
             self._write(card_id, header, body, f"{card_id}: done")
             return {"state": "done"}
 
+    def accept_blocked(self, card_id: str, by: str, note: str) -> dict:
+        """A person has checked a blocked card's work and takes it as it is.
+
+        The card goes to review with who accepted it and why written on it, so
+        `mark_done` can follow the merge like for any reviewed card.
+        """
+        with self._lock:
+            header, body, _ = self._read_raw(card_id)
+            if header.get("state") != "blocked":
+                raise Refused("not-blocked", f"{card_id} is {header.get('state')}, not blocked")
+            header["state"] = "in_review"
+            header["accepted_by"] = by
+            header["accepted_note"] = note
+            header["accepted_at"] = utc_now()
+            self._write(card_id, header, body, f"{card_id}: accepted while blocked by {by}")
+            return {"state": "in_review"}
+
     def release(self, card_id: str, lease_id: str = "", reason: str = "",
                 stop_code: str = "") -> dict:
         with self._lock:

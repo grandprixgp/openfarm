@@ -19,6 +19,7 @@ import contextlib
 import datetime as _dt
 import difflib
 import functools
+import getpass
 import inspect
 import io
 import json
@@ -1699,7 +1700,10 @@ def cmd_done(ctx: Context, args) -> int:
     base = ctx.cfg.base_branch
     branch = f"openfarm/{card.id}-{card.slug()}"
     reason = ""
-    if not git.ref_exists(f"refs/heads/{base}"):
+    if card.state == "blocked":
+        reason = (f"{card_id} is blocked, not in review. If you have checked its work yourself, "
+                  f"accept it with: openfarm land {card_id} --accept-blocked --note \"what you checked\"")
+    elif not git.ref_exists(f"refs/heads/{base}"):
         reason = f"the base branch {base} does not exist"
     elif not git.branch_exists(branch):
         reason = f"there is no branch {branch} to check"
@@ -1941,6 +1945,10 @@ def cmd_land(ctx: Context, args) -> int:
     cards_by_id = {c.id: c for c in source.all_cards()}
     landed: list[dict] = []
     dry_run = bool(getattr(args, "dry_run", False))
+    accept_blocked = bool(getattr(args, "accept_blocked", False))
+    accept_note = str(getattr(args, "note", "") or "").strip()
+    if accept_blocked and not accept_note:
+        raise UsageError("--accept-blocked needs --note saying what you checked")
     runner = open_runner(ctx.cfg, ctx.repo)
 
     for cid in card_ids:
@@ -1949,9 +1957,33 @@ def cmd_land(ctx: Context, args) -> int:
             payload = {"landed": landed, "stopped_at": cid, "reason": f"no such card {cid}"}
             _emit_ctx(ctx, payload, "land")
             return EXIT_REFUSED
+        if accept_blocked and card.state == "blocked" and not dry_run:
+            # A person has checked this card's work and overrules the gate that blocked it.
+            # Who and why go on the card and in the run's verdict, then it lands like any card.
+            runs = sorted(ctx.state.cards.glob(f"{cid}/*/card-record.json"))
+            if not runs or not git.branch_exists(f"openfarm/{card.id}-{card.slug()}"):
+                payload = {"landed": landed, "stopped_at": cid,
+                           "reason": f"{cid} has no finished work on a branch to accept"}
+                _emit_ctx(ctx, payload, "land")
+                return EXIT_REFUSED
+            if not hasattr(source, "accept_blocked"):
+                payload = {"landed": landed, "stopped_at": cid,
+                           "reason": "this card source cannot accept a blocked card"}
+                _emit_ctx(ctx, payload, "land")
+                return EXIT_REFUSED
+            who = git._run(["config", "user.name"], check=False).stdout.strip() or getpass.getuser()
+            source.accept_blocked(cid, by=who, note=accept_note)
+            write_json(runs[-1].parent / "verdict.json", {
+                "card": cid, "verdict": "clean", "review_tokens": 0, "minutes": None,
+                "note": accept_note, "at": utc_now(), "by": f"person/{who}",
+                "accepted_blocked": True,
+            })
+            card = next(c for c in source.all_cards() if c.id == cid)
         if card.state != "in_review":
+            hint = (f". If you have checked its work yourself: openfarm land {cid} --accept-blocked "
+                    f"--note \"what you checked\"") if card.state == "blocked" else ""
             payload = {"landed": landed, "stopped_at": cid,
-                       "reason": f"{cid} is in state {card.state!r}, not 'in_review'"}
+                       "reason": f"{cid} is in state {card.state!r}, not 'in_review'{hint}"}
             _emit_ctx(ctx, payload, "land")
             return EXIT_REFUSED
         # Require an approved verdict ('clean' or 'minor-fix') in the latest run's verdict.json.
@@ -2785,6 +2817,10 @@ def build_parser() -> argparse.ArgumentParser:
                       help="trial-merge and verify only, without modifying base_branch")
     land.add_argument("--promote-integration", action="store_true",
                       help="merge local [factory] integration_branch into base_branch (zero push)")
+    land.add_argument("--accept-blocked", action="store_true",
+                      help="you have checked a blocked card's work yourself: record who and why "
+                           "(--note is required), then land it like a reviewed card")
+    land.add_argument("--note", default=None, help="with --accept-blocked: what you checked")
 
     plan_p = sub.add_parser(
         "plan",
@@ -2866,11 +2902,14 @@ def build_parser() -> argparse.ArgumentParser:
     verdict.add_argument("card")
     verdict.add_argument("verdict",
                          choices=("clean", "minor-fix", "bounced", "scrapped"))
-    verdict.add_argument("--review-tokens", type=int, required=True)
+    verdict.add_argument("--review-tokens", type=int, default=0,
+                         help="tokens a model spent reviewing; leave out when a person reviewed")
     verdict.add_argument("--minutes", type=float, default=None)
     verdict.add_argument("--note", default=None)
 
-    escape = sub.add_parser("escape", help="record a later defect")
+    escape = sub.add_parser(
+        "escape",
+        help="record a defect that escaped review and was found later (it does not hand the card to a person)")
     escape.add_argument("card")
     escape.add_argument("--note", required=True)
 
