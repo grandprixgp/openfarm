@@ -28,6 +28,7 @@ def run_textual_tui(
     from .app import OpenfarmApp
 
     view_map = {
+        "projects": "projects",
         "overview": "studio",
         "studio": "studio",
         "cards": "review",
