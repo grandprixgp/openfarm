@@ -72,8 +72,13 @@ CHECKS = [  # the plan checks, in the words the Plan screen uses
 ]
 STOPPED = {"task": "the task is wrong, not the code", "builder": "the builder fell short, the task is sound",
            "check": "a check may be wrong"}
-PHASES = {"tests": "writing the tests", "code": "writing code", "implement": "writing code", "review": "being reviewed",
-          "gates": "being checked", "scaffold": "setting up", "claim": "starting"}
+PHASES = {  # what the build reports -> what it means for the reader
+    "claim": "starting", "worktree": "setting up its own copy of the code", "baseline": "checking the starting point",
+    "plan": "reading the task", "test-writer": "writing the tests", "tests": "writing the tests",
+    "prove": "proving the tests fail without the code", "implement": "writing code", "code": "writing code",
+    "check": "running the checks", "gates": "running the checks", "checker": "being reviewed", "review": "being reviewed",
+    "pre-review": "being reviewed", "catch-up": "catching up with main", "finish": "finishing",
+}
 
 
 def terminal_is_light() -> bool:

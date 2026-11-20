@@ -53,7 +53,7 @@ def send_notification(
             data=payload,
             headers={
                 "Content-Type": "application/json",
-                "User-Agent": "openfarm-notify/0.14.0",
+                "User-Agent": "openfarm-notify/0.15.0",
             },
             method="POST",
         )

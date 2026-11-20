@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.14.0-16a34a?style=flat-square" alt="version 0.14.0">
+  <img src="https://img.shields.io/badge/version-0.15.0-16a34a?style=flat-square" alt="version 0.15.0">
   <img src="https://img.shields.io/badge/status-pre--release-d97706?style=flat-square" alt="status: pre-release">
   <img src="https://img.shields.io/badge/python-3.11%2B-7c3aed?style=flat-square" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/core%20deps-stdlib%20only-0284c7?style=flat-square" alt="core dependencies: Python standard library only">
@@ -35,7 +35,7 @@
 </p>
 
 > [!IMPORTANT]
-> **Pre-release (v0.14.0).** `openfarm_core/` is **100% Python 3.11+ stdlib-only** (`dependencies = []`). An optional Textual workbench (`pip install "openfarm[tui]"`) automatically falls back to the stdlib `curses` TUI when Textual is not installed. Merges are strictly local-only (the core has **no `git push` code path**), and neither the TUI nor the Web Companion displays dollar spend.
+> **Pre-release (v0.15.0).** `openfarm_core/` is **100% Python 3.11+ stdlib-only** (`dependencies = []`). An optional Textual workbench (`pip install "openfarm[tui]"`) automatically falls back to the stdlib `curses` TUI when Textual is not installed. Merges are strictly local-only (the core has **no `git push` code path**), and neither the TUI nor the Web Companion displays dollar spend.
 
 ---
 
