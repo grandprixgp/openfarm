@@ -61,7 +61,10 @@ BUILD_RULES = (
     "The build refuses new code that calls the network directly (a bare `fetch(` call, `XMLHttpRequest`, `WebSocket`), "
     "starts a process, or runs code built at run time (`eval`, `Function(`, a computed `import(`), in any file, browser "
     "code and code inside strings included. A task that needs the network says how: the function is passed in or held "
-    "in a value first (`const net = globalThis.fetch; await net(url)`), never called by its bare name."
+    "in a value first (`const net = globalThis.fetch; await net(url)`), never called by its bare name. "
+    "Only a task that itself must use the network (it is the HTTP server and imports `node:http`, or it is the one "
+    "client of a remote API) sets `network = true` in its header and says why in its Goal; the owner is shown this "
+    "before the build. No other task sets it."
 )
 
 
@@ -202,6 +205,8 @@ def propose_fix(root: Path, cfg, store, card_id: str, why: str = "", backend=Non
         new_header, new_body, more = apply_fixes(new_header, new_body,
                                                  check_card(card_from(new_header, new_body), cfg, root, store.cards()))
         notes += more
+        if new_header.get("network") is True and header.get("network") is not True:
+            notes.append("this task may now use the network, which the build otherwise refuses")
     if not notes:
         return None
     after = render_card_file(new_header, new_body)

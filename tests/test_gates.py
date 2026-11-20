@@ -62,6 +62,26 @@ class BannedPatternTests(unittest.TestCase):
         self.assertEqual(gate.result, PASS)
         self.assertEqual(gate.evidence["flagged_count"], 1)
 
+    def test_a_task_whose_plan_allows_the_network_may_add_it_and_nothing_else(self) -> None:
+        from openfarm_core.gates.checks import banned_patterns
+        from openfarm_core.packs.typescript import TypeScriptPack
+
+        added = [{"path": "src/server.ts", "line": 1, "text": 'import { createServer } from "node:http";'},
+                 {"path": "src/server.ts", "line": 2, "text": "eval(x);"}]
+        head = {"src/server.ts": {"network-call": 1, "dynamic-exec": 1}}
+        refused = banned_patterns(added, FakeConfig(), {"src/server.ts"}, base_counts={}, head_counts=head,
+                                  pack=TypeScriptPack())
+        self.assertEqual({b["pattern"] for b in refused.evidence["banned"]}, {"network-call", "dynamic-exec"})
+        gate = banned_patterns(added, FakeConfig(), {"src/server.ts"}, base_counts={}, head_counts=head,
+                               pack=TypeScriptPack(), allowed=frozenset({"network-call"}))
+        self.assertEqual(gate.result, FAIL)
+        self.assertEqual([b["pattern"] for b in gate.evidence["banned"]], ["dynamic-exec"])
+        self.assertTrue(any(f.get("allowed_by_plan") for f in gate.evidence["flagged"]))  # the reviewer still sees it
+        only = banned_patterns(added[:1], FakeConfig(), {"src/server.ts"}, base_counts={},
+                               head_counts={"src/server.ts": {"network-call": 1}}, pack=TypeScriptPack(),
+                               allowed=frozenset({"network-call"}))
+        self.assertEqual(only.result, PASS)
+
 
 class SuiteGateTests(unittest.TestCase):
     def parsed(self, results, missing=None):

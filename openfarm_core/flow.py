@@ -3139,7 +3139,7 @@ class CardRun:
             added, self.cfg, production,
             base_counts=self._banned_counts(changed, at_base=True),
             head_counts=self._banned_counts(changed, at_base=False),
-            pack=self.pack))
+            pack=self.pack, allowed=self._plan_allows()))
         if not banned.ok:
             sig = "banned:" + banned.detail[:120]
             self.error_signatures.append(sig)
@@ -3375,6 +3375,10 @@ class CardRun:
                     StopCode.NO_PROGRESS,
                     f"passing named tests did not rise: {previous} then {current}")
 
+    def _plan_allows(self) -> frozenset[str]:
+        """What this card may introduce that the build otherwise refuses: its plan said so, and the owner saw it."""
+        return frozenset({"network-call"}) if self.card.network else frozenset()
+
     def _banned_counts(self, paths: list[str], at_base: bool
                        ) -> dict[str, dict[str, int]]:
         """How often each banned pattern appears in each file, at base or at head.
@@ -3506,7 +3510,7 @@ class CardRun:
                 whole_added, self.cfg, production_all,
                 base_counts=self._banned_counts(changed, at_base=True),
                 head_counts=self._banned_counts(changed, at_base=False),
-                pack=self.pack))
+                pack=self.pack, allowed=self._plan_allows()))
         if not final_banned.ok:
             raise GateFailure(StopCode.REFUSED, final_banned.detail)
 

@@ -6,7 +6,7 @@ import json
 import unittest
 from pathlib import Path
 
-from openfarm_core.blocked import propose_fix, triage
+from openfarm_core.blocked import apply_fix_and_retry, propose_fix, triage
 from tests.test_store import BODY, _header, _Project
 
 FIXTURES = Path(__file__).parent / "fixtures" / "dogfood-blocked"
@@ -85,6 +85,18 @@ class FixTests(_Project):
         self.assertIn('+touches = ["tally/core.py", "tally/extra.py"]', fix["diff"])
         self.assertIn("added `tally/extra.py`", fix["notes"][0])
         self.assertEqual(self.store.read("W1-01")[0]["touches"], ["tally/core.py"])  # nothing saved yet
+
+    def test_a_fix_that_lets_the_task_use_the_network_says_so_and_the_build_reads_it(self) -> None:
+        from openfarm_core.adapters.files import render_card_file
+
+        self.store.change_card("W1-01", "create", header=_header("W1-01"), body=BODY)
+        self.assertFalse(next(c for c in self.store.cards() if c.id == "W1-01").network)
+        fix = propose_fix(self.root, self.cfg, self.store, "W1-01", why="x", backend=lambda _p: json.dumps(
+            {"card": render_card_file(dict(_header("W1-01"), network=True), BODY), "change": "it is the server"}))
+        self.assertIn("this task may now use the network", fix["notes"][-1])
+        self.assertIn("+network = true", fix["diff"])
+        apply_fix_and_retry(self.store, "W1-01", fix)
+        self.assertTrue(next(c for c in self.store.cards() if c.id == "W1-01").network)
 
     def test_no_fix_is_said_plainly(self) -> None:
         self.store.change_card("W1-01", "create", header=_header("W1-01"), body=BODY)

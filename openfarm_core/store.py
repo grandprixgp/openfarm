@@ -35,7 +35,7 @@ DOCS = {
 }
 
 #: The card fields a person writes. The rest (state, holder, lease, timestamps) is the farm's.
-CONTENT_FIELDS = ("title", "category", "touches", "depends", "tests", "wave", "reference", "new_symbols")
+CONTENT_FIELDS = ("title", "category", "touches", "depends", "tests", "wave", "reference", "new_symbols", "network")
 
 #: What each kind of change may start from. `create` has no card yet.
 _EDITABLE = ("ready", "backlog", "blocked")

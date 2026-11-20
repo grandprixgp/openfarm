@@ -80,6 +80,7 @@ def _task(card, cards_by_id: dict, state_dir: Path, header: dict) -> dict:
         "id": card.id, "title": card.title, "state": state, "files": list(card.touches), "deps": list(card.deps),
         "waits": waits, "tries": len(runs),
         "parked": [str(r) for r in header.get("preflight") or []],
+        "network": header.get("network") is True,
         "repairs": [str(r) for r in header.get("repairs") or []],
         "triage": triage_card(state_dir, card.id) if runs and state == "blocked" else None,
         "last": runs[-1] if runs else None,

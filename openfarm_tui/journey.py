@@ -928,6 +928,8 @@ class Journey(App):
         for task in tasks:
             lines += [f"[$accent]↻[/] Repaired {esc(task['id'])}: {esc(note)}  [$foreground-muted](Space: why)[/]"
                       for note in task["repairs"]]
+        lines += [f"[$warning]![/] {esc(task['id'])} may use the network: its text says why  [$foreground-muted](Space)[/]"
+                  for task in tasks if task["network"]]
         box = self.query_one("#plan-checks", Static)
         box.update("\n".join(lines))
         box.set_classes("card " + ("bad" if failed else "ok"))

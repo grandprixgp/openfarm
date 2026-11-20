@@ -70,6 +70,7 @@ OPTIONAL_CARD_FIELDS = (
     "replan_if",
     "complexity",
     "profile",
+    "network",
     "wave",
     "from_card",
     "created_at",
@@ -185,6 +186,11 @@ class Card:
         except (TypeError, ValueError):
             return False
         return math.isfinite(num)
+
+    @property
+    def network(self) -> bool:
+        """The plan says this task itself must use the network (a server, a client of a remote API)."""
+        return self.fields.get("network") is True
 
     @property
     def new_symbols(self) -> bool:

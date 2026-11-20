@@ -526,6 +526,20 @@ class FlowTests(_Folder):
 
     # spec and plan ----------------------------------------------------------------
 
+    def test_the_plan_says_which_task_may_use_the_network_before_build(self) -> None:
+        async def body(app, pilot) -> None:
+            from openfarm_core.store import Store
+
+            self.assertNotIn("may use the network", str(app.query_one("#plan-checks").render()))
+            store = Store(app.repo, app.facts["cfg"])
+            header, text = store.read("W1-03")
+            store.src._write("W1-03", dict(header, network=True), text, "W1-03: it is the server")
+            app.refresh_screen()
+            await pilot.pause(0.1)
+            self.assertIn("W1-03 may use the network", str(app.query_one("#plan-checks").render()))
+
+        self.drive("plan", body)
+
     def test_spec_to_plan_shows_the_tasks_the_checks_and_the_repairs(self) -> None:
         async def body(app, pilot) -> None:
             with mock.patch("openfarm_tui.journey.draft_wave_plan", side_effect=fake_plan) as plan:

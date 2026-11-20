@@ -360,6 +360,7 @@ Each repository carries `.openfarm/config.toml` on its base branch (`openfarm in
 - **Architectural invariants (`[invariants]`):** declarative `forbidden_imports`, `max_file_bytes`, and `require_exports` rules enforced deterministically.
 - **Runtime acceptance (`[acceptance]`):** declarative CLI and ephemeral loopback HTTP `{PORT}` smoke checks with process-group cleanup.
 - **Notifications (`[notifications]`):** optional `webhook_url`, `desktop = true|false`, and `events` filter.
+- **Network permission (per task):** the build refuses new code that uses the network. A task that must (the HTTP server, the one client of a remote API) carries `network = true` in its header; the Plan screen shows it before you build, and the reviewer still sees every such line. No other rule can be switched off this way.
 - **Try it (`[try]`):** optional. `start = "npm start"` (a web app, told its port through `PORT`), `port`, `path = "/"`, or `sample = "python3 app.py --demo"` for an app with no page. Without it the language pack works out how to start the app.
 - **Budgets & hooks:** per-card attempt/build/token/wall-clock caps, spend caps, circuit breaker, kill switch, `[[gates.extra]]`, `[runner.env]`, and `[brief] test_conventions`.
 
