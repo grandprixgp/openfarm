@@ -418,6 +418,69 @@ def compute_pipeline_stages(
     }
 
 
+class _AcpArchitectBackend:
+    """Thin Frontier ACP Architect wrapper over `open_acp_worker`."""
+
+    def __init__(self, worker, model: str = "") -> None:
+        self._worker = worker
+        self._model = model
+
+    def ask(self, prompt: str) -> str:
+        comp = self._worker.complete(
+            "architect",
+            self._model,
+            0.2,
+            [{"role": "user", "content": prompt}],
+            system_prompt=(
+                "You are a senior Frontier Software Architect inside Openfarm. "
+                "Return ONLY valid JSON of shape {\"files\": {\"<repo-relative-path>\": \"<content>\"}} "
+                "matching the repository's configured language stack. Never emit files for another language."
+            ),
+        )
+        return str(comp.content or "")
+
+    def close(self) -> None:
+        self._worker.close()
+
+
+def open_architect_backend(repo: Path, cfg=None) -> tuple[object | None, str]:
+    """Open a live Frontier ACP Architect backend if OAuth is ready (returns `(backend, reason)`)."""
+    from .adapters.acp import is_acp_adapter, normalize_acp_provider
+    from .adapters.claude_worker import open_acp_worker
+    from .providers import load_global_providers
+
+    root = Path(repo).expanduser().resolve()
+    if cfg is None:
+        try:
+            cfg = load_config(root)
+        except (ConfigError, OSError) as exc:
+            return None, f"config unavailable: {exc}"
+
+    mm_adapter = str(getattr(cfg, "micromanager_adapter", "") or "")
+    if is_acp_adapter(mm_adapter):
+        provider = normalize_acp_provider(mm_adapter)
+    else:
+        gp = load_global_providers()
+        provider = str(gp.get("frontier", {}).get("provider") or "claude").strip().lower()
+
+    if provider == "antigravity":
+        return None, "antigravity architect requires explicit interactive run"
+
+    try:
+        status = inspect_acp_status(root, provider=provider)
+    except Exception as exc:
+        return None, f"{provider} status check failed: {exc}"
+    if not (status.get("oauth_ready") or status.get("ok")):
+        return None, f"{provider} ACP OAuth is not signed in"
+
+    try:
+        worker = open_acp_worker(cfg, provider=provider)
+        mm_model = str(getattr(getattr(cfg, "micromanager", None), "model", "") or "")
+        return _AcpArchitectBackend(worker, model=mm_model), f"{provider} ACP"
+    except Exception as exc:
+        return None, f"{provider} ACP unavailable: {exc}"
+
+
 def run_grill_and_architect(
     repo: Path,
     *,
@@ -425,7 +488,18 @@ def run_grill_and_architect(
     backend=None,
 ) -> dict:
     """Write `.openfarm/GRILL_DECISIONS.md` and expand spec/cards via Frontier backend."""
+    from .globs import matches_any
+
     root = Path(repo).expanduser().resolve()
+    cfg = None
+    try:
+        cfg = load_config(root)
+    except (ConfigError, OSError):
+        cfg = None
+    lang = (cfg.languages[0] if (cfg and cfg.languages) else "rust").lower()
+    never_touch = list(getattr(cfg, "never_touch", ()) or ()) if cfg else []
+    forbidden = list(getattr(cfg, "forbidden_files", ()) or ()) if cfg else []
+
     decisions_path = root / ".openfarm" / "GRILL_DECISIONS.md"
     decisions_path.parent.mkdir(parents=True, exist_ok=True)
     lines = ["# Grill Decisions\n"]
@@ -437,11 +511,28 @@ def run_grill_and_architect(
 
     written: list[str] = [".openfarm/GRILL_DECISIONS.md"]
     if backend is not None:
+        existing_files = [
+            p.relative_to(root).as_posix()
+            for p in sorted(root.rglob("*"))
+            if p.is_file()
+            and ".git" not in p.parts
+            and ".openfarm" not in p.parts
+            and "node_modules" not in p.parts
+            and "target" not in p.parts
+        ][:40]
         prompt = (
-            "Expand this openfarm repository from the owner's Grill decisions.\n"
+            f"Expand this {lang} Openfarm repository from the owner's Grill decisions.\n"
+            f"Language stack: {lang} (STRICT: generate ONLY {lang} source/test files — NEVER emit .rs or Cargo.toml in a non-Rust project).\n"
+            f"Locked never_touch files (DO NOT modify or list in card touches): {never_touch}\n"
+            f"Existing repository files: {existing_files}\n"
             "Return ONLY a JSON object: {\"files\": {\"<repo-relative-path>\": \"<content>\", ...}}.\n"
-            "Include `.openfarm/PROJECT_SPEC.md` and at least one Wave 1 card under `cards/`.\n"
-            "Never modify `.openfarm/config.toml`.\n\n"
+            "Include:\n"
+            "1. `.openfarm/PROJECT_SPEC.md` (concrete architecture & vertical slice)\n"
+            f"2. One clean {lang} golden reference vertical slice file and passing baseline test matching the stack\n"
+            "3. 2 to 5 scoped, non-overlapping Wave 1 cards under `cards/W1-01.md`.. using TOML +++ headers "
+            "(id, title, state=\"ready\", category=\"small-feature\", touches, reference, new_symbols=true, depends, tests=[{name, file, asserts}]) "
+            "and concrete `## Done` sections without vague adjectives.\n"
+            "Never modify `.openfarm/config.toml` or `never_touch` files.\n\n"
             + "\n".join(lines)
         )
         raw = str(backend.ask(prompt) if hasattr(backend, "ask") else backend(prompt))
@@ -452,6 +543,10 @@ def run_grill_and_architect(
             for rel, content in files.items():
                 rel_s = str(rel).strip().lstrip("/")
                 if not rel_s or rel_s in (".openfarm/config.toml",) or rel_s.startswith(".git/"):
+                    continue
+                if lang != "rust" and (rel_s.endswith(".rs") or rel_s.endswith("Cargo.toml") or rel_s.endswith("Cargo.lock")):
+                    continue
+                if matches_any(rel_s, never_touch) or (not rel_s.startswith(".openfarm/") and matches_any(rel_s, forbidden)):
                     continue
                 target = resolves_within(root, rel_s)
                 if target is None:
@@ -471,15 +566,19 @@ def run_grill_and_architect(
 
     cards_dir = root / "cards"
     cards_dir.mkdir(parents=True, exist_ok=True)
-    if not any(p.is_file() for p in cards_dir.glob("*.md")):
+    existing_md = [p for p in cards_dir.glob("*.md") if p.is_file() and not p.stem.upper().startswith("FIND-")]
+    should_write_fallback = not existing_md
+    if not should_write_fallback and backend is None and len(existing_md) == 1 and existing_md[0].name == "W1-01.md":
+        try:
+            from .adapters.files import parse_card_file
+            hdr, _ = parse_card_file(existing_md[0].read_text(encoding="utf-8", errors="replace"))
+            if str(hdr.get("state") or "ready").lower() in ("ready", "backlog"):
+                should_write_fallback = True
+        except (OSError, ValueError):
+            should_write_fallback = False
+    if should_write_fallback:
         from .adapters.files import render_card_file
 
-        cfg = None
-        try:
-            cfg = load_config(root)
-        except (ConfigError, OSError):
-            cfg = None
-        lang = (cfg.languages[0] if (cfg and cfg.languages) else "rust").lower()
         allowed_cats = list(cfg.categories) if (cfg and cfg.categories) else ["small-feature"]
         category = next(
             (c for c in ("small-feature", "feature", "pattern", "test-backfill") if c in allowed_cats),
@@ -831,6 +930,22 @@ def draft_wave_plan(
             "path": str(md),
         })
 
+    if (root / ".git").exists() and cfg is not None:
+        from .adapters.files import FileCardSource
+
+        try:
+            ensure_baseline_committed(root, extra_allowed=written)
+            card_src = FileCardSource(
+                root,
+                "cards",
+                worktree=cfg.state_dir / "cards-source",
+                base_branch=cfg.base_branch,
+            )
+            card_src.sync_ready_cards_from_base()
+        except (OSError, Refused, AdapterError, ConfigError) as exc:
+            sync_note = str(exc)
+            _ = sync_note
+
     return {
         "written": written,
         "decisions_path": res.get("decisions_path", ""),
@@ -842,7 +957,7 @@ def draft_wave_plan(
     }
 
 
-def ensure_baseline_committed(repo: Path) -> bool:
+def ensure_baseline_committed(repo: Path, *, extra_allowed: list[str] | None = None) -> bool:
     """Ensure the repo has an initial HEAD commit and committed `.openfarm/` + `cards/` baseline."""
     from .git import Git
 
@@ -858,9 +973,13 @@ def ensure_baseline_committed(repo: Path) -> bool:
     lines = git.status_lines()
     if not lines:
         return False
+    allowed_extra = {str(p).strip().lstrip("/") for p in (extra_allowed or ()) if str(p).strip()}
     paths = [line[3:].strip().split(" -> ")[-1].strip('"') for line in lines if len(line) > 3]
     if paths and all(
-        p.startswith(".openfarm/") or p.startswith("cards/") or p in (".openfarm", "cards")
+        p.startswith(".openfarm/")
+        or p.startswith("cards/")
+        or p in (".openfarm", "cards")
+        or p in allowed_extra
         for p in paths
     ):
         git.commit_all("chore: commit openfarm spec and cards")

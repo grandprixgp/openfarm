@@ -156,6 +156,24 @@ class FileCardSource:
                 "ops": ["hello", "next", "read", "hash", "claim", "heartbeat",
                         "move", "release", "finding", "stale"]}
 
+    @staticmethod
+    def _worktree_belongs_to_repo(worktree: Path, repo: Path) -> bool:
+        git_marker = worktree / ".git"
+        if not git_marker.is_file() or git_marker.is_symlink():
+            return False
+        try:
+            lines = git_marker.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return False
+        if not lines or not lines[0].strip().startswith("gitdir:"):
+            return False
+        raw_gd = lines[0].strip()[len("gitdir:"):].strip()
+        if not raw_gd:
+            return False
+        gd = (worktree / raw_gd).resolve()
+        repo_git = (repo / ".git").resolve()
+        return gd == repo_git or gd.is_relative_to(repo_git)
+
     def prepare(self) -> Path:
         """Check the cards branch out in its own worktree, creating it if needed.
 
@@ -172,6 +190,9 @@ class FileCardSource:
                     f"refs/heads/{self.base_branch}") else "HEAD")
                 self.git.create_branch(self.branch, start)
                 created = True
+            if self.worktree.exists() and not self._worktree_belongs_to_repo(self.worktree, self.repo):
+                # Foreign or stale cards-source worktree from another repository: rebuild cleanly.
+                shutil.rmtree(self.worktree)
             if not self.worktree.exists():
                 self.git.worktree_add(self.worktree, self.branch)
             else:
@@ -193,6 +214,39 @@ class FileCardSource:
             (self.worktree / self.folder).mkdir(parents=True, exist_ok=True)
             self._seed_from_base()
             return self.worktree
+
+    def sync_ready_cards_from_base(self) -> int:
+        """Sync new or updated `ready`/`backlog` cards from base `cards/` onto `openfarm-cards`."""
+        self.prepare()
+        with self._lock:
+            if self.worktree is None:
+                return 0
+            source = self.repo / self.folder
+            if not source.is_dir():
+                return 0
+            updated = 0
+            for path in sorted(source.glob("*.md")):
+                if path.is_symlink():
+                    continue
+                target = self.worktree / self.folder / path.name
+                src_bytes = path.read_bytes()
+                if target.exists():
+                    if target.read_bytes() == src_bytes:
+                        continue
+                    try:
+                        hdr, _bd = parse_card_file(target.read_text(encoding="utf-8", errors="replace"))
+                        st = str(hdr.get("state") or "").strip().lower()
+                        cid = str(hdr.get("id") or path.stem).upper()
+                    except (OSError, ValueError):
+                        continue
+                    if cid.startswith("FIND-") or st not in ("ready", "backlog"):
+                        continue
+                shutil.copy2(path, target, follow_symlinks=False)
+                updated += 1
+            if updated:
+                Git(self.worktree).commit_all(
+                    f"openfarm: sync {updated} planned card(s) from base branch")
+            return updated
 
     def _seed_from_base(self) -> None:
         """Copy card files the base branch already holds onto the cards branch."""

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import json
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
@@ -41,6 +42,7 @@ from openfarm_core.automode import (
     detect_workspace_state,
     draft_wave_plan,
     ensure_baseline_committed,
+    open_architect_backend,
 )
 from openfarm_core.bootstrap import initialize_project
 from openfarm_core.cli import Context, cmd_run, main as cli_main
@@ -453,9 +455,11 @@ class OpenfarmApp(App):
                         yield TextArea(DEFAULT_GRILL_QUESTIONS[1]["default"], id="ta-invariants")
                         yield Static(f"3. {DEFAULT_GRILL_QUESTIONS[2]['question']}", classes="section-h")
                         yield TextArea(DEFAULT_GRILL_QUESTIONS[2]["default"], id="ta-slice")
-                        with Horizontal(classes="action-row"):
+                        with Horizontal(classes="action-row-tall"):
                             yield Button("Draft Plan with Architect", classes="primary-cta", id="btn-draft-plan")
                             yield Button("Configure Providers", classes="soft-btn", id="btn-open-providers")
+                            yield Static("  Frontier Architect: ", classes="inline-label")
+                            yield Switch(value=True, id="sw-use-architect")
 
                     # 1B: Pre-Verified Wave Plan Approval
                     with Horizontal(id="studio-plan"):
@@ -490,6 +494,7 @@ class OpenfarmApp(App):
                             with Horizontal(classes="action-row"):
                                 yield Button("Launch Wave", classes="primary-cta", id="btn-run-start")
                                 yield Button("Pause [p]", classes="soft-btn", id="btn-pause")
+                                yield Button("Resume", classes="soft-btn", id="btn-resume")
                                 yield Button("Stop [s]", classes="soft-btn", id="btn-stop")
                                 yield Button("Hint [h]", classes="soft-btn", id="btn-hint")
                                 yield Button("Open Review [2]", classes="approve-btn", id="btn-jump-review")
@@ -700,9 +705,15 @@ class OpenfarmApp(App):
         else:
             banner.add_class("hidden")
 
+        # Sync Studio stack selector chip to the active project's configured language
+        if cfg is not None and getattr(cfg, "languages", None):
+            cfg_lang = str(cfg.languages[0]).strip().lower()
+            if cfg_lang in ("typescript", "python", "rust", "go") and cfg_lang != self._selected_stack:
+                self._apply_stack_chip(cfg_lang)
+
         # Update Studio sub-mode (when not actively running)
         studio_sw = self.query_one("#studio-switcher", ContentSwitcher)
-        if not self._running_wave:
+        if not self._running_wave and studio_sw.current != "studio-run":
             if not non_findings:
                 studio_sw.current = "studio-grill"
             elif studio_sw.current == "studio-grill":
@@ -1343,12 +1354,8 @@ class OpenfarmApp(App):
         except (Refused, AdapterError, ConfigError) as exc:
             self.notify(f"Provider error: {exc}", severity="error")
 
-    @on(Button.Pressed, ".stack-chip")
-    def _stack_selected(self, event: Button.Pressed) -> None:
-        bid = event.button.id or ""
-        if not bid.startswith("stk-"):
-            return
-        self._selected_stack = bid[4:]
+    def _apply_stack_chip(self, stack_id: str) -> None:
+        self._selected_stack = stack_id
         for lang_id, label in (
             ("typescript", "TypeScript / Web"),
             ("python", "Python"),
@@ -1364,6 +1371,13 @@ class OpenfarmApp(App):
                 btn.remove_class("selected")
                 btn.label = f"○ {label}"
 
+    @on(Button.Pressed, ".stack-chip")
+    def _stack_selected(self, event: Button.Pressed) -> None:
+        bid = event.button.id or ""
+        if not bid.startswith("stk-"):
+            return
+        self._apply_stack_chip(bid[4:])
+
     @on(Button.Pressed, "#btn-draft-plan")
     def _draft_plan_clicked(self) -> None:
         self._draft_plan_bg()
@@ -1373,11 +1387,13 @@ class OpenfarmApp(App):
         wf = self.query_one("#ta-workflow", TextArea).text.strip() or DEFAULT_GRILL_QUESTIONS[0]["default"]
         inv = self.query_one("#ta-invariants", TextArea).text.strip() or DEFAULT_GRILL_QUESTIONS[1]["default"]
         slc = self.query_one("#ta-slice", TextArea).text.strip() or DEFAULT_GRILL_QUESTIONS[2]["default"]
+        use_architect = bool(self.query_one("#sw-use-architect", Switch).value)
         answers = [
             {"id": "goal", "question": DEFAULT_GRILL_QUESTIONS[0]["question"], "answer": wf},
             {"id": "invariants", "question": DEFAULT_GRILL_QUESTIONS[1]["question"], "answer": inv},
             {"id": "slice", "question": DEFAULT_GRILL_QUESTIONS[2]["question"], "answer": slc},
         ]
+        backend = None
         try:
             if not (self.repo / CONFIG_PATH).is_file():
                 initialize_project(
@@ -1387,7 +1403,32 @@ class OpenfarmApp(App):
                     language=self._selected_stack,
                     commit=True,
                 )
-            plan = draft_wave_plan(self.repo, answers=answers, include_picked_findings=True)
+            cfg = self._safe_cfg()
+            arch_note = "local template"
+            if use_architect:
+                backend, reason = open_architect_backend(self.repo, cfg)
+                if backend is not None:
+                    arch_note = reason
+                    self.call_from_thread(self.notify, f"Drafting golden slice & Wave cards with {reason}...")
+                else:
+                    arch_note = f"local fallback ({reason})"
+            try:
+                plan = draft_wave_plan(
+                    self.repo,
+                    answers=answers,
+                    backend=backend,
+                    include_picked_findings=True,
+                )
+            except Exception as arch_exc:
+                if backend is None:
+                    raise
+                arch_note = f"local fallback (architect error: {arch_exc})"
+                plan = draft_wave_plan(
+                    self.repo,
+                    answers=answers,
+                    backend=None,
+                    include_picked_findings=True,
+                )
             self.call_from_thread(self.refresh_all_views)
             self.call_from_thread(
                 setattr,
@@ -1397,11 +1438,17 @@ class OpenfarmApp(App):
             )
             self.call_from_thread(
                 self.notify,
-                f"Wave plan ready: {len(plan['cards'])} eligible card(s)"
+                f"Wave plan ready ({arch_note}): {len(plan['cards'])} eligible card(s)"
                 + (f" ({plan['repaired_count']} auto-repaired)" if plan["repaired_count"] else ""),
             )
         except Exception as exc:
             self.call_from_thread(self.notify, f"Plan error: {exc}", severity="error")
+        finally:
+            if backend is not None and hasattr(backend, "close"):
+                try:
+                    backend.close()
+                except Exception as close_exc:
+                    self.log.warning(f"architect close error: {close_exc}")
 
     @on(DataTable.RowHighlighted, "#projects-table")
     def _project_row_changed(self, event: DataTable.RowHighlighted) -> None:
@@ -1529,12 +1576,13 @@ class OpenfarmApp(App):
     def _run_wave_bg(self) -> None:
         self._running_wave = True
         self.call_from_thread(self._set_running_badge, True)
+        self.call_from_thread(self._append_activity, "[#94a3b8]Preparing baseline and launching wave...[/]")
         try:
             ensure_baseline_committed(self.repo)
             ctx = Context(self.repo, self.config_path, json_output=True)
             args = SimpleNamespace(
-                cards=3, spend=None, hours=None, dry_run=False, card=None,
-                run_id=None, profile=None, once=False, no_micromanager=False, json=True,
+                cards=3, spend=None, for_duration=None, until=None, dry_run=False, card=None,
+                run_id=None, profile=None, learn_from=None, script=None, mm_script=None, json=True,
             )
 
             def _on_ev(ev: dict) -> None:
@@ -1542,9 +1590,48 @@ class OpenfarmApp(App):
 
             buf = io.StringIO()
             with redirect_stdout(buf), redirect_stderr(buf):
-                cmd_run(ctx, args, on_event=_on_ev)
+                rc = cmd_run(ctx, args, on_event=_on_ev)
+            raw_out = buf.getvalue().strip()
+            parsed: dict = {}
+            if raw_out:
+                try:
+                    obj = json.loads(raw_out)
+                    if isinstance(obj, dict):
+                        parsed = obj
+                except ValueError:
+                    parsed = {}
+            if rc != 0 or parsed.get("refused") or parsed.get("error"):
+                reason = str(parsed.get("reason") or parsed.get("error") or raw_out.splitlines()[-1] if raw_out else f"run exited {rc}")
+                self.call_from_thread(
+                    self._append_activity,
+                    f"[bold #fb7185]✗ Wave refused/stopped (exit {rc}):[/] {rich_escape(reason)}",
+                )
+                if "paused" in reason.lower():
+                    self.call_from_thread(
+                        self._append_activity,
+                        "[#fbbf24]Tip: click [Resume] below (or run `openfarm resume`) to clear the stale pause, then click Launch Wave.[/]",
+                    )
+                elif "key" in reason.lower() or "endpoint" in reason.lower() or "api.example.invalid" in reason.lower():
+                    self.call_from_thread(
+                        self._append_activity,
+                        "[#fbbf24]Tip: press Ctrl+K → Providers to configure your Worker endpoint & API key.[/]",
+                    )
+                self.call_from_thread(self.notify, f"Wave stopped: {reason[:100]}", severity="error")
+            else:
+                outcomes = parsed.get("outcomes") if isinstance(parsed.get("outcomes"), list) else []
+                if not outcomes:
+                    self.call_from_thread(
+                        self._append_activity,
+                        "[#fbbf24]○ Wave finished with 0 cards claimed (check card states in Plan / Review).[/]",
+                    )
+                else:
+                    self.call_from_thread(
+                        self._append_activity,
+                        f"[bold #4ade80]✓ Wave finished:[/] {len(outcomes)} card(s) processed.",
+                    )
         except Exception as exc:
             self.call_from_thread(self._append_activity, f"[bold #fb7185]✗ Run error:[/] {rich_escape(str(exc))}")
+            self.call_from_thread(self.notify, f"Run error: {str(exc)[:100]}", severity="error")
         finally:
             self._running_wave = False
             self.call_from_thread(self._set_running_badge, False)
@@ -1691,6 +1778,11 @@ class OpenfarmApp(App):
     @on(Button.Pressed, "#btn-pause")
     def _pause_btn(self) -> None:
         self._run_cli_quick(["pause"])
+
+    @on(Button.Pressed, "#btn-resume")
+    def _resume_btn(self) -> None:
+        self._run_cli_quick(["resume", "--clear-breaker", "--clear-kill"])
+        self._append_activity("[bold #4ade80]✓ Queue resumed (pause/breaker/kill cleared).[/]")
 
     @on(Button.Pressed, "#btn-stop")
     def _stop_btn(self) -> None:

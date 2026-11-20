@@ -238,6 +238,7 @@ def adopt_project(
 
     resolved_state.mkdir(parents=True, exist_ok=True)
     os.chmod(resolved_state, 0o700)
+    (resolved_state / "repo.path").write_text(f"{root}\n", encoding="utf-8")
 
     config_path.parent.mkdir(parents=True, exist_ok=True)
     with config_path.open("x", encoding="utf-8") as handle:
