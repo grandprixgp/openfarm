@@ -9,6 +9,25 @@ description: >-
 
 # Openfarm Grill-Me Skill (`v0.9.2`)
 
+## Steps and words (the same in the TUI, the CLI and here)
+
+The work goes through seven steps: **Idea, Questions, Spec, Plan, Build, Try it, Accept**. Use these words with
+the owner, whichever front door they came in by:
+
+| Say | It is | In commands and files |
+|---|---|---|
+| task | one small piece of work a lesser model builds | card (`openfarm card`, `cards/`) |
+| goal | an ordered part of the spec, built and accepted as a whole | chunk (`CHUNKS.json`) |
+| plan | a goal's tasks, checked before they are shown | wave plan (`openfarm plan`) |
+| build | running the plan | `openfarm run --follow`, `openfarm daemon` |
+| questions from builders | what a builder could not decide alone | findings (`openfarm findings`) |
+| try it | start the app and check the goal's content can be seen | `openfarm try` |
+| accept | merge a finished task locally (never pushes) | `openfarm verdict` + `openfarm land` |
+
+Tasks, the spec and the decisions log live on the `openfarm-cards` branch. Add or change a task with
+`openfarm card add|show|history|skip`, never by writing files under `cards/` on the main branch. After the
+owner tries the app, "something's wrong" becomes fix tasks under the same goal; it never restarts the project.
+
 Use this skill whenever the user invokes `/openfarm-grill-me`, asks to stress-test a project idea before `/openfarm-initialize`, or wants to sharpen a multi-card feature specification on an existing Openfarm repository.
 
 Read [prompts/grill_protocol.md](./prompts/grill_protocol.md) for the exact 5-branch decision tree and `.openfarm/GRILL_DECISIONS.md` output template.

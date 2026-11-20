@@ -297,8 +297,27 @@ def _render_next(steps: list[str], *, style: Style, numbered: bool = False) -> l
     lines = [style.bold("Next:")]
     for idx, step in enumerate(clean, start=1):
         prefix = f"  {idx}." if numbered else f"  {ICON_DOT}"
-        lines.append(f"{style.dim(prefix)} {step}")
+        words = step.split()
+        gloss = _NEXT_WORDS.get(words[1], "") if len(words) > 1 and words[0] == "openfarm" else ""
+        lines.append(f"{style.dim(prefix)} {step}" + (style.dim(f"   ({gloss})") if gloss else ""))
     return lines
+
+
+# What each suggested command does, in the words the screen uses (task, goal, plan, build, accept).
+_NEXT_WORDS = {
+    "run": "build the tasks that are ready",
+    "check": "can this task be built as written?",
+    "plan": "the plan: tasks in the order they build",
+    "status": "where the build and each task stand",
+    "dossier": "what a finished task changed, and its evidence",
+    "verdict": "record your review of a finished task",
+    "land": "accept: merge finished tasks locally, nothing is pushed",
+    "resume": "let the build carry on",
+    "findings": "questions and notes from the builders",
+    "card": "add, read or change a task",
+    "try": "try it: start the app and check what can be seen",
+    "tui": "the screen: Idea, Questions, Spec, Plan, Build, Try it, Accept",
+}
 
 
 def _render_kv_section(title: str, pairs: list[tuple[str, object]], *, style: Style) -> list[str]:
