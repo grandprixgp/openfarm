@@ -2332,11 +2332,14 @@ class OpenfarmApp(App):
                 )
                 self.refresh_all_views()
                 if res["eligible"]:
-                    self.notify(f"Saved {entry['id']} — ✓ eligible")
+                    self.notify(f"Saved {entry['id']}. It can be built.")
                 else:
-                    self.notify(f"Saved {entry['id']} — ineligible: {'; '.join(res['failures'][:2])}", severity="warning")
-            except (OSError, Refused, ConfigError) as exc:
-                self.notify(f"Card edit error: {exc}", severity="error")
+                    why = "; ".join(str(f.get("detail") or f.get("rule")) for f in res["failures"][:2])
+                    self.notify(f"Saved {entry['id']}, but it can't be built yet: {why}", severity="warning")
+            except Refused as exc:
+                self.notify(f"Not saved: {exc.message}", severity="warning")
+            except (OSError, ConfigError) as exc:
+                self.notify(f"Not saved: {exc}", severity="error")
 
         self.push_screen(CardEditorModal(entry), _done)
 

@@ -1598,6 +1598,14 @@ def ensure_baseline_committed(repo: Path, *, extra_allowed: list[str] | None = N
     return False
 
 
+_EDIT_REFUSALS = {
+    "in_progress": "is building; stop it first",
+    "in_review": "is waiting for review; decide it first",
+    "done": "is done; its text can't change now",
+    "dropped": "was dropped; its text can't change now",
+}
+
+
 def update_card_with_eligibility(
     repo: Path,
     card_id: str,
@@ -1610,46 +1618,85 @@ def update_card_with_eligibility(
     tests: list[dict] | None = None,
     done_text: str | None = None,
 ) -> dict:
-    """Edit a card under `cards/`, evaluate `check_eligibility` live, and sync to `openfarm-cards`."""
-    from .adapters.files import FileCardSource, parse_card_file, render_card_file
+    """Edit a card where the farm reads it (the `openfarm-cards` copy) and check eligibility.
+
+    The same edit goes to the base branch's `cards/` file, so a later sync from the
+    base branch cannot put the old text back. A field left as None keeps its value.
+    """
+    from .adapters.files import _holder, _lease_expiry, open_file_source, parse_card_file, render_card_file
     from .cards import Card
     from .gates.eligibility import check_eligibility
+    from .state import utc_now
 
     root = Path(repo).expanduser().resolve()
     cfg = load_config(root)
+
+    def _apply(header: dict, body: str) -> tuple[dict, str]:
+        if title is not None and title.strip():
+            header["title"] = title.strip()
+        if category is not None and category.strip():
+            header["category"] = category.strip()
+        if touches is not None:
+            header["touches"] = [str(t).strip() for t in touches if str(t).strip()]
+            if header.get("reference") and header["touches"]:
+                header["reference"] = header["touches"][0]
+        if depends is not None:
+            header.pop("deps", None)
+            header["depends"] = [str(d).strip() for d in depends if str(d).strip()]
+        if wave is not None:
+            header["wave"] = max(1, int(wave))
+        if tests is not None:
+            header["tests"] = list(tests)
+        if done_text is not None:
+            body = done_text.strip() + "\n"
+        return header, body
+
     cards_dir = root / "cards"
-    card_path = cards_dir / f"{card_id}.md"
-    if not card_path.is_file():
+    base_path = cards_dir / f"{card_id}.md"
+    if not base_path.is_file() and cards_dir.is_dir():
         for cand in sorted(cards_dir.glob("*.md")):
             try:
                 h_c, _ = parse_card_file(cand.read_text(encoding="utf-8", errors="replace"))
             except (OSError, ValueError):
                 continue
             if str(h_c.get("id") or "") == card_id:
-                card_path = cand
+                base_path = cand
                 break
-    if not card_path.is_file():
-        raise Refused("card-not-found", f"no card file found for {card_id!r}")
 
-    header, body = parse_card_file(card_path.read_text(encoding="utf-8"))
-    if title is not None and title.strip():
-        header["title"] = title.strip()
-    if category is not None and category.strip():
-        header["category"] = category.strip()
-    if touches is not None:
-        header["touches"] = [str(t).strip() for t in touches if str(t).strip()]
-        if header.get("reference") and header["touches"]:
-            header["reference"] = header["touches"][0]
-    if depends is not None:
-        header["depends"] = [str(d).strip() for d in depends if str(d).strip()]
-    if wave is not None:
-        header["wave"] = max(1, int(wave))
-    if tests is not None:
-        header["tests"] = list(tests)
-    if done_text is not None:
-        body = done_text.strip() + "\n"
+    src = None
+    header = body = None
+    if (root / ".git").exists():
+        src = open_file_source(cfg, cfg.state_dir)
+        src.prepare()
+        if base_path.is_file():
+            src.sync_ready_cards_from_base()  # a card drafted a moment ago may not be there yet
+        try:
+            header, body, _path = src._read_raw(card_id)
+        except Refused:
+            src = None
+    if header is None:
+        if not base_path.is_file():
+            raise Refused("card-not-found", f"no card file found for {card_id!r}")
+        header, body = parse_card_file(base_path.read_text(encoding="utf-8"))
 
-    card_path.write_text(render_card_file(header, body), encoding="utf-8")
+    if src is not None:
+        state = str(header.get("state") or "ready")
+        held = bool(_holder(header)) and _lease_expiry(header) > utc_now()
+        if state in _EDIT_REFUSALS or held:
+            why = _EDIT_REFUSALS.get(state, _EDIT_REFUSALS["in_progress"])
+            raise Refused("card-not-editable", f"{card_id} {why}")
+
+    header, body = _apply(header, body)
+    if src is not None:
+        src._write(card_id, header, body, f"{card_id}: edited")
+    if base_path.is_file():
+        if src is None:
+            base_path.write_text(render_card_file(header, body), encoding="utf-8")
+        else:
+            b_header, b_body = _apply(*parse_card_file(base_path.read_text(encoding="utf-8")))
+            base_path.write_text(render_card_file(b_header, b_body), encoding="utf-8")
+        ensure_baseline_committed(root, extra_allowed=[base_path.relative_to(root).as_posix()])
+
     card_obj = Card(
         id=str(header.get("id") or card_id),
         title=str(header.get("title") or card_id),
@@ -1660,10 +1707,6 @@ def update_card_with_eligibility(
         fields=dict(header),
     )
     elig = check_eligibility(card_obj, cfg, worktree=root)
-    if (root / ".git").exists():
-        ensure_baseline_committed(root, extra_allowed=[card_path.relative_to(root).as_posix()])
-        src = FileCardSource(root, "cards", worktree=cfg.state_dir / "cards-source", base_branch=cfg.base_branch)
-        src.sync_ready_cards_from_base()
     return {
         "card": {
             "id": card_obj.id,

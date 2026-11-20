@@ -565,7 +565,7 @@ def _read_cards_readonly(ctx: TuiContext) -> tuple[list[Card], str]:
                         "state": str(merged.get("state", "ready")),
                         "unit": str(merged.get("unit", ".")),
                         "touches": touches,
-                        "depends": deps,
+                        "deps": deps,
                         "tests": merged.get("tests") or [],
                         "fields": fields,
                         "done_text": body,

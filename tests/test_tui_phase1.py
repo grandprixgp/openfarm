@@ -102,5 +102,79 @@ class MarkupSafetyTests(_RegistryIsolation):
             self.assertEqual(shown.replace("\\ ", "\\"), f"{raw} tail")
 
 
+def _two_card_toy(case: unittest.TestCase):
+    """A toy with CARD-1 and CARD-2, where CARD-2 depends on CARD-1."""
+    toy = build_python_toy()
+    case.addCleanup(toy.cleanup)
+    for cid, deps in (("CARD-1", []), ("CARD-2", ["CARD-1"])):
+        toy.write_card(
+            cid,
+            title=f"Add part {cid[-1]}",
+            category="small-feature",
+            touches=["tally/bounded.py"],
+            tests=[{"name": "test_a", "file": "tests/test_a.py", "asserts": "returns 3"}],
+            done_text="## Done\n\n- `push` returns 3 for a full bundle.",
+            depends=deps,
+        )
+    toy.commit("add cards")
+    cfg = load_config(toy.root)
+    src = FileCardSource(toy.root, "cards", worktree=cfg.state_dir / "cards-source")
+    src.prepare()
+    return toy, src
+
+
+class CardEditTests(_RegistryIsolation):
+    """R1.2: Edit Card saves the copy the farm builds from, and keeps `depends`."""
+
+    def test_an_edit_to_a_blocked_card_is_what_the_next_run_gets(self) -> None:
+        from openfarm_core.automode import update_card_with_eligibility
+
+        toy, src = _two_card_toy(self)
+        claim = src.claim("CARD-1", holder="test-lane")
+        src.move("CARD-1", claim["lease_id"], "blocked", stop_code="tests-unprovable")
+
+        update_card_with_eligibility(
+            toy.root, "CARD-1", done_text="## Done\n\n- `push` returns 4 for a full bundle.")
+        self.assertIn("returns 4", src.read("CARD-1")["card"]["done_text"])
+        self.assertEqual(src.read("CARD-1")["card"]["state"], "blocked")
+
+        src.release("CARD-1", reason="retry")
+        src.sync_ready_cards_from_base()  # what drafting more cards does later
+        self.assertEqual(src.next()["cards"], ["CARD-1"])
+        self.assertIn("returns 4", src.read("CARD-1")["card"]["done_text"])
+
+    def test_a_card_being_built_is_refused_with_the_reason(self) -> None:
+        from openfarm_core.automode import update_card_with_eligibility
+        from openfarm_core.errors import Refused
+
+        toy, src = _two_card_toy(self)
+        src.claim("CARD-1", holder="test-lane")
+        with self.assertRaises(Refused) as caught:
+            update_card_with_eligibility(toy.root, "CARD-1", title="New title")
+        self.assertIn("CARD-1 is building; stop it first", str(caught.exception))
+        self.assertEqual(src.read("CARD-1")["card"]["title"], "Add part 1")
+
+    @unittest.skipUnless(textual_available(), "textual optional extra not installed")
+    def test_saving_the_form_unchanged_keeps_depends(self) -> None:
+        from openfarm_tui.app import OpenfarmApp
+
+        toy, src = _two_card_toy(self)
+
+        async def _run() -> None:
+            app = OpenfarmApp(repo=toy.root, initial_view="studio")
+            async with app.run_test(size=(132, 42)) as pilot:
+                await pilot.pause(0.15)
+                app._selected_plan_id = "CARD-2"
+                app._open_card_editor_modal()
+                await pilot.pause(0.1)
+                self.assertEqual(app.screen.query_one("#ce-depends").value, "CARD-1")
+                app.screen._ok()
+                await pilot.pause(0.2)
+
+        asyncio.run(_run())
+        self.assertEqual(src.read("CARD-2")["card"]["deps"], ["CARD-1"])
+        self.assertIn('depends = ["CARD-1"]', (toy.root / "cards" / "CARD-2.md").read_text())
+
+
 if __name__ == "__main__":
     unittest.main()
