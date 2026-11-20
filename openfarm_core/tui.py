@@ -4340,8 +4340,14 @@ def _run_suspended_tty(stdscr, cli_argv: list[str], cwd: Path) -> int:
 
 
 def _run_worker_key_modal(stdscr, ctrl: TuiController, *, theme: dict[str, int] | None = None) -> None:
-    """In-TUI worker API key setup: reuse an existing key or paste masked (0600 atomic)."""
-    from .automode import list_existing_key_files, reuse_existing_key_file, save_worker_key_atomic
+    """In-TUI worker setup: API key (reuse or masked 0600) + endpoint URL & model name."""
+    from .automode import (
+        configure_worker_endpoint,
+        is_placeholder_endpoint,
+        list_existing_key_files,
+        reuse_existing_key_file,
+        save_worker_key_atomic,
+    )
 
     tctx = _load_tui_context(ctrl.repo, ctrl.config_path)
     cfg = tctx.cfg
@@ -4350,32 +4356,75 @@ def _run_worker_key_modal(stdscr, ctrl: TuiController, *, theme: dict[str, int] 
         ctrl.status_message = "no worker key_file configured yet; init or adopt first"
         return
     dest = Path(key_file)
-    existing = list_existing_key_files()
-    if existing:
-        choices = ", ".join(f"[{i}] {p.name}" for i, p in enumerate(existing[:5], 1))
-        pick = _prompt_line(
-            stdscr,
-            f"Worker key — reuse {choices} or [p]aste new: ",
-            theme=theme,
-        )
-        if pick is None:
-            ctrl.status_message = "worker key setup cancelled"
-            return
-        pick = pick.strip()
-        if pick.isdigit() and 1 <= int(pick) <= len(existing[:5]):
-            src = existing[int(pick) - 1]
-            reuse_existing_key_file(src, dest)
-            ctrl.refresh()
-            ctrl.status_message = f"copied worker key from {src.name} -> {dest.name} (0600)"
-            return
+    status_parts: list[str] = []
+    key_present = dest.is_file() and dest.stat().st_size > 0
+    if not key_present:
+        existing = list_existing_key_files()
+        reused = False
+        if existing:
+            choices = ", ".join(f"[{i}] {p.name}" for i, p in enumerate(existing[:5], 1))
+            pick = _prompt_line(
+                stdscr,
+                f"Worker key — reuse {choices} or [p]aste new: ",
+                theme=theme,
+            )
+            if pick is None:
+                ctrl.status_message = "worker setup cancelled"
+                return
+            pick = pick.strip()
+            if pick.isdigit() and 1 <= int(pick) <= len(existing[:5]):
+                src = existing[int(pick) - 1]
+                reuse_existing_key_file(src, dest)
+                status_parts.append(f"copied key {src.name} -> {dest.name} (0600)")
+                reused = True
+        if not reused:
+            secret = _prompt_line(stdscr, f"Paste Worker API key for {dest.name} (masked): ", theme=theme, mask="*")
+            if not secret or not secret.strip():
+                ctrl.status_message = "worker setup cancelled"
+                return
+            save_worker_key_atomic(dest, secret)
+            status_parts.append(f"saved key to {dest} (0600)")
 
-    secret = _prompt_line(stdscr, f"Paste Worker API key for {dest.name} (masked): ", theme=theme, mask="*")
-    if not secret or not secret.strip():
-        ctrl.status_message = "worker key setup cancelled"
-        return
-    save_worker_key_atomic(dest, secret)
+    cur_ep = str(getattr(cfg, "endpoint", "") or "")
+    if is_placeholder_endpoint(cur_ep):
+        ep = _prompt_line(
+            stdscr,
+            "Endpoint> ",
+            theme=theme,
+            box_title="Worker Endpoint URL",
+            box_lines=[
+                "Enter your OpenAI-compatible Worker API base URL (e.g. https://openrouter.ai/api/v1).",
+                f"Current: {cur_ep or '(unset)'}",
+            ],
+        )
+        if not ep or not ep.strip():
+            ctrl.refresh()
+            ctrl.status_message = "; ".join(status_parts) if status_parts else "worker endpoint setup cancelled"
+            return
+        role_models = getattr(cfg, "role_models", None) or {}
+        cur_model = str(getattr(role_models.get("implementer"), "model", "") or "lesser-coder")
+        mdl = _prompt_line(
+            stdscr,
+            "Model> ",
+            theme=theme,
+            box_title="Worker Model Name",
+            box_lines=[
+                "Enter the Worker coding model ID for this endpoint (Enter to keep current).",
+                f"Default: {cur_model}",
+            ],
+        )
+        if mdl is None:
+            ctrl.refresh()
+            ctrl.status_message = "; ".join(status_parts) if status_parts else "worker model setup cancelled"
+            return
+        cfg_file = ctrl.config_path or (ctrl.repo / ".openfarm" / "config.toml")
+        configure_worker_endpoint(cfg_file, ep.strip(), mdl.strip())
+        status_parts.append(f"endpoint={ep.strip()}")
+        if mdl.strip():
+            status_parts.append(f"model={mdl.strip()}")
+
     ctrl.refresh()
-    ctrl.status_message = f"saved worker key to {dest} (0600)"
+    ctrl.status_message = "; ".join(status_parts) if status_parts else "worker already configured"
 
 
 def _run_grill_modal(stdscr, ctrl: TuiController, *, theme: dict[str, int] | None = None) -> None:

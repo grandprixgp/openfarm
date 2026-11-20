@@ -271,6 +271,47 @@ class TuiModalsTests(unittest.TestCase):
             elig = check_eligibility(card, cfg, worktree=root)
             self.assertTrue(elig.ok, f"eligibility failed: {elig.failures}")
 
+    def test_worker_modal_configures_placeholder_endpoint_and_model_in_tui(self) -> None:
+        from openfarm_core.automode import compute_pipeline_stages, save_worker_key_atomic
+        from openfarm_core.bootstrap import initialize_project
+        from openfarm_core.config import load_config
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "photo-app"
+            state_dir = Path(tmp) / "state"
+            secrets_dir = Path(tmp) / "secrets"
+            initialize_project(
+                "photo-app",
+                directory=root,
+                idea="Daily photo gallery",
+                state_dir=state_dir,
+                secrets_dir=secrets_dir,
+                no_git=True,
+            )
+            cfg_before = load_config(root)
+            save_worker_key_atomic(Path(cfg_before.key_file), "sk-live-secret")
+
+            # Even with key present, placeholder endpoint keeps worker_key stage current.
+            pipe_before = compute_pipeline_stages(root, acp_status={"oauth_ready": True})
+            self.assertEqual(pipe_before["current_stage"]["id"], "worker_key")
+
+            ctrl = TuiController(root)
+            keys = (
+                [ord(c) for c in "https://openrouter.ai/api/v1"]
+                + [ord("\n")]
+                + [ord(c) for c in "qwen/qwen3-coder"]
+                + [ord("\n")]
+            )
+            scr = _FakeStdscr(keys)
+            _run_worker_key_modal(scr, ctrl)
+
+            cfg_after = load_config(root)
+            self.assertEqual(cfg_after.endpoint, "https://openrouter.ai/api/v1")
+            self.assertEqual(cfg_after.allowed_endpoints, ["https://openrouter.ai/api/v1"])
+            self.assertEqual(cfg_after.role_models["implementer"].model, "qwen/qwen3-coder")
+            pipe_after = compute_pipeline_stages(root, acp_status={"oauth_ready": True})
+            self.assertNotEqual(pipe_after["current_stage"]["id"], "worker_key")
+
 
 if __name__ == "__main__":
     unittest.main()
