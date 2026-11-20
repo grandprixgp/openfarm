@@ -26,6 +26,7 @@ KNOWN_TABLES = {
     "project", "adapters", "model", "policy", "eligibility", "brief",
     "runner", "budget", "gates", "cards", "micromanager", "state", "harness",
     "swarm", "tiers", "units", "factory", "invariants", "acceptance",
+    "notifications",
 }
 
 _UNIT_LANGUAGES = ("rust", "python", "typescript", "go")
@@ -95,6 +96,7 @@ _TABLE_KEYS = {
                 "require_zero_findings", "require_frontier_consensus"},
     "invariants": {"forbidden_imports", "max_file_bytes", "require_exports"},
     "acceptance": {"checks"},
+    "notifications": {"webhook_url", "desktop", "events"},
 }
 _ROLE_MODEL_KEYS = {"model", "temperature", "vary_seed", "effort", "retry_effort", "effort_ladder"}
 _HEADER_NAME = re.compile(r"^[A-Za-z0-9!#$%&'*+.^_`|~-]+$")
@@ -271,6 +273,15 @@ class AcceptanceConfig:
     """Declarative runtime smoke checks under `[acceptance]`."""
 
     checks: tuple[dict, ...] = ()
+
+
+@dataclasses.dataclass
+class NotificationsConfig:
+    """Optional `[notifications]` webhook & desktop alert settings."""
+
+    webhook_url: str = ""
+    desktop: bool = False
+    events: tuple[str, ...] = ()
 
 
 @dataclasses.dataclass
@@ -551,6 +562,10 @@ class Config:
                         cand_kf = Path(g_kf_str).expanduser().resolve()
                         if not cand_kf.is_relative_to(self.repo):
                             self.key_file = cand_kf
+                    if bool((wk or {}).get("zdr", False)) and not any(
+                        k.lower() == "x-cmd-zdr" for k in self.model_headers
+                    ):
+                        self.model_headers = {**self.model_headers, "x-cmd-zdr": "1"}
                     g_model = str((wk or {}).get("model") or "").strip()
                     if g_model:
                         for role_name, rm in list(self.role_models.items()):
@@ -562,13 +577,6 @@ class Config:
                                     effort=rm.effort,
                                     effort_ladder=rm.effort_ladder,
                                 )
-            if (
-                g_ep
-                and self.endpoint.rstrip("/") == g_ep.rstrip("/")
-                and bool((wk or {}).get("zdr", False))
-                and not any(k.lower() == "x-cmd-zdr" for k in self.model_headers)
-            ):
-                self.model_headers = {**self.model_headers, "x-cmd-zdr": "1"}
 
         policy = self._table("policy")
         self.never_touch = _as_str_list(policy.get("never_touch", []),
@@ -760,6 +768,7 @@ class Config:
         self.factory = self._parse_factory(self._table("factory"))
         self.invariants = self._parse_invariants(self._table("invariants"))
         self.acceptance = self._parse_acceptance(self._table("acceptance"))
+        self.notifications = self._parse_notifications(self._table("notifications"))
         self.effort_ladder: tuple[str, ...] = tuple(
             _as_str_list(self._table("model").get("effort_ladder", []), "[model] effort_ladder")
         )
@@ -813,6 +822,14 @@ class Config:
         if not isinstance(raw, list) or any(not isinstance(x, dict) for x in raw):
             raise ConfigError("[acceptance] checks: expected a list of tables")
         return AcceptanceConfig(checks=tuple(dict(x) for x in raw))
+
+    def _parse_notifications(self, ntf: dict) -> NotificationsConfig:
+        url = str(ntf.get("webhook_url") or "").strip()
+        if url and not (url.startswith("http://") or url.startswith("https://")):
+            raise ConfigError("[notifications] webhook_url must start with http:// or https://")
+        desktop = _as_bool(ntf.get("desktop"), "[notifications] desktop", False)
+        events = tuple(_as_str_list(ntf.get("events", []), "[notifications] events"))
+        return NotificationsConfig(webhook_url=url, desktop=desktop, events=events)
 
     def _parse_factory(self, f: dict) -> FactoryConfig:
         auto_land = _as_bool(f.get("auto_land"), "[factory] auto_land", False)

@@ -2662,9 +2662,9 @@ def cmd_swarm(ctx: Context, args) -> int:
 # -- the parser ----------------------------------------------------------------
 
 _CLI_EPILOG = """\
-Command groups (35 commands):
+Command groups (37 commands):
   Setup & Auth         init, adopt, install-skill, acp, providers, projects, doctor
-  Run & Monitor        auto, plan, check, run, status, pause, resume, stop, tui
+  Run & Monitor        auto, plan, check, run, daemon, web, status, pause, resume, stop, tui
   Review & Harness     triage, review, land, findings, replay, routing, timeline, frontier-review, dossier, verdict, done, release, escape, supervise, harness
   Swarm, Board & Bench swarm, board, drive, bench
 
@@ -3178,6 +3178,30 @@ def build_parser() -> argparse.ArgumentParser:
                        help="apply strictly non-destructive Openfarm housekeeping fixes")
     doc_p.add_argument("--probe", action="store_true",
                        help="also run a live Worker endpoint probe")
+
+    dmn_p = sub.add_parser(
+        "daemon",
+        help="start, stop, inspect, or tail a detached Openfarm background run daemon",
+        formatter_class=raw_fmt,
+        epilog="Examples:\n  openfarm daemon start --cards 5\n  openfarm daemon status\n  openfarm daemon logs --tail 50\n  openfarm daemon stop",
+    )
+    dmn_p.add_argument("action", nargs="?", default="status", choices=("start", "stop", "status", "logs"))
+    dmn_p.add_argument("--cards", type=int, default=3, help="maximum cards for daemon start (default: 3)")
+    dmn_p.add_argument("--spend", type=float, default=None, help="optional spend cap for daemon start")
+    dmn_p.add_argument("--profile", choices=("lean", "balanced", "strict"), default=None)
+    dmn_p.add_argument("--card", action="append", default=[], help="specific card id(s) to run")
+    dmn_p.add_argument("--tail", type=int, default=80, help="number of log lines for daemon logs")
+
+    web_p = sub.add_parser(
+        "web",
+        help="serve the stdlib local/tailnet Factory Companion web UI (default: 127.0.0.1:8787)",
+        formatter_class=raw_fmt,
+        epilog="Examples:\n  openfarm web\n  openfarm web --port 8787\n  openfarm web --bind 100.64.0.1 --port 8787",
+    )
+    web_p.add_argument("--bind", default="127.0.0.1", help="bind address (default: 127.0.0.1)")
+    web_p.add_argument("--port", type=int, default=8787, help="TCP port (default: 8787)")
+    web_p.add_argument("--allow-all-interfaces", action="store_true",
+                       help="explicitly permit binding to 0.0.0.0 / ::")
 
     auto_p = sub.add_parser(
         "auto",
@@ -3823,10 +3847,83 @@ def cmd_timeline(args) -> int:
     return EXIT_OK
 
 
+def cmd_daemon(args) -> int:
+    from .daemon import daemon_status, read_daemon_logs, start_daemon, stop_daemon
+
+    repo = Path(args.repo) if getattr(args, "repo", None) else Path.cwd()
+    cfg_p = Path(args.config) if getattr(args, "config", None) else None
+    action = str(getattr(args, "action", "status") or "status").lower()
+    if action == "start":
+        res = start_daemon(
+            repo,
+            cards=int(getattr(args, "cards", 3) or 3),
+            spend=getattr(args, "spend", None),
+            profile=getattr(args, "profile", None),
+            card_ids=list(getattr(args, "card", None) or []),
+            config_path=cfg_p,
+        )
+        if args.json:
+            print(json.dumps(res, indent=2))
+        else:
+            print(f"Started detached Openfarm daemon (pid {res['pid']}); log: {res['log_path']}")
+        return EXIT_OK
+    if action == "stop":
+        res = stop_daemon(repo, config_path=cfg_p)
+        if args.json:
+            print(json.dumps(res, indent=2))
+        else:
+            print(f"Stopped daemon (was_running={res['was_running']}, pid={res['pid']})")
+        return EXIT_OK
+    if action == "logs":
+        res = read_daemon_logs(repo, tail=int(getattr(args, "tail", 80) or 80), config_path=cfg_p)
+        if args.json:
+            print(json.dumps(res, indent=2))
+        else:
+            if not res["lines"]:
+                print(f"(no daemon logs yet at {res['log_path']})")
+            else:
+                print("\n".join(res["lines"]))
+        return EXIT_OK
+    res = daemon_status(repo, config_path=cfg_p)
+    if args.json:
+        print(json.dumps(res, indent=2))
+    else:
+        st = f"running (pid {res['pid']})" if res["running"] else "stopped"
+        print(f"Openfarm daemon: {st} · log: {res.get('log_path') or '(none)'}")
+    return EXIT_OK
+
+
+def cmd_web(args) -> int:
+    from .web import create_web_server
+
+    repo = Path(args.repo) if getattr(args, "repo", None) else Path.cwd()
+    cfg_p = Path(args.config) if getattr(args, "config", None) else None
+    srv = create_web_server(
+        repo,
+        bind=str(getattr(args, "bind", "127.0.0.1") or "127.0.0.1"),
+        port=int(getattr(args, "port", 8787) or 8787),
+        allow_all_interfaces=bool(getattr(args, "allow_all_interfaces", False)),
+        config_path=cfg_p,
+    )
+    host, port = srv.server_address[:2]
+    url = f"http://{host}:{port}/"
+    if args.json:
+        print(json.dumps({"ok": True, "url": url, "bind": host, "port": port}, indent=2), flush=True)
+    else:
+        print(f"Openfarm Factory Companion listening on {url} (Ctrl-C to stop)", flush=True)
+    try:
+        with contextlib.suppress(KeyboardInterrupt):
+            srv.serve_forever()
+    finally:
+        srv.server_close()
+    return EXIT_OK
+
+
 PRE_CONFIG_COMMANDS = {
     "adopt": cmd_adopt,
     "auto": cmd_auto,
     "bench": cmd_bench,
+    "daemon": cmd_daemon,
     "doctor": cmd_doctor,
     "init": cmd_init,
     "install-skill": cmd_install_skill,
@@ -3837,6 +3934,7 @@ PRE_CONFIG_COMMANDS = {
     "routing": cmd_routing,
     "timeline": cmd_timeline,
     "tui": cmd_tui,
+    "web": cmd_web,
 }
 
 
