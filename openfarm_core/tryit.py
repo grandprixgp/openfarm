@@ -380,8 +380,32 @@ def try_it(root: Path, cfg, goal: dict | None = None, *, out_dir: Path | None = 
         result["output"] = log.read_text(encoding="utf-8", errors="replace").strip()[-3000:]
     oks = [c["ok"] for c in result["checks"]]
     result["ok"] = False if False in oks else (True if oks and None not in oks else None)
+    result["head"] = code_version(root)  # which code was tried, so a later change asks for a new try
     (out_dir / "result.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     return result
+
+
+def code_version(root: Path) -> str:
+    """The commit the project's code is at, or "" outside a repository."""
+    done = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True, check=False)
+    return done.stdout.strip() if done.returncode == 0 else ""
+
+
+def last_result(root: Path, cfg, goal_id: str) -> dict | None:
+    """The saved result of trying this goal, if the code has not changed since."""
+    try:
+        result = json.loads((Path(cfg.state_dir) / "tryit" / goal_id / "result.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return result if result.get("head") == code_version(root) else None
+
+
+def looks_right(cfg, goal_id: str, why: str = "") -> None:
+    """Record that a person looked and is satisfied, whatever the checks said."""
+    path = Path(cfg.state_dir) / "tryit" / goal_id / "result.json"
+    result = json.loads(path.read_text(encoding="utf-8"))
+    result.update(looks_right=True, looks_right_why=why)
+    path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
 
 
 def fix_request(result: dict) -> str:

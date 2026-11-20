@@ -692,7 +692,8 @@ def architect_grill_turn(
         "- NEVER ask the user to invent 'invariants' or 'golden slices' — YOU solve for those.\n"
         "- Ask at most 2-3 total questions across the whole conversation; if len(history) >= 3 or the prompt is already concrete, set ready_to_plan = true.\n"
         "Return ONLY JSON:\n"
-        '{"ready_to_plan": false, "question": "...", "options": ["...", "..."], "recommended": "...", "summary": ""}\n\n'
+        '{"ready_to_plan": false, "question": "...", "why": "one sentence on what this answer decides", '
+        '"options": ["...", "..."], "recommended": "...", "total": <how many questions you expect to ask in all>, "summary": ""}\n\n'
         f"Owner's request:\n{clean_idea}\n\n"
         f"Conversation so far:\n{hist_text}\n"
     )
@@ -708,6 +709,8 @@ def architect_grill_turn(
         "options": options,
         "recommended": str(parsed.get("recommended") or (options[0] if options else "")).strip(),
         "summary": str(parsed.get("summary") or "").strip(),
+        "why": str(parsed.get("why") or "").strip(),
+        "total": max(len(hist) + 1, int(parsed.get("total") or 0) if str(parsed.get("total") or "").isdigit() else 0),
     }
 
 

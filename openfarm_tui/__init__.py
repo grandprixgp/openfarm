@@ -43,14 +43,23 @@ def run_textual_tui(
         "providers": "providers",
     }
     mapped = view_map.get(str(initial_view or "studio").strip().lower(), "studio")
-    app = OpenfarmApp(
-        repo=Path(repo).expanduser().resolve(),
-        config_path=Path(config_path).expanduser().resolve() if config_path else None,
-        run_id=run_id,
-        initial_view=mapped,
-    )
-    app.run()
-    return 0
+    repo = Path(repo).expanduser().resolve()
+    config_path = Path(config_path).expanduser().resolve() if config_path else None
+    while True:
+        if mapped == "auto":
+            # The one screen. Projects, providers and settings are behind Ctrl+K: choosing
+            # one there opens the older screen for it, and closing that comes back here.
+            from .journey import Journey
+
+            wanted = Journey(repo=repo, config_path=config_path).run()
+            if not (isinstance(wanted, tuple) and wanted and wanted[0] == "classic"):
+                return 0
+            classic = OpenfarmApp(repo=repo, config_path=config_path, run_id=run_id, initial_view=wanted[1])
+            classic.run()
+            repo = Path(getattr(classic, "repo", repo))  # a project switched to there is the one shown here
+            continue
+        OpenfarmApp(repo=repo, config_path=config_path, run_id=run_id, initial_view=mapped).run()
+        return 0
 
 
 __all__ = ["run_textual_tui", "textual_available"]
