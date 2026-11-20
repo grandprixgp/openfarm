@@ -357,7 +357,7 @@ Full schema, stop codes, and record formats are in [`docs/USAGE-AND-FIRST-DEPLOY
 
 - **v0.14.0 Live Dogfood (20 Nov 2026, TypeScript/Web):**
   - Fresh repo (`pulse-app`): `init` (inherited Command Code + `x-cmd-zdr: 1`) → `doctor ok=True` → live Claude ACP Grill → Spec & 3 Chunks → 4 DAG-tiered Wave 1 Cards (`eligibility_ok=True`, `baseline_ok=True`, clean git, `0` `.rs` files) → live Web Companion HTTP/SSE → live DeepSeek V4.1 Flash Worker + Claude ACP Supervisor passing **22/22 deterministic gates** (`W1-01 ✓ in-review`, **77% worker / 23% supervisor**) → live `routing` & `timeline` telemetry.
-  - **Live Tailscale HTTPS (`20 Nov 2026`):** `tailscale serve --bg --https=8787 http://127.0.0.1:8787` verified serving live `/api/state` over `https://development.tail8c150c.ts.net:8787/`.
+  - **Live Tailscale HTTPS (`20 Nov 2026`):** `tailscale serve --bg --https=8787 http://127.0.0.1:8787` verified serving live `/api/state` over a private tailnet HTTPS URL (`https://<your-node>.ts.net:8787/`).
 - **v0.13.0 Live Dogfood (20 Nov 2026, TypeScript/Web):** Live Claude ACP Grill (tailored product question, 4 options, zero Rust boilerplate) → 145-line authentic web app spec (*Lumen*) + 4 Chunks + 4 Wave 1 cards + 23 passing baseline tests.
 - **v0.8.7 144-run Live Bench (19 Nov 2026, [`docs/bench-v0.8.7.md`](docs/bench-v0.8.7.md)):** 12 tasks × 3 repeats, DeepSeek V4.1 Flash workers on Command Code (`x-cmd-zdr: 1`):
   - Claude: farm **35/36** vs solo **34/36**, **37.5% fewer** frontier tokens (worker share 65.3%), 0 false pre-review bounces.
