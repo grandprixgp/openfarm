@@ -336,6 +336,125 @@ class ConversationalArchitectRoutingTimelineV013Tests(unittest.TestCase):
                 else:
                     os.environ["OPENFARM_PROVIDERS_FILE"] = prev_prov
 
+    def test_chunk_split_omits_existing_spec_chunks_and_slice_from_prompt(self) -> None:
+        from openfarm_core.automode import run_grill_and_architect, save_project_chunks
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "existing-slice-app"
+            initialize_project(
+                "existing-slice-app",
+                directory=repo,
+                language="typescript",
+                state_dir=Path(tmp) / "st",
+                secrets_dir=Path(tmp) / "sec",
+                commit=True,
+            )
+            (repo / ".openfarm" / "PROJECT_SPEC.md").write_text("# Spec\n\nExisting spec.\n", encoding="utf-8")
+            save_project_chunks(
+                repo,
+                [
+                    {"id": "C1", "title": "Core", "goal": "Core app", "status": "done"},
+                    {"id": "C2", "title": "Polish", "goal": "Breadcrumbs + keyboard", "status": "active"},
+                ],
+            )
+            (repo / "src" / "server.ts").write_text("export function startServer() { return 1; }\n", encoding="utf-8")
+
+            seen: list[str] = []
+
+            def fake_backend(prompt: str) -> str:
+                seen.append(prompt)
+                return json.dumps({
+                    "files": {
+                        "cards/W2-01.md": (
+                            '+++\nid = "W2-01"\ntitle = "Add breadcrumbs"\nstate = "ready"\n'
+                            'category = "small-feature"\nwave = 2\ntouches = ["src/breadcrumbs.ts"]\n'
+                            'reference = "src/breadcrumbs.ts"\nnew_symbols = true\ndepends = []\n'
+                            '[[tests]]\nname = "breadcrumbs_works"\nfile = "tests/breadcrumbs.test.ts"\n'
+                            'asserts = "returns trail"\n+++\n## Done\n- `buildTrail` returns ordered path.\n'
+                        )
+                    }
+                })
+
+            run_grill_and_architect(repo, idea="Polish", chunk_id="C2", backend=fake_backend)
+            self.assertEqual(len(seen), 1)
+            prompt = seen[0]
+            self.assertIn("DO NOT re-emit `.openfarm/PROJECT_SPEC.md` or `.openfarm/CHUNKS.json`", prompt)
+            self.assertIn("DO NOT rewrite or re-emit existing `src/` or `tests/` files", prompt)
+            self.assertIn("cards/W2-01.md", prompt)
+
+    def test_reset_cards_from_base_can_clear_stale_findings(self) -> None:
+        from openfarm_core.adapters.files import FileCardSource
+        from openfarm_core.config import load_config
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "reinit-app"
+            initialize_project(
+                "reinit-app",
+                directory=repo,
+                language="typescript",
+                state_dir=Path(tmp) / "st",
+                secrets_dir=Path(tmp) / "sec",
+                commit=True,
+            )
+            cfg = load_config(repo)
+            src = FileCardSource(repo, "cards", worktree=cfg.state_dir / "cards-source", base_branch=cfg.base_branch)
+            src.prepare()
+            (src.cards_dir / "FIND-1.md").write_text(
+                '+++\nid = "FIND-1"\ntitle = "Old Rust finding"\nstate = "backlog"\nfrom_card = "W1-01"\ntouches = []\n+++\nOld.\n',
+                encoding="utf-8",
+            )
+            src.reset_non_finding_cards_from_base(clear_findings=False)
+            self.assertTrue((src.cards_dir / "FIND-1.md").is_file())
+            src.reset_non_finding_cards_from_base(clear_findings=True)
+            self.assertFalse((src.cards_dir / "FIND-1.md").exists())
+
+    def test_tui_architect_cancel_closes_backend_and_unlocks(self) -> None:
+        import asyncio
+        try:
+            from openfarm_tui.app import OpenfarmApp
+            from textual.widgets import Button
+        except ImportError:
+            self.skipTest("textual not installed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "cancel-tui"
+            initialize_project(
+                "cancel-tui",
+                directory=repo,
+                language="typescript",
+                state_dir=Path(tmp) / "st",
+                secrets_dir=Path(tmp) / "sec",
+                commit=True,
+            )
+
+            class _FakeBackend:
+                def __init__(self) -> None:
+                    self.closed = False
+
+                def close(self) -> None:
+                    self.closed = True
+
+            fake = _FakeBackend()
+
+            async def _run() -> None:
+                app = OpenfarmApp(repo)
+                async with app.run_test(size=(120, 40)) as pilot:
+                    app._active_architect_backend = fake
+                    app._set_drafting_state(True, "Waiting on Frontier ACP...")
+                    await pilot.pause()
+                    cancel_btn = app.query_one("#btn-arch-cancel", Button)
+                    self.assertFalse(cancel_btn.has_class("hidden"))
+                    self.assertTrue(app.query_one("#btn-draft-plan", Button).disabled)
+                    await pilot.click("#btn-arch-cancel")
+                    await pilot.pause()
+                    self.assertTrue(fake.closed)
+                    self.assertTrue(app._architect_cancelled)
+                    self.assertFalse(app._drafting_plan)
+                    self.assertTrue(cancel_btn.has_class("hidden"))
+                    self.assertFalse(app.query_one("#btn-draft-plan", Button).disabled)
+
+            asyncio.run(_run())
+
 
 if __name__ == "__main__":
     unittest.main()

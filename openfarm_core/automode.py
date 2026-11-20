@@ -444,7 +444,12 @@ class _AcpArchitectBackend:
         self._worker.close()
 
 
-def open_architect_backend(repo: Path, cfg=None) -> tuple[object | None, str]:
+def open_architect_backend(
+    repo: Path,
+    cfg=None,
+    *,
+    timeout_s: float = 180.0,
+) -> tuple[object | None, str]:
     """Open a live Frontier ACP Architect backend if OAuth is ready (returns `(backend, reason)`)."""
     from .adapters.acp import is_acp_adapter, normalize_acp_provider
     from .adapters.claude_worker import open_acp_worker
@@ -476,6 +481,8 @@ def open_architect_backend(repo: Path, cfg=None) -> tuple[object | None, str]:
 
     try:
         worker = open_acp_worker(cfg, provider=provider)
+        if timeout_s and timeout_s > 0:
+            worker.timeout_s = min(float(getattr(worker, "timeout_s", timeout_s)), float(timeout_s))
         mm_model = str(getattr(getattr(cfg, "micromanager", None), "model", "") or "")
         return _AcpArchitectBackend(worker, model=mm_model), f"{provider} ACP"
     except Exception as exc:
@@ -790,7 +797,7 @@ def draft_spec_and_chunks(
             f"Existing repo files: {existing_files or '(empty workspace)'}\n"
             f"{_stack_authentic_guidance(lang)}\n"
             "Your job:\n"
-            "1. Flesh out a concrete, inspiring, runnable Product & Technical Specification in Markdown (`.openfarm/PROJECT_SPEC.md`):\n"
+            "1. Flesh out a concrete, inspiring, runnable Product & Technical Specification in Markdown (`.openfarm/PROJECT_SPEC.md`, keep it crisp and focused at ~50-90 lines of concrete bullets — no filler):\n"
             "   - Product Vision & User Experience (faithful to the owner's idea, whether a full app or a feature in an existing repo)\n"
             "   - Architecture & How to Run It locally\n"
             "   - Internal Safety Invariants (derived by YOU — never turn a visual web app into a pure offline library)\n"
@@ -927,7 +934,28 @@ def run_grill_and_architect(
             and ".openfarm" not in p.parts
             and "node_modules" not in p.parts
             and "target" not in p.parts
-        ][:40]
+        ][:30]
+        # Detect whether a real runnable slice already exists (beyond a bare starter stub).
+        starter_stubs = {
+            "src/invariants.ts", "src/index.ts", "tests/baseline.test.ts",
+            "src/invariants.rs", "src/lib.rs", "tests/baseline_tests.rs",
+            "src/invariants.py", "app.py", "tests/test_baseline.py",
+            "invariants.go", "main.go", "main_test.go",
+            "package.json", "tsconfig.json", "Cargo.toml", "pyproject.toml", "go.mod",
+            "AGENTS.md", ".gitignore", "cards/.gitkeep",
+        }
+        non_card_files = [f for f in existing_files if not f.startswith("cards/")]
+        extra_code_files = [f for f in non_card_files if f not in starter_stubs]
+        has_existing_slice = len(extra_code_files) >= 1
+        has_spec_and_chunks = bool(existing_spec_text) and bool(existing_chunks)
+
+        wave_num = 1
+        if active_chunk is not None and existing_chunks:
+            for idx, ch in enumerate(existing_chunks, start=1):
+                if ch.get("id") == active_chunk.get("id"):
+                    wave_num = idx
+                    break
+
         chunk_section = ""
         if active_chunk is not None:
             chunk_section = (
@@ -935,9 +963,43 @@ def run_grill_and_architect(
                 f"  - ID: {active_chunk['id']}\n"
                 f"  - Title: {active_chunk['title']}\n"
                 f"  - Goal: {active_chunk.get('goal', '')}\n"
-                f"  (Do NOT delete completed chunks; split THIS active chunk into 2 to 5 concrete cards.)\n"
+                f"  (Do NOT delete completed chunks; split THIS active chunk into 2 to 4 concise cards under `cards/W{wave_num}-01.md`..)\n"
             )
-        spec_section = f"\nExisting Living Spec (`.openfarm/PROJECT_SPEC.md`):\n{existing_spec_text[:3500]}\n" if existing_spec_text else ""
+        spec_section = (
+            f"\nExisting Living Spec (`.openfarm/PROJECT_SPEC.md`):\n{existing_spec_text[:2400]}\n"
+            if existing_spec_text
+            else ""
+        )
+
+        # Keep prompt & JSON output compact so Frontier ACP finishes in ~20-60s instead of rewriting the whole repo.
+        include_lines: list[str] = []
+        if not has_spec_and_chunks:
+            include_lines.append(
+                "1. `.openfarm/PROJECT_SPEC.md` (concise ~50-80 line product spec, architecture, how to run it, and Chunks plan)"
+            )
+            include_lines.append(
+                '2. `.openfarm/CHUNKS.json` (2 to 3 ordered chunks `{"chunks": [{"id": "C1", "title": "...", "goal": "...", "status": "active"}, ...]}`)'
+            )
+        if not has_existing_slice:
+            include_lines.append(
+                f"- A COMPACT runnable {lang} vertical slice (1 to 3 small files totaling ~80-180 lines) plus 1 concise passing baseline test file"
+            )
+        include_lines.append(
+            f"- 2 to 4 scoped, non-overlapping Wave cards under `cards/W{wave_num}-01.md`.. (~35-55 lines each) using TOML +++ headers "
+            f"(id, title, state=\"ready\", category=\"small-feature\", wave={wave_num}, touches, reference, new_symbols=true, depends, tests=[{{name, file, asserts}}]) "
+            "and concrete `## Done` sections without vague adjectives. "
+            "Prefer exported functions (e.g. `export function neutralTheme()`) over non-function module constants for newly introduced symbols so TDD scaffolds compile cleanly."
+        )
+        omit_rules: list[str] = ["Never modify `.openfarm/config.toml` or `never_touch` files."]
+        if has_spec_and_chunks:
+            omit_rules.append(
+                "DO NOT re-emit `.openfarm/PROJECT_SPEC.md` or `.openfarm/CHUNKS.json` — they are already saved on disk."
+            )
+        if has_existing_slice:
+            omit_rules.append(
+                "DO NOT rewrite or re-emit existing `src/` or `tests/` files — the runnable slice is already on disk, and openfarm auto-creates placeholder files for any new `touches` paths."
+            )
+
         prompt = (
             f"You are the Frontier Software Architect for this {lang} Openfarm repository.\n"
             f"Language stack: {lang} (STRICT: generate ONLY {lang} files — NEVER emit .rs or Cargo.toml in a non-Rust project).\n"
@@ -945,21 +1007,12 @@ def run_grill_and_architect(
             f"Locked never_touch files (DO NOT modify or list in card touches): {never_touch}\n"
             f"Existing repository files: {existing_files}\n"
             f"{spec_section}{chunk_section}"
-            "YOU are responsible for deriving:\n"
-            "  - The full, faithful product architecture tailored directly to the owner's request (whether it's a whole new runnable app or a feature in an existing codebase)\n"
-            "  - Internal safety invariants (without turning a web app into a pure offline library)\n"
-            "  - A real, runnable vertical slice with passing baseline tests\n"
-            "  - 2 to 5 scoped, non-overlapping Wave cards that implement the active chunk (or Chunk 1)\n"
-            "Return ONLY a JSON object: {\"files\": {\"<repo-relative-path>\": \"<content>\", ...}}.\n"
-            "Include:\n"
-            "1. `.openfarm/PROJECT_SPEC.md` (clear product spec, architecture, how to run it, and Chunks/Waves plan — preserve/refine existing spec if present)\n"
-            "2. `.openfarm/CHUNKS.json` (ordered milestone chunks `{\"chunks\": [{\"id\": \"C1\", \"title\": \"...\", \"goal\": \"...\", \"status\": \"active\"}, ...]}` if not already present)\n"
-            f"3. The runnable {lang} vertical slice file(s) and passing baseline test(s)\n"
-            "4. 2 to 5 scoped, non-overlapping Wave cards under `cards/W1-01.md`.. (or `W2-01.md` for later chunks) using TOML +++ headers "
-            "(id, title, state=\"ready\", category=\"small-feature\", wave=1, touches, reference, new_symbols=true, depends, tests=[{name, file, asserts}]) "
-            "and concrete `## Done` sections without vague adjectives. "
-            "Prefer exported functions (e.g. `export function neutralTheme()`) over non-function module constants for newly introduced symbols so TDD scaffolds compile cleanly.\n"
-            "Never modify `.openfarm/config.toml` or `never_touch` files.\n\n"
+            "Return ONLY a compact JSON object: {\"files\": {\"<repo-relative-path>\": \"<content>\", ...}}.\n"
+            "Include ONLY:\n"
+            + "\n".join(include_lines)
+            + "\nRules:\n- "
+            + "\n- ".join(omit_rules)
+            + "\n\n"
             + "\n".join(lines)
         )
         if callable(on_progress):

@@ -394,6 +394,8 @@ class OpenfarmApp(App):
         self._draft_started_at = 0.0
         self._draft_phase_msg = ""
         self._draft_last_heartbeat = 0
+        self._active_architect_backend: object | None = None
+        self._architect_cancelled = False
         self._last_baseline_ok: bool | None = None
         self._last_baseline_error = ""
         self._worker_tokens = 0
@@ -508,6 +510,7 @@ class OpenfarmApp(App):
                 with Vertical(id="architect-panel", classes="hidden"):
                     with Horizontal(id="architect-panel-head"):
                         yield Static("", id="architect-banner")
+                        yield Button("Cancel", classes="soft-btn hidden", id="btn-arch-cancel")
                         yield Button("Hide Log", classes="soft-btn", id="btn-arch-hide")
                     yield RichLog(id="architect-log", markup=True, wrap=True, min_width=0)
                 with ContentSwitcher(initial="studio-grill", id="studio-switcher"):
@@ -1658,6 +1661,21 @@ class OpenfarmApp(App):
         except Exception:
             pass
 
+    @on(Button.Pressed, "#btn-arch-cancel")
+    def _arch_cancel_clicked(self) -> None:
+        if not self._drafting_plan:
+            return
+        self._architect_cancelled = True
+        backend = self._active_architect_backend
+        self._active_architect_backend = None
+        if backend is not None and hasattr(backend, "close"):
+            try:
+                backend.close()
+            except Exception as exc:
+                self.log.warning(f"architect cancel close error: {exc}")
+        self._set_drafting_state(False, "[bold #f59e0b]■ Architect cancelled by user[/]")
+        self.notify("Architect call cancelled.", severity="warning")
+
     @on(Button.Pressed, "#btn-arch-hide")
     def _arch_hide_clicked(self) -> None:
         self.query_one("#architect-panel", Vertical).add_class("hidden")
@@ -1685,6 +1703,14 @@ class OpenfarmApp(App):
                 b.label = busy_lbl if active else idle_lbl
             except Exception:
                 pass
+        try:
+            cancel_btn = self.query_one("#btn-arch-cancel", Button)
+            if active:
+                cancel_btn.remove_class("hidden")
+            else:
+                cancel_btn.add_class("hidden")
+        except Exception:
+            pass
         pill = self.query_one("#status-badge", Static)
         panel = self.query_one("#architect-panel", Vertical)
         banner = self.query_one("#architect-banner", Static)
@@ -1713,8 +1739,14 @@ class OpenfarmApp(App):
                 banner.update(message)
                 status_box.remove_class("hidden")
                 status_box.update(message)
-                plain = message.replace("[bold #4ade80]", "").replace("[bold #fb7185]", "").replace("[/]", "")
-                self._log_architect(plain, style=("#fb7185" if "✗" in plain else "#4ade80"))
+                plain = (
+                    message.replace("[bold #4ade80]", "")
+                    .replace("[bold #fb7185]", "")
+                    .replace("[bold #f59e0b]", "")
+                    .replace("[/]", "")
+                )
+                log_color = "#fb7185" if "✗" in plain else ("#f59e0b" if "■" in plain else "#4ade80")
+                self._log_architect(plain, style=log_color)
             else:
                 status_box.add_class("hidden")
                 if was_active:
@@ -1802,11 +1834,13 @@ class OpenfarmApp(App):
     @work(thread=True)
     def _grill_ask_bg(self, idea: str) -> None:
         use_architect = bool(self.query_one("#sw-use-architect", Switch).value)
+        self._architect_cancelled = False
         backend = None
         try:
             cfg = self._safe_cfg()
             if use_architect:
                 backend, reason = open_architect_backend(self.repo, cfg)
+                self._active_architect_backend = backend
                 if backend is not None:
                     self.call_from_thread(
                         self._set_drafting_state,
@@ -1820,6 +1854,8 @@ class OpenfarmApp(App):
                 language=self._selected_stack,
                 backend=backend,
             )
+            if self._architect_cancelled:
+                return
             if turn.get("ready_to_plan") or not str(turn.get("question") or "").strip():
                 self._grill_pending_question = ""
                 self._grill_options = []
@@ -1833,12 +1869,16 @@ class OpenfarmApp(App):
             if self._grill_pending_question:
                 self.call_from_thread(self.query_one("#inp-grill-answer", Input).focus)
         except Exception as exc:
+            if self._architect_cancelled:
+                return
             self.call_from_thread(
                 self._set_drafting_state,
                 False,
                 f"[bold #fb7185]✗ Grill error:[/] {rich_escape(str(exc))}",
             )
         finally:
+            if self._active_architect_backend is backend:
+                self._active_architect_backend = None
             if backend is not None and hasattr(backend, "close"):
                 try:
                     backend.close()
@@ -1861,16 +1901,19 @@ class OpenfarmApp(App):
     @work(thread=True)
     def _draft_spec_bg(self, idea: str) -> None:
         use_architect = bool(self.query_one("#sw-use-architect", Switch).value)
+        self._architect_cancelled = False
         backend = None
         try:
             self._ensure_workspace_initialized_for_studio(idea)
             cfg = self._safe_cfg()
             if use_architect:
                 backend, reason = open_architect_backend(self.repo, cfg)
+                self._active_architect_backend = backend
                 if backend is not None:
                     self.call_from_thread(self._set_drafting_state, True, f"Fleshing out spec & chunks with {reason}...")
             def _on_spec_prog(msg: str) -> None:
-                self.call_from_thread(self._set_drafting_state, True, msg)
+                if not self._architect_cancelled:
+                    self.call_from_thread(self._set_drafting_state, True, msg)
 
             res = draft_spec_and_chunks(
                 self.repo,
@@ -1880,6 +1923,8 @@ class OpenfarmApp(App):
                 backend=backend,
                 on_progress=_on_spec_prog,
             )
+            if self._architect_cancelled:
+                return
             self.call_from_thread(
                 self._set_drafting_state,
                 False,
@@ -1897,6 +1942,8 @@ class OpenfarmApp(App):
                 f"Spec ready with {len(res['chunks'])} chunk(s) — review or split into cards.",
             )
         except Exception as exc:
+            if self._architect_cancelled:
+                return
             self.call_from_thread(
                 self._set_drafting_state,
                 False,
@@ -1904,6 +1951,8 @@ class OpenfarmApp(App):
             )
             self.call_from_thread(self.notify, f"Spec error: {exc}", severity="error")
         finally:
+            if self._active_architect_backend is backend:
+                self._active_architect_backend = None
             if backend is not None and hasattr(backend, "close"):
                 try:
                     backend.close()
@@ -2028,7 +2077,7 @@ class OpenfarmApp(App):
                         "cards",
                         worktree=fresh_cfg.state_dir / "cards-source",
                         base_branch=fresh_cfg.base_branch,
-                    ).reset_non_finding_cards_from_base()
+                    ).reset_non_finding_cards_from_base(clear_findings=bool(stack_changed_on_blank))
 
     @staticmethod
     def _skeleton_missing_for_cfg(repo: Path, cfg) -> bool:
@@ -2049,6 +2098,7 @@ class OpenfarmApp(App):
     def _draft_plan_bg(self, chunk_id: str | None = None) -> None:
         idea = self.query_one("#ta-idea", TextArea).text.strip() or DEFAULT_GRILL_QUESTIONS[0]["default"]
         use_architect = bool(self.query_one("#sw-use-architect", Switch).value)
+        self._architect_cancelled = False
         backend = None
         try:
             self._ensure_workspace_initialized_for_studio(idea)
@@ -2056,6 +2106,7 @@ class OpenfarmApp(App):
             arch_note = "local template"
             if use_architect:
                 backend, reason = open_architect_backend(self.repo, cfg)
+                self._active_architect_backend = backend
                 if backend is not None:
                     arch_note = reason
                     self.call_from_thread(
@@ -2074,7 +2125,8 @@ class OpenfarmApp(App):
                 self.call_from_thread(self._set_drafting_state, True, "Drafting instant local Wave plan...")
 
             def _on_prog(msg: str) -> None:
-                self.call_from_thread(self._set_drafting_state, True, f"{msg} ({arch_note})")
+                if not self._architect_cancelled:
+                    self.call_from_thread(self._set_drafting_state, True, f"{msg} ({arch_note})")
 
             try:
                 plan = draft_wave_plan(
@@ -2088,6 +2140,8 @@ class OpenfarmApp(App):
                     on_progress=_on_prog,
                 )
             except Exception as arch_exc:
+                if self._architect_cancelled:
+                    return
                 if backend is None:
                     raise
                 arch_note = f"local fallback (architect error: {arch_exc})"
@@ -2106,6 +2160,8 @@ class OpenfarmApp(App):
                     verify_baseline=True,
                     on_progress=_on_prog,
                 )
+            if self._architect_cancelled:
+                return
             self._last_baseline_ok = bool(plan.get("baseline_ok", True))
             self._last_baseline_error = str(plan.get("baseline_error") or "")
             self.call_from_thread(self._set_drafting_state, False, "")
@@ -2123,6 +2179,8 @@ class OpenfarmApp(App):
                 severity=("warning" if not self._last_baseline_ok else "information"),
             )
         except Exception as exc:
+            if self._architect_cancelled:
+                return
             self.call_from_thread(
                 self._set_drafting_state,
                 False,
@@ -2130,6 +2188,8 @@ class OpenfarmApp(App):
             )
             self.call_from_thread(self.notify, f"Plan error: {exc}", severity="error")
         finally:
+            if self._active_architect_backend is backend:
+                self._active_architect_backend = None
             if backend is not None and hasattr(backend, "close"):
                 try:
                     backend.close()
