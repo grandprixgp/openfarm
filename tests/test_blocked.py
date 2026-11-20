@@ -107,6 +107,23 @@ class FixTests(_Project):
         self.assertIn("the Architect rewrote it: cut the scope to one function", fix["notes"][0])
         self.assertIn('+title = "Count, smaller"', fix["diff"])
 
+    def test_the_architects_fix_takes_the_plan_checks_own_repairs_before_it_is_shown(self) -> None:
+        # from the acceptance run: a rewrite that failed the plan checks was saved and the task parked
+        from openfarm_core.adapters.files import render_card_file
+
+        self.store.change_card("W1-01", "create", header=_header("W1-01"), body=BODY)
+        asked = []
+
+        def architect(prompt: str) -> str:
+            asked.append(prompt)
+            return json.dumps({"card": render_card_file(_header("W1-01"), BODY + "- `tally/extra.py` holds a helper.\n"),
+                               "change": "moved the helper out"})
+
+        fix = propose_fix(self.root, self.cfg, self.store, "W1-01", why="x", backend=architect)
+        self.assertIn("Files no task may write", asked[0])
+        self.assertEqual(fix["header"]["touches"], ["tally/core.py", "tally/extra.py"])
+        self.assertTrue(any("added `tally/extra.py`" in note for note in fix["notes"][1:]))
+
 
 if __name__ == "__main__":
     unittest.main()

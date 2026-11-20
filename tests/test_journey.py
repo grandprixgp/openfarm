@@ -504,6 +504,26 @@ class FlowTests(_Folder):
         self.app = lambda stage, theme="openfarm-dark": journey.Journey(repo=root2, theme=theme)
         self.drive("spec", bar, size=(100, 30))
 
+    def test_a_build_left_with_only_a_parked_task_still_has_a_main_button(self) -> None:
+        # from the acceptance run: a fix that failed the plan checks parked the last task and left no way forward
+        async def body(app, pilot) -> None:
+            from openfarm_core.store import Store
+
+            store = Store(app.repo, app.facts["cfg"])
+            for task in app.facts["tasks"]:
+                header, text = store.read(task["id"])
+                if task["id"] == "W1-04":
+                    header = dict(header, state="backlog", preflight=["touches: it names a file no task may write"])
+                elif header.get("state") != "done":
+                    header = dict(header, state="done")
+                store.src._write(task["id"], header, text, f"{task['id']}: as the run left it")
+            app.refresh_screen()
+            await pilot.pause(0.2)
+            self.assertEqual(app.screen_name, "build")
+            self.assertEqual(self.label(app), "▶ Repair 1 task")
+
+        self.drive("blocked", body)
+
     # spec and plan ----------------------------------------------------------------
 
     def test_spec_to_plan_shows_the_tasks_the_checks_and_the_repairs(self) -> None:
