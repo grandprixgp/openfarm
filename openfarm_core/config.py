@@ -496,6 +496,38 @@ class Config:
             for role in ("test_writer", "implementer", "checker", "planner")
         }
 
+        # Inherit global provider profile (`~/.config/openfarm/providers.toml`) when the
+        # repo still carries the init/adopt placeholder endpoint.
+        if self.model_adapter == "openai-compatible":
+            from .providers import is_placeholder_endpoint, load_global_providers
+
+            if is_placeholder_endpoint(self.endpoint):
+                gp = load_global_providers()
+                wk = gp.get("worker") if isinstance(gp, dict) else {}
+                g_ep = str((wk or {}).get("endpoint") or "").strip()
+                if g_ep and not is_placeholder_endpoint(g_ep):
+                    self.endpoint = g_ep
+                    if g_ep not in self.allowed_endpoints:
+                        self.allowed_endpoints = [
+                            ep for ep in self.allowed_endpoints if not is_placeholder_endpoint(ep)
+                        ] + [g_ep]
+                    g_kf_str = str((wk or {}).get("key_file") or "").strip()
+                    if g_kf_str and (self.key_file is None or not self.key_file.is_file()):
+                        cand_kf = Path(g_kf_str).expanduser().resolve()
+                        if not cand_kf.is_relative_to(self.repo):
+                            self.key_file = cand_kf
+                    g_model = str((wk or {}).get("model") or "").strip()
+                    if g_model:
+                        for role_name, rm in list(self.role_models.items()):
+                            if rm.model in ("", "lesser-coder"):
+                                self.role_models[role_name] = RoleModel(
+                                    model=g_model,
+                                    temperature=rm.temperature,
+                                    vary_seed=rm.vary_seed,
+                                    effort=rm.effort,
+                                    effort_ladder=rm.effort_ladder,
+                                )
+
         policy = self._table("policy")
         self.never_touch = _as_str_list(policy.get("never_touch", []),
                                         "[policy] never_touch")

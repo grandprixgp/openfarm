@@ -321,6 +321,18 @@ def initialize_project(
         if secrets_dir is not None
         else (Path.home() / ".config" / "openfarm").resolve()
     )
+    from .providers import is_placeholder_endpoint, load_global_providers
+
+    gp = load_global_providers()
+    gp_wk = gp.get("worker") if isinstance(gp, dict) else {}
+    if is_placeholder_endpoint(endpoint) and not is_placeholder_endpoint(str((gp_wk or {}).get("endpoint") or "")):
+        endpoint = str(gp_wk["endpoint"])
+        if model in ("", "lesser-coder") and str(gp_wk.get("model") or "").strip():
+            model = str(gp_wk["model"]).strip()
+        if key_file is None and str(gp_wk.get("key_file") or "").strip():
+            cand_kf = Path(str(gp_wk["key_file"])).expanduser().resolve()
+            if not cand_kf.is_relative_to(target_dir):
+                key_file = cand_kf
     resolved_key = (
         Path(key_file).expanduser().resolve()
         if key_file is not None

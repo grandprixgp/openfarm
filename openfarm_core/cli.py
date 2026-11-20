@@ -2618,8 +2618,8 @@ def cmd_swarm(ctx: Context, args) -> int:
 # -- the parser ----------------------------------------------------------------
 
 _CLI_EPILOG = """\
-Command groups (27 commands):
-  Setup & Auth         init, adopt, install-skill, acp
+Command groups (28 commands):
+  Setup & Auth         init, adopt, install-skill, acp, providers
   Run & Monitor        auto, check, run, status, pause, resume, stop, tui
   Review & Harness     triage, review, land, frontier-review, dossier, verdict, done, release, escape, supervise, harness
   Swarm, Board & Bench swarm, board, drive, bench
@@ -3037,6 +3037,22 @@ def build_parser() -> argparse.ArgumentParser:
     acp.add_argument("--setup-token", action="store_true",
                      help="run `claude setup-token` for long-lived CLAUDE_CODE_OAUTH_TOKEN")
 
+    prov_p = sub.add_parser(
+        "providers",
+        help="inspect, configure, or probe global Frontier & Worker providers",
+        formatter_class=raw_fmt,
+        epilog="Examples:\n  openfarm providers status\n  openfarm providers set --preset openrouter --model qwen/qwen3-coder\n  openfarm providers probe",
+    )
+    prov_p.add_argument("action", nargs="?", default="status", choices=("status", "set", "probe"))
+    prov_p.add_argument("--frontier", choices=("claude", "codex", "antigravity"), default=None)
+    prov_p.add_argument("--preset", choices=("openrouter", "fireworks", "together", "ollama", "custom"), default=None)
+    prov_p.add_argument("--endpoint", default="")
+    prov_p.add_argument("--model", default="")
+    prov_p.add_argument("--key-file", default=None)
+    prov_p.add_argument("--api-key", default="")
+    prov_p.add_argument("--no-zdr", action="store_true")
+    prov_p.add_argument("--timeout", type=float, default=5.0)
+
     auto_p = sub.add_parser(
         "auto",
         help="context-aware automode landing & command palette (default when running bare `openfarm` on a TTY)",
@@ -3412,6 +3428,66 @@ def cmd_drive(ctx: Context, args) -> int:
     return EXIT_OK if payload.get("ok") else EXIT_TROUBLE
 
 
+def cmd_providers(args) -> int:
+    from .providers import load_global_providers, probe_worker_endpoint, save_global_providers
+
+    action = str(getattr(args, "action", "status") or "status")
+    if action == "status":
+        data = load_global_providers()
+        if args.json:
+            print(json.dumps(data, indent=2))
+        else:
+            wk = data["worker"]
+            print(f"Global providers: {data['path']} ({'configured' if data['configured'] else 'unconfigured'})")
+            print(f"  Frontier: {data['frontier']['provider']}")
+            print(f"  Worker:   preset={wk['preset']} endpoint={wk['endpoint'] or '(unset)'} model={wk['model'] or '(unset)'}")
+            print(f"  Key file: {wk['key_file']} ({'ready' if wk['key_present'] else 'missing'})  zdr={wk['zdr']}")
+        return EXIT_OK
+
+    if action == "set":
+        cur = load_global_providers()
+        res = save_global_providers(
+            frontier_provider=args.frontier or cur["frontier"]["provider"],
+            worker_preset=args.preset or cur["worker"]["preset"],
+            endpoint=args.endpoint or ("" if args.preset else cur["worker"]["endpoint"]),
+            model=args.model or ("" if args.preset else cur["worker"]["model"]),
+            key_file=Path(args.key_file) if args.key_file else Path(cur["worker"]["key_file"]),
+            api_key=args.api_key or "",
+            zdr=(False if args.no_zdr else None),
+        )
+        if args.json:
+            print(json.dumps(res, indent=2))
+        else:
+            wk = res["worker"]
+            print(f"Saved global providers to {res['path']} (preset={wk['preset']}, endpoint={wk['endpoint']}, model={wk['model']})")
+        return EXIT_OK
+
+    if action == "probe":
+        cur = load_global_providers()
+        wk = cur["worker"]
+        ep = args.endpoint or wk["endpoint"]
+        mdl = args.model or wk["model"]
+        kf = Path(args.key_file) if args.key_file else (Path(wk["key_file"]) if wk.get("key_file") else None)
+        res = probe_worker_endpoint(
+            ep,
+            key_file=kf,
+            api_key=args.api_key or "",
+            model=mdl,
+            zdr=not bool(args.no_zdr) and bool(wk.get("zdr", True)),
+            timeout_s=float(args.timeout or 5.0),
+        )
+        if args.json:
+            print(json.dumps(res, indent=2))
+        else:
+            if res["ok"]:
+                print(f"✓ Connected ({res['latency_ms']}ms · HTTP {res['status']} · zdr={res['zdr_sent']} · models={res['models_count']})")
+            else:
+                print(f"✗ Probe failed: {res['error']} (HTTP {res['status']})")
+        return EXIT_OK if res["ok"] else EXIT_TROUBLE
+
+    raise UsageError(f"unknown providers subcommand: {action}")
+
+
 PRE_CONFIG_COMMANDS = {
     "adopt": cmd_adopt,
     "auto": cmd_auto,
@@ -3419,6 +3495,7 @@ PRE_CONFIG_COMMANDS = {
     "init": cmd_init,
     "install-skill": cmd_install_skill,
     "acp": cmd_acp,
+    "providers": cmd_providers,
     "tui": cmd_tui,
 }
 
