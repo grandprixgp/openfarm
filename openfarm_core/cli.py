@@ -2618,10 +2618,10 @@ def cmd_swarm(ctx: Context, args) -> int:
 # -- the parser ----------------------------------------------------------------
 
 _CLI_EPILOG = """\
-Command groups (28 commands):
+Command groups (29 commands):
   Setup & Auth         init, adopt, install-skill, acp, providers
   Run & Monitor        auto, check, run, status, pause, resume, stop, tui
-  Review & Harness     triage, review, land, frontier-review, dossier, verdict, done, release, escape, supervise, harness
+  Review & Harness     triage, review, land, findings, frontier-review, dossier, verdict, done, release, escape, supervise, harness
   Swarm, Board & Bench swarm, board, drive, bench
 
 Common workflows:
@@ -2739,6 +2739,20 @@ def build_parser() -> argparse.ArgumentParser:
     land.add_argument("cards", nargs="+", help="card IDs to land serially onto base_branch")
     land.add_argument("--dry-run", action="store_true",
                       help="trial-merge and verify only, without modifying base_branch")
+
+    find_p = sub.add_parser(
+        "findings",
+        help="list, pick for next wave, dismiss, or fold worker-filed findings",
+        formatter_class=raw_fmt,
+        epilog="Examples:\n  openfarm findings list\n  openfarm findings pick FIND-1\n  openfarm findings dismiss FIND-2 --reason 'already fixed'\n  openfarm findings fold FIND-3 --into CARD-2",
+    )
+    find_p.add_argument("action", nargs="?", default="list", choices=("list", "pick", "dismiss", "fold"))
+    find_p.add_argument("finding_id", nargs="?", default="", help="finding id (e.g. FIND-1)")
+    find_p.add_argument("--state", default="waiting", choices=("waiting", "picked", "dismissed", "folded", "promoted", "all"))
+    find_p.add_argument("--from", dest="from_card", default="", help="filter findings filed by this card id")
+    find_p.add_argument("--query", default="", help="substring filter")
+    find_p.add_argument("--reason", default="", help="optional one-line reason when dismissing")
+    find_p.add_argument("--into", dest="target_card", default="", help="target card id when folding")
 
     dossier = sub.add_parser(
         "dossier",
@@ -3503,6 +3517,50 @@ PRE_CONFIG_COMMANDS = {
 }
 
 
+def cmd_findings(ctx: Context, args) -> int:
+    from .findings import decide_finding, list_findings
+
+    action = str(getattr(args, "action", "list") or "list")
+    if action == "list":
+        res = list_findings(
+            ctx.repo,
+            ctx.cfg,
+            state_filter=getattr(args, "state", "waiting"),
+            from_card=getattr(args, "from_card", ""),
+            query=getattr(args, "query", ""),
+        )
+        if getattr(args, "json", False):
+            print(json.dumps(res, indent=2))
+        else:
+            c = res["counts"]
+            print(f"Findings: {c['waiting']} waiting · {c['new_since_last_run']} new · {c['picked']} picked for next wave ({c['total']} total)")
+            for item in res["findings"]:
+                tag = " [new]" if item["is_new"] else ""
+                print(f"  {item['id']:<8}  {item['from_card']:<10}  {item['title']}{tag}")
+        return EXIT_OK
+
+    fid = str(getattr(args, "finding_id", "") or "").strip()
+    if not fid:
+        raise UsageError(f"findings {action} requires a finding id (e.g. FIND-1)")
+    if action == "pick":
+        res = decide_finding(ctx.repo, ctx.cfg, fid, "next-wave")
+    elif action == "dismiss":
+        res = decide_finding(ctx.repo, ctx.cfg, fid, "dismissed", reason=getattr(args, "reason", ""))
+    elif action == "fold":
+        target = str(getattr(args, "target_card", "") or "").strip()
+        if not target:
+            raise UsageError("findings fold requires --into <CARD-ID>")
+        res = decide_finding(ctx.repo, ctx.cfg, fid, "folded", target_card=target)
+    else:
+        raise UsageError(f"unknown findings subcommand: {action}")
+
+    if getattr(args, "json", False):
+        print(json.dumps(res, indent=2))
+    else:
+        print(f"{res['id']}: {res['decision']} ({res['state']})")
+    return EXIT_OK
+
+
 COMMANDS = {
     "run": cmd_run,
     "status": cmd_status,
@@ -3513,6 +3571,7 @@ COMMANDS = {
     "done": cmd_done,
     "review": cmd_review,
     "land": cmd_land,
+    "findings": cmd_findings,
     "triage": cmd_triage,
     "frontier-review": cmd_frontier_review,
     "dossier": cmd_dossier,

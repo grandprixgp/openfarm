@@ -70,6 +70,13 @@ OPTIONAL_CARD_FIELDS = (
     "replan_if",
     "complexity",
     "profile",
+    "from_card",
+    "created_at",
+    "finding_decision",
+    "finding_reason",
+    "folded_into",
+    "finding_decided_at",
+    "promoted_card",
 )
 
 _OPENFARM_BLOCK_RE = re.compile(

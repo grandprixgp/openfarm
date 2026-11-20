@@ -1889,5 +1889,5 @@ def error_hint(kind: str, message: str) -> str:
     if "outside the repository" in low:
         return "point state_dir and key_file outside the repository (e.g. ~/.openfarm/<name> and ~/.config/openfarm/<name>.key)"
     if kind == "usage error" and "no subcommand" in low:
-        return "run 'openfarm --help' to list all 28 commands and workflows"
+        return "run 'openfarm --help' to list all 29 commands and workflows"
     return ""
