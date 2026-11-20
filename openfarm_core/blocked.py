@@ -187,6 +187,7 @@ def propose_fix(root: Path, cfg, store, card_id: str, why: str = "", backend=Non
             f"What the builder reported: {why or 'no diagnosis'}\n"
             "Rules: every file the text names is in `touches`; no parameter defaults in a signature.\n"
             f"{BUILD_RULES}\n"
+            f"Files no task may write (never put them in `touches`): {', '.join(getattr(cfg, 'forbidden_files', []) or []) or 'none'}\n"
             'Return ONLY JSON: {"card": "<the whole card file, +++ TOML header and body>", "change": "<one sentence>"}\n\n'
             + before
         )
@@ -197,6 +198,10 @@ def propose_fix(root: Path, cfg, store, card_id: str, why: str = "", backend=Non
             return None
         new_header = {**header, **{k: v for k, v in got_header.items() if k not in ("id", "state")}}
         notes = [f"the Architect rewrote it: {str(parsed.get('change') or 'to fit what the builder reported').strip()}"]
+        # The rewrite is judged by the same checks as any task, and takes their own fixes before anyone sees it.
+        new_header, new_body, more = apply_fixes(new_header, new_body,
+                                                 check_card(card_from(new_header, new_body), cfg, root, store.cards()))
+        notes += more
     if not notes:
         return None
     after = render_card_file(new_header, new_body)

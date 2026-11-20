@@ -1178,6 +1178,10 @@ class Journey(App):
             primary = ("open_blocked", f"See why {blocked['id']} stopped")
         elif waiting and not facts["running"] and not self._following:
             primary = ("build", f"Build {len(waiting)} task{'s' if len(waiting) != 1 else ''}")
+        elif not facts["running"] and not self._following and self._first("backlog"):  # parked by the plan checks
+            parked = sum(1 for t in facts["tasks"] if t["state"] == "backlog")
+            primary = ("fix_parked", f"Repair {parked} task{'s' if parked != 1 else ''}")
+            others.append(("edit_task", "Edit a task"))
         if facts["questions"] and primary and primary[0] != "answer_question":
             others.append(("answer_question", "Answer the question"))
         if blocked and primary and primary[0] != "open_blocked":
