@@ -103,3 +103,84 @@ class DogfoodCardsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PlanTests(unittest.TestCase):
+    """The same four cards through the whole plan step: repaired in the open, or parked with the reason."""
+
+    def setUp(self) -> None:
+        import os
+        import subprocess
+        from unittest import mock
+
+        from openfarm_core.bootstrap import initialize_project
+        from openfarm_core.config import load_config
+        from openfarm_core.store import Store
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name)
+        patcher = mock.patch.dict(os.environ, {"OPENFARM_PROJECTS_FILE": str(base / "projects.json")})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.root = base / "iotd"
+        initialize_project("iotd", directory=self.root, idea="image of the day", language="typescript",
+                           state_dir=base / "state", secrets_dir=base / "secrets", commit=True)
+        for rel in ("src/server.ts", "src/shared/palette.ts", "src/shared/theme.ts", "tests/slice.test.ts"):
+            (self.root / rel).parent.mkdir(parents=True, exist_ok=True)
+            (self.root / rel).write_text("export const real = 1;\n")
+        subprocess.run(["git", "-C", str(self.root), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+                        "commit", "-q", "-m", "slice"], check=True)
+        self.cfg = load_config(self.root)
+        self.store = Store(self.root, self.cfg)
+        for path in sorted(FIXTURES.glob("W1-*.md")):
+            header, body = parse_card_file(path.read_text())
+            self.store.change_card(path.stem, "create", by="architect", header=header, body=body)
+
+    def _plan(self, backend=None) -> dict:
+        from openfarm_core.automode import preflight_plan
+
+        plan = preflight_plan(self.root, self.cfg, self.store, backend=backend)
+        return {entry["id"]: entry for entry in plan["cards"]} | {"_checks": plan["plan_checks"]}
+
+    def test_fixable_faults_are_repaired_and_shown_and_the_seam_keeps_its_card_parked(self) -> None:
+        plan = self._plan()
+        self.assertTrue(any("made `fetchImpl` optional" in note for note in plan["W1-01"]["repairs"]))
+        self.assertIn("fetchImpl?: typeof fetch", self.store.read("W1-01")[1])
+        self.assertTrue(any("added `src/client/sample.ts`" in note for note in plan["W1-04"]["repairs"]))
+        self.assertIn("src/client/style.css", self.store.read("W1-04")[0]["touches"])
+
+        self.assertFalse(plan["W1-04"]["eligible"])  # nobody but the Architect or a person can settle the seam
+        self.assertIn("seams", [f["rule"] for f in plan["W1-04"]["failures"]])
+        self.assertEqual(self.store.read("W1-04")[0]["state"], "backlog")
+        self.assertTrue(any(reason.startswith("seams:") for reason in self.store.read("W1-04")[0]["preflight"]))
+        self.assertIn({"check": "seams", "status": "fail"}, plan["_checks"])
+        self.assertIn({"check": "scaffold", "status": "pass"}, plan["_checks"])
+        # the repairs are in the cards' history too, with who made them
+        self.assertEqual(self.store.history("W1-01")[-1]["by"], "openfarm/preflight")
+        self.assertNotIn("W1-04", self.store.src.next()["cards"])
+
+    def test_the_architect_repairs_the_seam_in_the_same_pass(self) -> None:
+        import json
+
+        from openfarm_core.adapters.files import render_card_file
+
+        asked: list[str] = []
+
+        def architect(prompt: str) -> str:
+            asked.append(prompt)
+            header, body = self.store.read("W1-04")
+            body = body.replace("  - the text card uses",
+                                "  - `#date`, `#title`, `#story` and `#credit` sit in the text card, which uses")
+            return json.dumps({"cards": {"W1-04": render_card_file(header, body)},
+                               "changes": {"W1-04": "the stylesheet now names the page's four text ids"}})
+
+        plan = self._plan(architect)
+        self.assertEqual(len(asked), 1)
+        self.assertIn("W1-04 fails these checks", asked[0])
+        self.assertIn("seams:", asked[0])
+        self.assertNotIn("### W1-02 fails", asked[0])
+        self.assertTrue(plan["W1-04"]["eligible"], plan["W1-04"]["failures"])
+        self.assertTrue(any("the Architect rewrote it: the stylesheet now names" in n for n in plan["W1-04"]["repairs"]))
+        self.assertEqual(self.store.read("W1-04")[0]["state"], "ready")

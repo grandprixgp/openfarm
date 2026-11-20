@@ -1083,6 +1083,18 @@ def run_grill_and_architect(
                 f"  - Goal: {active_chunk.get('goal', '')}\n"
                 f"  (Do NOT delete completed chunks; split THIS active chunk into 2 to 4 concise cards under `cards/{first_card}.md`..)\n"
             )
+        if decision_kind == "iteration" and active_chunk is not None:
+            # Feedback on work that exists: fix tasks under the same goal, nothing rewritten.
+            finished = [f"{c.id} ({c.title})" for c in (store.cards() if store is not None else [])
+                        if str(c.state).lower() in ("done", "in_review")]
+            chunk_section = (
+                f"\nThe owner tried the app built for goal {active_chunk['id']} ({active_chunk['title']}) and reports:\n"
+                f"  {idea.strip()}\n"
+                f"Draft 1 to 3 FIX cards under this goal, starting at `cards/{first_card}.md`. Each fix card changes "
+                "existing files: list every file it changes in `touches`, and where two files must agree (a page's "
+                "element ids and its stylesheet's selectors), quote the shared names exactly in the card.\n"
+                f"These tasks are finished and must not be re-issued or rewritten: {finished or 'none'}.\n"
+            )
         spec_section = (
             f"\nExisting Living Spec (`.openfarm/PROJECT_SPEC.md`):\n{existing_spec_text[:2400]}\n"
             if existing_spec_text
@@ -1519,8 +1531,14 @@ def draft_wave_plan(
     include_picked_findings: bool = True,
     verify_baseline: bool = True,
     on_progress=None,
+    decision_kind: str = "answer",
 ) -> dict:
-    """Run Grill + Architect, incorporate picked findings, auto-repair eligibility, and triage cards."""
+    """Run Grill + Architect, incorporate picked findings, auto-repair eligibility, and triage cards.
+
+    `decision_kind="iteration"` is feedback on the current goal: the request is added
+    to the decisions log, fix tasks get new IDs under that goal, and no task that
+    exists, built or not, is replaced.
+    """
     from .findings import decide_finding, picked_findings_for_planning
 
     def _emit_progress(msg: str) -> None:
@@ -1541,6 +1559,7 @@ def draft_wave_plan(
         chunk_id=chunk_id,
         backend=backend,
         on_progress=_emit_progress,
+        decision_kind=decision_kind,
     )
     written = list(res.get("written") or [])
 
@@ -1548,7 +1567,8 @@ def draft_wave_plan(
     store = store_or_none(root, cfg)
     if store is None:
         raise Refused("not-a-project", "this folder is not a git repository with an openfarm project in it")
-    retired = _retire_replaced_cards(root, cfg, list(res.get("new_cards") or []))
+    retired = ([] if decision_kind == "iteration"
+               else _retire_replaced_cards(root, cfg, list(res.get("new_cards") or [])))
     if retired:
         _emit_progress(f"Replaced {len(retired)} unbuilt task(s) from an earlier split: {', '.join(retired)}")
     lang = (cfg.languages[0] if cfg.languages else "rust").lower()
@@ -1990,3 +2010,53 @@ def split_card_into_two(
             "failures": as_rule_failures(outcome["checks"]),
         })
     return {"split_from": card_id, "cards": out_cards}
+
+
+def something_wrong(repo: Path, text: str, *, chunk_id: str | None = None, backend=None, on_progress=None) -> dict:
+    """Feedback on the current goal: log it and draft fix tasks for it.
+
+    The fix tasks get new IDs under the goal and go through the plan checks. The
+    original idea, the spec's goals and every existing task stay as they are.
+    """
+    text = str(text or "").strip()
+    if not text:
+        raise Refused("nothing-said", "say what is wrong first")
+    if backend is None:
+        raise Refused("architect-needed", "fix tasks are drafted by the Architect, and none is set up")
+    return draft_wave_plan(repo, idea=text, chunk_id=chunk_id or _current_goal_id(repo), backend=backend,
+                           include_picked_findings=False, on_progress=on_progress, decision_kind="iteration")
+
+
+def _current_goal_id(repo: Path) -> str | None:
+    chunks = load_project_chunks(repo)
+    active = next((c for c in chunks if c["status"] == "active"), None) or next(
+        (c for c in chunks if c["status"] != "done"), None)
+    return active["id"] if active else (chunks[-1]["id"] if chunks else None)
+
+
+def next_goal(repo: Path) -> dict | None:
+    """Mark the current goal done and make the next one in the spec current. None when there is none."""
+    current = _current_goal_id(repo)
+    chunks = load_project_chunks(repo)
+    if current and any(c["id"] == current and c["status"] != "done" for c in chunks):
+        chunks = set_chunk_status(repo, current, "done")
+    return next((c for c in chunks if c["status"] == "active"), None)
+
+
+def new_feature(repo: Path, text: str) -> dict:
+    """Add a goal from a typed request: appended to the spec, the goals and the decisions log."""
+    root = Path(repo).expanduser().resolve()
+    text = str(text or "").strip()
+    if not text:
+        raise Refused("nothing-said", "say what the new feature is first")
+    cfg = _cfg_or_none(root)
+    chunks = load_project_chunks(root)
+    number = 1 + max((int(m.group(1)) for c in chunks if (m := re.fullmatch(r"C(\d+)", c["id"]))), default=0)
+    title = text.splitlines()[0].strip().rstrip(".")[:70]
+    goal = {"id": f"C{number}", "title": title, "goal": text,
+            "status": "pending" if any(c["status"] != "done" for c in chunks) else "active"}
+    save_project_chunks(root, [*chunks, goal])
+    spec = read_doc(root, cfg, "spec").rstrip()
+    write_doc(root, cfg, "spec", f"{spec}\n\n## Goal {goal['id']}: {title}\n\n{text}\n", why=f"goal {goal['id']} added")
+    log_decisions(root, cfg, [("feature", "", text)])
+    return goal
