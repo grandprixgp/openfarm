@@ -570,6 +570,7 @@ def initialize_project(
             f"# Test Conventions for {project_slug}\n\n"
             "- Place tests in `tests/<subject>.test.ts`.\n"
             "- Reach behavior through exports in `src/index.ts` or module exports under `src/`.\n"
+            "- Node runs `.ts` files directly via `node --test` (ESM type-stripping): ALWAYS use `.ts` extensions in relative imports (e.g. `from \"../src/index.ts\"`), NEVER `.js`.\n"
             "- Never skip or silence failing assertions.\n"
         )
     elif resolved_lang == "go":

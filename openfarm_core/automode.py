@@ -15,7 +15,7 @@ from pathlib import Path
 from . import adopt
 from .acp_setup import inspect_acp_status
 from .config import CONFIG_PATH, load_config
-from .errors import ConfigError, Refused
+from .errors import AdapterError, ConfigError, Refused
 from .globs import resolves_within
 from .state import StateDir
 
@@ -481,6 +481,75 @@ def open_architect_backend(repo: Path, cfg=None) -> tuple[object | None, str]:
         return None, f"{provider} ACP unavailable: {exc}"
 
 
+def _fix_typescript_relative_js_imports(root: Path) -> int:
+    """Rewrite relative `.js` imports to `.ts` in `src/` and `tests/` when only `.ts` exists.
+
+    Node's native `node --test` runs TypeScript directly with ESM type-stripping, so
+    `from "../src/foo.js"` fails with `ERR_MODULE_NOT_FOUND` unless `.ts` is used.
+    """
+    import re
+
+    pattern = re.compile(r"""((?:from|import)\s*\(?\s*['"])(\.\.?/[^'"]+?)\.js(['"])""")
+    changed_files = 0
+    for folder in ("src", "tests"):
+        base_dir = root / folder
+        if not base_dir.is_dir():
+            continue
+        for ts_file in sorted(base_dir.rglob("*.ts")):
+            if ts_file.is_symlink():
+                continue
+            try:
+                original = ts_file.read_text(encoding="utf-8")
+            except OSError:
+                continue
+
+            def _repl(match: re.Match[str]) -> str:
+                prefix, rel_no_ext, quote = match.group(1), match.group(2), match.group(3)
+                cand_js = (ts_file.parent / f"{rel_no_ext}.js").resolve()
+                cand_ts = (ts_file.parent / f"{rel_no_ext}.ts").resolve()
+                if not cand_js.exists() and cand_ts.is_file():
+                    return f"{prefix}{rel_no_ext}.ts{quote}"
+                return match.group(0)
+
+            updated = pattern.sub(_repl, original)
+            if updated != original:
+                ts_file.write_text(updated, encoding="utf-8")
+                changed_files += 1
+    return changed_files
+
+
+def _verify_baseline_quick(root: Path, cfg) -> tuple[bool, str]:
+    """Run the repo's configured pack test suite once to verify the baseline is green."""
+    from .adapters.direct import open_runner
+    from .cli import _configured_pack
+
+    try:
+        pack = _configured_pack(cfg, root)
+        cmd_info = pack.commands("test")
+        argv = cmd_info.get("argv") if isinstance(cmd_info, dict) else None
+        if not argv:
+            return True, ""
+        runner = open_runner(cfg, root)
+        res = runner.exec("test", list(argv), cwd=root, timeout_s=min(90.0, float(getattr(cfg, "test_timeout_s", 120.0))))
+        if res.cls == "infra":
+            return True, ""
+        parsed = pack.parse_tests(res.stdout, res.stderr)
+        compile_errs = parsed.get("compile_errors") or []
+        failed = [r for r in (parsed.get("results") or []) if r.get("status") == "FAILED"]
+        if res.exit_code == 0 and not compile_errs and not failed:
+            return True, ""
+        if compile_errs:
+            detail = "; ".join(str(e.get("binary") or e) if isinstance(e, dict) else str(e) for e in compile_errs[:3])
+            return False, f"baseline compile error: {detail}"
+        if failed:
+            names = ", ".join(str(r.get("name") or "") for r in failed[:4])
+            return False, f"baseline test(s) failed: {names}"
+        tail = (res.stderr or res.stdout or "").strip().splitlines()
+        return False, (tail[-1][:200] if tail else f"baseline exited {res.exit_code}")
+    except (OSError, ConfigError, AdapterError, Refused) as exc:
+        return False, str(exc)
+
+
 def run_grill_and_architect(
     repo: Path,
     *,
@@ -520,9 +589,16 @@ def run_grill_and_architect(
             and "node_modules" not in p.parts
             and "target" not in p.parts
         ][:40]
+        ts_rule = (
+            "TypeScript rule: Node executes `.ts` directly via `node --test` (ESM type-stripping); "
+            "ALWAYS use `.ts` extensions in relative imports (e.g. `from \"../src/foo.ts\"`), NEVER `.js`.\n"
+            if lang == "typescript"
+            else ""
+        )
         prompt = (
             f"Expand this {lang} Openfarm repository from the owner's Grill decisions.\n"
             f"Language stack: {lang} (STRICT: generate ONLY {lang} source/test files — NEVER emit .rs or Cargo.toml in a non-Rust project).\n"
+            f"{ts_rule}"
             f"Locked never_touch files (DO NOT modify or list in card touches): {never_touch}\n"
             f"Existing repository files: {existing_files}\n"
             "Return ONLY a JSON object: {\"files\": {\"<repo-relative-path>\": \"<content>\", ...}}.\n"
@@ -804,6 +880,8 @@ def draft_wave_plan(
     backend=None,
     max_repairs: int = 2,
     include_picked_findings: bool = True,
+    verify_baseline: bool = True,
+    on_progress=None,
 ) -> dict:
     """Run Grill + Architect, incorporate picked findings, auto-repair eligibility, and triage cards."""
     from .adapters.files import parse_card_file, render_card_file
@@ -812,7 +890,12 @@ def draft_wave_plan(
     from .gates.eligibility import check_eligibility
     from .triage import triage_card_heuristic
 
+    def _emit_progress(msg: str) -> None:
+        if callable(on_progress):
+            on_progress(msg)
+
     root = Path(repo).expanduser().resolve()
+    _emit_progress("Designing spec, golden slice & Wave cards...")
     res = run_grill_and_architect(root, answers=answers, backend=backend)
     written = list(res.get("written") or [])
 
@@ -820,6 +903,16 @@ def draft_wave_plan(
     cards_dir = root / "cards"
     cards_dir.mkdir(parents=True, exist_ok=True)
     lang = (cfg.languages[0] if cfg.languages else "rust").lower()
+    if lang == "typescript":
+        _fix_typescript_relative_js_imports(root)
+
+    baseline_ok = True
+    baseline_error = ""
+    if verify_baseline:
+        _emit_progress("Verifying baseline tests on golden slice...")
+        baseline_ok, baseline_error = _verify_baseline_quick(root, cfg)
+
+    _emit_progress("Checking & repairing card eligibility...")
 
     promoted_findings: list[str] = []
     if include_picked_findings:
@@ -952,6 +1045,8 @@ def draft_wave_plan(
         "cards": planned_cards,
         "triage_counts": triage_counts,
         "eligibility_ok": all_ok and len(planned_cards) > 0,
+        "baseline_ok": baseline_ok,
+        "baseline_error": baseline_error,
         "repaired_count": repaired_count,
         "promoted_findings": promoted_findings,
     }

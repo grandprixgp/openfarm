@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import time
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
@@ -281,9 +282,18 @@ class OpenfarmApp(App):
     .stack-chip.selected { background: #12384d; color: #38bdf8; text-style: bold; }
     TextArea { background: #0b1019; border: round #334663; color: #f8fafc; margin-top: 1; }
     TextArea:focus { border: round #38bdf8; }
-    #ta-workflow { height: 6; }
-    #ta-invariants { height: 4; }
-    #ta-slice { height: 4; }
+    #ta-workflow { height: 4; }
+    #ta-invariants { height: 3; }
+    #ta-slice { height: 3; }
+    #grill-status {
+        height: auto;
+        background: #12283d;
+        border: round #38bdf8;
+        color: #e0f2fe;
+        padding: 0 2;
+        margin-top: 1;
+    }
+    #grill-status.hidden { display: none; }
 
     /* Split Panes */
     .split-left  { width: 46; margin-right: 2; height: 1fr; }
@@ -331,6 +341,11 @@ class OpenfarmApp(App):
         self._initial_view = initial_view
         self._selected_stack = "typescript"
         self._running_wave = False
+        self._drafting_plan = False
+        self._draft_started_at = 0.0
+        self._draft_phase_msg = ""
+        self._last_baseline_ok: bool | None = None
+        self._last_baseline_error = ""
         self._worker_tokens = 0
         self._supervisor_tokens = 0
         self._tokens_fresh = 0
@@ -460,6 +475,7 @@ class OpenfarmApp(App):
                             yield Button("Configure Providers", classes="soft-btn", id="btn-open-providers")
                             yield Static("  Frontier Architect: ", classes="inline-label")
                             yield Switch(value=True, id="sw-use-architect")
+                        yield Static("", id="grill-status", classes="hidden")
 
                     # 1B: Pre-Verified Wave Plan Approval
                     with Horizontal(id="studio-plan"):
@@ -597,6 +613,7 @@ class OpenfarmApp(App):
 
         self._load_providers_into_form()
         self.refresh_all_views()
+        self.set_interval(1.0, self._tick_draft_timer)
 
         # Choose initial screen cleanly
         gp = load_global_providers()
@@ -740,10 +757,16 @@ class OpenfarmApp(App):
             pt.add_row(c.id, c.title[:26], entry["profile"], "✓", key=c.id)
         if self._plan_cards:
             self._render_plan_detail(self._plan_cards[0])
+        base_line = ""
+        if self._last_baseline_ok is True:
+            base_line = "\n[bold #4ade80]✓[/] Baseline tests passed"
+        elif self._last_baseline_ok is False:
+            base_line = f"\n[bold #fb7185]✗ Baseline failed:[/] {rich_escape(self._last_baseline_error[:120])}"
         self.query_one("#plan-preflight", Static).update(
             f"[bold #4ade80]✓[/] {len(ready_cards)} ready card(s)  ·  "
             f"{self._findings_counts['picked']} picked finding(s)\n"
             f"[bold #38bdf8]✓[/] Worker: {rich_escape(gp['worker'].get('model') or '(repo config)')}"
+            f"{base_line}"
         )
 
         # Populate Review table
@@ -1378,8 +1401,56 @@ class OpenfarmApp(App):
             return
         self._apply_stack_chip(bid[4:])
 
+    def _set_drafting_state(self, active: bool, message: str = "") -> None:
+        self._drafting_plan = bool(active)
+        if active and not self._draft_started_at:
+            self._draft_started_at = time.monotonic()
+        elif not active:
+            self._draft_started_at = 0.0
+        self._draft_phase_msg = message
+        btn = self.query_one("#btn-draft-plan", Button)
+        btn.disabled = active
+        btn.label = "⏳ Architecting..." if active else "Draft Plan with Architect"
+        pill = self.query_one("#status-badge", Static)
+        status_box = self.query_one("#grill-status", Static)
+        if active:
+            pill.remove_class("status-ready")
+            pill.add_class("status-running")
+            pill.update("● ARCHITECTING")
+            status_box.remove_class("hidden")
+            self._render_draft_status()
+        else:
+            if not self._running_wave:
+                pill.remove_class("status-running")
+                pill.add_class("status-ready")
+                pill.update("○ READY")
+            if message:
+                status_box.remove_class("hidden")
+                status_box.update(message)
+            else:
+                status_box.add_class("hidden")
+
+    def _render_draft_status(self) -> None:
+        if not self._drafting_plan:
+            return
+        elapsed = int(max(0.0, time.monotonic() - self._draft_started_at)) if self._draft_started_at else 0
+        mins, secs = divmod(elapsed, 60)
+        self.query_one("#grill-status", Static).update(
+            f"[bold #38bdf8]⏳ [{mins:02d}:{secs:02d}][/]  [bold #f8fafc]{rich_escape(self._draft_phase_msg or 'Working...')}[/]\n"
+            f"[#94a3b8]Frontier ACP typically takes 30–120s to design a full golden slice + cards "
+            f"(turn off the Frontier Architect switch for instant local templates).[/]"
+        )
+
+    def _tick_draft_timer(self) -> None:
+        if self._drafting_plan:
+            self._render_draft_status()
+
     @on(Button.Pressed, "#btn-draft-plan")
     def _draft_plan_clicked(self) -> None:
+        if self._drafting_plan:
+            self.notify("Architect is already drafting your plan...")
+            return
+        self._set_drafting_state(True, "Preparing workspace & connecting to Frontier Architect...")
         self._draft_plan_bg()
 
     @work(thread=True)
@@ -1396,6 +1467,11 @@ class OpenfarmApp(App):
         backend = None
         try:
             if not (self.repo / CONFIG_PATH).is_file():
+                self.call_from_thread(
+                    self._set_drafting_state,
+                    True,
+                    f"Initializing {self._selected_stack} project scaffold...",
+                )
                 initialize_project(
                     self.repo.name or "my-app",
                     directory=self.repo,
@@ -1409,26 +1485,53 @@ class OpenfarmApp(App):
                 backend, reason = open_architect_backend(self.repo, cfg)
                 if backend is not None:
                     arch_note = reason
-                    self.call_from_thread(self.notify, f"Drafting golden slice & Wave cards with {reason}...")
+                    self.call_from_thread(
+                        self._set_drafting_state,
+                        True,
+                        f"Designing golden slice & Wave cards with {reason}...",
+                    )
                 else:
                     arch_note = f"local fallback ({reason})"
+                    self.call_from_thread(
+                        self._set_drafting_state,
+                        True,
+                        f"Drafting local Wave plan ({reason})...",
+                    )
+            else:
+                self.call_from_thread(self._set_drafting_state, True, "Drafting instant local Wave plan...")
+
+            def _on_prog(msg: str) -> None:
+                self.call_from_thread(self._set_drafting_state, True, f"{msg} ({arch_note})")
+
             try:
                 plan = draft_wave_plan(
                     self.repo,
                     answers=answers,
                     backend=backend,
                     include_picked_findings=True,
+                    verify_baseline=True,
+                    on_progress=_on_prog,
                 )
             except Exception as arch_exc:
                 if backend is None:
                     raise
                 arch_note = f"local fallback (architect error: {arch_exc})"
+                self.call_from_thread(
+                    self._set_drafting_state,
+                    True,
+                    f"Architect failed ({arch_exc}) — generating local fallback plan...",
+                )
                 plan = draft_wave_plan(
                     self.repo,
                     answers=answers,
                     backend=None,
                     include_picked_findings=True,
+                    verify_baseline=True,
+                    on_progress=_on_prog,
                 )
+            self._last_baseline_ok = bool(plan.get("baseline_ok", True))
+            self._last_baseline_error = str(plan.get("baseline_error") or "")
+            self.call_from_thread(self._set_drafting_state, False, "")
             self.call_from_thread(self.refresh_all_views)
             self.call_from_thread(
                 setattr,
@@ -1436,12 +1539,18 @@ class OpenfarmApp(App):
                 "current",
                 "studio-plan",
             )
+            base_tag = " · baseline ✓" if self._last_baseline_ok else f" · baseline ✗ ({self._last_baseline_error[:60]})"
             self.call_from_thread(
                 self.notify,
-                f"Wave plan ready ({arch_note}): {len(plan['cards'])} eligible card(s)"
-                + (f" ({plan['repaired_count']} auto-repaired)" if plan["repaired_count"] else ""),
+                f"Wave plan ready ({arch_note}): {len(plan['cards'])} eligible card(s){base_tag}",
+                severity=("warning" if not self._last_baseline_ok else "information"),
             )
         except Exception as exc:
+            self.call_from_thread(
+                self._set_drafting_state,
+                False,
+                f"[bold #fb7185]✗ Plan error:[/] {rich_escape(str(exc))}",
+            )
             self.call_from_thread(self.notify, f"Plan error: {exc}", severity="error")
         finally:
             if backend is not None and hasattr(backend, "close"):
@@ -1729,12 +1838,19 @@ class OpenfarmApp(App):
         cid = self._selected_review_id
         if not cid:
             return
-        self._run_cli_quick(["verdict", cid, "clean", "--review-tokens", "0"])
+        buf = io.StringIO()
+        with redirect_stdout(buf), redirect_stderr(buf):
+            rc = cli_main(["--repo", str(self.repo), "verdict", cid, "clean", "--review-tokens", "0"])
+        if rc != 0:
+            err = buf.getvalue().strip().splitlines()[-1] if buf.getvalue().strip() else f"verdict exited {rc}"
+            self.notify(f"Approve failed: {err[:100]}", severity="error")
+            return
         if cid not in self._approved_to_land:
             self._approved_to_land.append(cid)
         self.query_one("#approved-queue-label", Static).update(
             f"Approved to land: {', '.join(self._approved_to_land)}"
         )
+        self.notify(f"Approved {cid} — press [L] to Land Locally")
         self.refresh_all_views()
 
     @on(Button.Pressed, "#btn-land")
