@@ -37,6 +37,7 @@ from textual.widgets import (
 )
 
 from openfarm_core.acp_setup import inspect_acp_status
+from openfarm_core.adopt import adopt_project
 from openfarm_core.automode import (
     DEFAULT_GRILL_QUESTIONS,
     compute_pipeline_stages,
@@ -44,12 +45,16 @@ from openfarm_core.automode import (
     draft_wave_plan,
     ensure_baseline_committed,
     open_architect_backend,
+    split_card_into_two,
+    update_card_with_eligibility,
 )
 from openfarm_core.bootstrap import initialize_project
 from openfarm_core.cli import Context, cmd_run, main as cli_main
 from openfarm_core.config import CONFIG_PATH, load_config
+from openfarm_core.doctor import compute_touches_conflict_matrix, run_doctor
 from openfarm_core.errors import AdapterError, ConfigError, Refused
 from openfarm_core.findings import (
+    bulk_decide_findings,
     decide_finding,
     findings_for_card,
     is_finding_id_or_header,
@@ -58,6 +63,7 @@ from openfarm_core.findings import (
 from openfarm_core.git import Git
 from openfarm_core.projects import (
     _is_ephemeral_tmp_path,
+    discover_workspace_projects,
     edit_project,
     get_project,
     list_projects,
@@ -76,6 +82,7 @@ from openfarm_core.tui import _load_tui_context, _read_cards_readonly
 
 from .modals import (
     BounceNoteModal,
+    CardEditorModal,
     DeleteProjectModal,
     DismissFindingModal,
     EditProjectModal,
@@ -83,6 +90,8 @@ from .modals import (
     FullFindingModal,
     HintModal,
     NewProjectModal,
+    SplitCardModal,
+    WorkspaceDiscoveryModal,
 )
 
 
@@ -352,6 +361,7 @@ class OpenfarmApp(App):
         self._tokens_cached = 0
         self._spark_points: list[float] = [0.0, 0.0, 0.0, 0.0, 0.0]
         self._plan_cards: list[dict] = []
+        self._selected_plan_id: str = ""
         self._review_cards: list = []
         self._selected_review_id: str = ""
         self._findings_items: list[dict] = []
@@ -404,6 +414,7 @@ class OpenfarmApp(App):
                     with Horizontal(classes="action-row"):
                         yield Button("Switch Project [Enter]", classes="primary-cta", id="btn-proj-switch")
                         yield Button("Add / New [n]", classes="approve-btn", id="btn-proj-new")
+                        yield Button("Scan ~/projects [S]", classes="soft-btn", id="btn-proj-scan")
                         yield Button("Edit [e]", classes="soft-btn", id="btn-proj-edit")
                         yield Button("Remove From Openfarm [d]", classes="soft-btn", id="btn-proj-delete")
 
@@ -490,6 +501,9 @@ class OpenfarmApp(App):
                             yield Static("Select a card to inspect its scope and named tests.", id="plan-detail")
                             with Horizontal(classes="action-row"):
                                 yield Button("Commit Baseline & Launch Wave", classes="primary-cta", id="btn-launch-wave")
+                                yield Button("Edit Card [e]", classes="soft-btn", id="btn-plan-edit")
+                                yield Button("Split Card [x]", classes="soft-btn", id="btn-plan-split")
+                                yield Button("Release Blocked", classes="soft-btn", id="btn-plan-release")
                                 yield Button("Re-Grill", classes="soft-btn", id="btn-regrill")
 
                     # 1C: Live Non-Blocking Factory Floor
@@ -558,7 +572,9 @@ class OpenfarmApp(App):
                         with Horizontal(classes="action-row"):
                             yield Button("Pick Next Wave [w]", classes="primary-cta", id="btn-find-pick")
                             yield Button("Dismiss [x]", classes="soft-btn", id="btn-find-dismiss")
+                            yield Button("Bulk Dismiss Card [X]", classes="soft-btn", id="btn-find-bulk-dismiss")
                             yield Button("Fold Into Card [c]", classes="soft-btn", id="btn-find-fold")
+                            yield Button("Synthesize Wave [W]", classes="approve-btn", id="btn-find-synth")
                             yield Button("Open Full [Enter]", classes="soft-btn", id="btn-find-full")
 
             # ── VIEW 4: ENGINE DIAGNOSTICS ───────────────────────────────────
@@ -577,6 +593,11 @@ class OpenfarmApp(App):
                             yield Static("", id="engine-providers")
                             with Horizontal(classes="action-row"):
                                 yield Button("Open Global Provider Setup", classes="primary-cta", id="btn-eng-providers")
+                        with TabPane("Doctor"):
+                            yield Static("Click Run Doctor to inspect repo, OAuth, Worker, bwrap, toolchains & locks.", id="engine-doctor")
+                            with Horizontal(classes="action-row"):
+                                yield Button("Run Doctor", classes="primary-cta", id="btn-doc-run")
+                                yield Button("Run Safe Fix", classes="approve-btn", id="btn-doc-fix")
 
         yield Footer()
 
@@ -590,7 +611,7 @@ class OpenfarmApp(App):
 
         pt = self.query_one("#plan-table", DataTable)
         pt.cursor_type = "row"
-        pt.add_columns("ID", "Title", "Profile", "Elig")
+        pt.add_columns("ID", "Title", "St", "Prof")
 
         rt = self.query_one("#review-table", DataTable)
         rt.cursor_type = "row"
@@ -671,7 +692,7 @@ class OpenfarmApp(App):
         if cfg is not None:
             tctx = _load_tui_context(self.repo, self.config_path)
             cards, _mode = _read_cards_readonly(tctx)
-            fres = list_findings(self.repo, cfg, state_filter="waiting", query=self._findings_query)
+            fres = list_findings(self.repo, cfg, state_filter="waiting", query=self._findings_query, deduplicate=True)
             self._findings_items = fres["findings"]
             self._findings_counts = fres["counts"]
         else:
@@ -742,9 +763,11 @@ class OpenfarmApp(App):
         self._plan_cards = []
         for c in ready_cards + blocked_cards:
             tri = triage_card_heuristic(c)
+            st_short = "rdy" if str(c.state).lower() == "ready" else "blk"
             entry = {
                 "id": c.id,
                 "title": c.title,
+                "state": str(c.state).lower(),
                 "category": c.category,
                 "touches": list(c.touches),
                 "depends": list(c.deps),
@@ -754,9 +777,20 @@ class OpenfarmApp(App):
                 "eligible": True,
             }
             self._plan_cards.append(entry)
-            pt.add_row(c.id, c.title[:26], entry["profile"], "✓", key=c.id)
+            pt.add_row(c.id, c.title[:18], st_short, entry["profile"][:4], key=c.id)
         if self._plan_cards:
-            self._render_plan_detail(self._plan_cards[0])
+            if self._selected_plan_id not in {e["id"] for e in self._plan_cards}:
+                self._selected_plan_id = self._plan_cards[0]["id"]
+            sel_plan = next(e for e in self._plan_cards if e["id"] == self._selected_plan_id)
+            self._render_plan_detail(sel_plan)
+        else:
+            self._selected_plan_id = ""
+        matrix = compute_touches_conflict_matrix(ready_cards)
+        if matrix["conflict_count"]:
+            c_pairs = ", ".join(f"{c['a']}↔{c['b']}" for c in matrix["conflicts"][:3])
+            conflict_line = f"\n[bold #fbbf24]![/] {matrix['conflict_count']} conflict(s) ({rich_escape(c_pairs)}) · {matrix['max_parallelism']} parallel lane(s)"
+        else:
+            conflict_line = f"\n[bold #4ade80]✓[/] 0 touches conflicts · {matrix['max_parallelism']} parallel lane(s)"
         base_line = ""
         if self._last_baseline_ok is True:
             base_line = "\n[bold #4ade80]✓[/] Baseline tests passed"
@@ -766,7 +800,7 @@ class OpenfarmApp(App):
             f"[bold #4ade80]✓[/] {len(ready_cards)} ready card(s)  ·  "
             f"{self._findings_counts['picked']} picked finding(s)\n"
             f"[bold #38bdf8]✓[/] Worker: {rich_escape(gp['worker'].get('model') or '(repo config)')}"
-            f"{base_line}"
+            f"{conflict_line}{base_line}"
         )
 
         # Populate Review table
@@ -913,7 +947,8 @@ class OpenfarmApp(App):
         ft.clear()
         for item in self._findings_items:
             tag = " [new]" if item["is_new"] else ""
-            ft.add_row(item["id"], item["from_card"], f"{item['title'][:36]}{tag}", key=item["id"])
+            dup = f" (×{item['duplicate_count']})" if int(item.get("duplicate_count") or 1) > 1 else ""
+            ft.add_row(item["id"], item["from_card"], f"{item['title'][:32]}{dup}{tag}", key=item["id"])
         if self._findings_items:
             if self._selected_finding_id not in {f["id"] for f in self._findings_items}:
                 self._selected_finding_id = self._findings_items[0]["id"]
@@ -1241,6 +1276,9 @@ class OpenfarmApp(App):
             elif event.key == "n":
                 self._open_new_project_modal()
                 event.stop()
+            elif event.key == "S":
+                self._open_workspace_scan_modal()
+                event.stop()
             elif event.key == "e" and self._selected_project_id:
                 self._open_edit_project_modal()
                 event.stop()
@@ -1253,6 +1291,12 @@ class OpenfarmApp(App):
                 event.stop()
             elif event.key == "x" and self._selected_finding_id:
                 self._open_dismiss_modal()
+                event.stop()
+            elif event.key == "X" and self._selected_finding_id:
+                self._bulk_dismiss_from_selected_card()
+                event.stop()
+            elif event.key == "W":
+                self._synthesize_wave_from_findings()
                 event.stop()
             elif event.key == "c" and self._selected_finding_id:
                 self._open_fold_modal()
@@ -1453,6 +1497,21 @@ class OpenfarmApp(App):
         self._set_drafting_state(True, "Preparing workspace & connecting to Frontier Architect...")
         self._draft_plan_bg()
 
+    @staticmethod
+    def _skeleton_missing_for_cfg(repo: Path, cfg) -> bool:
+        if cfg is None:
+            return True
+        lang = (cfg.languages[0] if getattr(cfg, "languages", None) else "rust").lower()
+        if lang == "rust":
+            return not (repo / "Cargo.toml").is_file()
+        if lang == "typescript":
+            return not (repo / "package.json").is_file()
+        if lang == "go":
+            return not (repo / "go.mod").is_file()
+        if lang == "python":
+            return not ((repo / "pyproject.toml").is_file() or any((repo / "src").rglob("*.py")) if (repo / "src").is_dir() else (repo / "pyproject.toml").is_file())
+        return False
+
     @work(thread=True)
     def _draft_plan_bg(self) -> None:
         wf = self.query_one("#ta-workflow", TextArea).text.strip() or DEFAULT_GRILL_QUESTIONS[0]["default"]
@@ -1466,7 +1525,9 @@ class OpenfarmApp(App):
         ]
         backend = None
         try:
-            if not (self.repo / CONFIG_PATH).is_file():
+            existing_cfg = self._safe_cfg()
+            needs_init = (not (self.repo / CONFIG_PATH).is_file()) or self._skeleton_missing_for_cfg(self.repo, existing_cfg)
+            if needs_init:
                 self.call_from_thread(
                     self._set_drafting_state,
                     True,
@@ -1477,8 +1538,25 @@ class OpenfarmApp(App):
                     directory=self.repo,
                     idea=wf,
                     language=self._selected_stack,
+                    force=True,
                     commit=True,
                 )
+                # Remove stale card files from any previous wiped skeleton before drafting fresh cards
+                cards_dir = self.repo / "cards"
+                if cards_dir.is_dir():
+                    for old_md in cards_dir.glob("*.md"):
+                        if not old_md.stem.upper().startswith("FIND-"):
+                            old_md.unlink(missing_ok=True)
+                fresh_cfg = self._safe_cfg()
+                if fresh_cfg is not None and (self.repo / ".git").exists():
+                    from openfarm_core.adapters.files import FileCardSource
+
+                    FileCardSource(
+                        self.repo,
+                        "cards",
+                        worktree=fresh_cfg.state_dir / "cards-source",
+                        base_branch=fresh_cfg.base_branch,
+                    ).reset_non_finding_cards_from_base()
             cfg = self._safe_cfg()
             arch_note = "local template"
             if use_architect:
@@ -1636,10 +1714,167 @@ class OpenfarmApp(App):
 
         self.push_screen(DeleteProjectModal(item), _done)
 
+    @on(Button.Pressed, "#btn-proj-scan")
+    def _open_workspace_scan_modal(self) -> None:
+        scan_root = Path.home() / "projects"
+        items = discover_workspace_projects(scan_root)
+        if not items:
+            self.notify(f"No project directories found under {scan_root}")
+            return
+
+        def _done(data: dict | None) -> None:
+            if not data or not data.get("item"):
+                return
+            item = data["item"]
+            action = data.get("action", "register")
+            try:
+                if action == "adopt" and item["kind"] != "configured":
+                    adopt_project(Path(item["repo"]), run_suite=False)
+                entry = register_project(
+                    item["repo"],
+                    name=item["name"],
+                    language=item.get("detected_language") or "",
+                )
+                self._selected_project_id = entry["id"]
+                self.refresh_all_views()
+                self.notify(f"{action.title()}ed {entry['name']}")
+            except (OSError, Refused, ConfigError) as exc:
+                self.notify(f"Workspace scan error: {exc}", severity="error")
+
+        self.push_screen(WorkspaceDiscoveryModal(str(scan_root), items), _done)
+
+    @on(Button.Pressed, "#btn-plan-edit")
+    def _open_card_editor_modal(self) -> None:
+        entry = next((e for e in self._plan_cards if e["id"] == self._selected_plan_id), None)
+        if entry is None:
+            self.notify("Select a card in the Wave Plan first")
+            return
+
+        def _done(data: dict | None) -> None:
+            if not data:
+                return
+            try:
+                res = update_card_with_eligibility(
+                    self.repo,
+                    entry["id"],
+                    title=data.get("title"),
+                    category=data.get("category"),
+                    touches=data.get("touches"),
+                    depends=data.get("depends"),
+                    done_text=data.get("done_text"),
+                )
+                self.refresh_all_views()
+                if res["eligible"]:
+                    self.notify(f"Saved {entry['id']} — ✓ eligible")
+                else:
+                    self.notify(f"Saved {entry['id']} — ineligible: {'; '.join(res['failures'][:2])}", severity="warning")
+            except (OSError, Refused, ConfigError) as exc:
+                self.notify(f"Card edit error: {exc}", severity="error")
+
+        self.push_screen(CardEditorModal(entry), _done)
+
+    @on(Button.Pressed, "#btn-plan-release")
+    def _release_blocked_cards_btn(self) -> None:
+        blocked = [e["id"] for e in self._plan_cards if e.get("state") == "blocked"]
+        if not blocked:
+            self.notify("No blocked cards to release")
+            return
+        for cid in blocked:
+            self._run_cli_quick(["release", cid, "--reason", "released from Studio Plan for retry"])
+        self.refresh_all_views()
+
+    @on(Button.Pressed, "#btn-plan-split")
+    def _open_split_card_modal(self) -> None:
+        entry = next((e for e in self._plan_cards if e["id"] == self._selected_plan_id), None)
+        if entry is None:
+            self.notify("Select a card in the Wave Plan first")
+            return
+
+        def _done(data: dict | None) -> None:
+            if not data:
+                return
+            try:
+                res = split_card_into_two(
+                    self.repo,
+                    entry["id"],
+                    first_title=data["first_title"],
+                    first_touches=data["first_touches"],
+                    second_title=data["second_title"],
+                    second_touches=data["second_touches"],
+                )
+                self.refresh_all_views()
+                ids = ", ".join(c["id"] for c in res["cards"])
+                self.notify(f"Split {entry['id']} → {ids}")
+            except (OSError, Refused, ConfigError) as exc:
+                self.notify(f"Split error: {exc}", severity="error")
+
+        self.push_screen(SplitCardModal(entry), _done)
+
+    @on(Button.Pressed, "#btn-find-bulk-dismiss")
+    def _bulk_dismiss_from_selected_card(self) -> None:
+        item = next((f for f in self._findings_items if f["id"] == self._selected_finding_id), None)
+        cfg = self._safe_cfg()
+        if item is None or cfg is None or not item.get("from_card"):
+            return
+        res = bulk_decide_findings(
+            self.repo,
+            cfg,
+            decision="dismissed",
+            from_card=item["from_card"],
+            reason=f"bulk dismissed findings from {item['from_card']}",
+        )
+        self.refresh_all_views()
+        self.notify(f"Bulk dismissed {res['count']} finding(s) from {item['from_card']}")
+
+    @on(Button.Pressed, "#btn-find-synth")
+    def _synthesize_wave_from_findings(self) -> None:
+        if self._findings_counts.get("picked", 0) <= 0:
+            self.notify("Pick at least one finding with [w] before synthesizing a wave", severity="warning")
+            return
+        try:
+            plan = draft_wave_plan(
+                self.repo,
+                answers=[{"id": "goal", "question": "Goal", "answer": "Synthesize picked worker findings into Wave cards"}],
+                backend=None,
+                include_picked_findings=True,
+                verify_baseline=False,
+            )
+            self.refresh_all_views()
+            self.action_switch_view("studio")
+            self.query_one("#studio-switcher", ContentSwitcher).current = "studio-plan"
+            self.notify(f"Synthesized {len(plan['promoted_findings'])} finding(s) into Wave Plan")
+        except (OSError, Refused, ConfigError) as exc:
+            self.notify(f"Synthesis error: {exc}", severity="error")
+
+    @on(Button.Pressed, "#btn-doc-run")
+    def _run_doctor_btn(self) -> None:
+        self._render_doctor_report(fix=False)
+
+    @on(Button.Pressed, "#btn-doc-fix")
+    def _fix_doctor_btn(self) -> None:
+        self._render_doctor_report(fix=True)
+
+    def _render_doctor_report(self, *, fix: bool = False) -> None:
+        rep = run_doctor(self.repo, config_path=self.config_path, fix=fix)
+        icons = {"ok": "[bold #4ade80]✓[/]", "warn": "[bold #fbbf24]![/]", "fail": "[bold #fb7185]✗[/]"}
+        lines = [f"[bold #38bdf8]Openfarm Doctor[/]  ({rich_escape(rep['repo'])})\n"]
+        for chk in rep["checks"]:
+            ic = icons.get(chk["status"], "·")
+            fx = " [#fbbf24](fixable)[/]" if chk.get("fixable") else ""
+            lines.append(f"  {ic} [bold]{rich_escape(chk['label']):<24}[/] {rich_escape(chk['detail'])}{fx}")
+        if rep["fixes_applied"]:
+            lines.append("\n[bold #4ade80]Safe Fixes Applied:[/]")
+            for item in rep["fixes_applied"]:
+                lines.append(f"  + {rich_escape(item)}")
+        self.query_one("#engine-doctor", Static).update("\n".join(lines))
+        if fix:
+            self.refresh_all_views()
+
     @on(DataTable.RowHighlighted, "#plan-table")
     def _plan_row_changed(self, event: DataTable.RowHighlighted) -> None:
         if event.row_key and event.row_key.value:
             cid = str(event.row_key.value)
+            self._selected_plan_id = cid
             match = next((e for e in self._plan_cards if e["id"] == cid), None)
             if match:
                 self._render_plan_detail(match)
@@ -1665,7 +1900,7 @@ class OpenfarmApp(App):
         self._findings_query = event.value.strip()
         cfg = self._safe_cfg()
         if cfg is not None:
-            fres = list_findings(self.repo, cfg, state_filter="waiting", query=self._findings_query)
+            fres = list_findings(self.repo, cfg, state_filter="waiting", query=self._findings_query, deduplicate=True)
             self._findings_items = fres["findings"]
             self._findings_counts = fres["counts"]
             self._refresh_findings_widgets()

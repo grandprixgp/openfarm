@@ -248,6 +248,33 @@ class FileCardSource:
                     f"openfarm: sync {updated} planned card(s) from base branch")
             return updated
 
+    def reset_non_finding_cards_from_base(self) -> int:
+        """Replace all non-finding cards on `openfarm-cards` with the base branch's `cards/` (used after re-init)."""
+        self.prepare()
+        with self._lock:
+            if self.worktree is None:
+                return 0
+            dst_dir = self.worktree / self.folder
+            dst_dir.mkdir(parents=True, exist_ok=True)
+            removed = 0
+            for existing in sorted(dst_dir.glob("*.md")):
+                if existing.stem.upper().startswith("FIND-"):
+                    continue
+                existing.unlink(missing_ok=True)
+                removed += 1
+            src_dir = self.repo / self.folder
+            copied = 0
+            if src_dir.is_dir():
+                for path in sorted(src_dir.glob("*.md")):
+                    if path.is_symlink() or path.stem.upper().startswith("FIND-"):
+                        continue
+                    shutil.copy2(path, dst_dir / path.name, follow_symlinks=False)
+                    copied += 1
+            if removed or copied:
+                Git(self.worktree).commit_all(
+                    f"openfarm: reset cards branch from re-initialized base ({copied} card(s))")
+            return copied
+
     def _seed_from_base(self) -> None:
         """Copy card files the base branch already holds onto the cards branch."""
         if self.worktree is None:

@@ -2649,8 +2649,8 @@ def cmd_swarm(ctx: Context, args) -> int:
 # -- the parser ----------------------------------------------------------------
 
 _CLI_EPILOG = """\
-Command groups (30 commands):
-  Setup & Auth         init, adopt, install-skill, acp, providers, projects
+Command groups (31 commands):
+  Setup & Auth         init, adopt, install-skill, acp, providers, projects, doctor
   Run & Monitor        auto, check, run, status, pause, resume, stop, tui
   Review & Harness     triage, review, land, findings, frontier-review, dossier, verdict, done, release, escape, supervise, harness
   Swarm, Board & Bench swarm, board, drive, bench
@@ -3102,19 +3102,30 @@ def build_parser() -> argparse.ArgumentParser:
 
     proj_p = sub.add_parser(
         "projects",
-        help="list, add, edit, or remove Openfarm projects (non-destructive to project files)",
+        help="list, add, edit, remove, or discover Openfarm projects (non-destructive to project files)",
         formatter_class=raw_fmt,
-        epilog="Examples:\n  openfarm projects list\n  openfarm projects add ~/projects/my-app --name 'My App'\n  openfarm projects edit my-app --name 'Renamed'\n  openfarm projects remove my-app",
+        epilog="Examples:\n  openfarm projects list\n  openfarm projects discover --dir ~/projects\n  openfarm projects add ~/projects/my-app --name 'My App'\n  openfarm projects edit my-app --name 'Renamed'\n  openfarm projects remove my-app",
     )
-    proj_p.add_argument("action", nargs="?", default="list", choices=("list", "add", "edit", "remove"))
+    proj_p.add_argument("action", nargs="?", default="list", choices=("list", "add", "edit", "remove", "discover"))
     proj_p.add_argument("target", nargs="?", default="", help="project id (for edit/remove) or repo path (for add)")
     proj_p.add_argument("--name", default=None, help="display name")
-    proj_p.add_argument("--dir", dest="project_dir", default=None, help="project directory path")
+    proj_p.add_argument("--dir", dest="project_dir", default=None, help="project directory path (or scan root for discover)")
     proj_p.add_argument("--lang", dest="project_lang", default=None, help="language stack")
     proj_p.add_argument("--base-branch", dest="project_branch", default=None, help="git base branch")
     proj_p.add_argument("--idea", default=None, help="short project summary/idea")
     proj_p.add_argument("--clear-state", action="store_true",
                         help="also remove Openfarm's external state dir under ~/.openfarm (never touches project files)")
+
+    doc_p = sub.add_parser(
+        "doctor",
+        help="run preflight health checks (git, ACP OAuth, Worker key, bwrap, toolchains, stale locks)",
+        formatter_class=raw_fmt,
+        epilog="Examples:\n  openfarm doctor\n  openfarm doctor --fix\n  openfarm doctor --probe --json",
+    )
+    doc_p.add_argument("--fix", action="store_true",
+                       help="apply strictly non-destructive Openfarm housekeeping fixes")
+    doc_p.add_argument("--probe", action="store_true",
+                       help="also run a live Worker endpoint probe")
 
     auto_p = sub.add_parser(
         "auto",
@@ -3557,9 +3568,30 @@ def cmd_providers(args) -> int:
 
 
 def cmd_projects(args) -> int:
-    from .projects import edit_project, list_projects, register_project, remove_project
+    from .projects import (
+        discover_workspace_projects,
+        edit_project,
+        list_projects,
+        register_project,
+        remove_project,
+    )
 
     action = str(getattr(args, "action", "list") or "list")
+    if action == "discover":
+        scan_root = str(getattr(args, "project_dir", "") or getattr(args, "target", "") or "").strip() or None
+        found = discover_workspace_projects(scan_root)
+        if args.json:
+            print(json.dumps({"root": str(scan_root or (Path.home() / "projects")), "projects": found, "count": len(found)}, indent=2))
+        else:
+            if not found:
+                print("No project directories found.")
+            else:
+                for p in found:
+                    reg_tag = " [registered]" if p["registered"] else ""
+                    lang = p.get("detected_language") or "—"
+                    print(f"  {p['name']:<24}  {p['kind']:<11}  {lang:<10}  {p['repo']}{reg_tag}")
+        return EXIT_OK
+
     if action == "list":
         items = list_projects()
         if args.json:
@@ -3622,10 +3654,38 @@ def cmd_projects(args) -> int:
     raise UsageError(f"unknown projects subcommand: {action}")
 
 
+def cmd_doctor(args) -> int:
+    from .doctor import run_doctor
+
+    repo = Path(args.repo) if getattr(args, "repo", None) else Path.cwd()
+    cfg_p = Path(args.config) if getattr(args, "config", None) else None
+    report = run_doctor(
+        repo,
+        config_path=cfg_p,
+        fix=bool(getattr(args, "fix", False)),
+        probe_worker=bool(getattr(args, "probe", False)),
+    )
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        print(f"Openfarm Doctor ({report['repo']}):")
+        icons = {"ok": "✓", "warn": "!", "fail": "✗"}
+        for chk in report["checks"]:
+            ic = icons.get(chk["status"], "·")
+            fix_tag = " [fixable]" if chk.get("fixable") else ""
+            print(f"  {ic} {chk['label']:<24} {chk['detail']}{fix_tag}")
+        if report["fixes_applied"]:
+            print("Fixes applied:")
+            for fx in report["fixes_applied"]:
+                print(f"  + {fx}")
+    return EXIT_OK if report["ok"] else EXIT_TROUBLE
+
+
 PRE_CONFIG_COMMANDS = {
     "adopt": cmd_adopt,
     "auto": cmd_auto,
     "bench": cmd_bench,
+    "doctor": cmd_doctor,
     "init": cmd_init,
     "install-skill": cmd_install_skill,
     "acp": cmd_acp,

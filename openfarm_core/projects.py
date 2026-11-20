@@ -417,8 +417,59 @@ def remove_project(
     }
 
 
+def _detect_folder_language(folder: Path) -> str:
+    if (folder / "Cargo.toml").is_file():
+        return "rust"
+    if (folder / "package.json").is_file() or (folder / "tsconfig.json").is_file():
+        return "typescript"
+    if (folder / "go.mod").is_file():
+        return "go"
+    if (folder / "pyproject.toml").is_file() or (folder / "setup.py").is_file() or (folder / "requirements.txt").is_file():
+        return "python"
+    return ""
+
+
+def discover_workspace_projects(
+    root: Path | str | None = None,
+    *,
+    registry_path: Path | None = None,
+) -> list[dict]:
+    """Read-only 1-level scan of a workspace root (default `~/projects`) for projects."""
+    base = Path(root).expanduser().resolve() if root is not None else (Path.home() / "projects").resolve()
+    if not base.is_dir():
+        return []
+    registered_repos = {
+        Path(item["repo"]).expanduser().resolve()
+        for item in _load_raw_registry(registry_path).values()
+    }
+    found: list[dict] = []
+    for child in sorted(base.iterdir(), key=lambda p: p.name.lower()):
+        if not child.is_dir() or child.is_symlink() or child.name.startswith("."):
+            continue
+        resolved = child.resolve()
+        if (resolved / CONFIG_PATH).is_file():
+            meta = _read_repo_meta(resolved)
+            kind = "configured"
+            lang = meta.get("language") or _detect_folder_language(resolved)
+        elif (resolved / ".git").exists():
+            kind = "git-repo"
+            lang = _detect_folder_language(resolved)
+        else:
+            kind = "folder"
+            lang = _detect_folder_language(resolved)
+        found.append({
+            "name": child.name,
+            "repo": str(resolved),
+            "kind": kind,
+            "detected_language": lang,
+            "registered": resolved in registered_repos,
+        })
+    return found
+
+
 __all__ = [
     "default_projects_path",
+    "discover_workspace_projects",
     "edit_project",
     "get_project",
     "list_projects",

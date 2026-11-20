@@ -404,3 +404,161 @@ class DeleteProjectModal(ModalScreen[dict | None]):
 
     def key_escape(self) -> None:
         self.dismiss(None)
+
+
+class WorkspaceDiscoveryModal(ModalScreen[dict | None]):
+    """Read-only workspace scanner (`[S]` in Projects) to register/adopt discovered repos."""
+
+    CSS = _MODAL_CSS + "\n.modal-box { width: 92; }\nOptionList { height: 12; background: #0b1019; border: round #2b3b54; }"
+
+    def __init__(self, root_label: str, items: list[dict]) -> None:
+        super().__init__()
+        self._root_label = root_label
+        self._items = items
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="modal-box"):
+            yield Static(f"Discovered Projects in {self._root_label}", classes="modal-title")
+            yield Static("Read-only scan. Select a folder to Register (or Adopt if git-repo).", classes="modal-sub")
+            opts = [
+                Option(
+                    f"{p['name']:<24} [{p['kind']:<10}] {(p.get('detected_language') or '—'):<10} {'✓ registered' if p['registered'] else ''}",
+                    id=str(idx),
+                )
+                for idx, p in enumerate(self._items)
+            ]
+            yield OptionList(*opts, id="disc-options")
+            with Horizontal(classes="modal-actions"):
+                yield Button("Cancel [Esc]", id="cancel", classes="btn-cancel")
+                yield Button("Register Selected", id="register", classes="btn-ok")
+                yield Button("Adopt Selected", id="adopt", classes="btn-ok")
+
+    def on_mount(self) -> None:
+        if self._items:
+            self.query_one("#disc-options", OptionList).focus()
+
+    def _selected(self) -> dict | None:
+        if not self._items:
+            return None
+        ol = self.query_one("#disc-options", OptionList)
+        idx = ol.highlighted if ol.highlighted is not None else 0
+        return self._items[idx] if 0 <= idx < len(self._items) else self._items[0]
+
+    @on(Button.Pressed, "#register")
+    def _reg(self) -> None:
+        sel = self._selected()
+        self.dismiss({"action": "register", "item": sel} if sel else None)
+
+    @on(Button.Pressed, "#adopt")
+    def _adopt(self) -> None:
+        sel = self._selected()
+        self.dismiss({"action": "adopt", "item": sel} if sel else None)
+
+    @on(OptionList.OptionSelected, "#disc-options")
+    def _picked(self) -> None:
+        sel = self._selected()
+        self.dismiss({"action": "register", "item": sel} if sel else None)
+
+    @on(Button.Pressed, "#cancel")
+    def _cancel(self) -> None:
+        self.dismiss(None)
+
+    def key_escape(self) -> None:
+        self.dismiss(None)
+
+
+class CardEditorModal(ModalScreen[dict | None]):
+    """In-TUI Card Editor (`[e]` in Plan view) with live eligibility fields."""
+
+    CSS = _MODAL_CSS + "\n.modal-box { width: 92; }\n.field-lbl { color: #94a3b8; margin-top: 1; }\nTextArea { height: 8; background: #0b1019; border: round #334663; }"
+
+    def __init__(self, card_entry: dict) -> None:
+        super().__init__()
+        self._card = dict(card_entry)
+
+    def compose(self) -> ComposeResult:
+        c = self._card
+        with Vertical(classes="modal-box"):
+            yield Static(f"Edit Card: {c.get('id', '')}", classes="modal-title")
+            yield Label("Title", classes="field-lbl")
+            yield Input(value=str(c.get("title") or ""), id="ce-title")
+            yield Label("Category (small-feature | feature | pinned-bugfix | refactor | test-backfill)", classes="field-lbl")
+            yield Input(value=str(c.get("category") or "small-feature"), id="ce-cat")
+            yield Label("Touches (comma-separated relative file paths)", classes="field-lbl")
+            yield Input(value=", ".join(c.get("touches") or []), id="ce-touches")
+            yield Label("Depends (comma-separated card IDs)", classes="field-lbl")
+            yield Input(value=", ".join(c.get("depends") or []), id="ce-depends")
+            yield Label("Done Specification (Markdown)", classes="field-lbl")
+            yield TextArea(str(c.get("done_text") or ""), id="ce-done")
+            with Horizontal(classes="modal-actions"):
+                yield Button("Cancel [Esc]", id="cancel", classes="btn-cancel")
+                yield Button("Save & Check Eligibility", id="ok", classes="btn-ok")
+
+    def on_mount(self) -> None:
+        self.query_one("#ce-title", Input).focus()
+
+    @on(Button.Pressed, "#ok")
+    def _ok(self) -> None:
+        self.dismiss({
+            "title": self.query_one("#ce-title", Input).value.strip(),
+            "category": self.query_one("#ce-cat", Input).value.strip(),
+            "touches": [t.strip() for t in self.query_one("#ce-touches", Input).value.split(",") if t.strip()],
+            "depends": [d.strip() for d in self.query_one("#ce-depends", Input).value.split(",") if d.strip()],
+            "done_text": self.query_one("#ce-done", TextArea).text.strip(),
+        })
+
+    @on(Button.Pressed, "#cancel")
+    def _cancel(self) -> None:
+        self.dismiss(None)
+
+    def key_escape(self) -> None:
+        self.dismiss(None)
+
+
+class SplitCardModal(ModalScreen[dict | None]):
+    """Split a large card into two chained child cards (`[x]` in Plan view)."""
+
+    CSS = _MODAL_CSS + "\n.modal-box { width: 86; }\n.field-lbl { color: #94a3b8; margin-top: 1; }"
+
+    def __init__(self, card_entry: dict) -> None:
+        super().__init__()
+        self._card = dict(card_entry)
+
+    def compose(self) -> ComposeResult:
+        c = self._card
+        touches = list(c.get("touches") or [])
+        t1 = touches[0] if touches else ""
+        t2 = touches[1] if len(touches) > 1 else t1
+        with Vertical(classes="modal-box"):
+            yield Static(f"Split Card {c.get('id', '')} Into Two Chained Cards", classes="modal-title")
+            yield Static(f"Creates {c.get('id', '')}a and {c.get('id', '')}b (with b depending on a).", classes="modal-sub")
+            yield Label("Part A Title", classes="field-lbl")
+            yield Input(value=f"{c.get('title', '')} (Part A)", id="sc-t1")
+            yield Label("Part A Touches (comma-separated)", classes="field-lbl")
+            yield Input(value=t1, id="sc-f1")
+            yield Label("Part B Title", classes="field-lbl")
+            yield Input(value=f"{c.get('title', '')} (Part B)", id="sc-t2")
+            yield Label("Part B Touches (comma-separated)", classes="field-lbl")
+            yield Input(value=t2, id="sc-f2")
+            with Horizontal(classes="modal-actions"):
+                yield Button("Cancel [Esc]", id="cancel", classes="btn-cancel")
+                yield Button("Split Card", id="ok", classes="btn-ok")
+
+    def on_mount(self) -> None:
+        self.query_one("#sc-t1", Input).focus()
+
+    @on(Button.Pressed, "#ok")
+    def _ok(self) -> None:
+        self.dismiss({
+            "first_title": self.query_one("#sc-t1", Input).value.strip(),
+            "first_touches": [t.strip() for t in self.query_one("#sc-f1", Input).value.split(",") if t.strip()],
+            "second_title": self.query_one("#sc-t2", Input).value.strip(),
+            "second_touches": [t.strip() for t in self.query_one("#sc-f2", Input).value.split(",") if t.strip()],
+        })
+
+    @on(Button.Pressed, "#cancel")
+    def _cancel(self) -> None:
+        self.dismiss(None)
+
+    def key_escape(self) -> None:
+        self.dismiss(None)
