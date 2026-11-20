@@ -17,7 +17,7 @@ from openfarm_core.git import Git
 
 
 class WavePlanV010Tests(unittest.TestCase):
-    def test_draft_wave_plan_silently_repairs_ineligible_frontier_cards(self) -> None:
+    def test_draft_wave_plan_repairs_structure_and_keeps_the_done_words(self) -> None:
         from openfarm_core.automode import draft_wave_plan
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -64,13 +64,15 @@ class WavePlanV010Tests(unittest.TestCase):
                 ],
                 backend=fake_backend,
             )
-            self.assertTrue(plan["eligibility_ok"], plan)
             self.assertGreaterEqual(plan["repaired_count"], 1)
             self.assertEqual(len(plan["cards"]), 1)
             self.assertIn(plan["cards"][0]["profile"], ("lean", "balanced", "strict"))
 
-            # Confirm the file on disk passes real check_eligibility with zero failures
+            # The category, touches and tests are repaired. The Done text keeps its words,
+            # so the card is not eligible and says which words are the problem.
             header, body = parse_card_file((root / "cards" / "W1-01.md").read_text(encoding="utf-8"))
+            self.assertIn("Design a robust hero layout that handles images properly.", body)
+            self.assertFalse(plan["eligibility_ok"])
             card = Card(
                 id=str(header["id"]),
                 title=str(header["title"]),
@@ -81,7 +83,8 @@ class WavePlanV010Tests(unittest.TestCase):
                 fields=dict(header),
             )
             elig = check_eligibility(card, load_config(root), worktree=root)
-            self.assertTrue(elig.ok, f"repaired card still failed eligibility: {elig.failures}")
+            self.assertEqual({f["rule"] for f in elig.failures}, {"vague-done", "design-left"}, elig.failures)
+            self.assertEqual(plan["cards"][0]["failures"], elig.failures)
 
     def test_draft_wave_plan_incorporates_picked_findings_as_eligible_cards(self) -> None:
         from openfarm_core.automode import draft_wave_plan

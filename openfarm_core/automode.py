@@ -1262,22 +1262,14 @@ def run_grill_and_architect(
         if cfg is not None and category in (getattr(cfg, "require_reference", ()) or ()):
             header["reference"] = touch
 
-        from .gates.eligibility import DESIGN_WORDS, VAGUE_WORDS
-
-        def _clean_done_prose(text: str) -> str:
-            cleaned = str(text or "").strip()
-            for phrase in DESIGN_WORDS:
-                cleaned = re.sub(re.escape(phrase), "layout", cleaned, flags=re.IGNORECASE)
-            for word in VAGUE_WORDS:
-                cleaned = re.sub(rf"\b{re.escape(word)}\b", "deterministic", cleaned, flags=re.IGNORECASE)
-            return cleaned
-
+        # The owner's words go in as written. If the eligibility check finds them vague,
+        # the card says so instead of having its meaning changed.
         body = (
             "## Done\n\n"
             f"- Implement the Wave 1 golden slice in `{touch}` per `.openfarm/PROJECT_SPEC.md` and `.openfarm/GRILL_DECISIONS.md`.\n"
-            f"- Core workflow (`{touch}`): {_clean_done_prose(goal_ans)}\n"
-            f"- Golden slice returns expected values: {_clean_done_prose(slice_ans)}\n"
-            f"- Preserve invariants and return an error on invalid input: {_clean_done_prose(inv_ans)}\n"
+            f"- Core workflow (`{touch}`): {goal_ans.strip()}\n"
+            f"- Golden slice returns expected values: {slice_ans.strip()}\n"
+            f"- Preserve invariants and return an error on invalid input: {inv_ans.strip()}\n"
             f"- `{test_entry['name']}` passes alongside all baseline tests.\n"
         )
         card_path = cards_dir / "W1-01.md"
@@ -1326,17 +1318,6 @@ def _default_touch_and_test(root: Path, lang: str, card_id: str) -> tuple[str, d
         "file": f"tests/{slug}.test.ts",
         "asserts": "Core workflow returns expected output and rejects invalid input with an error",
     }
-
-
-def _sanitize_done_prose(text: str) -> str:
-    from .gates.eligibility import DESIGN_WORDS, VAGUE_WORDS
-
-    cleaned = str(text or "").strip()
-    for phrase in DESIGN_WORDS:
-        cleaned = re.sub(re.escape(phrase), "layout", cleaned, flags=re.IGNORECASE)
-    for word in VAGUE_WORDS:
-        cleaned = re.sub(rf"\b{re.escape(word)}\b", "deterministic", cleaned, flags=re.IGNORECASE)
-    return cleaned
 
 
 def _repair_card_for_eligibility(
@@ -1405,7 +1386,6 @@ def _repair_card_for_eligibility(
     if cat in ("pinned-bugfix", "test-backfill") and h.get("new_symbols"):
         h.pop("new_symbols", None)
 
-    b = _sanitize_done_prose(b)
     if not b:
         b = f"## Done\n\n- Implement `{h['touches'][0]}` so it returns expected values and returns an error on invalid input."
     elif not any(m in b for m in ("`", "==", "->", "returns", "assert", "error", "matches!", "equals")):
@@ -1575,8 +1555,8 @@ def draft_wave_plan(
                     header["reference"] = touch
                 body = (
                     "## Done\n\n"
-                    f"- Address worker finding `{fid}` (from `{item['from_card']}`): {_sanitize_done_prose(item['title'])}.\n"
-                    f"- Details: {_sanitize_done_prose(item['body'] or item['title'])}\n"
+                    f"- Address worker finding `{fid}` (from `{item['from_card']}`): {str(item['title']).strip()}.\n"
+                    f"- Details: {str(item['body'] or item['title']).strip()}\n"
                     f"- `{test_entry['name']}` returns expected values and verifies an error on invalid input.\n"
                 )
                 card_path.write_text(render_card_file(header, body), encoding="utf-8")
