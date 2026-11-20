@@ -26,6 +26,7 @@ class StopCode(str, enum.Enum):
     EXTRA_GATE = "extra-gate"
     CARD_CHANGED = "card-changed"
     STALE_CONFLICT = "stale-conflict"
+    REBASE_CONFLICT = "rebase-conflict"
     REFUSED = "refused"
     INFRA = "infra"
     LEASE_EXPIRED = "lease-expired"

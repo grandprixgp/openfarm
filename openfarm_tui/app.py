@@ -548,6 +548,7 @@ class OpenfarmApp(App):
                             with Horizontal(classes="action-row"):
                                 yield Button("Approve [a]", classes="approve-btn", id="btn-approve")
                                 yield Button("Land Locally [L]", classes="primary-cta", id="btn-land")
+                                yield Button("Merge Integration → Main", classes="soft-btn", id="btn-promote-int")
                                 yield Button("Bounce [b]", classes="soft-btn", id="btn-bounce")
                                 yield Button("Frontier Review [m]", classes="soft-btn", id="btn-freview")
                         with TabPane("Tests & Spec"):
@@ -2086,6 +2087,11 @@ class OpenfarmApp(App):
             f"Approved to land: {', '.join(self._approved_to_land)}"
         )
         self.notify(f"Approved {cid} — press [L] to Land Locally")
+        self.refresh_all_views()
+
+    @on(Button.Pressed, "#btn-promote-int")
+    def _promote_integration_btn(self) -> None:
+        self._run_cli_quick(["land", "--promote-integration"])
         self.refresh_all_views()
 
     @on(Button.Pressed, "#btn-land")

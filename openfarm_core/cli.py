@@ -1910,6 +1910,19 @@ def cmd_land(ctx: Context, args) -> int:
     once per head (unless `--dry-run`), merges locally with `--no-ff`, marks the
     card `done`, and cleans up lingering card worktrees.
     """
+    if getattr(args, "promote_integration", False):
+        from .factory import promote_integration_branch
+
+        res = promote_integration_branch(ctx.repo, ctx.cfg)
+        if ctx.json:
+            print(json.dumps(res, indent=2))
+        else:
+            if res["promoted"]:
+                print(f"Promoted {res['integration_branch']} (+{res['ahead']} commit(s)) into {res['base_branch']} locally.")
+            else:
+                print(res.get("reason") or "Nothing to promote.")
+        return EXIT_OK
+
     card_ids = [_check_id(cid, "card id") for cid in (args.cards or [])]
     if not card_ids:
         _emit_ctx(ctx, {"landed": [], "reason": "no cards specified"}, "land")
@@ -2649,9 +2662,9 @@ def cmd_swarm(ctx: Context, args) -> int:
 # -- the parser ----------------------------------------------------------------
 
 _CLI_EPILOG = """\
-Command groups (31 commands):
+Command groups (32 commands):
   Setup & Auth         init, adopt, install-skill, acp, providers, projects, doctor
-  Run & Monitor        auto, check, run, status, pause, resume, stop, tui
+  Run & Monitor        auto, plan, check, run, status, pause, resume, stop, tui
   Review & Harness     triage, review, land, findings, frontier-review, dossier, verdict, done, release, escape, supervise, harness
   Swarm, Board & Bench swarm, board, drive, bench
 
@@ -2764,12 +2777,24 @@ def build_parser() -> argparse.ArgumentParser:
 
     land = sub.add_parser(
         "land",
-        help="local-only serial merge queue for reviewed cards",
+        help="local-only serial merge queue for reviewed cards (or promote integration branch)",
         formatter_class=raw_fmt,
     )
-    land.add_argument("cards", nargs="+", help="card IDs to land serially onto base_branch")
+    land.add_argument("cards", nargs="*", help="card IDs to land serially onto base_branch")
     land.add_argument("--dry-run", action="store_true",
                       help="trial-merge and verify only, without modifying base_branch")
+    land.add_argument("--promote-integration", action="store_true",
+                      help="merge local [factory] integration_branch into base_branch (zero push)")
+
+    plan_p = sub.add_parser(
+        "plan",
+        help="inspect Cards-as-the-DAG wave schedule or draft a multi-wave plan",
+        formatter_class=raw_fmt,
+        epilog="Examples:\n  openfarm plan\n  openfarm plan --json\n  openfarm plan --draft --idea 'Daily photo viewer'",
+    )
+    plan_p.add_argument("--draft", action="store_true", help="draft new wave cards from --idea before rendering DAG")
+    plan_p.add_argument("--idea", default="", help="project workflow/goal for --draft")
+    plan_p.add_argument("--no-baseline", action="store_true", help="skip baseline test verification when drafting")
 
     find_p = sub.add_parser(
         "findings",
@@ -3739,8 +3764,32 @@ def cmd_findings(ctx: Context, args) -> int:
     return EXIT_OK
 
 
+def cmd_plan(ctx: Context, args) -> int:
+    """Inspect the Cards-as-the-DAG wave tiers or draft a new multi-wave plan."""
+    from .automode import draft_wave_plan
+    from .dag import build_card_dag, render_dag_ascii
+
+    if getattr(args, "draft", False):
+        idea = str(getattr(args, "idea", "") or "").strip() or f"Implement next wave for {ctx.cfg.name}"
+        draft_wave_plan(
+            ctx.repo,
+            answers=[{"id": "goal", "question": "Goal", "answer": idea}],
+            backend=None,
+            verify_baseline=not bool(getattr(args, "no_baseline", False)),
+        )
+    source = ctx.cards()
+    source.prepare()
+    dag = build_card_dag(source.all_cards())
+    if ctx.json:
+        print(json.dumps(dag, indent=2))
+    else:
+        print(render_dag_ascii(dag))
+    return EXIT_OK
+
+
 COMMANDS = {
     "run": cmd_run,
+    "plan": cmd_plan,
     "status": cmd_status,
     "pause": cmd_pause,
     "resume": cmd_resume,
