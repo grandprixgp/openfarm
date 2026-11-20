@@ -299,7 +299,7 @@ One `openfarm` CLI with **37 subcommands**, shared exit codes (`0` ok, `1` refus
 | --- | --- |
 | `openfarm triage [CARDS...]` | Score card complexity (`low`/`medium`/`high`/`split`) and recommend supervision profiles |
 | `openfarm review` | Interactive (or `--json`) wave review of `in-review` cards, diffs, and dossiers |
-| `openfarm land CARD... [--promote-integration]` | Local-only serial merge queue (trial-merge/rebase + full test gate + `git merge --no-ff` + cleanup; zero push) |
+| `openfarm land CARD... [--promote-integration]` | Local-only serial merge queue (trial-merge/rebase + full test gate + `git merge --no-ff` + cleanup; zero push). `--accept-blocked --note "what I checked"` lands a blocked card a person has checked, recording who and why |
 | `openfarm findings [list\|pick\|dismiss\|fold]` | Manage worker-filed findings inbox across waves |
 | `openfarm frontier-review` | Mixture-of-Frontiers review across multiple providers (`--providers claude,codex`) |
 | `openfarm dossier CARD` | Print a card's reviewer dossier as Markdown or JSON |
