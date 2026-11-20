@@ -18,7 +18,7 @@ from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.command import Hit, Hits, Provider
-from textual.containers import Container, Horizontal, Vertical, VerticalScroll
+from textual.containers import Container, Horizontal, ItemGrid, Vertical, VerticalScroll
 from textual.widgets import (
     Button,
     ContentSwitcher,
@@ -149,6 +149,15 @@ class OpenfarmPaletteProvider(Provider):
                 )
 
 
+class ButtonRow(ItemGrid):
+    """A row of buttons that wraps onto more lines when its pane is too narrow for one."""
+
+    def on_mount(self) -> None:
+        # Every column is as wide as the longest button, so no label is ever cut.
+        self.min_column_width = max(
+            (len(str(b.label)) + 5 for b in self.query(Button)), default=None)
+
+
 class OpenfarmApp(App):
     """High-contrast Textual workbench for Openfarm v0.10.0."""
 
@@ -263,7 +272,7 @@ class OpenfarmApp(App):
     .pill-purple { width: auto; background: #2f1b47; color: #c084fc; text-style: bold; padding: 0 1; margin-right: 1; }
     .pill-yellow { width: auto; background: #423310; color: #fbbf24; text-style: bold; padding: 0 1; margin-right: 1; }
 
-    .action-row { height: 1; align: left middle; margin-top: 1; }
+    .action-row { height: auto; margin-top: 1; }
     .action-row-tall { height: 3; align: left middle; margin-top: 1; }
     Button.primary-cta {
         width: auto; min-width: 10; height: 1; background: #38bdf8; color: #08101a;
@@ -342,17 +351,16 @@ class OpenfarmApp(App):
     }
     #grill-status.hidden { display: none; }
     #architect-panel {
-        height: auto;
-        max-height: 11;
+        dock: bottom;
+        height: 8;
         background: #0e1c2b;
         border: round #38bdf8;
         padding: 0 2;
-        margin-bottom: 1;
     }
     #architect-panel.hidden { display: none; }
     #architect-panel-head { height: 1; align: left middle; }
     #architect-banner { width: 1fr; color: #e0f2fe; }
-    #architect-log { height: 6; background: #09111b; border: round #1e334a; padding: 0 1; margin-top: 1; }
+    #architect-log { height: 1fr; background: #09111b; padding: 0 1; }
 
     /* Split Panes */
     .split-left  { width: 46; margin-right: 2; height: 1fr; }
@@ -481,7 +489,7 @@ class OpenfarmApp(App):
                 with right_pr:
                     with VerticalScroll(id="project-detail-scroll"):
                         yield Static("No projects registered yet.", id="project-detail")
-                    with Horizontal(classes="action-row"):
+                    with ButtonRow(classes="action-row"):
                         yield Button("Switch Project \\[Enter]", classes="primary-cta", id="btn-proj-switch")
                         yield Button("Add / New \\[n]", classes="approve-btn", id="btn-proj-new")
                         yield Button("Scan ~/projects \\[S]", classes="soft-btn", id="btn-proj-scan")
@@ -540,7 +548,7 @@ class OpenfarmApp(App):
                         yield Button("Retry", classes="primary-cta hidden", id="btn-arch-retry")
                         yield Button("Use a basic template instead", classes="soft-btn hidden", id="btn-arch-template")
                         yield Button("Cancel", classes="soft-btn hidden", id="btn-arch-cancel")
-                        yield Button("Hide Log", classes="soft-btn", id="btn-arch-hide")
+                        yield Button("Hide", classes="soft-btn", id="btn-arch-hide")
                     yield RichLog(id="architect-log", markup=True, wrap=True, min_width=0)
                 with ContentSwitcher(initial="studio-grill", id="studio-switcher"):
                     # 1A: Single-Prompt Studio & Conversational Frontier Architect
@@ -570,7 +578,7 @@ class OpenfarmApp(App):
                                 yield Input(placeholder="Reply to Architect (or click an option above)...", id="inp-grill-answer")
                                 yield Button("Reply", classes="primary-cta", id="btn-grill-send")
                                 yield Button("Reset Chat", classes="soft-btn", id="btn-grill-reset")
-                        with Horizontal(classes="action-row-tall"):
+                        with ButtonRow(classes="action-row"):
                             yield Button("Ask Architect to Grill Me", classes="primary-cta", id="btn-grill-ask")
                             yield Button("Flesh Out Spec & Chunks", classes="approve-btn", id="btn-draft-spec")
                             yield Button("Quick: Draft Cards Now", classes="soft-btn", id="btn-draft-plan")
@@ -593,7 +601,7 @@ class OpenfarmApp(App):
                         with right_sp:
                             yield TextArea("", id="ta-spec-editor")
                             yield Static("", id="spec-status", classes="subtext")
-                            with Horizontal(classes="action-row"):
+                            with ButtonRow(classes="action-row"):
                                 yield Button("Split Chunk into Cards", classes="primary-cta", id="btn-chunk-to-cards")
                                 yield Button("Mark Chunk Done", classes="approve-btn", id="btn-chunk-done")
                                 yield Button("Save Spec", classes="soft-btn", id="btn-spec-save")
@@ -606,11 +614,12 @@ class OpenfarmApp(App):
                         with left_p:
                             yield DataTable(id="plan-table")
                             yield Static("", id="plan-preflight", classes="subtext")
-                        right_p = VerticalScroll(classes="card split-right")
+                        right_p = Vertical(classes="card split-right")
                         right_p.border_title = "Card Detail"
                         with right_p:
-                            yield Static("Select a card to inspect its scope and named tests.", id="plan-detail")
-                            with Horizontal(classes="action-row"):
+                            yield VerticalScroll(
+                                Static("Select a card to inspect its scope and named tests.", id="plan-detail"))
+                            with ButtonRow(classes="action-row"):
                                 yield Button("Commit Baseline & Launch Wave", classes="primary-cta", id="btn-launch-wave")
                                 yield Button("Edit Card \\[e]", classes="soft-btn", id="btn-plan-edit")
                                 yield Button("Split Card \\[x]", classes="soft-btn", id="btn-plan-split")
@@ -633,7 +642,7 @@ class OpenfarmApp(App):
                         right_r.border_title = "Live Activity Stream"
                         with right_r:
                             yield RichLog(id="activity-log", markup=True, wrap=True, min_width=0)
-                            with Horizontal(classes="action-row", id="run-controls"):
+                            with ButtonRow(classes="action-row", id="run-controls"):
                                 yield Button("Back to Plan", classes="primary-cta", id="btn-run-back")
                                 yield Button("Pause \\[p]", classes="soft-btn hidden", id="btn-pause")
                                 yield Button("Stop \\[s]", classes="soft-btn hidden", id="btn-stop")
@@ -660,7 +669,7 @@ class OpenfarmApp(App):
                             yield Static("", id="review-status", classes="subtext")
                             with VerticalScroll(id="diff-scroll"):
                                 yield Static("(no diff preview)", id="review-diff")
-                            with Horizontal(classes="action-row"):
+                            with ButtonRow(classes="action-row"):
                                 yield Button("Approve \\[a]", classes="approve-btn", id="btn-approve")
                                 yield Button("Land Locally \\[L]", classes="primary-cta", id="btn-land")
                                 yield Button("Merge Integration → Main", classes="soft-btn", id="btn-promote-int")
@@ -687,7 +696,7 @@ class OpenfarmApp(App):
                     with right_f:
                         with VerticalScroll(id="finding-detail-scroll"):
                             yield Static("No waiting findings.", id="finding-detail")
-                        with Horizontal(classes="action-row"):
+                        with ButtonRow(classes="action-row"):
                             yield Button("Pick Next Wave \\[w]", classes="primary-cta", id="btn-find-pick")
                             yield Button("Dismiss \\[x]", classes="soft-btn", id="btn-find-dismiss")
                             yield Button("Bulk Dismiss Card \\[X]", classes="soft-btn", id="btn-find-bulk-dismiss")
@@ -709,11 +718,11 @@ class OpenfarmApp(App):
                             yield Static("(harness status loading...)", id="engine-harness")
                         with TabPane("Providers & Config"):
                             yield Static("", id="engine-providers")
-                            with Horizontal(classes="action-row"):
+                            with ButtonRow(classes="action-row"):
                                 yield Button("Open Global Provider Setup", classes="primary-cta", id="btn-eng-providers")
                         with TabPane("Doctor"):
                             yield Static("Click Run Doctor to inspect repo, OAuth, Worker, bwrap, toolchains & locks.", id="engine-doctor")
-                            with Horizontal(classes="action-row"):
+                            with ButtonRow(classes="action-row"):
                                 yield Button("Run Doctor", classes="primary-cta", id="btn-doc-run")
                                 yield Button("Run Safe Fix", classes="approve-btn", id="btn-doc-fix")
                         with TabPane("Spec"):
@@ -1933,7 +1942,7 @@ class OpenfarmApp(App):
             else:
                 status_box.add_class("hidden")
                 if was_active:
-                    banner.update("[bold #4ade80]✓ Step finished[/]  [#94a3b8](Hide Log closes this)[/]")
+                    banner.update("[bold #4ade80]✓ Step finished[/]  [#94a3b8](Hide closes this)[/]")
 
     def _render_draft_status(self) -> None:
         if not self._drafting_plan:

@@ -785,6 +785,107 @@ class IdeaScreenTests(_RegistryIsolation):
             self._open(toy, on_run)
 
 
+class LayoutTests(_RegistryIsolation):
+    """R1.15: nothing is cut off at 100 columns and up, and nothing jumps."""
+
+    SCREENS = (("studio", "studio-grill"), ("studio", "studio-spec"), ("studio", "studio-plan"),
+               ("studio", "studio-run"), ("review", None), ("findings", None), ("engine", None),
+               ("projects", None), ("providers", None))
+
+    @staticmethod
+    def _cut_off(app) -> list[str]:
+        from textual.widgets import Button
+
+        out = []
+        for button in app.screen.query(Button):
+            if not all(node.display for node in button.ancestors_with_self):
+                continue
+            region = button.region
+            boxes = [node.region for node in button.ancestors if node is not app.screen and hasattr(node, "region")]
+            if not region.area or not all(box.contains_region(region) for box in boxes):
+                out.append(str(button.id))
+        return out
+
+    def _open(self, toy, size, body) -> None:
+        from openfarm_tui.app import OpenfarmApp
+
+        async def _run() -> None:
+            app = OpenfarmApp(repo=toy.root, initial_view="studio")
+            async with app.run_test(size=size) as pilot:
+                await pilot.pause(0.2)
+                await body(app, pilot)
+
+        asyncio.run(_run())
+
+    def _toy(self, done_lines: int = 1):
+        toy, src = _two_card_toy(self)
+        if done_lines > 1:
+            from openfarm_core.automode import update_card_with_eligibility
+            update_card_with_eligibility(
+                toy.root, "CARD-1",
+                done_text="## Done\n\n" + "\n".join(f"- `push` returns {n} for bundle {n}." for n in range(done_lines)))
+        claim = src.claim("CARD-1", holder="test-lane")
+        src.move("CARD-1", claim["lease_id"], "blocked", stop_code="tests-unprovable")  # shows every review button
+        return toy
+
+    def test_no_button_is_cut_off_from_100_columns_up(self) -> None:
+        toy = self._toy()
+        for size in ((100, 44), (120, 44), (160, 50)):
+            async def body(app, pilot, size=size) -> None:
+                for view, sub in self.SCREENS:
+                    app.action_switch_view(view)
+                    if sub:
+                        app.query_one("#studio-switcher").current = sub
+                    await pilot.pause(0.15)
+                    self.assertEqual(self._cut_off(app), [], f"{view} {sub or ''} at {size[0]} columns")
+
+            self._open(toy, size, body)
+
+    def test_the_launch_button_stays_in_view_under_a_long_done_text(self) -> None:
+        toy = self._toy(done_lines=120)
+
+        async def body(app, pilot) -> None:
+            app.query_one("#studio-switcher").current = "studio-plan"
+            table = app.query_one("#plan-table")
+            table.move_cursor(row=table.get_row_index("CARD-1"))
+            await pilot.pause(0.2)
+            detail = app.query_one("#plan-detail")
+            self.assertGreater(detail.region.height, app.size.height)  # the text is longer than the screen
+            self.assertEqual(self._cut_off(app), [])
+            launch = app.query_one("#btn-launch-wave").region
+            self.assertTrue(app.screen.region.contains_region(launch))
+            self.assertGreater(detail.parent.max_scroll_y, 0)  # and scrolls on its own
+
+        self._open(toy, (100, 40), body)
+
+    def test_the_progress_panel_is_one_size_and_moves_nothing(self) -> None:
+        toy = self._toy()
+
+        async def body(app, pilot) -> None:
+            app.query_one("#studio-switcher").current = "studio-plan"
+            await pilot.pause(0.15)
+            table, launch = app.query_one("#plan-table"), app.query_one("#btn-launch-wave")
+            before = (table.region.y, app.query_one("#studio-switcher").region.y)
+
+            app._busy_button = "#btn-draft-plan"
+            app._set_drafting_state(True, "Connecting to the Architect...")
+            await pilot.pause(0.15)
+            panel = app.query_one("#architect-panel")
+            height = panel.region.height
+            self.assertEqual((table.region.y, app.query_one("#studio-switcher").region.y), before)
+            self.assertEqual(self._cut_off(app), [])
+            self.assertLess(launch.region.bottom, panel.region.y + 1)  # the main button is still above it
+
+            for n in range(40):
+                app._log_architect(f"Writing card {n}...")
+            await pilot.pause(0.15)
+            self.assertEqual(panel.region.height, height)
+            self.assertEqual((table.region.y, app.query_one("#studio-switcher").region.y), before)
+            app._set_drafting_state(False, "")
+
+        self._open(toy, (100, 44), body)
+
+
 class ReviewActionTests(_RegistryIsolation):
     """R1.9, R1.17: slow review actions show they run and how they end; a blocked card can be accepted."""
 
