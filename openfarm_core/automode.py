@@ -255,6 +255,47 @@ def reuse_existing_key_file(source: Path, dest: Path) -> Path:
     return save_worker_key_atomic(dest, secret)
 
 
+def is_placeholder_endpoint(url: str) -> bool:
+    """True when `[model] endpoint` is still the init/adopt placeholder or empty."""
+    cleaned = str(url or "").strip().lower()
+    return (not cleaned) or ("api.example.invalid" in cleaned)
+
+
+def configure_worker_endpoint(config_path: Path, endpoint: str, model: str = "") -> Path:
+    """Update `[model]` endpoint, allowed_endpoints, and optional role models in `.openfarm/config.toml`."""
+    import re
+
+    ep = str(endpoint or "").strip().rstrip("/")
+    if not (ep.startswith("https://") or ep.startswith("http://")) or is_placeholder_endpoint(ep):
+        raise Refused("bad-endpoint", "Worker endpoint must be a real http(s):// URL")
+    mdl = str(model or "").strip()
+    cfg_p = Path(config_path).expanduser().resolve()
+    raw = cfg_p.read_text(encoding="utf-8")
+    out_lines: list[str] = []
+    in_model = False
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            in_model = stripped == "[model]"
+            out_lines.append(line)
+            continue
+        if in_model:
+            if re.match(r"^\s*endpoint\s*=", line):
+                out_lines.append(f'endpoint = "{ep}"')
+                continue
+            if re.match(r"^\s*allowed_endpoints\s*=", line):
+                out_lines.append(f'allowed_endpoints = ["{ep}"]')
+                continue
+            if mdl and re.match(r"^\s*(test_writer|implementer|checker|planner)\s*=", line):
+                line = re.sub(r'model\s*=\s*"[^"]*"', f'model = "{mdl}"', line)
+        out_lines.append(line)
+    updated = "\n".join(out_lines) + ("\n" if raw.endswith("\n") else "")
+    cfg_p.write_text(updated, encoding="utf-8")
+    # Verify the updated config still parses cleanly.
+    load_config(cfg_p.parent.parent, cfg_p)
+    return cfg_p
+
+
 def _spec_and_cards_ready(root: Path, counts: dict) -> bool:
     spec = root / ".openfarm" / "PROJECT_SPEC.md"
     spec_ok = False
@@ -330,10 +371,17 @@ def compute_pipeline_stages(
 
     key_done = True
     key_file_path = ""
+    worker_prompt = "Configure Worker API key, endpoint & model in-TUI"
     if cfg is not None and getattr(cfg, "model_adapter", "") == "openai-compatible":
         kf = getattr(cfg, "key_file", None)
         key_file_path = str(kf or "")
-        key_done = bool(kf and Path(kf).is_file() and Path(kf).stat().st_size > 0)
+        key_present = bool(kf and Path(kf).is_file() and Path(kf).stat().st_size > 0)
+        ep_ok = not is_placeholder_endpoint(str(getattr(cfg, "endpoint", "") or ""))
+        key_done = key_present and ep_ok
+        if key_present and not ep_ok:
+            worker_prompt = "Configure Worker endpoint & model in-TUI (currently placeholder)"
+        else:
+            worker_prompt = f"Set Worker API key & endpoint in-TUI ({key_file_path or 'key_file'})"
 
     counts = ws.get("counts") or {}
     spec_done = _spec_and_cards_ready(root_p, counts)
@@ -343,7 +391,7 @@ def compute_pipeline_stages(
         {"id": "auth", "label": "Auth", "done": auth_done, "action": "auth",
          "prompt": f"Sign in to Frontier {auth_provider} OAuth in-TUI", "provider": auth_provider},
         {"id": "worker_key", "label": "Worker Key", "done": key_done, "action": "worker_key",
-         "prompt": f"Set Worker API key in-TUI ({key_file_path or 'key_file'})", "key_file": key_file_path},
+         "prompt": worker_prompt, "key_file": key_file_path},
         {"id": "spec_and_slice", "label": "Spec & Cards", "done": spec_done, "action": "grill",
          "prompt": "Run in-TUI Grill & Architect to expand PROJECT_SPEC.md, invariants, and Wave 1 cards"},
         {"id": "wave", "label": "Wave", "done": False, "action": ws["next_action"], "prompt": ws["summary"]},
