@@ -3196,10 +3196,13 @@ def build_parser() -> argparse.ArgumentParser:
         "web",
         help="serve the stdlib local/tailnet Factory Companion web UI (default: 127.0.0.1:8787)",
         formatter_class=raw_fmt,
-        epilog="Examples:\n  openfarm web\n  openfarm web --port 8787\n  openfarm web --bind 100.64.0.1 --port 8787",
+        epilog="Examples:\n  openfarm web\n  openfarm web --tailscale\n  openfarm web --bind tailscale --port 8787",
     )
-    web_p.add_argument("--bind", default="127.0.0.1", help="bind address (default: 127.0.0.1)")
+    web_p.add_argument("--bind", default="127.0.0.1",
+                       help="bind address or 'tailscale' to auto-detect tailnet IPv4 (default: 127.0.0.1)")
     web_p.add_argument("--port", type=int, default=8787, help="TCP port (default: 8787)")
+    web_p.add_argument("--tailscale", action="store_true",
+                       help="expose 127.0.0.1:<port> over HTTPS on your tailnet via `tailscale serve --bg`")
     web_p.add_argument("--allow-all-interfaces", action="store_true",
                        help="explicitly permit binding to 0.0.0.0 / ::")
 
@@ -3894,23 +3897,31 @@ def cmd_daemon(args) -> int:
 
 
 def cmd_web(args) -> int:
-    from .web import create_web_server
+    from .web import create_web_server, expose_via_tailscale_serve
 
     repo = Path(args.repo) if getattr(args, "repo", None) else Path.cwd()
     cfg_p = Path(args.config) if getattr(args, "config", None) else None
+    use_ts_serve = bool(getattr(args, "tailscale", False))
+    bind_addr = "127.0.0.1" if use_ts_serve else str(getattr(args, "bind", "127.0.0.1") or "127.0.0.1")
     srv = create_web_server(
         repo,
-        bind=str(getattr(args, "bind", "127.0.0.1") or "127.0.0.1"),
+        bind=bind_addr,
         port=int(getattr(args, "port", 8787) or 8787),
         allow_all_interfaces=bool(getattr(args, "allow_all_interfaces", False)),
         config_path=cfg_p,
     )
     host, port = srv.server_address[:2]
     url = f"http://{host}:{port}/"
+    ts_info = expose_via_tailscale_serve(port) if use_ts_serve else None
     if args.json:
-        print(json.dumps({"ok": True, "url": url, "bind": host, "port": port}, indent=2), flush=True)
+        payload = {"ok": True, "url": url, "bind": host, "port": port}
+        if ts_info is not None:
+            payload["tailscale"] = ts_info
+        print(json.dumps(payload, indent=2), flush=True)
     else:
         print(f"Openfarm Factory Companion listening on {url} (Ctrl-C to stop)", flush=True)
+        if ts_info is not None:
+            print(f"Tailscale HTTPS (tailnet only): {ts_info['url']}  (disable: {ts_info['disable_cmd']})", flush=True)
     try:
         with contextlib.suppress(KeyboardInterrupt):
             srv.serve_forever()

@@ -12,6 +12,8 @@ import contextlib
 import http.server
 import json
 import secrets
+import shutil
+import subprocess
 import time
 import urllib.parse
 from pathlib import Path
@@ -373,6 +375,83 @@ def _recent_event_lines(repo: Path, *, config_path: Path | None = None, limit: i
     return [f"openfarm companion watching {cfg.name}"]
 
 
+def resolve_tailscale_ipv4(*, runner=None) -> str:
+    """Resolve this host's Tailscale IPv4 address via `tailscale ip -4`."""
+    binary = shutil.which("tailscale") if runner is None else "tailscale"
+    if not binary:
+        raise Refused("tailscale-missing", "tailscale CLI is not installed on PATH")
+    run_fn = runner or subprocess.run
+    proc = run_fn(
+        [binary, "ip", "-4"],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=5.0,
+        check=False,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        raise Refused("tailscale-unavailable", f"tailscale ip -4 failed: {detail or proc.returncode}")
+    for line in (proc.stdout or "").splitlines():
+        ip = line.strip()
+        if ip:
+            return ip
+    raise Refused("tailscale-no-ip", "tailscale ip -4 returned no IPv4 address")
+
+
+def resolve_tailscale_dns_name(*, runner=None) -> str:
+    """Return this node's Tailscale MagicDNS name (without trailing dot), or empty string."""
+    binary = shutil.which("tailscale") if runner is None else "tailscale"
+    if not binary:
+        return ""
+    run_fn = runner or subprocess.run
+    try:
+        proc = run_fn(
+            [binary, "status", "--self", "--json"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            check=False,
+        )
+        if proc.returncode != 0:
+            return ""
+        data = json.loads(proc.stdout or "{}")
+        dns = str(((data.get("Self") or {}).get("DNSName") or "")).strip().rstrip(".")
+        return dns
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return ""
+
+
+def expose_via_tailscale_serve(port: int, *, runner=None) -> dict:
+    """Expose `http://127.0.0.1:<port>` on the tailnet over HTTPS via `tailscale serve --bg`."""
+    binary = shutil.which("tailscale") if runner is None else "tailscale"
+    if not binary:
+        raise Refused("tailscale-missing", "tailscale CLI is not installed on PATH")
+    run_fn = runner or subprocess.run
+    p = int(port)
+    proc = run_fn(
+        [binary, "serve", "--bg", f"--https={p}", f"http://127.0.0.1:{p}"],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=10.0,
+        check=False,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        raise Refused("tailscale-serve-failed", f"tailscale serve failed: {detail or proc.returncode}")
+    dns = resolve_tailscale_dns_name(runner=runner)
+    ts_url = f"https://{dns}:{p}/" if dns else f"https://<tailnet-host>:{p}/"
+    return {
+        "ok": True,
+        "port": p,
+        "dns_name": dns,
+        "url": ts_url,
+        "disable_cmd": f"tailscale serve --https={p} off",
+    }
+
+
 def create_web_server(
     repo: Path,
     *,
@@ -380,9 +459,15 @@ def create_web_server(
     port: int = 8787,
     allow_all_interfaces: bool = False,
     config_path: Path | None = None,
+    tailscale_runner=None,
 ) -> OpenfarmWebServer:
-    """Create the stdlib HTTP companion server (refusing wildcard binds unless explicitly opted in)."""
+    """Create the stdlib HTTP companion server (refusing wildcard binds unless explicitly opted in).
+
+    Passing `bind="tailscale"` resolves this host's Tailscale IPv4 via `tailscale ip -4`.
+    """
     host = str(bind or "127.0.0.1").strip()
+    if host.lower() == "tailscale":
+        host = resolve_tailscale_ipv4(runner=tailscale_runner)
     if host in _WILDCARD_BINDS and not allow_all_interfaces:
         raise Refused(
             "wildcard-bind-refused",
@@ -391,4 +476,11 @@ def create_web_server(
     return OpenfarmWebServer((host, int(port)), repo, config_path=config_path)
 
 
-__all__ = ["OpenfarmWebServer", "build_web_state", "create_web_server"]
+__all__ = [
+    "OpenfarmWebServer",
+    "build_web_state",
+    "create_web_server",
+    "expose_via_tailscale_serve",
+    "resolve_tailscale_dns_name",
+    "resolve_tailscale_ipv4",
+]
