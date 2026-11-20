@@ -261,6 +261,7 @@ def adopt_project(
             state_dir=resolved_state,
             language=resolved_language,
             base_branch=base_branch,
+            auto=True,
         )
     except (OSError, Refused):
         registered_project = False
