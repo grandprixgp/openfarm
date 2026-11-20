@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -72,6 +73,7 @@ from openfarm_core.gates.eligibility import check_eligibility
 from openfarm_core.git import Git
 from openfarm_core.projects import (
     _is_ephemeral_tmp_path,
+    default_projects_path,
     discover_workspace_projects,
     edit_project,
     get_project,
@@ -425,6 +427,8 @@ class OpenfarmApp(App):
         self._spark_points: list[float] = [0.0, 0.0, 0.0, 0.0, 0.0]
         self._plan_cards: list[dict] = []
         self._selected_plan_id: str = ""
+        self._in_review_count = 0
+        self._startable_count = 0
         self._review_cards: list = []
         self._selected_review_id: str = ""
         self._findings_items: list[dict] = []
@@ -762,9 +766,58 @@ class OpenfarmApp(App):
         gp = load_global_providers()
         ws = detect_workspace_state(self.repo, self.config_path)
         target_view = self._initial_view
-        if target_view == "studio" and not gp["configured"] and ws["stage"] == "empty":
+        if target_view in ("studio", "auto") and not gp["configured"] and ws["stage"] == "empty":
             target_view = "providers"
+        elif target_view == "auto":
+            # No tab was asked for: open where the project's next step is.
+            target_view = "studio"
+            if self._wave_active():
+                self.query_one("#studio-switcher", ContentSwitcher).current = "studio-run"
+            elif self._in_review_count and not self._startable_count:
+                target_view = "review"
+        self._load_idea_draft()
         self.action_switch_view(target_view)
+
+    def _idea_draft_path(self) -> Path:
+        """The unsent idea is kept beside the projects list, since a new folder has nowhere to put it."""
+        key = hashlib.sha256(str(self.repo).encode()).hexdigest()[:16]
+        return default_projects_path().parent / "idea-drafts" / f"{key}.txt"
+
+    def _load_idea_draft(self) -> None:
+        try:
+            text = self._idea_draft_path().read_text(encoding="utf-8")
+        except OSError:
+            text = ""
+        self.query_one("#ta-idea", TextArea).load_text(text)
+
+    @on(TextArea.Changed, "#ta-idea")
+    def _save_idea_draft(self, event: TextArea.Changed) -> None:
+        path = self._idea_draft_path()
+        try:
+            if event.text_area.text.strip():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(event.text_area.text, encoding="utf-8")
+            else:
+                path.unlink(missing_ok=True)
+        except OSError as exc:
+            self.log.warning(f"could not save the idea draft: {exc}")
+
+    def _typing_target(self):
+        """The text field a typed letter belongs to on the idea screen, or None."""
+        if len(self.screen_stack) > 1:
+            return None
+        if self.query_one("#main-switcher", ContentSwitcher).current != "studio":
+            return None
+        if self.query_one("#studio-switcher", ContentSwitcher).current != "studio-grill":
+            return None
+        if not self.query_one("#grill-chat-box").has_class("hidden"):
+            return self.query_one("#inp-grill-answer", Input)
+        return self.query_one("#ta-idea", TextArea)
+
+    def _focus_typing_target(self) -> None:
+        target = self._typing_target()
+        if target is not None and not isinstance(self.focused, (Input, TextArea)):
+            target.focus()
 
     def notify(self, message, *, title="", severity="information", timeout=None, markup=False):
         """Toasts carry card text, errors and key names like [L], so they are plain text."""
@@ -833,6 +886,7 @@ class OpenfarmApp(App):
         ready_cards = [c for c in non_findings if str(c.state).lower() == "ready"]
         blocked_cards = [c for c in non_findings if str(c.state).lower() == "blocked"]
         startable = [c for c in ready_cards if c.id not in waiting_on(non_findings)]
+        self._in_review_count, self._startable_count = len(in_review), len(startable)
 
         # Update daemon pill when not actively drafting/running in-process
         if not self._running_wave and not self._drafting_plan:
@@ -1344,6 +1398,7 @@ class OpenfarmApp(App):
             studio_sw = self.query_one("#studio-switcher", ContentSwitcher)
             if studio_sw.current == "studio-run":
                 self._back_to_plan()
+        self.call_after_refresh(self._focus_typing_target)
         for vid, bid in (
             ("projects", "nav-projects"),
             ("studio", "nav-studio"),
@@ -1438,6 +1493,7 @@ class OpenfarmApp(App):
         self._grill_pending_question = ""
         self._grill_options = []
         self._render_grill_chat()
+        self._load_idea_draft()
         self._selected_review_id = ""
         self._selected_finding_id = ""
         self._approved_to_land.clear()
@@ -1537,6 +1593,19 @@ class OpenfarmApp(App):
                 self._findings_query = ""
                 self.refresh_all_views()
                 self.query_one("#findings-table", DataTable).focus()
+            return
+        if len(self.screen_stack) > 1:
+            return  # a dialog is open: its keys are its own
+
+        target = self._typing_target()
+        if target is not None and event.character and event.character.isalpha():
+            target.focus()
+            if isinstance(target, TextArea):
+                target.insert(event.character)
+            else:
+                target.insert_text_at_cursor(event.character)
+            event.stop()
+            event.prevent_default()
             return
 
         cur_view = self.query_one("#main-switcher", ContentSwitcher).current

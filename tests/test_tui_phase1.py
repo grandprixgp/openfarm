@@ -697,6 +697,94 @@ class PlanViewTests(_RegistryIsolation):
         RunPanelTests._drive(self, toy, body)
 
 
+class IdeaScreenTests(_RegistryIsolation):
+    """R1.11, R1.12: typing on a new project lands in the idea box, and the idea is kept."""
+
+    def _open(self, toy, body, view: str = "auto") -> None:
+        from openfarm_tui.app import OpenfarmApp
+
+        async def _run() -> None:
+            app = OpenfarmApp(repo=toy.root, initial_view=view)
+            async with app.run_test(size=(140, 44)) as pilot:
+                await pilot.pause(0.2)
+                await body(app, pilot)
+
+        asyncio.run(_run())
+
+    def _toy(self):
+        return ArchitectFailureTests._toy(self)
+
+    def test_first_keys_go_to_the_idea_box_even_from_a_button(self) -> None:
+        toy = self._toy()
+
+        async def body(app, pilot) -> None:
+            idea = app.query_one("#ta-idea")
+            self.assertIs(app.focused, idea)
+            await pilot.press("h", "i")
+            self.assertEqual(idea.text, "hi")
+
+            app.query_one("#btn-grill-ask").focus()
+            await pilot.pause(0.05)
+            await pilot.press("h", "e", "q", "r")
+            await pilot.pause(0.1)
+            self.assertEqual(idea.text, "hiheqr")
+            self.assertIs(app.focused, idea)
+            self.assertEqual(len(app.screen_stack), 1)  # no Hint dialog, and q did not quit
+
+        self._open(toy, body)
+
+    def test_the_idea_is_there_again_after_a_restart_in_the_same_folder(self) -> None:
+        toy = self._toy()
+
+        async def first(app, pilot) -> None:
+            await pilot.press(*"a photo site")
+            await pilot.pause(0.1)
+
+        async def second(app, pilot) -> None:
+            self.assertEqual(app.query_one("#ta-idea").text, "a photo site")
+            app.query_one("#ta-idea").load_text("")
+            await pilot.pause(0.1)
+
+        async def third(app, pilot) -> None:
+            self.assertEqual(app.query_one("#ta-idea").text, "")
+
+        self._open(toy, first)
+        self._open(toy, second)
+        self._open(toy, third)
+        dirty = subprocess.run(["git", "-C", str(toy.root), "status", "--porcelain"],
+                               capture_output=True, text=True).stdout
+        self.assertEqual(dirty, "")  # the draft is kept outside the folder
+
+    def test_the_app_opens_where_the_next_step_is(self) -> None:
+        toy, src = _two_card_toy(self)
+
+        async def on_plan(app, pilot) -> None:
+            self.assertEqual(app.query_one("#main-switcher").current, "studio")
+            self.assertEqual(app.query_one("#studio-switcher").current, "studio-plan")
+
+        self._open(toy, on_plan)
+
+        claim = src.claim("CARD-1", holder="test-lane")
+        src.move("CARD-1", claim["lease_id"], "in-review")
+
+        async def on_review(app, pilot) -> None:
+            self.assertEqual(app.query_one("#main-switcher").current, "review")
+
+        self._open(toy, on_review)  # CARD-2 waits for CARD-1, so review is the only thing to do
+
+        async def as_asked(app, pilot) -> None:
+            self.assertEqual(app.query_one("#main-switcher").current, "engine")
+
+        self._open(toy, as_asked, view="engine")
+
+        async def on_run(app, pilot) -> None:
+            self.assertEqual(app.query_one("#main-switcher").current, "studio")
+            self.assertEqual(app.query_one("#studio-switcher").current, "studio-run")
+
+        with mock.patch("openfarm_tui.app.daemon_status", return_value={"running": True, "pid": 4242}):
+            self._open(toy, on_run)
+
+
 class ReviewActionTests(_RegistryIsolation):
     """R1.9, R1.17: slow review actions show they run and how they end; a blocked card can be accepted."""
 

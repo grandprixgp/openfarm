@@ -23,13 +23,13 @@ def run_textual_tui(
     config_path: Path | str | None = None,
     *,
     run_id: str | None = None,
-    initial_view: str = "studio",
+    initial_view: str = "overview",
 ) -> int:
     from .app import OpenfarmApp
 
     view_map = {
         "projects": "projects",
-        "overview": "studio",
+        "overview": "auto",  # the default: the app picks the screen from the project's state
         "studio": "studio",
         "cards": "review",
         "dossier": "review",
