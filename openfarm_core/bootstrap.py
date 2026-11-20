@@ -720,6 +720,7 @@ def initialize_project(
             language=resolved_lang,
             base_branch=cfg.base_branch,
             idea=idea_text,
+            auto=True,
         )
     except (OSError, Refused):
         registered_project = False

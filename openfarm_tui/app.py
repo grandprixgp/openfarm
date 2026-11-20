@@ -54,6 +54,7 @@ from openfarm_core.findings import (
 )
 from openfarm_core.git import Git
 from openfarm_core.projects import (
+    _is_ephemeral_tmp_path,
     edit_project,
     get_project,
     list_projects,
@@ -585,7 +586,7 @@ class OpenfarmApp(App):
         # Register the current directory automatically once if it is already configured
         if (self.repo / CONFIG_PATH).is_file():
             try:
-                register_project(self.repo)
+                register_project(self.repo, auto=True)
             except (OSError, Refused) as exc:
                 self.log.warning(f"could not register current repo: {exc}")
 
@@ -1418,7 +1419,8 @@ class OpenfarmApp(App):
 
     @on(Button.Pressed, "#btn-proj-new")
     def _open_new_project_modal(self) -> None:
-        default_dir = str(self.repo.parent / "new-project")
+        base_parent = Path.home() / "projects" if (_is_ephemeral_tmp_path(self.repo) or not self.repo.is_dir()) else self.repo.parent
+        default_dir = str(base_parent / "new-project")
 
         def _done(data: dict | None) -> None:
             if not data or not data.get("repo"):

@@ -119,6 +119,32 @@ class ProjectsRegistryV0101Tests(unittest.TestCase):
                 else:
                     os.environ["OPENFARM_PROJECTS_FILE"] = prev
 
+    def test_auto_register_skips_ephemeral_tmp_when_default_registry_used(self) -> None:
+        from openfarm_core.projects import default_projects_path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_tmp = Path(tmp) / "ephemeral-test-app"
+            prev = os.environ.pop("OPENFARM_PROJECTS_FILE", None)
+            default_reg = default_projects_path()
+            existed_before = default_reg.exists()
+            before_text = default_reg.read_text(encoding="utf-8") if existed_before else None
+            try:
+                initialize_project(
+                    "ephemeral-test-app",
+                    directory=repo_tmp,
+                    language="python",
+                    state_dir=Path(tmp) / "st",
+                    secrets_dir=Path(tmp) / "sec",
+                    no_git=True,
+                )
+                if not existed_before:
+                    self.assertFalse(default_reg.exists())
+                else:
+                    self.assertEqual(default_reg.read_text(encoding="utf-8"), before_text)
+            finally:
+                if prev is not None:
+                    os.environ["OPENFARM_PROJECTS_FILE"] = prev
+
     def test_cli_projects_list_add_edit_remove_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             reg_path = Path(tmp) / "projects.toml"

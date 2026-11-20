@@ -161,6 +161,19 @@ def _enrich_entry(entry: dict) -> dict:
     return out
 
 
+def _is_ephemeral_tmp_path(repo_path: Path) -> bool:
+    """True when `repo_path` lives inside a temporary/test directory that should not auto-pollute the user's registry."""
+    resolved = repo_path.expanduser().resolve()
+    tmp_roots = [Path("/tmp").resolve(), Path("/var/tmp").resolve(), Path(tempfile.gettempdir()).resolve()]
+    for root in tmp_roots:
+        if resolved == root or resolved.is_relative_to(root):
+            return True
+    for part in resolved.parts:
+        if part.startswith(("openfarm-tests-", "tmp-v0", "openfarm-v0")):
+            return True
+    return False
+
+
 def register_project(
     repo: Path | str,
     *,
@@ -170,12 +183,28 @@ def register_project(
     language: str = "",
     base_branch: str = "",
     idea: str = "",
+    auto: bool = False,
     path: Path | None = None,
 ) -> dict:
     """Register or refresh a project in `projects.toml` and return its entry."""
     repo_path = Path(repo).expanduser().resolve()
-    entries = _load_raw_registry(path)
     meta = _read_repo_meta(repo_path)
+
+    # Never auto-pollute the user's default ~/.config/openfarm/projects.toml from temp/test dirs.
+    if auto and path is None and not os.environ.get("OPENFARM_PROJECTS_FILE", "").strip() and _is_ephemeral_tmp_path(repo_path):
+        pid = _slugify(project_id or name or meta["name"] or repo_path.name)
+        return _enrich_entry({
+            "id": pid,
+            "name": str(name or meta["name"] or repo_path.name).strip() or pid,
+            "repo": str(repo_path),
+            "state_dir": str(Path(state_dir).expanduser().resolve()) if state_dir else meta["state_dir"],
+            "language": str(language or meta["language"] or "").strip(),
+            "base_branch": str(base_branch or meta["base_branch"] or "main").strip() or "main",
+            "idea": str(idea or "").strip(),
+            "last_opened": utc_now(),
+        })
+
+    entries = _load_raw_registry(path)
 
     existing_id = ""
     for pid, item in entries.items():
