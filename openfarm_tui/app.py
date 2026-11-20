@@ -459,7 +459,7 @@ class OpenfarmApp(App):
             yield Static("openfarm", id="brand")
             yield Static(esc(self.repo.name), id="repo-title")
             yield Static("", classes="spacer")
-            yield Static("W —% · F —% (idle)", id="token-summary")
+            yield Static("Token share: worker —% · frontier —% (no run yet)", id="token-summary")
             yield Static("○ READY", id="status-badge", classes="status-pill status-ready")
 
         with Horizontal(id="navstrip"):
@@ -754,7 +754,7 @@ class OpenfarmApp(App):
 
         ft = self.query_one("#findings-table", DataTable)
         ft.cursor_type = "row"
-        ft.add_columns("ID", "From", "Title")
+        ft.add_columns("ID", "From", "Blocks", "Title")
 
         bt = self.query_one("#board-table", DataTable)
         bt.cursor_type = "row"
@@ -978,7 +978,7 @@ class OpenfarmApp(App):
             )
         else:
             self._selected_chunk_id = ""
-            self.query_one("#chunk-goal-detail", Static).update("No chunks yet — click Flesh Out Spec & Chunks from Studio.")
+            self.query_one("#chunk-goal-detail", Static).update("No chunks yet. Back to Grill / Iterate below opens the idea screen, where Flesh Out Spec & Chunks writes them.")
         spec_ed = self.query_one("#ta-spec-editor", TextArea)
         if self.focused is not spec_ed:
             sp = self.repo / ".openfarm" / "PROJECT_SPEC.md"
@@ -1119,10 +1119,10 @@ class OpenfarmApp(App):
         c_pct = int(round((ca / (fr + ca)) * 100)) if (fr + ca) > 0 else 0
         if tot > 0:
             self.query_one("#token-summary", Static).update(
-                f"Tokens: {tot:,}  ·  W {w_pct}% / F {f_pct}%  ·  {c_pct}% cached"
+                f"Token share: worker {w_pct}% · frontier {f_pct}%  ({tot:,} tokens, {c_pct}% cached)"
             )
         else:
-            self.query_one("#token-summary", Static).update("W —% · F —% (idle)")
+            self.query_one("#token-summary", Static).update("Token share: worker —% · frontier —% (no run yet)")
         pb = self.query_one("#worker-bar", ProgressBar)
         pb.update(total=100, progress=w_pct)
         self.query_one("#econ-stats", Static).update(
@@ -1231,7 +1231,9 @@ class OpenfarmApp(App):
         for item in self._findings_items:
             tag = " [new]" if item["is_new"] else ""
             dup = f" (×{item['duplicate_count']})" if int(item.get("duplicate_count") or 1) > 1 else ""
-            ft.add_row(Text(item["id"]), Text(item["from_card"]), Text(f"{item['title'][:32]}{dup}{tag}"), key=item["id"])
+            held = "blocks " + item["holds_up"][0] if item.get("holds_up") else "-"
+            ft.add_row(Text(item["id"]), Text(item["from_card"]), Text(held),
+                       Text(f"{item['title'][:32]}{dup}{tag}"), key=item["id"])
         if self._findings_items:
             if self._selected_finding_id not in {f["id"] for f in self._findings_items}:
                 self._selected_finding_id = self._findings_items[0]["id"]
@@ -1244,12 +1246,26 @@ class OpenfarmApp(App):
     def _render_finding_detail(self, item: dict) -> None:
         self._selected_finding_id = item["id"]
         new_badge = "  [bold #fbbf24 on #423310] NEW [/]" if item["is_new"] else ""
+        held = item.get("holds_up") or []
+        if held:
+            waiting = f", and {', '.join(held[1:])} wait{'s' if len(held) == 2 else ''} for it" if held[1:] else ""
+            blocks = f"[bold #fb7185]Holds up:[/] {esc(held[0])} (blocked){esc(waiting)}\n"
+        else:
+            state = str(item.get("from_card_state") or "").replace("_", " ")
+            why = f" ({item['from_card']} is {state})" if state else ""
+            blocks = f"[bold #4ade80]Doesn't block anything[/]{esc(why)}\n"
+        ids = item.get("duplicate_ids") or []
+        repeats = ""
+        if len(ids) > 1:
+            repeats = (f"[#94a3b8]Filed {len(ids)} times by retries of {esc(item['from_card'])} "
+                       f"({esc(', '.join(ids))}); a decision here covers all of them.[/]\n")
         self.query_one("#finding-detail", Static).update(
             f"[bold #f8fafc]{esc(item['id'])}  ·  {esc(item['title'])}[/]{new_badge}\n"
             f"[#94a3b8]From card:[/] [bold #38bdf8]{esc(item['from_card'])}[/] "
             f"({esc(item['from_card_title'])})\n"
             f"[#94a3b8]Created:[/]   {esc(item.get('created_at') or '—')}   "
-            f"[#94a3b8]Decision:[/] {esc(item.get('decision') or 'waiting')}\n\n"
+            f"[#94a3b8]Decision:[/] {esc(item.get('decision') or 'waiting')}\n"
+            f"{blocks}{repeats}\n"
             f"{esc(item.get('body') or '(no additional detail)')}"
         )
 
@@ -1478,17 +1494,14 @@ class OpenfarmApp(App):
         cfg = self._safe_cfg()
         if cfg is None or not finding_id:
             return None
-        res = decide_finding(
-            self.repo,
-            cfg,
-            finding_id,
-            decision,
-            reason=reason,
-            target_card=target_card,
-        )
+        # A folded finding stands for every repeat of it, so the decision goes to all.
+        shown = next((f for f in self._findings_items if f["id"] == finding_id), None)
+        ids = (shown or {}).get("duplicate_ids") or [finding_id]
+        results = {fid: decide_finding(self.repo, cfg, fid, decision, reason=reason, target_card=target_card)
+                   for fid in ids}
         self.refresh_all_views()
-        self.notify(f"{finding_id}: {decision}")
-        return res
+        self.notify(f"{finding_id}: {decision}" + (f" (with its {len(ids) - 1} repeats)" if len(ids) > 1 else ""))
+        return results.get(finding_id)
 
     def switch_active_project(self, project_id: str) -> dict | None:
         proj = get_project(project_id)

@@ -9,6 +9,7 @@ and keep dismissed/folded findings out of the active backlog.
 from __future__ import annotations
 
 import json
+import difflib
 import re
 from pathlib import Path
 from types import SimpleNamespace
@@ -130,6 +131,16 @@ def list_findings(
     """List findings newest-first with waiting / new / picked / dismissed / folded counts."""
     raw_cards = _read_raw_cards_readonly(repo, cfg)
     titles_by_id = {c["id"]: str(c["header"].get("title") or c["id"]) for c in raw_cards}
+    states_by_id = {c["id"]: str(c["header"].get("state") or "").strip().lower().replace("-", "_")
+                    for c in raw_cards}
+    deps_by_id = {c["id"]: [str(d) for d in (c["header"].get("depends") or [])] for c in raw_cards}
+
+    def holds_up(card_id: str) -> list[str]:
+        """The blocked card a finding came from, then the cards waiting behind that one."""
+        if states_by_id.get(card_id) != "blocked":
+            return []
+        return [card_id] + [cid for cid, deps in deps_by_id.items()
+                            if card_id in deps and states_by_id.get(cid) in ("ready", "backlog")]
     state = StateDir(cfg.state_dir)
     latest_started, latest_ids = _latest_run_context(state)
 
@@ -170,6 +181,8 @@ def list_findings(
             "body_preview": _body_preview(body),
             "from_card": src_id,
             "from_card_title": titles_by_id.get(src_id, src_id),
+            "from_card_state": states_by_id.get(src_id, ""),
+            "holds_up": holds_up(src_id),
             "created_at": created_at,
             "state": raw_state,
             "decision": decision,
@@ -218,21 +231,27 @@ def list_findings(
         filtered.append(item)
 
     if deduplicate:
+        # A retried card files the same finding again in slightly different words
+        # ("is unspecified" / "is not specified"), so near-identical titles from one
+        # card fold into the newest. 0.65 sits between real repeats (0.70 and up) and
+        # different findings from one card (0.51 and down) in the dogfood run.
+        def norm(title: str) -> str:
+            return re.sub(r"[^a-z0-9]+", " ", title.lower()).strip()
+
         deduped: list[dict] = []
-        by_sig: dict[tuple[str, str], dict] = {}
         for item in filtered:
-            norm_title = re.sub(r"\s+", " ", str(item["title"]).strip().lower())
-            sig = (str(item["from_card"]).strip(), norm_title)
-            if sig in by_sig:
-                existing = by_sig[sig]
-                existing["duplicate_count"] += 1
-                existing["duplicate_ids"].append(item["id"])
-            else:
-                copy_item = dict(item)
-                copy_item["duplicate_count"] = 1
-                copy_item["duplicate_ids"] = [item["id"]]
-                by_sig[sig] = copy_item
-                deduped.append(copy_item)
+            title = norm(str(item["title"]))
+            group = next(
+                (g for g in deduped if g["from_card"] == item["from_card"] and any(
+                    difflib.SequenceMatcher(None, title, norm(seen)).ratio() >= 0.65
+                    for seen in g["duplicate_titles"])),
+                None)
+            if group is None:
+                group = dict(item, duplicate_count=0, duplicate_ids=[], duplicate_titles=[])
+                deduped.append(group)
+            group["duplicate_count"] += 1
+            group["duplicate_ids"].append(item["id"])
+            group["duplicate_titles"].append(str(item["title"]))
         filtered = deduped
 
     return {

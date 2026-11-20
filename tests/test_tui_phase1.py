@@ -658,6 +658,7 @@ class PlanViewTests(_RegistryIsolation):
             self.assertEqual(rows["CARD-1"][2], "blocked")
             self.assertEqual(rows["CARD-2"][2:4], ["waits", "CARD-1"])
             self.assertEqual(table.parent.border_title, "Wave Plan")
+            self.assertIn("Token share: worker", str(app.query_one("#token-summary").render()))  # R1.16
 
             preflight = " ".join(str(app.query_one("#plan-preflight").render()).split())
             self.assertIn("0 can start now", preflight)
@@ -884,6 +885,64 @@ class LayoutTests(_RegistryIsolation):
             app._set_drafting_state(False, "")
 
         self._open(toy, (100, 44), body)
+
+
+class FindingsTests(_RegistryIsolation):
+    """R1.18: a finding says what it holds up, and a retried card's repeats are one row."""
+
+    def _toy(self):
+        toy, src = _two_card_toy(self)
+        claim = src.claim("CARD-1", holder="test-lane")
+        src.move("CARD-1", claim["lease_id"], "blocked", stop_code="tests-unprovable")
+        # The titles the dogfood run's retries of one card really filed.
+        for title in ("User-agent value is not specified", "Fixture is not scaffolded here",
+                      "User-agent value is unspecified", "User-agent value is not specified"):
+            src.finding("CARD-1", title, "The card does not say.")
+        src.finding("CARD-2", "Test name promises more than the card", "Only the font is emitted.")
+        return toy
+
+    def test_repeats_fold_and_each_finding_says_what_it_holds_up(self) -> None:
+        from openfarm_core.findings import list_findings
+
+        toy = self._toy()
+        found = list_findings(toy.root, load_config(toy.root), deduplicate=True)["findings"]
+        by_title = {f["title"]: f for f in found}
+        self.assertEqual(len(found), 3)
+        agent = next(f for f in found if f["title"].startswith("User-agent"))
+        self.assertEqual(agent["duplicate_count"], 3)
+        self.assertEqual(by_title["Fixture is not scaffolded here"]["duplicate_count"], 1)
+        self.assertEqual(agent["holds_up"], ["CARD-1", "CARD-2"])
+        self.assertEqual(by_title["Test name promises more than the card"]["holds_up"], [])
+
+    def test_the_inbox_shows_it_and_one_decision_covers_the_repeats(self) -> None:
+        from openfarm_core.findings import list_findings
+
+        toy = self._toy()
+
+        async def body(app, pilot, settle) -> None:
+            table = app.query_one("#findings-table")
+            self.assertEqual(table.row_count, 3)
+            agent = next(f for f in app._findings_items if f["title"].startswith("User-agent"))
+            self.assertEqual(str(table.get_row(agent["id"])[2]), "blocks CARD-1")
+            table.move_cursor(row=table.get_row_index(agent["id"]))
+            await pilot.pause(0.1)
+            detail = " ".join(str(app.query_one("#finding-detail").render()).split())
+            self.assertIn("Holds up: CARD-1 (blocked), and CARD-2 waits for it", detail)
+            self.assertIn("Filed 3 times by retries of CARD-1", detail)
+
+            other = next(f for f in app._findings_items if f["from_card"] == "CARD-2")
+            table.move_cursor(row=table.get_row_index(other["id"]))
+            await pilot.pause(0.1)
+            detail = " ".join(str(app.query_one("#finding-detail").render()).split())
+            self.assertIn("Doesn't block anything (CARD-2 is ready)", detail)
+
+            app.apply_finding_decision(agent["id"], "dismissed", reason="set in the card")
+            await pilot.pause(0.1)
+            self.assertEqual(table.row_count, 2)
+
+        RunPanelTests._drive(self, toy, body, view="findings")
+        counts = list_findings(toy.root, load_config(toy.root))["counts"]
+        self.assertEqual((counts["waiting"], counts["dismissed"]), (2, 3))
 
 
 class ReviewActionTests(_RegistryIsolation):
