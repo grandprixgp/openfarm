@@ -86,6 +86,7 @@ from openfarm_core.state import StateDir
 from openfarm_core.triage import triage_card_heuristic
 from openfarm_core.tui import _load_tui_context, _read_cards_readonly
 
+from .markup import esc
 from .modals import (
     BounceNoteModal,
     CardEditorModal,
@@ -422,7 +423,7 @@ class OpenfarmApp(App):
     def compose(self) -> ComposeResult:
         with Horizontal(id="topbar"):
             yield Static("openfarm", id="brand")
-            yield Static(f"{self.repo.name}", id="repo-title")
+            yield Static(esc(self.repo.name), id="repo-title")
             yield Static("", classes="spacer")
             yield Static("W —% · F —% (idle)", id="token-summary")
             yield Static("○ READY", id="status-badge", classes="status-pill status-ready")
@@ -737,6 +738,10 @@ class OpenfarmApp(App):
             target_view = "providers"
         self.action_switch_view(target_view)
 
+    def notify(self, message, *, title="", severity="information", timeout=None, markup=False):
+        """Toasts carry card text, errors and key names like [L], so they are plain text."""
+        super().notify(str(message), title=title, severity=severity, timeout=timeout, markup=markup)
+
     def _safe_cfg(self):
         cfg_p = self.config_path or (self.repo / CONFIG_PATH)
         if not cfg_p.is_file():
@@ -757,7 +762,7 @@ class OpenfarmApp(App):
             signed = False
         badge = "[bold #4ade80]✓ signed in[/]" if signed else "[bold #fbbf24]○ login required[/]"
         self.query_one("#prov-frontier-status", Static).update(
-            f"[bold #f8fafc]● {fr.title()} ACP (OAuth)[/]   {badge}"
+            f"[bold #f8fafc]● {esc(fr.title())} ACP (OAuth)[/]   {badge}"
         )
         if wk.get("endpoint"):
             self.query_one("#inp-endpoint", Input).value = wk["endpoint"]
@@ -777,7 +782,7 @@ class OpenfarmApp(App):
             except Exception:
                 branch = ""
         self.query_one("#repo-title", Static).update(
-            f"{self.repo.name}  ({branch})" if branch else self.repo.name
+            esc(f"{self.repo.name}  ({branch})" if branch else self.repo.name)
         )
 
         # Load cards & findings
@@ -839,7 +844,7 @@ class OpenfarmApp(App):
         if w_cnt > 0:
             new_cnt = self._findings_counts["new_since_last_run"]
             sample_titles = "  ·  ".join(
-                f"{item['id']}: {rich_escape(item['title'][:40])}" for item in self._findings_items[:3]
+                f"{item['id']}: {esc(item['title'][:40])}" for item in self._findings_items[:3]
             )
             banner.remove_class("hidden")
             banner.update(
@@ -869,15 +874,15 @@ class OpenfarmApp(App):
         cht.clear()
         for ch in self._chunks_items:
             st_code = {"active": "act", "done": "✓", "pending": "pnd"}.get(ch["status"], ch["status"][:3])
-            cht.add_row(ch["id"], st_code, ch["title"][:28], key=ch["id"])
+            cht.add_row(Text(ch["id"]), st_code, Text(ch["title"][:28]), key=ch["id"])
         if self._chunks_items:
             if self._selected_chunk_id not in {c["id"] for c in self._chunks_items}:
                 act = next((c for c in self._chunks_items if c["status"] == "active"), self._chunks_items[0])
                 self._selected_chunk_id = act["id"]
             sel_ch = next(c for c in self._chunks_items if c["id"] == self._selected_chunk_id)
             self.query_one("#chunk-goal-detail", Static).update(
-                f"[bold #38bdf8]{rich_escape(sel_ch['id'])}[/] ({rich_escape(sel_ch['status'])})\n"
-                f"{rich_escape(sel_ch['title'])}\n[#cbd5e1]{rich_escape(sel_ch.get('goal') or '')}[/]"
+                f"[bold #38bdf8]{esc(sel_ch['id'])}[/] ({esc(sel_ch['status'])})\n"
+                f"{esc(sel_ch['title'])}\n[#cbd5e1]{esc(sel_ch.get('goal') or '')}[/]"
             )
         else:
             self._selected_chunk_id = ""
@@ -907,7 +912,7 @@ class OpenfarmApp(App):
                 "eligible": True,
             }
             self._plan_cards.append(entry)
-            pt.add_row(c.id, c.title[:18], st_short, entry["profile"][:4], key=c.id)
+            pt.add_row(Text(c.id), Text(c.title[:18]), st_short, Text(entry["profile"][:4]), key=c.id)
         if self._plan_cards:
             if self._selected_plan_id not in {e["id"] for e in self._plan_cards}:
                 self._selected_plan_id = self._plan_cards[0]["id"]
@@ -918,18 +923,18 @@ class OpenfarmApp(App):
         matrix = compute_touches_conflict_matrix(ready_cards)
         if matrix["conflict_count"]:
             c_pairs = ", ".join(f"{c['a']}↔{c['b']}" for c in matrix["conflicts"][:3])
-            conflict_line = f"\n[bold #fbbf24]![/] {matrix['conflict_count']} conflict(s) ({rich_escape(c_pairs)}) · {matrix['max_parallelism']} parallel lane(s)"
+            conflict_line = f"\n[bold #fbbf24]![/] {matrix['conflict_count']} conflict(s) ({esc(c_pairs)}) · {matrix['max_parallelism']} parallel lane(s)"
         else:
             conflict_line = f"\n[bold #4ade80]✓[/] 0 touches conflicts · {matrix['max_parallelism']} parallel lane(s)"
         base_line = ""
         if self._last_baseline_ok is True:
             base_line = "\n[bold #4ade80]✓[/] Baseline tests passed"
         elif self._last_baseline_ok is False:
-            base_line = f"\n[bold #fb7185]✗ Baseline failed:[/] {rich_escape(self._last_baseline_error[:120])}"
+            base_line = f"\n[bold #fb7185]✗ Baseline failed:[/] {esc(self._last_baseline_error[:120])}"
         self.query_one("#plan-preflight", Static).update(
             f"[bold #4ade80]✓[/] {len(ready_cards)} ready card(s)  ·  "
             f"{self._findings_counts['picked']} picked finding(s)\n"
-            f"[bold #38bdf8]✓[/] Worker: {rich_escape(gp['worker'].get('model') or '(repo config)')}"
+            f"[bold #38bdf8]✓[/] Worker: {esc(gp['worker'].get('model') or '(repo config)')}"
             f"{conflict_line}{base_line}"
         )
 
@@ -939,7 +944,7 @@ class OpenfarmApp(App):
         self._review_cards = in_review + blocked_cards + ready_cards
         for c in self._review_cards:
             st = str(c.state).lower().replace("_", "-")
-            rt.add_row(c.id, st, c.title[:28], key=c.id)
+            rt.add_row(Text(c.id), st, Text(c.title[:28]), key=c.id)
         if self._review_cards:
             if self._selected_review_id not in {c.id for c in self._review_cards}:
                 self._selected_review_id = self._review_cards[0].id
@@ -1003,17 +1008,17 @@ class OpenfarmApp(App):
     def _render_plan_detail(self, entry: dict) -> None:
         touches = ", ".join(entry.get("touches") or []) or "(none)"
         tests_lines = "\n".join(
-            f"  [bold #4ade80]• {rich_escape(t.get('name', ''))}[/] ({rich_escape(t.get('file', ''))})\n"
-            f"    [#94a3b8]{rich_escape(t.get('asserts', ''))}[/]"
+            f"  [bold #4ade80]• {esc(t.get('name', ''))}[/] ({esc(t.get('file', ''))})\n"
+            f"    [#94a3b8]{esc(t.get('asserts', ''))}[/]"
             for t in (entry.get("tests") or [])
         ) or "  (none)"
         self.query_one("#plan-detail", Static).update(
-            f"[bold #f8fafc]{rich_escape(entry['id'])}  ·  {rich_escape(entry['title'])}[/]\n"
-            f"[bold #c084fc on #2f1b47] {rich_escape(entry['category'])} [/]  "
-            f"[bold #4ade80 on #103623] profile: {rich_escape(entry['profile'])} [/]  "
+            f"[bold #f8fafc]{esc(entry['id'])}  ·  {esc(entry['title'])}[/]\n"
+            f"[bold #c084fc on #2f1b47] {esc(entry['category'])} [/]  "
+            f"[bold #4ade80 on #103623] profile: {esc(entry['profile'])} [/]  "
             f"[bold #4ade80 on #103623] ✓ eligible [/]\n\n"
-            f"[bold #38bdf8]SCOPE[/]\nTouches: {rich_escape(touches)}\n\n"
-            f"[bold #38bdf8]DONE SPEC[/]\n{rich_escape(entry.get('done_text', '')[:500])}\n\n"
+            f"[bold #38bdf8]SCOPE[/]\nTouches: {esc(touches)}\n\n"
+            f"[bold #38bdf8]DONE SPEC[/]\n{esc(entry.get('done_text', '')[:500])}\n\n"
             f"[bold #38bdf8]TESTS[/]\n{tests_lines}"
         )
 
@@ -1021,23 +1026,23 @@ class OpenfarmApp(App):
         self._selected_review_id = card.id
         st = str(card.state).lower().replace("_", "-")
         self.query_one("#review-gates", Static).update(
-            f"[bold #f8fafc]{rich_escape(card.id)} · {rich_escape(card.title)}[/]   "
-            f"[bold #38bdf8 on #12384d] {st} [/]   "
-            f"[bold #c084fc on #2f1b47] {rich_escape(card.category)} [/]"
+            f"[bold #f8fafc]{esc(card.id)} · {esc(card.title)}[/]   "
+            f"[bold #38bdf8 on #12384d] {esc(st)} [/]   "
+            f"[bold #c084fc on #2f1b47] {esc(card.category)} [/]"
         )
         # Findings filed by this card (id, title, start of body)
         card_findings = findings_for_card(self.repo, cfg, card.id) if cfg is not None else []
         if card_findings:
-            flines = [f"[bold #fbbf24]Findings filed by {rich_escape(card.id)} ({len(card_findings)}):[/]"]
+            flines = [f"[bold #fbbf24]Findings filed by {esc(card.id)} ({len(card_findings)}):[/]"]
             for f in card_findings[:5]:
                 flines.append(
-                    f"  [bold #38bdf8]{rich_escape(f['id'])}[/]  [bold #f8fafc]{rich_escape(f['title'])}[/]  "
-                    f"[#94a3b8]{rich_escape(f['body_preview'][:90])}[/]"
+                    f"  [bold #38bdf8]{esc(f['id'])}[/]  [bold #f8fafc]{esc(f['title'])}[/]  "
+                    f"[#94a3b8]{esc(f['body_preview'][:90])}[/]"
                 )
             self.query_one("#review-card-findings", Static).update("\n".join(flines))
         else:
             self.query_one("#review-card-findings", Static).update(
-                f"[#94a3b8]No findings filed by {rich_escape(card.id)}.[/]"
+                f"[#94a3b8]No findings filed by {esc(card.id)}.[/]"
             )
 
         # Diff preview from card branch if present
@@ -1055,14 +1060,14 @@ class OpenfarmApp(App):
             )
         else:
             self.query_one("#review-diff", Static).update(
-                f"[#94a3b8](No branch diff yet for {rich_escape(card.id)}; touches: {', '.join(card.touches)})[/]"
+                f"[#94a3b8](No branch diff yet for {esc(card.id)}; touches: {esc(', '.join(card.touches))})[/]"
             )
 
         tests_txt = "\n".join(
             f"• {t.name} ({t.file}) — {t.asserts}" for t in card.tests
         ) or "(no named tests)"
         self.query_one("#review-tests", Static).update(
-            f"Touches: {', '.join(card.touches)}\n\nTests:\n{tests_txt}\n\n{card.done_text}"
+            esc(f"Touches: {', '.join(card.touches)}\n\nTests:\n{tests_txt}\n\n{card.done_text}")
         )
 
     def _refresh_findings_widgets(self) -> None:
@@ -1078,7 +1083,7 @@ class OpenfarmApp(App):
         for item in self._findings_items:
             tag = " [new]" if item["is_new"] else ""
             dup = f" (×{item['duplicate_count']})" if int(item.get("duplicate_count") or 1) > 1 else ""
-            ft.add_row(item["id"], item["from_card"], f"{item['title'][:32]}{dup}{tag}", key=item["id"])
+            ft.add_row(Text(item["id"]), Text(item["from_card"]), Text(f"{item['title'][:32]}{dup}{tag}"), key=item["id"])
         if self._findings_items:
             if self._selected_finding_id not in {f["id"] for f in self._findings_items}:
                 self._selected_finding_id = self._findings_items[0]["id"]
@@ -1092,21 +1097,21 @@ class OpenfarmApp(App):
         self._selected_finding_id = item["id"]
         new_badge = "  [bold #fbbf24 on #423310] NEW [/]" if item["is_new"] else ""
         self.query_one("#finding-detail", Static).update(
-            f"[bold #f8fafc]{rich_escape(item['id'])}  ·  {rich_escape(item['title'])}[/]{new_badge}\n"
-            f"[#94a3b8]From card:[/] [bold #38bdf8]{rich_escape(item['from_card'])}[/] "
-            f"({rich_escape(item['from_card_title'])})\n"
-            f"[#94a3b8]Created:[/]   {rich_escape(item.get('created_at') or '—')}   "
-            f"[#94a3b8]Decision:[/] {rich_escape(item.get('decision') or 'waiting')}\n\n"
-            f"{rich_escape(item.get('body') or '(no additional detail)')}"
+            f"[bold #f8fafc]{esc(item['id'])}  ·  {esc(item['title'])}[/]{new_badge}\n"
+            f"[#94a3b8]From card:[/] [bold #38bdf8]{esc(item['from_card'])}[/] "
+            f"({esc(item['from_card_title'])})\n"
+            f"[#94a3b8]Created:[/]   {esc(item.get('created_at') or '—')}   "
+            f"[#94a3b8]Decision:[/] {esc(item.get('decision') or 'waiting')}\n\n"
+            f"{esc(item.get('body') or '(no additional detail)')}"
         )
 
     def _refresh_engine_widgets(self, cfg, gp: dict) -> None:
         wk = gp["worker"]
         self.query_one("#engine-providers", Static).update(
-            f"[bold #38bdf8]Global Profile[/] ({rich_escape(gp['path'])})\n"
-            f"  Frontier: {rich_escape(gp['frontier']['provider'])}\n"
-            f"  Worker:   preset={rich_escape(wk['preset'])} · endpoint={rich_escape(wk['endpoint'] or '(unset)')} · model={rich_escape(wk['model'] or '(unset)')}\n"
-            f"  Key file: {rich_escape(wk['key_file'])} ({'ready' if wk['key_present'] else 'missing'}) · zdr={wk['zdr']}"
+            f"[bold #38bdf8]Global Profile[/] ({esc(gp['path'])})\n"
+            f"  Frontier: {esc(gp['frontier']['provider'])}\n"
+            f"  Worker:   preset={esc(wk['preset'])} · endpoint={esc(wk['endpoint'] or '(unset)')} · model={esc(wk['model'] or '(unset)')}\n"
+            f"  Key file: {esc(wk['key_file'])} ({'ready' if wk['key_present'] else 'missing'}) · zdr={wk['zdr']}"
         )
         bt = self.query_one("#board-table", DataTable)
         bt.clear()
@@ -1129,9 +1134,9 @@ class OpenfarmApp(App):
         )
         self.query_one("#engine-spec", Static).update(
             f"[bold #38bdf8]Living Project Spec[/] (.openfarm/PROJECT_SPEC.md)\n\n"
-            f"{rich_escape(spec_txt[:3500])}\n\n"
-            f"[bold #fbbf24]Locked [policy] never_touch[/]\n{rich_escape(nt_lines)}\n\n"
-            f"[bold #4ade80]Architectural Invariants[/]\n  {rich_escape(inv_summary)}"
+            f"{esc(spec_txt[:3500])}\n\n"
+            f"[bold #fbbf24]Locked [policy] never_touch[/]\n{esc(nt_lines)}\n\n"
+            f"[bold #4ade80]Architectural Invariants[/]\n  {esc(inv_summary)}"
         )
         try:
             rt = compute_routing_recommendations(self.repo)
@@ -1142,11 +1147,11 @@ class OpenfarmApp(App):
                 ]
                 for rec in recs:
                     r_lines.append(
-                        f"• [bold #f8fafc]{rich_escape(rec['language'])} / {rich_escape(rec['category'])}[/]  "
+                        f"• [bold #f8fafc]{esc(rec['language'])} / {esc(rec['category'])}[/]  "
                         f"pass={int(rec['pass_rate']*100)}% · first-try={int(rec['first_try_rate']*100)}% "
                         f"(n={rec['samples']}, {rec['confidence']})\n"
-                        f"  Recommended: [bold #4ade80]{rich_escape(rec['recommended_model'] or 'default')}[/] · "
-                        f"effort={rich_escape(rec['recommended_effort'])} · profile={rich_escape(rec['recommended_profile'])}"
+                        f"  Recommended: [bold #4ade80]{esc(rec['recommended_model'] or 'default')}[/] · "
+                        f"effort={esc(rec['recommended_effort'])} · profile={esc(rec['recommended_profile'])}"
                     )
                 self.query_one("#engine-routing", Static).update("\n".join(r_lines))
             else:
@@ -1154,16 +1159,18 @@ class OpenfarmApp(App):
                     "No completed card runs yet — empirical routing recommendations populate automatically after your first wave."
                 )
         except Exception as rt_exc:
-            self.query_one("#engine-routing", Static).update(f"Routing telemetry unavailable: {rich_escape(str(rt_exc))}")
+            self.query_one("#engine-routing", Static).update(f"Routing telemetry unavailable: {esc(str(rt_exc))}")
         state = StateDir(cfg.state_dir)
         self.query_one("#engine-swarm", Static).update(
-            f"Micromanager: {cfg.micromanager_adapter} ({getattr(cfg.micromanager, 'mode', 'off')})\n"
-            f"Worker: {cfg.model_adapter} ({cfg.endpoint})\n"
-            f"State dir: {cfg.state_dir}"
+            esc(
+                f"Micromanager: {cfg.micromanager_adapter} ({getattr(cfg.micromanager, 'mode', 'off')})\n"
+                f"Worker: {cfg.model_adapter} ({cfg.endpoint})\n"
+                f"State dir: {cfg.state_dir}"
+            )
         )
         h_enabled = bool(getattr(getattr(cfg, "harness", None), "enabled", False))
         self.query_one("#engine-harness", Static).update(
-            f"Harness enabled: {h_enabled}  ·  Dir: {state.harness()}"
+            esc(f"Harness enabled: {h_enabled}  ·  Dir: {state.harness()}")
         )
         # Load most recent board posts if present
         if state.runs.is_dir():
@@ -1179,11 +1186,11 @@ class OpenfarmApp(App):
                         except ValueError:
                             continue
                         bt.add_row(
-                            f"#{row.get('seq', '')}",
-                            str(row.get("from", "")),
-                            str(row.get("card", "")),
-                            str(row.get("kind", "")),
-                            str(row.get("body", ""))[:68],
+                            Text(f"#{row.get('seq', '')}"),
+                            Text(str(row.get("from", ""))),
+                            Text(str(row.get("card", ""))),
+                            Text(str(row.get("kind", ""))),
+                            Text(str(row.get("body", ""))[:68]),
                         )
                     break
 
@@ -1199,10 +1206,10 @@ class OpenfarmApp(App):
             status = "ready" if item["configured"] else ("dir" if item["repo_exists"] else "missing")
             prt.add_row(
                 mark,
-                item["name"][:22],
-                (item.get("language") or "—")[:10],
+                Text(item["name"][:22]),
+                Text((item.get("language") or "—")[:10]),
                 status,
-                str(item["repo"])[-30:],
+                Text(str(item["repo"])[-30:]),
                 key=item["id"],
             )
         if self._projects_items:
@@ -1231,13 +1238,13 @@ class OpenfarmApp(App):
         )
         state_status = "present" if item.get("state_exists") else "none"
         self.query_one("#project-detail", Static).update(
-            f"[bold #f8fafc]{rich_escape(item['name'])}[/]  [#94a3b8]({rich_escape(item['id'])})[/]{badge}\n\n"
-            f"[#94a3b8]Directory:[/]   {rich_escape(item['repo'])}\n"
+            f"[bold #f8fafc]{esc(item['name'])}[/]  [#94a3b8]({esc(item['id'])})[/]{badge}\n\n"
+            f"[#94a3b8]Directory:[/]   {esc(item['repo'])}\n"
             f"[#94a3b8]Status:[/]      {status}\n"
-            f"[#94a3b8]Stack:[/]       {rich_escape(item.get('language') or 'auto')}\n"
-            f"[#94a3b8]Base branch:[/] {rich_escape(item.get('base_branch') or 'main')}\n"
-            f"[#94a3b8]State cache:[/] {rich_escape(item.get('state_dir') or '(none)')} ({state_status})\n"
-            f"[#94a3b8]Idea / Note:[/] {rich_escape(item.get('idea') or '(none)')}\n\n"
+            f"[#94a3b8]Stack:[/]       {esc(item.get('language') or 'auto')}\n"
+            f"[#94a3b8]Base branch:[/] {esc(item.get('base_branch') or 'main')}\n"
+            f"[#94a3b8]State cache:[/] {esc(item.get('state_dir') or '(none)')} ({state_status})\n"
+            f"[#94a3b8]Idea / Note:[/] {esc(item.get('idea') or '(none)')}\n\n"
             f"[#4ade80]Note:[/] Removing a project here only removes it from Openfarm — "
             f"your project files on disk are NEVER deleted or modified."
         )
@@ -1578,7 +1585,7 @@ class OpenfarmApp(App):
             msg = f"[bold #4ade80]✓ Live Probe Passed[/]  {res['latency_ms']}ms · HTTP {res['status']} · zdr={res['zdr_sent']} · models={res['models_count']}"
         else:
             err_detail = str(res["error"] or f"HTTP {res['status']}")
-            msg = f"[bold #fb7185]✗ Probe Failed[/]  {rich_escape(err_detail)}"
+            msg = f"[bold #fb7185]✗ Probe Failed[/]  {esc(err_detail)}"
         self.call_from_thread(self.query_one("#probe-status", Static).update, msg)
 
     @on(Button.Pressed, "#btn-save-prov")
@@ -1630,10 +1637,10 @@ class OpenfarmApp(App):
         chat_box.remove_class("hidden")
         lines: list[str] = ["[bold #38bdf8]Frontier Architect Grill[/]"]
         for turn in self._grill_history:
-            lines.append(f"[bold #cbd5e1]Architect:[/] {rich_escape(str(turn.get('question') or ''))}")
-            lines.append(f"[bold #4ade80]You:[/]       {rich_escape(str(turn.get('answer') or ''))}")
+            lines.append(f"[bold #cbd5e1]Architect:[/] {esc(str(turn.get('question') or ''))}")
+            lines.append(f"[bold #4ade80]You:[/]       {esc(str(turn.get('answer') or ''))}")
         if self._grill_pending_question:
-            lines.append(f"\n[bold #fbbf24]Architect:[/] {rich_escape(self._grill_pending_question)}")
+            lines.append(f"\n[bold #fbbf24]Architect:[/] {esc(self._grill_pending_question)}")
         else:
             lines.append("\n[bold #4ade80]✓ Architect has enough context — click Draft Plan Now (or ask another question).[/]")
         self.query_one("#grill-transcript", Static).update("\n".join(lines))
@@ -1643,7 +1650,7 @@ class OpenfarmApp(App):
             for idx in range(3):
                 btn = self.query_one(f"#btn-grill-opt-{idx}", Button)
                 if idx < len(self._grill_options):
-                    btn.label = self._grill_options[idx][:48]
+                    btn.label = esc(self._grill_options[idx][:48])
                     btn.remove_class("hidden")
                 else:
                     btn.add_class("hidden")
@@ -1744,6 +1751,7 @@ class OpenfarmApp(App):
                     .replace("[bold #fb7185]", "")
                     .replace("[bold #f59e0b]", "")
                     .replace("[/]", "")
+                    .replace("\\[", "[")
                 )
                 log_color = "#fb7185" if "✗" in plain else ("#f59e0b" if "■" in plain else "#4ade80")
                 self._log_architect(plain, style=log_color)
@@ -1759,7 +1767,7 @@ class OpenfarmApp(App):
         mins, secs = divmod(elapsed, 60)
         head = (
             f"[bold #38bdf8]⏳ [{mins:02d}:{secs:02d}][/]  "
-            f"[bold #f8fafc]{rich_escape(self._draft_phase_msg or 'Working...')}[/]"
+            f"[bold #f8fafc]{esc(self._draft_phase_msg or 'Working...')}[/]"
         )
         self.query_one("#architect-banner", Static).update(head)
         self.query_one("#grill-status", Static).update(
@@ -1874,7 +1882,7 @@ class OpenfarmApp(App):
             self.call_from_thread(
                 self._set_drafting_state,
                 False,
-                f"[bold #fb7185]✗ Grill error:[/] {rich_escape(str(exc))}",
+                f"[bold #fb7185]✗ Grill error:[/] {esc(str(exc))}",
             )
         finally:
             if self._active_architect_backend is backend:
@@ -1947,7 +1955,7 @@ class OpenfarmApp(App):
             self.call_from_thread(
                 self._set_drafting_state,
                 False,
-                f"[bold #fb7185]✗ Spec error:[/] {rich_escape(str(exc))}",
+                f"[bold #fb7185]✗ Spec error:[/] {esc(str(exc))}",
             )
             self.call_from_thread(self.notify, f"Spec error: {exc}", severity="error")
         finally:
@@ -1967,8 +1975,8 @@ class OpenfarmApp(App):
             if match:
                 self._selected_chunk_id = cid
                 self.query_one("#chunk-goal-detail", Static).update(
-                    f"[bold #38bdf8]{rich_escape(match['id'])}[/] ({rich_escape(match['status'])})\n"
-                    f"{rich_escape(match['title'])}\n[#cbd5e1]{rich_escape(match.get('goal') or '')}[/]"
+                    f"[bold #38bdf8]{esc(match['id'])}[/] ({esc(match['status'])})\n"
+                    f"{esc(match['title'])}\n[#cbd5e1]{esc(match.get('goal') or '')}[/]"
                 )
 
     @on(Button.Pressed, "#btn-spec-save")
@@ -2184,7 +2192,7 @@ class OpenfarmApp(App):
             self.call_from_thread(
                 self._set_drafting_state,
                 False,
-                f"[bold #fb7185]✗ Plan error:[/] {rich_escape(str(exc))}",
+                f"[bold #fb7185]✗ Plan error:[/] {esc(str(exc))}",
             )
             self.call_from_thread(self.notify, f"Plan error: {exc}", severity="error")
         finally:
@@ -2416,15 +2424,15 @@ class OpenfarmApp(App):
     def _render_doctor_report(self, *, fix: bool = False) -> None:
         rep = run_doctor(self.repo, config_path=self.config_path, fix=fix)
         icons = {"ok": "[bold #4ade80]✓[/]", "warn": "[bold #fbbf24]![/]", "fail": "[bold #fb7185]✗[/]"}
-        lines = [f"[bold #38bdf8]Openfarm Doctor[/]  ({rich_escape(rep['repo'])})\n"]
+        lines = [f"[bold #38bdf8]Openfarm Doctor[/]  ({esc(rep['repo'])})\n"]
         for chk in rep["checks"]:
             ic = icons.get(chk["status"], "·")
             fx = " [#fbbf24](fixable)[/]" if chk.get("fixable") else ""
-            lines.append(f"  {ic} [bold]{rich_escape(chk['label']):<24}[/] {rich_escape(chk['detail'])}{fx}")
+            lines.append(f"  {ic} [bold]{esc(chk['label']):<24}[/] {esc(chk['detail'])}{fx}")
         if rep["fixes_applied"]:
             lines.append("\n[bold #4ade80]Safe Fixes Applied:[/]")
             for item in rep["fixes_applied"]:
-                lines.append(f"  + {rich_escape(item)}")
+                lines.append(f"  + {esc(item)}")
         self.query_one("#engine-doctor", Static).update("\n".join(lines))
         if fix:
             self.refresh_all_views()
@@ -2595,7 +2603,7 @@ class OpenfarmApp(App):
         if cid and phase:
             self._card_phases[cid] = phase
             q_lines = [
-                f"[bold #38bdf8]▶ {rich_escape(k)}[/]  [#cbd5e1]{rich_escape(v)}[/]"
+                f"[bold #38bdf8]▶ {esc(k)}[/]  [#cbd5e1]{esc(v)}[/]"
                 for k, v in self._card_phases.items()
             ]
             self.query_one("#run-queue-view", Static).update("\n".join(q_lines))
@@ -2666,7 +2674,7 @@ class OpenfarmApp(App):
         if cid not in self._approved_to_land:
             self._approved_to_land.append(cid)
         self.query_one("#approved-queue-label", Static).update(
-            f"Approved to land: {', '.join(self._approved_to_land)}"
+            esc(f"Approved to land: {', '.join(self._approved_to_land)}")
         )
         self.notify(f"Approved {cid} — press [L] to Land Locally")
         self.refresh_all_views()
@@ -2712,7 +2720,7 @@ class OpenfarmApp(App):
         with redirect_stdout(buf), redirect_stderr(buf):
             cli_main(argv)
         out = buf.getvalue().strip() or "(no frontier-review output)"
-        self.call_from_thread(self.query_one("#review-frontier-out", Static).update, out)
+        self.call_from_thread(self.query_one("#review-frontier-out", Static).update, esc(out))
 
     @on(Button.Pressed, "#btn-pause")
     def _pause_btn(self) -> None:

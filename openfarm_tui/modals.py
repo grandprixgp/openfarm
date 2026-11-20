@@ -9,6 +9,8 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Label, OptionList, Static, Switch, TextArea
 from textual.widgets.option_list import Option
 
+from .markup import esc
+
 
 _MODAL_CSS = """
 ModalScreen {
@@ -70,8 +72,8 @@ class DismissFindingModal(ModalScreen[str | None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(classes="modal-box"):
-            yield Static(f"Dismiss Finding {self._fid}", classes="modal-title")
-            yield Static(self._title, classes="modal-sub")
+            yield Static(f"Dismiss Finding {self._fid}", classes="modal-title", markup=False)
+            yield Static(self._title, classes="modal-sub", markup=False)
             yield Input(placeholder="Optional one-line reason (Enter to dismiss)", id="dismiss-reason")
             with Horizontal(classes="modal-actions"):
                 yield Button("Cancel [Esc]", id="cancel", classes="btn-cancel")
@@ -109,9 +111,9 @@ class FoldFindingModal(ModalScreen[str | None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(classes="modal-box"):
-            yield Static(f"Fold {self._fid} Into Existing Card", classes="modal-title")
-            yield Static(self._title, classes="modal-sub")
-            opts = [Option(f"{cid}  ·  {ctitle}", id=cid) for cid, ctitle in self._cards]
+            yield Static(f"Fold {self._fid} Into Existing Card", classes="modal-title", markup=False)
+            yield Static(self._title, classes="modal-sub", markup=False)
+            opts = [Option(esc(f"{cid}  ·  {ctitle}"), id=cid) for cid, ctitle in self._cards]
             yield OptionList(*opts, id="fold-options")
             with Horizontal(classes="modal-actions"):
                 yield Button("Cancel [Esc]", id="cancel", classes="btn-cancel")
@@ -156,12 +158,12 @@ class FullFindingModal(ModalScreen[None]):
     def compose(self) -> ComposeResult:
         f = self._finding
         with Vertical(classes="modal-box"):
-            yield Static(f"{f['id']}  ·  {f['title']}", classes="modal-title")
+            yield Static(f"{f['id']}  ·  {f['title']}", classes="modal-title", markup=False)
             meta = (
                 f"From: {f['from_card']} ({f['from_card_title']})  ·  "
                 f"Created: {f.get('created_at') or '—'}  ·  Decision: {f.get('decision') or 'waiting'}"
             )
-            yield Static(meta, classes="modal-sub")
+            yield Static(meta, classes="modal-sub", markup=False)
             with VerticalScroll(id="full-body"):
                 yield Static(f.get("body") or "(no explanation body)", markup=False)
             with Horizontal(classes="modal-actions"):
@@ -187,8 +189,8 @@ class BounceNoteModal(ModalScreen[str | None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(classes="modal-box"):
-            yield Static(f"Bounce {self._cid} With Feedback", classes="modal-title")
-            yield Static(self._title, classes="modal-sub")
+            yield Static(f"Bounce {self._cid} With Feedback", classes="modal-title", markup=False)
+            yield Static(self._title, classes="modal-sub", markup=False)
             yield TextArea("", id="bounce-note")
             with Horizontal(classes="modal-actions"):
                 yield Button("Cancel [Esc]", id="cancel", classes="btn-cancel")
@@ -220,7 +222,7 @@ class HintModal(ModalScreen[str | None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(classes="modal-box"):
-            yield Static(f"Send Hint for {self._cid or 'Active Run'}", classes="modal-title")
+            yield Static(f"Send Hint for {self._cid or 'Active Run'}", classes="modal-title", markup=False)
             yield Input(placeholder="Short guidance for the active worker/supervisor...", id="hint-input")
             with Horizontal(classes="modal-actions"):
                 yield Button("Cancel [Esc]", id="cancel", classes="btn-cancel")
@@ -314,8 +316,8 @@ class EditProjectModal(ModalScreen[dict | None]):
     def compose(self) -> ComposeResult:
         p = self._project
         with Vertical(classes="modal-box"):
-            yield Static(f"Edit Project: {p.get('id', '')}", classes="modal-title")
-            yield Static("Updates Openfarm registry (and [project] metadata in .openfarm/config.toml if present).", classes="modal-sub")
+            yield Static(f"Edit Project: {p.get('id', '')}", classes="modal-title", markup=False)
+            yield Static("Updates Openfarm registry (and [project] metadata in .openfarm/config.toml if present).", classes="modal-sub", markup=False)
             yield Label("Display Name", classes="field-lbl")
             yield Input(value=str(p.get("name") or ""), id="ep-name")
             yield Label("Repository Path", classes="field-lbl")
@@ -376,14 +378,15 @@ class DeleteProjectModal(ModalScreen[dict | None]):
         p = self._project
         state_dir = str(p.get("state_dir") or "(none)")
         with Vertical(classes="modal-box"):
-            yield Static(f"Remove Project From Openfarm: {p.get('name', p.get('id', ''))}", classes="modal-title")
+            yield Static(f"Remove Project From Openfarm: {p.get('name', p.get('id', ''))}", classes="modal-title", markup=False)
             yield Static(
                 "SAFE & NON-DESTRUCTIVE: Your project directory and all files inside\n"
                 f"{p.get('repo', '')}\n"
                 "will NOT be deleted or modified on disk.",
                 classes="safe-banner",
+                markup=False,
             )
-            yield Static(f"External Openfarm state cache: {state_dir}", classes="modal-sub")
+            yield Static(f"External Openfarm state cache: {state_dir}", classes="modal-sub", markup=False)
             with Horizontal(classes="switch-row"):
                 yield Switch(value=False, id="dp-clear-state")
                 yield Static("Also clear Openfarm's external state cache under ~/.openfarm/", classes="switch-lbl")
@@ -418,11 +421,11 @@ class WorkspaceDiscoveryModal(ModalScreen[dict | None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(classes="modal-box"):
-            yield Static(f"Discovered Projects in {self._root_label}", classes="modal-title")
+            yield Static(f"Discovered Projects in {self._root_label}", classes="modal-title", markup=False)
             yield Static("Read-only scan. Select a folder to Register (or Adopt if git-repo).", classes="modal-sub")
             opts = [
                 Option(
-                    f"{p['name']:<24} [{p['kind']:<10}] {(p.get('detected_language') or '—'):<10} {'✓ registered' if p['registered'] else ''}",
+                    esc(f"{p['name']:<24} [{p['kind']:<10}] {(p.get('detected_language') or '—'):<10} {'✓ registered' if p['registered'] else ''}"),
                     id=str(idx),
                 )
                 for idx, p in enumerate(self._items)
@@ -479,7 +482,7 @@ class CardEditorModal(ModalScreen[dict | None]):
     def compose(self) -> ComposeResult:
         c = self._card
         with Vertical(classes="modal-box"):
-            yield Static(f"Edit Card: {c.get('id', '')}", classes="modal-title")
+            yield Static(f"Edit Card: {c.get('id', '')}", classes="modal-title", markup=False)
             yield Label("Title", classes="field-lbl")
             yield Input(value=str(c.get("title") or ""), id="ce-title")
             yield Label("Category (small-feature | feature | pinned-bugfix | refactor | test-backfill)", classes="field-lbl")
@@ -530,8 +533,8 @@ class SplitCardModal(ModalScreen[dict | None]):
         t1 = touches[0] if touches else ""
         t2 = touches[1] if len(touches) > 1 else t1
         with Vertical(classes="modal-box"):
-            yield Static(f"Split Card {c.get('id', '')} Into Two Chained Cards", classes="modal-title")
-            yield Static(f"Creates {c.get('id', '')}a and {c.get('id', '')}b (with b depending on a).", classes="modal-sub")
+            yield Static(f"Split Card {c.get('id', '')} Into Two Chained Cards", classes="modal-title", markup=False)
+            yield Static(f"Creates {c.get('id', '')}a and {c.get('id', '')}b (with b depending on a).", classes="modal-sub", markup=False)
             yield Label("Part A Title", classes="field-lbl")
             yield Input(value=f"{c.get('title', '')} (Part A)", id="sc-t1")
             yield Label("Part A Touches (comma-separated)", classes="field-lbl")
