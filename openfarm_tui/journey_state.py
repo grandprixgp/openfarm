@@ -71,7 +71,7 @@ def save_session(repo: Path, session: dict) -> None:
 
 
 def _task(card, cards_by_id: dict, state_dir: Path, header: dict) -> dict:
-    from openfarm_core.blocked import records, triage
+    from openfarm_core.blocked import records, triage_card
 
     state = str(card.state).lower().replace("-", "_")
     runs = records(state_dir, card.id)
@@ -81,7 +81,7 @@ def _task(card, cards_by_id: dict, state_dir: Path, header: dict) -> dict:
         "waits": waits, "tries": len(runs),
         "parked": [str(r) for r in header.get("preflight") or []],
         "repairs": [str(r) for r in header.get("repairs") or []],
-        "triage": triage(runs[-1], runs[:-1]) if runs and state == "blocked" else None,
+        "triage": triage_card(state_dir, card.id) if runs and state == "blocked" else None,
         "last": runs[-1] if runs else None,
     }
 

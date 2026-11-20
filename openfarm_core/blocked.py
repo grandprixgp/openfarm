@@ -156,6 +156,8 @@ def triage_card(state_dir: Path, card_id: str) -> dict | None:
     got = triage(runs[-1], runs[:-1])
     checks = failed_checks(state_dir, runs[-1])
     if checks and got["kind"] != "check":
+        if runs[-1].get("stop_code") == "cannot-split":  # "too big to split" is how it ended, not why
+            got["why"] = "The builder could not get past the checks and gave up."
         got["why"] += " What failed on the way: " + "; ".join(checks) + "."
         # Every try broke a rule the task's own text asks for: retrying the same task can't end differently.
         if got["kind"] == "builder" and all(c.startswith("a build rule") for c in checks) and int(runs[-1].get("attempts") or 0) > 1:
