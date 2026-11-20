@@ -353,13 +353,14 @@ Each repository carries `.openfarm/config.toml` on its base branch (`openfarm in
 
 <br>
 
-**Tables (`20`):** `[project]`, `[adapters]`, `[model]`, `[policy]`, `[eligibility]`, `[brief]`, `[runner]`, `[budget]`, `[gates]`, `[cards]`, `[micromanager]`, `[state]`, `[harness]`, `[swarm]`, `[tiers.*]`, `[units.*]`, `[factory]`, `[invariants]`, `[acceptance]`, and `[notifications]`.
+**Tables (`21`):** `[project]`, `[adapters]`, `[model]`, `[policy]`, `[eligibility]`, `[brief]`, `[runner]`, `[budget]`, `[gates]`, `[cards]`, `[micromanager]`, `[state]`, `[harness]`, `[swarm]`, `[tiers.*]`, `[units.*]`, `[factory]`, `[invariants]`, `[acceptance]`, and `[notifications]`, `[try]`.
 
 - **Polyglot units (`[units.<name>]`):** set per-unit `language = "rust" | "python" | "typescript" | "go"`.
 - **Factory auto-land (`[factory]`):** opt-in `auto_land = true`, `integration_branch = "openfarm/integration"`, `auto_land_profiles`, `require_zero_findings`, `require_frontier_consensus`.
 - **Architectural invariants (`[invariants]`):** declarative `forbidden_imports`, `max_file_bytes`, and `require_exports` rules enforced deterministically.
 - **Runtime acceptance (`[acceptance]`):** declarative CLI and ephemeral loopback HTTP `{PORT}` smoke checks with process-group cleanup.
 - **Notifications (`[notifications]`):** optional `webhook_url`, `desktop = true|false`, and `events` filter.
+- **Try it (`[try]`):** optional. `start = "npm start"` (a web app, told its port through `PORT`), `port`, `path = "/"`, or `sample = "python3 app.py --demo"` for an app with no page. Without it the language pack works out how to start the app.
 - **Budgets & hooks:** per-card attempt/build/token/wall-clock caps, spend caps, circuit breaker, kill switch, `[[gates.extra]]`, `[runner.env]`, and `[brief] test_conventions`.
 
 Full schema, stop codes, and record formats are in [`docs/USAGE-AND-FIRST-DEPLOYMENT.md`](docs/USAGE-AND-FIRST-DEPLOYMENT.md) and [`docs/openfarm-internals.md`](docs/openfarm-internals.md).

@@ -387,7 +387,9 @@ def try_it(root: Path, cfg, goal: dict | None = None, *, out_dir: Path | None = 
 
 def code_version(root: Path) -> str:
     """The commit the project's code is at, or "" outside a repository."""
-    done = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True, check=False)
+    from .git import Git
+
+    done = Git(root)._run(["rev-parse", "HEAD"], check=False)
     return done.stdout.strip() if done.returncode == 0 else ""
 
 

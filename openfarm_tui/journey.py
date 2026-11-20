@@ -174,7 +174,8 @@ class Rail(Vertical):
         lines = []
         for number, goal in enumerate(goals, start=1):
             mark = "✓" if goal["status"] == "done" else str(number)
-            text = esc(f"{mark}  {goal['title']}"[:22])
+            text = f"{mark}  {goal['title']}"
+            text = esc(text if len(text) <= 22 else text[:21] + "…")
             lines.append(f"[b $foreground]{text}[/]" if number == current else text)
         self.query_one("#goals", Static).update("\n".join(lines) or "none yet")
 
@@ -206,7 +207,7 @@ class Journey(App):
     .label { color: $foreground-muted; text-style: bold; }
     #idea-text { height: 6; border: tall $primary; }
     #stack { width: 36; margin-bottom: 1; }
-    OptionList { height: auto; max-height: 12; border: tall $panel; background: $surface; margin-bottom: 1; }
+    OptionList { height: auto; max-height: 10; border: tall $panel; background: $surface; margin-bottom: 1; }
     OptionList:focus { border: tall $primary; }
     .card { border: round $panel; padding: 0 1; margin-bottom: 1; height: auto; }
     .card.ok { border: round $success 60%; }
@@ -436,7 +437,7 @@ class Journey(App):
 
     def _row(self, glyph: str, colour: str, task: dict, words: str) -> str:
         """One task line that fits the pane: the title gives way first, then the words."""
-        room = max(30, self.size.width - 26 - 6 - 4) - len(task["id"]) - 6
+        room = max(30, self.size.width - 26 - 6 - 8) - len(task["id"]) - 6
         words = words if len(words) <= room - 14 else words[: room - 15] + "…"
         title = task["title"] if len(task["title"]) <= room - len(words) else task["title"][: max(0, room - len(words) - 1)] + "…"
         return (f"[{colour}]{glyph}[/]  [b]{esc(task['id'])}[/]  {esc(title)}{' ' * (room - len(title) - len(words))} "
@@ -463,7 +464,9 @@ class Journey(App):
         self.query_one(Rail).show(STEP_OF[picked["screen"]], picked["flag"], facts["goals"], facts["goal_no"])
         getattr(self, f"_draw_{name}")()
         primary, secondary, keys = self._actions()
-        self.query_one("#where", Static).update(esc(self._where(picked)))
+        where = self._where(picked)
+        room = self.size.width - len(f"openfarm · {facts['name']}") - 34
+        self.query_one("#where", Static).update(esc(where if len(where) <= room else where[: max(8, room - 1)] + "…"))
         self.query_one("#keys", Static).update(esc(f"{keys} · Ctrl+K everything else"))
         self._draw_health()
         self._draw_busy()
@@ -471,6 +474,8 @@ class Journey(App):
         self._render_activity()
         if changed or focus:
             self.call_after_refresh(self._focus_for_screen)
+        if changed:
+            self.call_after_refresh(lambda: self.query_one(f"#{name}").scroll_home(animate=False))
 
     def _where(self, picked: dict) -> str:
         facts = self.facts
@@ -632,9 +637,11 @@ class Journey(App):
         self.query_one("#q-title", Static).update(esc(pending.get("question") or (
             "Asking the Architect about your idea..." if self.busy else "No question is open.")))
         self.query_one("#q-why", Static).update(esc(pending.get("why") or ""))
-        suggested = pending.get("recommended") or ""
-        self._set_list("q-options", [(f"opt-{i}", esc(option) + ("   (suggested)" if option == suggested else ""))
-                                     for i, option in enumerate(pending.get("options") or [])])
+        suggested = str(pending.get("recommended") or "").strip().lower()
+        self._set_list("q-options", [
+            (f"opt-{i}", esc(option) + ("   (suggested)" if suggested and (
+                option.lower().startswith(suggested[:24]) or suggested.startswith(option.lower()[:24])) else ""))
+            for i, option in enumerate(pending.get("options") or [])])
         self._set_list("q-answered", [(f"ans-{i}", f"[$success]✓[/] {esc(turn['question'])}\n   {esc(turn['answer'])}"
                                        "   [$foreground-muted](Enter: change)[/]") for i, turn in enumerate(history)])
 
@@ -981,8 +988,10 @@ class Journey(App):
         elif kind == "phase" and task_id and phase and self.phases.get(task_id) != phase:
             self.phases[task_id] = phase
             line = f"{task_id}  {PHASES.get(phase, phase)}"
-        elif kind in ("run_start", "run_more", "run_waiting", "question") and message:
-            line = message
+        elif kind == "run_start":
+            line = "Build started" + (": " + message.partition("; ")[2] if "; " in message else "")
+        elif kind in ("run_more", "run_waiting", "question") and message:
+            line = message.replace("card(s)", "task(s)")
         if line:
             self.activity.append(f"{stamp or time.strftime('%H:%M')}  {line}")
             if not quiet:

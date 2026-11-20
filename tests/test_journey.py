@@ -238,6 +238,17 @@ class ScreenTests(_Folder):
         for widget in pane.query("*"):
             if widget.display and widget.region.width:
                 self.assertLessEqual(widget.region.right, pane.region.right, f"{where}: {widget} is wider than the pane")
+        from textual.widgets import OptionList
+
+        for rows in pane.query(OptionList):
+            if rows.display and rows.id in ("plan-tasks", "build-tasks"):
+                for index in range(rows.option_count):
+                    line = rows.get_option_at_index(index).prompt
+                    plain = __import__("textual.content", fromlist=["Content"]).Content.from_markup(str(line)).plain
+                    self.assertLessEqual(len(plain), rows.content_size.width, f"{where}: a task row wraps: {plain!r}")
+        shown = str(app.query_one("#where").render())
+        self.assertLessEqual(len(shown) + 2, app.query_one("#where").size.width, f"{where}: the top bar's middle is cut off")
+        self.assertEqual(pane.scroll_y, 0, f"{where}: the heading is scrolled out of view")
         # fixed zones: the same rows whatever the screen (nothing moves under the pointer)
         self.assertEqual((app.query_one("#top").region.height, app.query_one("Rail").region.width,
                           app.query_one("#actions").region.height, app.query_one("#activity").region.height,
@@ -458,6 +469,40 @@ class FlowTests(_Folder):
             self.backend.close.assert_called()
 
         self.drive("idea", body)
+
+    def test_long_names_and_long_choices_leave_the_heading_and_the_top_bar_whole(self) -> None:
+        async def body(app, pilot) -> None:
+            self.assertEqual(app.query_one("#questions").scroll_y, 0)
+            self.assertIn("(suggested)", str(app.query_one("#q-options").get_option_at_index(1).prompt))
+
+        root = build_project(self.base / "questions", "questions")
+        from openfarm_tui.journey_state import load_session
+
+        session = load_session(root)
+        session["pending"]["options"] = [f"Choice {n}: " + "a long explanation of what this choice means " * 4 for n in range(5)]
+        session["pending"]["recommended"] = "Choice 1: a long explanation"  # the Architect names it in fewer words
+        save_session(root, session)
+        import openfarm_tui.journey as journey
+
+        self.app = lambda stage, theme="openfarm-dark": journey.Journey(repo=root, theme=theme)
+        self.drive("questions", body, size=(100, 30))
+
+        async def bar(app, pilot) -> None:
+            from openfarm_core.automode import load_project_chunks, save_project_chunks
+
+            goals = load_project_chunks(app.repo)
+            goals[0]["title"] = "Image-of-the-day hero with live palette, served locally and themed from the photograph"
+            save_project_chunks(app.repo, goals)
+            app.refresh_screen()
+            await pilot.pause(0.1)
+            where = app.query_one("#where")
+            self.assertLessEqual(len(str(where.render())) + 2, where.size.width)
+            self.assertTrue(str(where.render()).endswith("…"))
+            self.assertTrue(str(app.query_one("#goals").render()).splitlines()[0].endswith("…"))
+
+        root2 = build_project(self.base / "spec", "spec")
+        self.app = lambda stage, theme="openfarm-dark": journey.Journey(repo=root2, theme=theme)
+        self.drive("spec", bar, size=(100, 30))
 
     # spec and plan ----------------------------------------------------------------
 
