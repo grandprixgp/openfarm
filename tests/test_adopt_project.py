@@ -58,8 +58,6 @@ class AdoptProjectTest(unittest.TestCase):
                 "language": "python",
                 "written": [
                     ".openfarm/config.toml",
-                    ".openfarm/PROJECT_SPEC.md",
-                    "cards/.gitkeep",
                 ],
             },
         )

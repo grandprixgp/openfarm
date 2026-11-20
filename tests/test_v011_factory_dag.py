@@ -147,6 +147,7 @@ class FactoryAutopilotV011Tests(unittest.TestCase):
             self.assertTrue(ev_ok["eligible"])
 
             # Land onto local openfarm/integration (main stays untouched!)
+            (repo / "cards").mkdir()  # a project from before the cards branch became the only home
             (repo / "cards" / "W1-01.md").write_text(
                 '+++\nid = "W1-01"\ntitle = "Small helper"\nstate = "in_review"\ncategory = "mechanical"\ntouches = ["src/helper.ts"]\n+++\n## Done\n- helper\n',
                 encoding="utf-8",

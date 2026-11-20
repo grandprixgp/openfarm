@@ -88,6 +88,7 @@ from openfarm_core.providers import (
     save_global_providers,
 )
 from openfarm_core.state import StateDir
+from openfarm_core.store import read_doc, store_or_none, write_doc
 from openfarm_core.triage import triage_card_heuristic
 from openfarm_core.tui import _load_tui_context, _read_cards_readonly
 
@@ -832,6 +833,15 @@ class OpenfarmApp(App):
         """Toasts carry card text, errors and key names like [L], so they are plain text."""
         super().notify(str(message), title=title, severity=severity, timeout=timeout, markup=markup)
 
+    def _card_ids(self) -> list[str]:
+        """Every task ID the project has, upper case. Empty for a folder with no project."""
+        cfg = self._safe_cfg()
+        try:
+            store = store_or_none(self.repo, cfg)
+            return list(store.states()) if store is not None else []
+        except (AdapterError, OSError):
+            return []
+
     def _safe_cfg(self):
         cfg_p = self.config_path or (self.repo / CONFIG_PATH)
         if not cfg_p.is_file():
@@ -981,8 +991,7 @@ class OpenfarmApp(App):
             self.query_one("#chunk-goal-detail", Static).update("No chunks yet. Back to Grill / Iterate below opens the idea screen, where Flesh Out Spec & Chunks writes them.")
         spec_ed = self.query_one("#ta-spec-editor", TextArea)
         if self.focused is not spec_ed:
-            sp = self.repo / ".openfarm" / "PROJECT_SPEC.md"
-            spec_ed.text = sp.read_text(encoding="utf-8", errors="replace") if sp.is_file() else ""
+            spec_ed.text = read_doc(self.repo, self._safe_cfg(), "spec")
 
         # Populate Plan table
         pt = self.query_one("#plan-table", DataTable)
@@ -1285,8 +1294,7 @@ class OpenfarmApp(App):
             self.query_one("#engine-spec", Static).update("(repository not initialized yet)")
             self.query_one("#engine-routing", Static).update("(repository not initialized yet)")
             return
-        spec_path = self.repo / ".openfarm" / "PROJECT_SPEC.md"
-        spec_txt = spec_path.read_text(encoding="utf-8", errors="replace").strip() if spec_path.is_file() else "(no PROJECT_SPEC.md yet)"
+        spec_txt = read_doc(self.repo, cfg, "spec").strip() or "(no spec yet)"
         nt_lines = "\n".join(f"  - {p}" for p in (getattr(cfg, "never_touch", ()) or ())) or "  (none)"
         inv_cfg = getattr(cfg, "invariants", None)
         inv_summary = (
@@ -2237,11 +2245,10 @@ class OpenfarmApp(App):
 
     @on(Button.Pressed, "#btn-spec-save")
     def _spec_save_clicked(self) -> None:
-        sp = self.repo / ".openfarm" / "PROJECT_SPEC.md"
-        sp.parent.mkdir(parents=True, exist_ok=True)
-        sp.write_text(self.query_one("#ta-spec-editor", TextArea).text.rstrip() + "\n", encoding="utf-8")
-        self.query_one("#spec-status", Static).update("[bold #4ade80]✓ Saved .openfarm/PROJECT_SPEC.md[/]")
-        self.notify("Saved PROJECT_SPEC.md")
+        write_doc(self.repo, self._safe_cfg(), "spec",
+                  self.query_one("#ta-spec-editor", TextArea).text.rstrip() + "\n", why="edited by hand")
+        self.query_one("#spec-status", Static).update("[bold #4ade80]✓ Spec saved[/]")
+        self.notify("Spec saved")
 
     @on(Button.Pressed, "#btn-chunk-done")
     def _chunk_done_clicked(self) -> None:
@@ -2260,11 +2267,9 @@ class OpenfarmApp(App):
             self.notify("Architect is already drafting cards...")
             return
         # Save any user edits to the spec before splitting chunk into cards
-        sp = self.repo / ".openfarm" / "PROJECT_SPEC.md"
         spec_txt = self.query_one("#ta-spec-editor", TextArea).text.strip()
-        if spec_txt:
-            sp.parent.mkdir(parents=True, exist_ok=True)
-            sp.write_text(spec_txt + "\n", encoding="utf-8")
+        if spec_txt and spec_txt != read_doc(self.repo, self._safe_cfg(), "spec").strip():
+            write_doc(self.repo, self._safe_cfg(), "spec", spec_txt + "\n", why="edited by hand")
         self._start_architect_step("split", chunk_id=self._selected_chunk_id or None)
 
     @on(Button.Pressed, "#btn-spec-back")
@@ -2297,7 +2302,7 @@ class OpenfarmApp(App):
             and self._selected_stack != "auto"
             and existing_lang != ""
             and existing_lang != self._selected_stack
-            and not any((self.repo / "cards").glob("W*.md"))
+            and not any(cid.startswith("W") for cid in self._card_ids())
         )
         needs_init = (
             (not (self.repo / CONFIG_PATH).is_file())
@@ -2318,11 +2323,6 @@ class OpenfarmApp(App):
                 force=True,
                 commit=True,
             )
-            cards_dir = self.repo / "cards"
-            if cards_dir.is_dir():
-                for old_md in cards_dir.glob("*.md"):
-                    if not old_md.stem.upper().startswith("FIND-"):
-                        old_md.unlink(missing_ok=True)
             fresh_cfg = self._safe_cfg()
             if fresh_cfg is not None:
                 for flag_name in ("paused", "stop"):

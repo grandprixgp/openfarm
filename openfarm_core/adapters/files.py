@@ -323,6 +323,30 @@ class FileCardSource:
             self.save_meta(data)
             return f"{prefix}{number:0{width}d}"
 
+    def reserve_id(self, card_id: str) -> str:
+        """Take `card_id` for a new card if it was never used, else hand back the next free one.
+
+        `W1-05` is taken as asked only when no card has it and the counter for `W1-`
+        is still below 5; otherwise the counter decides, so a number is never reused.
+        An ID with no number is taken as asked unless a card already has it.
+        """
+        with self._lock:
+            match = re.fullmatch(r"(.*?)(\d+)", str(card_id))
+            existing = {card.id.upper() for card in self.all_cards()}
+            if match is None:
+                if str(card_id).upper() in existing:
+                    raise Refused("card-exists", f"{card_id} already exists")
+                return str(card_id)
+            prefix, number = match.group(1), int(match.group(2))
+            data = self.meta()
+            ids = data.get("ids") if isinstance(data.get("ids"), dict) else {}
+            if str(card_id).upper() in existing or number <= int(ids.get(prefix.upper(), 0) or 0):
+                return self.next_id(prefix, len(match.group(2)) if match.group(2).startswith("0") else 0)
+            ids[prefix.upper()] = number
+            data["ids"] = ids
+            self.save_meta(data)
+            return str(card_id)
+
     @property
     def cards_dir(self) -> Path:
         if self.worktree is None:

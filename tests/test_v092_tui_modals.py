@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from tests.storehelp import cards_dir, doc
 from openfarm_core.tui import (
     TuiController,
     _prompt_line,
@@ -86,8 +87,8 @@ class TuiModalsTests(unittest.TestCase):
         # Accept default for all 3 grill questions with Enter
         scr = _FakeStdscr([ord("\n"), ord("\n"), ord("\n")])
         _run_grill_modal(scr, ctrl)
-        self.assertTrue((toy.root / ".openfarm" / "GRILL_DECISIONS.md").is_file())
-        spec_text = (toy.root / ".openfarm" / "PROJECT_SPEC.md").read_text()
+        self.assertTrue(doc(toy.root, "decisions").is_file())
+        spec_text = doc(toy.root, "spec").read_text()
         self.assertIn("Project Specification", spec_text)
 
     def test_automode_enter_dispatches_to_current_stage_auth_suspended(self) -> None:
@@ -131,7 +132,7 @@ class TuiModalsTests(unittest.TestCase):
         keys = [ord(c) for c in long_workflow] + [ord("\n"), ord("\n"), ord("\n")]
         scr = _FakeStdscr(keys, rows=28, cols=80)
         _run_grill_modal(scr, ctrl)
-        decisions = (toy.root / ".openfarm" / "GRILL_DECISIONS.md").read_text()
+        decisions = doc(toy.root, "decisions").read_text()
         self.assertIn("FINAL_WORKFLOW_TOKEN", decisions)
         combined = "\n".join(scr.drawn)
         self.assertIn("Grill 1/3", combined)
@@ -144,10 +145,7 @@ class TuiModalsTests(unittest.TestCase):
         toy = build_python_toy()
         self.addCleanup(toy.cleanup)
         # Simulate freshly initialized repo with empty cards/ folder and minimal spec.
-        cards_dir = toy.root / "cards"
-        for md in cards_dir.glob("*.md"):
-            md.unlink()
-        spec_p = toy.root / ".openfarm" / "PROJECT_SPEC.md"
+        spec_p = doc(toy.root, "spec")
         if spec_p.exists():
             spec_p.unlink()
 
@@ -159,7 +157,7 @@ class TuiModalsTests(unittest.TestCase):
         scr = _FakeStdscr([ord(c) for c in "Daily photo gallery app"] + [ord("\n"), ord("\n"), ord("\n")])
         _run_grill_modal(scr, ctrl)
 
-        card_files = list(cards_dir.glob("*.md"))
+        card_files = list(cards_dir(toy.root).glob("*.md"))
         self.assertGreaterEqual(len(card_files), 1)
         after = compute_pipeline_stages(toy.root, acp_status={"oauth_ready": True})
         self.assertEqual(after["current_stage"]["id"], "wave")
@@ -256,7 +254,7 @@ class TuiModalsTests(unittest.TestCase):
                     {"id": "slice", "question": "Golden slice", "answer": "Add photo entry struct and list command"},
                 ],
             )
-            card_path = root / "cards" / "W1-01.md"
+            card_path = cards_dir(root) / "W1-01.md"
             self.assertTrue(card_path.is_file())
             header, body = parse_card_file(card_path.read_text(encoding="utf-8"))
             card = Card(

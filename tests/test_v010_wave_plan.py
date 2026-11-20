@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from tests.storehelp import card_path
 from openfarm_core.adapters.files import FileCardSource, parse_card_file
 from openfarm_core.bootstrap import initialize_project
 from openfarm_core.cards import Card
@@ -70,7 +71,7 @@ class WavePlanV010Tests(unittest.TestCase):
 
             # The category, touches and tests are repaired. The Done text keeps its words,
             # so the card is not eligible and says which words are the problem.
-            header, body = parse_card_file((root / "cards" / "W1-01.md").read_text(encoding="utf-8"))
+            header, body = parse_card_file(card_path(root, "W1-01").read_text(encoding="utf-8"))
             self.assertIn("Design a robust hero layout that handles images properly.", body)
             self.assertFalse(plan["eligibility_ok"])
             card = Card(

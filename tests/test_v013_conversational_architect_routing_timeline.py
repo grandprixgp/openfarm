@@ -12,6 +12,7 @@ import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 
+from tests.storehelp import doc
 from openfarm_core.automode import draft_wave_plan, ensure_baseline_committed
 from openfarm_core.bootstrap import initialize_project
 from openfarm_core.cli import main as cli_main
@@ -288,7 +289,7 @@ class ConversationalArchitectRoutingTimelineV013Tests(unittest.TestCase):
             )
             self.assertEqual(len(spec_res["chunks"]), 2)
             self.assertEqual(spec_res["chunks"][0]["status"], "active")
-            self.assertIn("Adaptive realtime web experience", (repo / ".openfarm" / "PROJECT_SPEC.md").read_text(encoding="utf-8"))
+            self.assertIn("Adaptive realtime web experience", doc(repo, "spec").read_text(encoding="utf-8"))
 
             # Mark C1 done -> C2 automatically becomes active for next iteration!
             updated = set_chunk_status(repo, "C1", "done")
@@ -349,7 +350,7 @@ class ConversationalArchitectRoutingTimelineV013Tests(unittest.TestCase):
                 secrets_dir=Path(tmp) / "sec",
                 commit=True,
             )
-            (repo / ".openfarm" / "PROJECT_SPEC.md").write_text("# Spec\n\nExisting spec.\n", encoding="utf-8")
+            doc(repo, "spec").write_text("# Spec\n\nExisting spec.\n", encoding="utf-8")
             save_project_chunks(
                 repo,
                 [

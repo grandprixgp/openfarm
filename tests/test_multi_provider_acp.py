@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from tests.storehelp import card_path as card_path_in_store
 from openfarm_core.acp_setup import (
     configure_acp_repo,
     inspect_acp_status,
@@ -967,7 +968,7 @@ class ConfigWiringCoordinatorAndCliTests(unittest.TestCase):
         )
         cfg_path.write_text(cfg_text, encoding="utf-8")
 
-        card_path = proj / "cards" / "CARD-1.md"
+        card_path = card_path_in_store(proj, "CARD-1")  # a card as the farm finds it, on the cards branch
         card_path.write_text(
             "+++\n"
             'id = "CARD-1"\n'
@@ -984,7 +985,8 @@ class ConfigWiringCoordinatorAndCliTests(unittest.TestCase):
             "```\n",
             encoding="utf-8",
         )
-        Git(proj).commit_all("add swarm acp config and card")
+        Git(card_path.parent).commit_all("add CARD-1")
+        Git(proj).commit_all("add swarm acp config")
 
         # `openfarm acp status --provider all --json` via CLI
         out_st = io.StringIO()

@@ -17,6 +17,8 @@ from . import adopt
 from .acp_setup import inspect_acp_status
 from .config import CONFIG_PATH, load_config
 from .errors import AdapterError, ConfigError, Infra, Refused
+from .preflight import as_rule_failures
+from .store import card_from, log_decisions, read_doc, store_or_none, write_doc
 from .globs import resolves_within
 from .state import StateDir
 
@@ -86,7 +88,8 @@ def detect_workspace_state(root: Path, config_path: Path | None = None) -> dict:
     cfg_file = Path(config_path) if config_path else (root / CONFIG_PATH)
 
     if cfg_file.is_file():
-        counts = {"ready": 0, "in_progress": 0, "in_review": 0, "blocked": 0, "done": 0}
+        # `backlog` holds tasks the plan checks parked; they exist and show in the plan.
+        counts = {"ready": 0, "backlog": 0, "in_progress": 0, "in_review": 0, "blocked": 0, "done": 0}
         economics: dict = {}
         try:
             from types import SimpleNamespace
@@ -297,17 +300,9 @@ def configure_worker_endpoint(config_path: Path, endpoint: str, model: str = "")
 
 
 def _spec_and_cards_ready(root: Path, counts: dict) -> bool:
-    spec = root / ".openfarm" / "PROJECT_SPEC.md"
-    spec_ok = False
-    if spec.is_file():
-        try:
-            text = spec.read_text(encoding="utf-8", errors="replace").strip()
-            spec_ok = len(text) >= 60 and len(text.splitlines()) >= 3
-        except OSError:
-            spec_ok = False
+    text = read_doc(root, _cfg_or_none(root), "spec").strip()
+    spec_ok = len(text) >= 60 and len(text.splitlines()) >= 3
     total_cards = sum(int(v or 0) for v in (counts or {}).values())
-    if total_cards == 0 and (root / "cards").is_dir():
-        total_cards = sum(1 for p in (root / "cards").glob("*.md") if p.is_file())
     return spec_ok and total_cards > 0
 
 
@@ -719,14 +714,19 @@ def architect_grill_turn(
 CHUNKS_REL_PATH = ".openfarm/CHUNKS.json"
 
 
-def load_project_chunks(repo: Path) -> list[dict]:
-    """Load ordered project chunks/milestones from `.openfarm/CHUNKS.json`."""
-    p = Path(repo).expanduser().resolve() / CHUNKS_REL_PATH
-    if not p.is_file():
-        return []
+def _cfg_or_none(root: Path):
     try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        return load_config(root)
+    except (ConfigError, OSError):
+        return None
+
+
+def load_project_chunks(repo: Path) -> list[dict]:
+    """The project's ordered goals (`CHUNKS.json`, kept with the cards)."""
+    root = Path(repo).expanduser().resolve()
+    try:
+        data = json.loads(read_doc(root, _cfg_or_none(root), "chunks") or "null")
+    except ValueError:
         return []
     raw = data.get("chunks") if isinstance(data, dict) else data
     if not isinstance(raw, list):
@@ -746,9 +746,8 @@ def load_project_chunks(repo: Path) -> list[dict]:
 
 
 def save_project_chunks(repo: Path, chunks: list[dict]) -> Path:
-    """Persist ordered project chunks to `.openfarm/CHUNKS.json`."""
-    p = Path(repo).expanduser().resolve() / CHUNKS_REL_PATH
-    p.parent.mkdir(parents=True, exist_ok=True)
+    """Save the project's ordered goals."""
+    root = Path(repo).expanduser().resolve()
     cleaned: list[dict] = []
     for idx, item in enumerate(chunks, start=1):
         cleaned.append({
@@ -757,8 +756,8 @@ def save_project_chunks(repo: Path, chunks: list[dict]) -> Path:
             "goal": str(item.get("goal") or "").strip(),
             "status": str(item.get("status") or ("active" if idx == 1 else "pending")).strip().lower(),
         })
-    p.write_text(json.dumps({"chunks": cleaned}, indent=2) + "\n", encoding="utf-8")
-    return p
+    return write_doc(root, _cfg_or_none(root), "chunks", json.dumps({"chunks": cleaned}, indent=2) + "\n",
+                     why="goals updated")
 
 
 def set_chunk_status(repo: Path, chunk_id: str, status: str) -> list[dict]:
@@ -785,61 +784,47 @@ def set_chunk_status(repo: Path, chunk_id: str, status: str) -> list[dict]:
     return chunks
 
 
-def _record_decisions(root: Path, items: list[tuple[str, str]]) -> tuple[Path, str]:
-    """Add questions and answers to `.openfarm/GRILL_DECISIONS.md`, keeping what is there.
+def _record_decisions(root: Path, items: list[tuple[str, str]], kind: str = "answer") -> tuple[Path, str]:
+    """Add what the owner said to the decisions log, which only ever grows.
 
-    The first idea stays at the top. Answers not yet in the file go below it under a
-    dated heading. Returns the path and the file's full text.
+    The first idea stays at the top for good. `What we are building` is logged as
+    the idea the first time, and as `kind` (an iteration request, say) after that.
+    Returns the path and the log's full text.
     """
-    from .state import utc_now
+    cfg = _cfg_or_none(root)
+    has_idea = bool(read_doc(root, cfg, "decisions").strip())
+    entries = []
+    for question, answer in items:
+        if question == "What we are building":
+            entries.append((("iteration" if kind == "answer" else kind) if has_idea else "idea", "", answer))
+            has_idea = True
+        else:
+            entries.append((kind, question, answer))
+    return log_decisions(root, cfg, entries)
 
-    path = root / ".openfarm" / "GRILL_DECISIONS.md"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    old = path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
-    sections = [f"## {q}\n\n{a}\n" for q, a in items if a and a not in old]
-    if not old.strip():
-        text = "\n".join(["# Architect Grill Decisions\n", *sections])
-    elif sections:
-        text = old.rstrip("\n") + "\n\n" + "\n".join([f"# Follow-up, {utc_now()[:10]}\n", *sections])
-    else:
-        text = old
-    if text != old:
-        path.write_text(text, encoding="utf-8")
-    return path, text
+
+def _start_repository(root: Path, cfg) -> None:
+    """Give a project that was set up without git its repository, so tasks have a home.
+
+    The first commit takes the starting files; a spec that waited in `.openfarm/`
+    then moves to the cards branch with nothing to compare it against.
+    """
+    from .git import Git
+
+    if cfg is None or (root / ".git").exists():
+        return
+    git = Git(root)
+    git.init(branch=cfg.base_branch)
+    git.commit_all("chore: commit initial openfarm baseline")
+    store = store_or_none(root, cfg)
+    if store is not None and not store.src.migrated and not store._base_card_files():
+        store._finish_migration(commit_base=True)
 
 
 def _cards_on_record(root: Path, cfg) -> dict[str, str]:
-    """Card IDs in use on the base branch's `cards/` or on the cards branch, with each one's state.
-
-    The cards branch holds the farm's real state, so its state wins.
-    """
-    from .adapters.files import parse_card_file
-    from .git import Git
-
-    found: dict[str, str] = {}
-
-    def _note(stem: str, text: str) -> None:
-        try:
-            header, _ = parse_card_file(text)
-        except (AdapterError, ValueError):
-            header = {}
-        state = str(header.get("state") or "ready").lower()
-        found[stem.upper()] = state
-        found[str(header.get("id") or stem).upper()] = state
-
-    cards_dir = root / "cards"
-    if cards_dir.is_dir():
-        for path in sorted(cards_dir.glob("*.md")):
-            _note(path.stem, path.read_text(encoding="utf-8", errors="replace"))
-    if (root / ".git").exists():
-        git = Git(root)
-        ref = f"refs/heads/{getattr(cfg, 'cards_branch', 'openfarm-cards')}"
-        ls = git._run(["ls-tree", "--name-only", ref, "cards/"], check=False)
-        for rel in (ls.stdout.splitlines() if ls.returncode == 0 else []):
-            blob = git._run(["show", f"{ref}:{rel}"], check=False) if rel.endswith(".md") else None
-            if blob is not None and blob.returncode == 0:
-                _note(Path(rel).stem, blob.stdout)
-    return found
+    """`{CARD-ID upper: state}` for every card the project has."""
+    store = store_or_none(root, cfg)
+    return store.states() if store is not None else {}
 
 
 def _retire_replaced_cards(root: Path, cfg, new_ids: list[str]) -> list[str]:
@@ -849,38 +834,23 @@ def _retire_replaced_cards(root: Path, cfg, new_ids: list[str]) -> list[str]:
     wave (and the starter card from init) would be built next to their replacements.
     A card that was ever claimed, or is past `ready`, is left alone.
     """
-    from .adapters.files import open_file_source, parse_card_file, render_card_file
-    from .state import utc_now
-
     waves = {m.group(1) for cid in new_ids if (m := re.match(r"W(\d+)-", cid, re.IGNORECASE))}
-    if not waves:
+    store = store_or_none(root, cfg)
+    if not waves or store is None:
         return []
     fresh = {cid.upper() for cid in new_ids}
-    src = None
-    if (root / ".git").exists() and cfg is not None:
-        src = open_file_source(cfg, cfg.state_dir)
-        src.prepare()
     retired: list[str] = []
-    for cid, state in sorted(_cards_on_record(root, cfg).items()):
-        m = re.match(r"W(\d+)-", cid)
-        if m is None or m.group(1) not in waves or cid in fresh or state not in ("ready", "backlog"):
+    for card in store.cards():
+        m = re.match(r"W(\d+)-", card.id)
+        if (m is None or m.group(1) not in waves or card.id.upper() in fresh
+                or str(card.state).lower() not in ("ready", "backlog")
+                or card.fields.get("claimed_at")):
             continue
-        base_path = root / "cards" / f"{cid}.md"
-        if src is not None:
-            try:
-                header, body, _path = src._read_raw(cid)
-            except Refused:
-                header = None
-            if header is not None:
-                if header.get("claimed_at") or header.get("holder"):
-                    continue
-                header.update(state="dropped", dropped_at=utc_now(), drop_reason="replaced by a new split")
-                src._write(cid, header, body, f"{cid}: dropped (replaced by a new split)")
-        if base_path.is_file():
-            b_header, b_body = parse_card_file(base_path.read_text(encoding="utf-8", errors="replace"))
-            b_header["state"] = "dropped"
-            base_path.write_text(render_card_file(b_header, b_body), encoding="utf-8")
-        retired.append(cid)
+        header, _body = store.read(card.id)
+        if header.get("claimed_at") or header.get("holder"):
+            continue
+        store.change_card(card.id, "drop", by="openfarm/plan", why="replaced by a new split")
+        retired.append(card.id)
     return retired
 
 
@@ -922,10 +892,7 @@ def draft_spec_and_chunks(
     spec_md = ""
     chunks: list[dict] = []
     if backend is not None:
-        existing_spec = ""
-        sp = root / ".openfarm" / "PROJECT_SPEC.md"
-        if sp.is_file():
-            existing_spec = sp.read_text(encoding="utf-8", errors="replace").strip()[:2500]
+        existing_spec = read_doc(root, cfg, "spec").strip()[:2500]
         existing_files = [
             p.relative_to(root).as_posix()
             for p in sorted(root.rglob("*"))
@@ -995,10 +962,9 @@ def draft_spec_and_chunks(
             },
         ]
 
-    spec_path = root / ".openfarm" / "PROJECT_SPEC.md"
-    spec_path.write_text(spec_md.rstrip() + "\n", encoding="utf-8")
+    spec_path = write_doc(root, cfg, "spec", spec_md.rstrip() + "\n", why="spec written")
     chunks_path = save_project_chunks(root, chunks)
-    written = [".openfarm/GRILL_DECISIONS.md", ".openfarm/PROJECT_SPEC.md", CHUNKS_REL_PATH]
+    written: list[str] = []  # nothing lands on the base branch: these live with the cards
     return {
         "spec_path": str(spec_path),
         "spec_text": spec_md.rstrip() + "\n",
@@ -1017,8 +983,13 @@ def run_grill_and_architect(
     chunk_id: str | None = None,
     backend=None,
     on_progress=None,
+    decision_kind: str = "answer",
 ) -> dict:
-    """Write `.openfarm/GRILL_DECISIONS.md` and expand spec/cards via Frontier backend."""
+    """Log what the owner said and have the Architect write the spec, goals and cards.
+
+    Cards, the spec and the goals go to the store on the cards branch. Only product
+    code (the first runnable slice) is written to the working tree.
+    """
     from .globs import matches_any
 
     root = Path(repo).expanduser().resolve()
@@ -1030,6 +1001,7 @@ def run_grill_and_architect(
     lang = (cfg.languages[0] if (cfg and cfg.languages) else "typescript").lower()
     never_touch = list(getattr(cfg, "never_touch", ()) or ()) if cfg else []
     forbidden = list(getattr(cfg, "forbidden_files", ()) or ()) if cfg else []
+    _start_repository(root, cfg)
 
     normalized_answers: list[dict] = []
     if idea.strip():
@@ -1045,18 +1017,18 @@ def run_grill_and_architect(
         normalized_answers.append({"id": "goal", "question": "What we are building", "answer": f"Build {root.name}"})
 
     given = bool(idea.strip() or answers or any(str(t.get("answer") or "").strip() for t in (grill_history or [])))
-    decisions_path = root / ".openfarm" / "GRILL_DECISIONS.md"
-    if given or not decisions_path.is_file():
+    if given or not read_doc(root, cfg, "decisions").strip():
         decisions_path, decisions_text = _record_decisions(root, [
             (str(item.get("question") or item.get("id") or "Context"), str(item.get("answer") or "").strip())
-            for item in normalized_answers])
+            for item in normalized_answers], kind=decision_kind)
     else:
-        decisions_text = decisions_path.read_text(encoding="utf-8", errors="replace")
+        decisions_path, decisions_text = _record_decisions(root, [])
+    store = store_or_none(root, cfg)
     lines = [decisions_text]
     on_record = _cards_on_record(root, cfg)
     new_cards: list[str] = []
 
-    written: list[str] = [".openfarm/GRILL_DECISIONS.md"]
+    written: list[str] = []  # files for the base branch: product code only
     existing_chunks = load_project_chunks(root)
     active_chunk: dict | None = None
     if existing_chunks:
@@ -1066,12 +1038,7 @@ def run_grill_and_architect(
             active_chunk = next((c for c in existing_chunks if c.get("status") == "active"), None) or next(
                 (c for c in existing_chunks if c.get("status") != "done"), existing_chunks[0]
             )
-    existing_spec_path = root / ".openfarm" / "PROJECT_SPEC.md"
-    existing_spec_text = (
-        existing_spec_path.read_text(encoding="utf-8", errors="replace").strip()
-        if existing_spec_path.is_file()
-        else ""
-    )
+    existing_spec_text = read_doc(root, cfg, "spec").strip()
 
     if backend is not None:
         existing_files = [
@@ -1186,42 +1153,57 @@ def run_grill_and_architect(
         if not isinstance(files, dict) or not files:
             raise Infra("architect-no-answer", "the Architect's reply had no files in it")
         if isinstance(files, dict):
-            # A card the Architect numbered like an existing one gets the next free ID instead.
+            # Each new card takes its ID from the store, which never hands out a used number.
             renamed: dict[str, str] = {}
-            used = set(on_record)
-            for rel in files:
-                stem_m = re.fullmatch(r"cards/([^/]+)\.md", str(rel).strip().lstrip("/"))
-                if stem_m is None:
-                    continue
-                stem = stem_m.group(1)
-                if stem.upper() in used:
-                    while f"W{wave_num}-{next_seq:02d}" in used:
-                        next_seq += 1
-                    renamed[stem] = f"W{wave_num}-{next_seq:02d}"
-                used.add(renamed.get(stem, stem).upper())
+            card_rels = [str(rel).strip().lstrip("/") for rel in files
+                         if re.fullmatch(r"cards/([^/]+)\.md", str(rel).strip().lstrip("/"))]
+            if card_rels and store is None:
+                raise Refused("not-a-project", "this folder is not an openfarm project yet, so it has nowhere to keep tasks")
+            for rel_s in card_rels:
+                stem = Path(rel_s).stem
+                taken = store.src.reserve_id(stem)
+                if taken != stem:
+                    renamed[stem] = taken
             renames_re = re.compile(r"\b(" + "|".join(re.escape(k) for k in renamed) + r")\b") if renamed else None
+            from .adapters.files import parse_card_file
+
             for rel, content in files.items():
                 rel_s = str(rel).strip().lstrip("/")
+                text_out = str(content)
                 stem_m = re.fullmatch(r"cards/([^/]+)\.md", rel_s)
                 if stem_m is not None:
                     if renames_re is not None:
-                        content = renames_re.sub(lambda m: renamed[m.group(1)], str(content))
-                    rel_s = f"cards/{renamed.get(stem_m.group(1), stem_m.group(1))}.md"
-                if not rel_s or rel_s in (".openfarm/config.toml",) or rel_s.startswith(".git/"):
+                        text_out = renames_re.sub(lambda m: renamed[m.group(1)], text_out)
+                    cid = renamed.get(stem_m.group(1), stem_m.group(1))
+                    try:
+                        c_header, c_body = parse_card_file(text_out)
+                    except AdapterError as exc:
+                        raise Infra("architect-no-answer", f"the Architect's task {cid} could not be read: {exc.message}") from exc
+                    c_header["id"] = cid
+                    store.change_card(cid, "create", by="architect", why="drafted from the spec",
+                                      header=c_header, body=c_body)
+                    new_cards.append(cid)
+                    if callable(on_progress):
+                        on_progress(f"Wrote task {cid} ({len(text_out.splitlines())} lines)")
                     continue
+                doc = {".openfarm/PROJECT_SPEC.md": "spec", ".openfarm/CHUNKS.json": "chunks"}.get(rel_s)
+                if doc is not None:
+                    write_doc(root, cfg, doc, text_out, why="written by the Architect")
+                    if callable(on_progress):
+                        on_progress(f"Wrote the {'spec' if doc == 'spec' else 'goals'} ({len(text_out.splitlines())} lines)")
+                    continue
+                if not rel_s or rel_s.startswith((".openfarm/", ".git/", "cards/")):
+                    continue  # the config, the decisions log and git's own files are not the Architect's to write
                 if lang != "rust" and (rel_s.endswith(".rs") or rel_s.endswith("Cargo.toml") or rel_s.endswith("Cargo.lock")):
                     continue
-                if matches_any(rel_s, never_touch) or (not rel_s.startswith(".openfarm/") and matches_any(rel_s, forbidden)):
+                if matches_any(rel_s, never_touch) or matches_any(rel_s, forbidden):
                     continue
                 target = resolves_within(root, rel_s)
                 if target is None:
                     continue
                 target.parent.mkdir(parents=True, exist_ok=True)
-                text_out = str(content)
                 target.write_text(text_out, encoding="utf-8")
                 written.append(rel_s)
-                if stem_m is not None:
-                    new_cards.append(Path(rel_s).stem)
                 if callable(on_progress):
                     on_progress(f"Wrote {rel_s} ({len(text_out.splitlines())} lines)")
     else:
@@ -1231,8 +1213,7 @@ def run_grill_and_architect(
                 q = str(item.get("question") or item.get("id") or "")
                 a = str(item.get("answer") or "").strip()
                 spec_lines.append(f"## {q}\n\n{a}\n")
-            existing_spec_path.write_text("\n".join(spec_lines), encoding="utf-8")
-            written.append(".openfarm/PROJECT_SPEC.md")
+            write_doc(root, cfg, "spec", "\n".join(spec_lines), why="basic template")
     if not load_project_chunks(root):
         short_goal = str(normalized_answers[0].get("answer") or f"Build {root.name}").splitlines()[0][:64]
         save_project_chunks(
@@ -1242,25 +1223,24 @@ def run_grill_and_architect(
                 {"id": "C2", "title": "Iteration & Polish", "goal": "Expand capabilities and polish UX per spec", "status": "pending"},
             ],
         )
-        if CHUNKS_REL_PATH not in written:
-            written.append(CHUNKS_REL_PATH)
 
     answers = normalized_answers
 
-    cards_dir = root / "cards"
-    cards_dir.mkdir(parents=True, exist_ok=True)
-    existing_md = [p for p in cards_dir.glob("*.md") if p.is_file() and not p.stem.upper().startswith("FIND-")]
+    existing_md = [c for c in (store.cards() if store is not None else [])
+                   if not c.id.upper().startswith("FIND-") and not c.fields.get("from_card")
+                   and str(c.state).lower() != "dropped"]
     # The template card is for the template path only. An Architect that answered
     # without cards is a failure the caller shows; it never turns into a template.
     should_write_fallback = not existing_md and backend is None
     if backend is not None and not existing_md:
         raise Infra("architect-no-answer", "the Architect's reply had no cards in it")
-    if not should_write_fallback and backend is None and len(existing_md) == 1 and existing_md[0].name == "W1-01.md":
-        # Only the untouched starter card is rewritten; one the farm has started keeps its file.
-        should_write_fallback = on_record.get("W1-01") in ("ready", "backlog")
+    starter = existing_md[0] if len(existing_md) == 1 and existing_md[0].id == "W1-01" else None
+    if not should_write_fallback and backend is None and starter is not None:
+        # Only an untouched starter card is rewritten; one the farm started keeps its text.
+        should_write_fallback = str(starter.state).lower() in ("ready", "backlog")
+    if should_write_fallback and store is None:
+        raise Refused("not-a-project", "this folder is not an openfarm project yet, so it has nowhere to keep tasks")
     if should_write_fallback:
-        from .adapters.files import render_card_file
-
         allowed_cats = list(cfg.categories) if (cfg and cfg.categories) else ["small-feature"]
         category = next(
             (c for c in ("small-feature", "feature", "pattern", "test-backfill") if c in allowed_cats),
@@ -1328,15 +1308,20 @@ def run_grill_and_architect(
         # the card says so instead of having its meaning changed.
         body = (
             "## Done\n\n"
-            f"- Implement the Wave 1 golden slice in `{touch}` per `.openfarm/PROJECT_SPEC.md` and `.openfarm/GRILL_DECISIONS.md`.\n"
+            f"- Implement the Wave 1 golden slice in `{touch}` per the project spec and the owner's decisions.\n"
             f"- Core workflow (`{touch}`): {goal_ans.strip()}\n"
             f"- Golden slice returns expected values: {slice_ans.strip()}\n"
             f"- Preserve invariants and return an error on invalid input: {inv_ans.strip()}\n"
             f"- `{test_entry['name']}` passes alongside all baseline tests.\n"
         )
-        card_path = cards_dir / "W1-01.md"
-        card_path.write_text(render_card_file(header, body), encoding="utf-8")
-        written.append("cards/W1-01.md")
+        if starter is not None:
+            store.change_card("W1-01", "edit", by="openfarm/template", why="basic template",
+                              apply=lambda _h, _b: (dict(header, state=_h.get("state", "ready")), body))
+        else:
+            header["id"] = store.src.reserve_id("W1-01")
+            store.change_card(header["id"], "create", by="openfarm/template", why="basic template",
+                              header=header, body=body)
+        new_cards.append(header["id"])
 
     return {"written": written, "decisions_path": str(decisions_path), "new_cards": new_cards}
 
@@ -1431,7 +1416,7 @@ def _repair_card_for_eligibility(
     ]
     if not touches:
         touches = [default_touch]
-    if h.get("new_symbols") and len(touches) > 1:
+    if h.get("new_symbols") and len(touches) > 1 and any(f.get("rule") == "new-symbols-touches" for f in elig.failures):
         touches = [touches[0]]
     h["touches"] = touches[: max(1, int(getattr(cfg, "max_files", 6) or 6))]
 
@@ -1456,7 +1441,7 @@ def _repair_card_for_eligibility(
     return h, b, True
 
 
-def _ensure_card_touch_placeholders(root: Path, cfg, cards_dir: Path, written: list[str]) -> list[str]:
+def _ensure_card_touch_placeholders(root: Path, cfg, cards: list, written: list[str]) -> list[str]:
     """Ensure every ready card's non-test production `touches` file exists on base.
 
     Openfarm's deterministic `additions-only-new-file` guard permits the test writer
@@ -1487,12 +1472,9 @@ def _ensure_card_touch_placeholders(root: Path, cfg, cards_dir: Path, written: l
             or name.endswith("_tests.rs")
         )
 
-    for md in sorted(cards_dir.glob("*.md")):
-        try:
-            header, _ = parse_card_file(md.read_text(encoding="utf-8", errors="replace"))
-        except (OSError, ValueError):
-            continue
-        cid = str(header.get("id") or md.stem)
+    for card in cards:
+        header = dict(card.fields, id=card.id, state=card.state, touches=list(card.touches))
+        cid = card.id
         if is_finding_id_or_header(cid, header):
             continue
         if str(header.get("state") or "ready").lower() not in ("ready", "backlog"):
@@ -1539,11 +1521,7 @@ def draft_wave_plan(
     on_progress=None,
 ) -> dict:
     """Run Grill + Architect, incorporate picked findings, auto-repair eligibility, and triage cards."""
-    from .adapters.files import parse_card_file, render_card_file
-    from .cards import Card
-    from .findings import decide_finding, is_finding_id_or_header, picked_findings_for_planning
-    from .gates.eligibility import check_eligibility
-    from .triage import triage_card_heuristic
+    from .findings import decide_finding, picked_findings_for_planning
 
     def _emit_progress(msg: str) -> None:
         if callable(on_progress):
@@ -1567,37 +1545,26 @@ def draft_wave_plan(
     written = list(res.get("written") or [])
 
     cfg = load_config(root)
-    cards_dir = root / "cards"
-    cards_dir.mkdir(parents=True, exist_ok=True)
+    store = store_or_none(root, cfg)
+    if store is None:
+        raise Refused("not-a-project", "this folder is not a git repository with an openfarm project in it")
     retired = _retire_replaced_cards(root, cfg, list(res.get("new_cards") or []))
     if retired:
-        written.extend(f"cards/{cid}.md" for cid in retired)
-        _emit_progress(f"Replaced {len(retired)} unbuilt task(s) from the earlier split: {', '.join(retired)}")
+        _emit_progress(f"Replaced {len(retired)} unbuilt task(s) from an earlier split: {', '.join(retired)}")
     lang = (cfg.languages[0] if cfg.languages else "rust").lower()
     if lang == "typescript":
         fixed_imports = _fix_typescript_relative_js_imports(root)
         if fixed_imports:
             _emit_progress(f"Normalized .js -> .ts relative imports in {fixed_imports} file(s)")
-    placeholders = _ensure_card_touch_placeholders(root, cfg, cards_dir, written)
-    if placeholders:
-        _emit_progress(f"Prepared {len(placeholders)} placeholder module(s): {', '.join(placeholders[:4])}")
-
-    baseline_ok = True
-    baseline_error = ""
-    if verify_baseline:
-        _emit_progress("Verifying baseline tests on golden slice...")
-        baseline_ok, baseline_error = _verify_baseline_quick(root, cfg)
-
-    _emit_progress("Checking & repairing card eligibility...")
 
     promoted_findings: list[str] = []
     if include_picked_findings:
         picked = picked_findings_for_planning(root, cfg)
+        on_record = store.states()
         for item in picked:
             fid = item["id"]
             new_cid = f"W-{fid}"
-            card_path = cards_dir / f"{new_cid}.md"
-            if not card_path.exists():
+            if new_cid.upper() not in on_record:
                 touch, test_entry = _default_touch_and_test(root, lang, new_cid)
                 allowed_cats = list(cfg.categories) or ["small-feature"]
                 cat = next(
@@ -1619,103 +1586,41 @@ def draft_wave_plan(
                     "## Done\n\n"
                     f"- Address worker finding `{fid}` (from `{item['from_card']}`): {str(item['title']).strip()}.\n"
                     f"- Details: {str(item['body'] or item['title']).strip()}\n"
-                    f"- `{test_entry['name']}` returns expected values and verifies an error on invalid input.\n"
+                    f"- `{test_entry['name']}` returns expected and verifies an error on invalid input.\n"
                 )
-                card_path.write_text(render_card_file(header, body), encoding="utf-8")
-                written.append(f"cards/{new_cid}.md")
+                store.change_card(new_cid, "create", by="openfarm/plan", why=f"from the builders' question {fid}",
+                                  header=header, body=body)
             try:
                 decide_finding(root, cfg, fid, "promoted", promoted_card=new_cid)
             except (Refused, OSError):
                 pass
             promoted_findings.append(fid)
 
-    planned_cards: list[dict] = []
+    _emit_progress("Checking each task with the rules that will judge it...")
+    plan = preflight_plan(root, cfg, store, backend=backend, max_repairs=max_repairs, on_progress=_emit_progress)
+    planned_cards = plan["cards"]
     triage_counts = {"lean": 0, "balanced": 0, "strict": 0}
-    repaired_count = 0
-    all_ok = True
+    for entry in planned_cards:
+        if entry["profile"] in triage_counts:
+            triage_counts[entry["profile"]] += 1
+    repaired_count = sum(1 for entry in planned_cards if entry["repaired"])
+    all_ok = all(entry["eligible"] for entry in planned_cards)
 
-    # The base branch's copy always says "ready"; the cards branch knows what was built.
-    on_record = _cards_on_record(root, cfg)
-    for md in sorted(cards_dir.glob("*.md")):
-        try:
-            header, body = parse_card_file(md.read_text(encoding="utf-8", errors="replace"))
-        except OSError:
-            continue
-        cid = str(header.get("id") or md.stem)
-        if is_finding_id_or_header(cid, header):
-            continue
-        if on_record.get(cid.upper(), "ready") not in ("ready", "backlog"):
-            continue
+    placeholders = _ensure_card_touch_placeholders(
+        root, cfg, [c for c in store.cards() if str(c.state).lower() in ("ready", "backlog")], written)
+    if placeholders:
+        _emit_progress(f"Prepared {len(placeholders)} placeholder module(s): {', '.join(placeholders[:4])}")
 
-        repaired_this = False
-        for _attempt in range(max(1, int(max_repairs))):
-            h_new, b_new, did_repair = _repair_card_for_eligibility(root, cfg, header, body)
-            if did_repair:
-                header, body = h_new, b_new
-                repaired_this = True
-                md.write_text(render_card_file(header, body), encoding="utf-8")
-            card_obj = Card(
-                id=str(header.get("id") or cid),
-                title=str(header.get("title") or cid),
-                state=str(header.get("state") or "ready"),
-                done_text=body,
-                touches=[str(t) for t in (header.get("touches") or [])],
-                deps=[str(d) for d in (header.get("depends") or header.get("deps") or [])],
-                fields=dict(header),
-            )
-            elig = check_eligibility(card_obj, cfg, worktree=root)
-            if elig.ok:
-                break
+    baseline_ok = True
+    baseline_error = ""
+    if verify_baseline:
+        _emit_progress("Verifying baseline tests on the golden slice...")
+        baseline_ok, baseline_error = _verify_baseline_quick(root, cfg)
 
-        if repaired_this:
-            repaired_count += 1
-        card_obj = Card(
-            id=str(header.get("id") or cid),
-            title=str(header.get("title") or cid),
-            state=str(header.get("state") or "ready"),
-            done_text=body,
-            touches=[str(t) for t in (header.get("touches") or [])],
-            deps=[str(d) for d in (header.get("depends") or header.get("deps") or [])],
-            fields=dict(header),
-        )
-        elig = check_eligibility(card_obj, cfg, worktree=root)
-        if not elig.ok:
-            all_ok = False
-        tri = triage_card_heuristic(card_obj)
-        prof = str(tri.get("recommended_profile") or "balanced")
-        if prof in triage_counts:
-            triage_counts[prof] += 1
-        planned_cards.append({
-            "id": card_obj.id,
-            "title": card_obj.title,
-            "category": card_obj.category,
-            "touches": list(card_obj.touches),
-            "depends": list(card_obj.deps),
-            "tests": [t.as_dict() for t in card_obj.tests],
-            "done_text": body,
-            "complexity": str(tri.get("complexity") or "medium"),
-            "profile": prof,
-            "eligible": bool(elig.ok),
-            "failures": list(elig.failures),
-            "repaired": repaired_this,
-            "path": str(md),
-        })
-
-    if (root / ".git").exists() and cfg is not None:
-        from .adapters.files import FileCardSource
-
-        try:
-            ensure_baseline_committed(root, extra_allowed=written)
-            card_src = FileCardSource(
-                root,
-                "cards",
-                worktree=cfg.state_dir / "cards-source",
-                base_branch=cfg.base_branch,
-            )
-            card_src.sync_ready_cards_from_base()
-        except (OSError, Refused, AdapterError, ConfigError) as exc:
-            sync_note = str(exc)
-            _ = sync_note
+    try:
+        ensure_baseline_committed(root, extra_allowed=written)
+    except (OSError, Refused, AdapterError, ConfigError) as exc:
+        _emit_progress(f"The starting code could not be committed: {exc}")
 
     return {
         "written": written,
@@ -1730,7 +1635,189 @@ def draft_wave_plan(
         "promoted_findings": promoted_findings,
         "new_cards": list(res.get("new_cards") or []),
         "retired_cards": retired,
+        "plan_checks": plan["plan_checks"],
     }
+
+
+def _structure_notes(before: dict, after: dict) -> list[str]:
+    """One sentence for each header field a repair changed."""
+    names = {"category": "category", "touches": "files it may write", "reference": "reference file",
+             "tests": "named tests", "new_symbols": "new-symbols flag"}
+    return [f"{label} changed from {before.get(key)!r} to {after.get(key)!r}"
+            for key, label in names.items() if before.get(key) != after.get(key)]
+
+
+def preflight_plan(root: Path, cfg, store, *, backend=None, max_repairs: int = 2, on_progress=None) -> dict:
+    """Check every unbuilt card, repair what can be repaired, and say what was repaired.
+
+    Order: the checks' own fixes, then the structure repair, then one pass by the
+    Architect over the cards that still fail. Every repair is written to the card
+    (`repairs`) and its history. A card that still fails is parked with its reasons.
+    """
+    from .preflight import apply_fixes, check_card, failures
+    from .triage import triage_card_heuristic
+
+    def say(msg: str) -> None:
+        if callable(on_progress):
+            on_progress(msg)
+
+    def todo() -> list:
+        return [c for c in store.cards()
+                if str(c.state).lower() in ("ready", "backlog") and not _finding_header(store, c.id)]
+
+    def repair_once(cid: str) -> list[str]:
+        header, body = store.read(cid)
+        checks = check_card(card_from(header, body), cfg, root, store.cards())
+        if not failures(checks):
+            return []
+        new_header, new_body, notes = apply_fixes(header, body, checks)
+        if any(c["check"] == "rules" for c in failures(checks)):
+            fixed_header, fixed_body, did = _repair_card_for_eligibility(root, cfg, new_header, new_body)
+            if did:
+                notes += _structure_notes(new_header, fixed_header)
+                if fixed_body.strip() != new_body.strip():
+                    notes.append("a line was added to the Done text so it states a result that can be checked")
+                new_header, new_body = fixed_header, fixed_body
+        if not notes:
+            return []
+        new_header["repairs"] = [*(header.get("repairs") or []), *notes]
+        store.change_card(cid, "edit", by="openfarm/preflight", why="; ".join(notes),
+                          apply=lambda _h, _b: (dict(new_header, state=_h.get("state", "ready")), new_body))
+        return notes
+
+    repaired: dict[str, list[str]] = {}
+    for _attempt in range(max(1, int(max_repairs))):
+        changed = False
+        for card in todo():
+            notes = repair_once(card.id)
+            if notes:
+                repaired.setdefault(card.id, []).extend(notes)
+                changed = True
+        if not changed:
+            break
+
+    def still_failing() -> dict[str, list[dict]]:
+        out = {}
+        for card in todo():
+            failed = failures(check_card(card, cfg, root, store.cards()))
+            if failed:
+                out[card.id] = failed
+        return out
+
+    failing = still_failing()
+    if failing and backend is not None:
+        say(f"Asking the Architect to repair {len(failing)} task(s): {', '.join(sorted(failing))}")
+        for cid, notes in _architect_repairs(root, cfg, store, backend, failing).items():
+            repaired.setdefault(cid, []).extend(notes)
+
+    cards: list[dict] = []
+    for card in todo():
+        header, body = store.read(card.id)
+        checks = check_card(card_from(header, body), cfg, root, store.cards())
+        # Writing through the store parks a card that fails and frees one that now passes.
+        outcome = store.change_card(card.id, "edit", by="openfarm/preflight", why="checked",
+                                    apply=lambda h, b: (h, b)) if _needs_parking(header, checks) else None
+        if outcome is not None:
+            header, body = store.read(card.id)
+        obj = card_from(header, body)
+        tri = triage_card_heuristic(obj)
+        failed = failures(checks)
+        cards.append({
+            "id": obj.id,
+            "title": obj.title,
+            "category": obj.category,
+            "touches": list(obj.touches),
+            "depends": list(obj.deps),
+            "tests": [t.as_dict() for t in obj.tests],
+            "done_text": body,
+            "complexity": str(tri.get("complexity") or "medium"),
+            "profile": str(tri.get("recommended_profile") or "balanced"),
+            "eligible": not failed,
+            "failures": as_rule_failures(checks),
+            "checks": checks,
+            "repaired": bool(header.get("repairs")),
+            "repairs": list(header.get("repairs") or []),
+            "state": str(header.get("state") or "ready"),
+        })
+    names = ("scaffold", "touches", "depends", "seams", "rules")
+    plan_checks = [{"check": name,
+                    "status": "fail" if any(c["check"] == name and c["status"] == "fail"
+                                            for e in cards for c in e["checks"]) else "pass"}
+                   for name in names]
+    return {"cards": cards, "plan_checks": plan_checks, "repaired": repaired}
+
+
+def _finding_header(store, card_id: str) -> bool:
+    try:
+        header, _body = store.read(card_id)
+    except Refused:
+        return False
+    return bool(header.get("from_card")) or str(card_id).upper().startswith("FIND-")
+
+
+def _needs_parking(header: dict, checks: list[dict]) -> bool:
+    failed = any(c["status"] == "fail" for c in checks)
+    state = str(header.get("state") or "ready")
+    return (failed and state == "ready") or (not failed and state == "backlog" and bool(header.get("preflight")))
+
+
+def _architect_repairs(root: Path, cfg, store, backend, failing: dict[str, list[dict]]) -> dict[str, list[str]]:
+    """One pass: the Architect rewrites the cards that fail, told exactly which check failed and why.
+
+    A rewrite is kept only when the card then fails fewer checks. Returns what was repaired.
+    """
+    from .adapters.files import parse_card_file, render_card_file
+    from .frontier_review import _extract_json_dict
+    from .preflight import check_card, failures
+
+    blocks = []
+    for cid, failed in sorted(failing.items()):
+        header, body = store.read(cid)
+        shown = {k: v for k, v in header.items() if k in ("id", "title", "category", "wave", "touches", "reference",
+                                                         "new_symbols", "depends", "tests")}
+        why = "\n".join(f"  - {c['check']}: {c['detail']}" for c in failed)
+        blocks.append(f"### {cid} fails these checks:\n{why}\n\n{render_card_file(shown, body)}")
+    context = "\n\n".join(
+        f"### {c.id} (for reference, not to be changed)\n{(c.done_text or '')[:1800]}"
+        for c in store.cards() if c.id not in failing and any(c.id in card_from(*store.read(f)).deps for f in failing))
+    prompt = (
+        "You wrote these task cards for an openfarm project. A deterministic pre-check found problems.\n"
+        "Rewrite ONLY the failing cards so each check passes, keeping what each task delivers.\n"
+        "Rules of the checks:\n"
+        "- scaffold: no parameter defaults in a signature; say the default in words instead.\n"
+        "- touches: every file the text names must be in `touches`, exist, or come from a card it depends on.\n"
+        "- seams: a card that writes a stylesheet for a page another card serves must quote that page's element ids "
+        "exactly (`#id`) in its stylesheet section, style every one of them, and name no selector the page lacks.\n"
+        "- depends: only existing card IDs, no loops.\n"
+        'Return ONLY JSON: {"cards": {"<ID>": "<the whole card file, +++ TOML header and body>"}, '
+        '"changes": {"<ID>": "<one sentence on what you changed>"}}\n\n'
+        + "\n\n".join(blocks) + ("\n\nCards they depend on:\n" + context if context else "")
+    )
+    try:
+        raw = str(backend.ask(prompt) if hasattr(backend, "ask") else backend(prompt))
+    except (Infra, AdapterError, OSError):
+        return {}
+    parsed = _extract_json_dict(raw) or {}
+    rewritten = parsed.get("cards") if isinstance(parsed.get("cards"), dict) else {}
+    said = parsed.get("changes") if isinstance(parsed.get("changes"), dict) else {}
+    out: dict[str, list[str]] = {}
+    for cid, text in rewritten.items():
+        if cid not in failing:
+            continue
+        try:
+            new_header, new_body = parse_card_file(str(text))
+        except AdapterError:
+            continue
+        old_header, _old_body = store.read(cid)
+        merged = {**old_header, **{k: v for k, v in new_header.items() if k not in ("id", "state")}}
+        after = failures(check_card(card_from(merged, new_body), cfg, root, store.cards()))
+        if len(after) >= len(failing[cid]):
+            continue
+        note = f"the Architect rewrote it: {str(said.get(cid) or 'to pass ' + ', '.join(c['check'] for c in failing[cid])).strip()}"
+        merged["repairs"] = [*(old_header.get("repairs") or []), note]
+        store.change_card(cid, "edit", by="architect", why=note, apply=lambda _h, _b, m=merged, b=new_body: (m, b))
+        out[cid] = [note]
+    return out
 
 
 def ensure_baseline_committed(repo: Path, *, extra_allowed: list[str] | None = None) -> bool:
@@ -1760,17 +1847,9 @@ def ensure_baseline_committed(repo: Path, *, extra_allowed: list[str] | None = N
         return False
 
     if paths and all(_path_is_allowed(p) for p in paths):
-        git.commit_all("chore: commit openfarm spec and cards")
+        git.commit_all("openfarm: starting code for the plan")
         return True
     return False
-
-
-_EDIT_REFUSALS = {
-    "in_progress": "is building; stop it first",
-    "in_review": "is waiting for review; decide it first",
-    "done": "is done; its text can't change now",
-    "dropped": "was dropped; its text can't change now",
-}
 
 
 def update_card_with_eligibility(
@@ -1784,19 +1863,19 @@ def update_card_with_eligibility(
     wave: int | None = None,
     tests: list[dict] | None = None,
     done_text: str | None = None,
+    skip_checks: list[str] | None = None,
+    by: str = "",
+    why: str = "",
 ) -> dict:
-    """Edit a card where the farm reads it (the `openfarm-cards` copy) and check eligibility.
+    """Edit a card in the store and run the plan checks on it. A field left as None keeps its value.
 
-    The same edit goes to the base branch's `cards/` file, so a later sync from the
-    base branch cannot put the old text back. A field left as None keeps its value.
+    `skip_checks` names preflight checks the person wants kept as written.
     """
-    from .adapters.files import _holder, _lease_expiry, open_file_source, parse_card_file, render_card_file
-    from .cards import Card
-    from .gates.eligibility import check_eligibility
-    from .state import utc_now
-
     root = Path(repo).expanduser().resolve()
     cfg = load_config(root)
+    store = store_or_none(root, cfg)
+    if store is None:
+        raise Refused("not-a-project", "this folder is not a git repository with an openfarm project in it")
 
     def _apply(header: dict, body: str) -> tuple[dict, str]:
         if title is not None and title.strip():
@@ -1805,7 +1884,7 @@ def update_card_with_eligibility(
             header["category"] = category.strip()
         if touches is not None:
             header["touches"] = [str(t).strip() for t in touches if str(t).strip()]
-            if header.get("reference") and header["touches"]:
+            if header.get("reference") and header["touches"] and header["reference"] not in header["touches"]:
                 header["reference"] = header["touches"][0]
         if depends is not None:
             header.pop("deps", None)
@@ -1816,64 +1895,19 @@ def update_card_with_eligibility(
             header["tests"] = list(tests)
         if done_text is not None:
             body = done_text.strip() + "\n"
+        if skip_checks is not None:
+            header["preflight_skip"] = [str(c).strip().lower() for c in skip_checks if str(c).strip()]
         return header, body
 
-    cards_dir = root / "cards"
-    base_path = cards_dir / f"{card_id}.md"
-    if not base_path.is_file() and cards_dir.is_dir():
-        for cand in sorted(cards_dir.glob("*.md")):
-            try:
-                h_c, _ = parse_card_file(cand.read_text(encoding="utf-8", errors="replace"))
-            except (OSError, ValueError):
-                continue
-            if str(h_c.get("id") or "") == card_id:
-                base_path = cand
-                break
-
-    src = None
-    header = body = None
-    if (root / ".git").exists():
-        src = open_file_source(cfg, cfg.state_dir)
-        src.prepare()
-        if base_path.is_file():
-            src.sync_ready_cards_from_base()  # a card drafted a moment ago may not be there yet
-        try:
-            header, body, _path = src._read_raw(card_id)
-        except Refused:
-            src = None
-    if header is None:
-        if not base_path.is_file():
-            raise Refused("card-not-found", f"no card file found for {card_id!r}")
-        header, body = parse_card_file(base_path.read_text(encoding="utf-8"))
-
-    if src is not None:
-        state = str(header.get("state") or "ready")
-        held = bool(_holder(header)) and _lease_expiry(header) > utc_now()
-        if state in _EDIT_REFUSALS or held:
-            why = _EDIT_REFUSALS.get(state, _EDIT_REFUSALS["in_progress"])
-            raise Refused("card-not-editable", f"{card_id} {why}")
-
-    header, body = _apply(header, body)
-    if src is not None:
-        src._write(card_id, header, body, f"{card_id}: edited")
-    if base_path.is_file():
-        if src is None:
-            base_path.write_text(render_card_file(header, body), encoding="utf-8")
-        else:
-            b_header, b_body = _apply(*parse_card_file(base_path.read_text(encoding="utf-8")))
-            base_path.write_text(render_card_file(b_header, b_body), encoding="utf-8")
-        ensure_baseline_committed(root, extra_allowed=[base_path.relative_to(root).as_posix()])
-
-    card_obj = Card(
-        id=str(header.get("id") or card_id),
-        title=str(header.get("title") or card_id),
-        state=str(header.get("state") or "ready"),
-        done_text=body,
-        touches=[str(t) for t in (header.get("touches") or [])],
-        deps=[str(d) for d in (header.get("depends") or header.get("deps") or [])],
-        fields=dict(header),
-    )
-    elig = check_eligibility(card_obj, cfg, worktree=root)
+    try:
+        outcome = store.change_card(card_id, "edit", by=by, why=why or "edited", apply=_apply)
+    except Refused as exc:
+        if exc.code == "not-found":
+            raise Refused("card-not-found", f"no card file found for {card_id!r}") from exc
+        raise
+    header, body = store.read(card_id)
+    card_obj = card_from(header, body)
+    failed = [c for c in outcome["checks"] if c["status"] == "fail"]
     return {
         "card": {
             "id": card_obj.id,
@@ -1884,9 +1918,11 @@ def update_card_with_eligibility(
             "wave": int(header.get("wave") or 1),
             "tests": [t.as_dict() for t in card_obj.tests],
             "done_text": body,
+            "state": str(header.get("state") or ""),
         },
-        "eligible": bool(elig.ok),
-        "failures": list(elig.failures),
+        "eligible": not failed,
+        "failures": as_rule_failures(outcome["checks"]),
+        "checks": outcome["checks"],
     }
 
 
@@ -1900,25 +1936,23 @@ def split_card_into_two(
     second_touches: list[str],
 ) -> dict:
     """Split an oversized card into `<card_id>a` and `<card_id>b` (chained via `depends`)."""
-    from .adapters.files import FileCardSource, parse_card_file, render_card_file
-    from .cards import Card
-    from .gates.eligibility import check_eligibility
-
     root = Path(repo).expanduser().resolve()
     cfg = load_config(root)
     lang = (cfg.languages[0] if cfg.languages else "rust").lower()
-    cards_dir = root / "cards"
-    orig_path = cards_dir / f"{card_id}.md"
-    if not orig_path.is_file():
-        raise Refused("card-not-found", f"no card file found for {card_id!r}")
-    orig_hdr, orig_body = parse_card_file(orig_path.read_text(encoding="utf-8"))
+    store = store_or_none(root, cfg)
+    if store is None:
+        raise Refused("not-a-project", "this folder is not a git repository with an openfarm project in it")
+    try:
+        orig_hdr, _orig_body = store.read(card_id)
+    except Refused as exc:
+        raise Refused("card-not-found", f"no card file found for {card_id!r}") from exc
 
     id_a, id_b = f"{card_id}a", f"{card_id}b"
-    taken = [cid for cid in (id_a, id_b) if cid.upper() in _cards_on_record(root, cfg)]
+    taken = [cid for cid in (id_a, id_b) if cid.upper() in store.states()]
     if taken:
         raise Refused("card-exists", f"{' and '.join(taken)} already exist; {card_id} was split before")
+    store.change_card(card_id, "split", why=f"split into {id_a} and {id_b}")
     out_cards: list[dict] = []
-    written_rel: list[str] = []
     for cid, ctitle, ctouches, cdeps in (
         (id_a, first_title, first_touches, list(orig_hdr.get("depends") or [])),
         (id_b, second_title, second_touches, [id_a]),
@@ -1945,34 +1979,14 @@ def split_card_into_two(
             f"- `{dtest['name']}` returns expected values and verifies an error on invalid input.\n"
         )
         hdr, body, _rep = _repair_card_for_eligibility(root, cfg, hdr, body)
-        cpath = cards_dir / f"{cid}.md"
-        cpath.write_text(render_card_file(hdr, body), encoding="utf-8")
-        written_rel.append(f"cards/{cid}.md")
-        cobj = Card(
-            id=cid,
-            title=hdr["title"],
-            state="ready",
-            done_text=body,
-            touches=list(hdr["touches"]),
-            deps=list(hdr["depends"]),
-            fields=dict(hdr),
-        )
-        elig = check_eligibility(cobj, cfg, worktree=root)
+        outcome = store.change_card(cid, "create", why=f"split from {card_id}", header=hdr, body=body)
+        failed = [c for c in outcome["checks"] if c["status"] == "fail"]
         out_cards.append({
             "id": cid,
             "title": hdr["title"],
             "touches": list(hdr["touches"]),
             "depends": list(hdr["depends"]),
-            "eligible": bool(elig.ok),
-            "failures": list(elig.failures),
+            "eligible": not failed,
+            "failures": as_rule_failures(outcome["checks"]),
         })
-
-    orig_hdr["state"] = "split"
-    orig_path.write_text(render_card_file(orig_hdr, orig_body), encoding="utf-8")
-    written_rel.append(f"cards/{card_id}.md")
-
-    if (root / ".git").exists():
-        ensure_baseline_committed(root, extra_allowed=written_rel)
-        src = FileCardSource(root, "cards", worktree=cfg.state_dir / "cards-source", base_branch=cfg.base_branch)
-        src.sync_ready_cards_from_base()
     return {"split_from": card_id, "cards": out_cards}

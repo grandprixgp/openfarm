@@ -736,10 +736,8 @@ class InitBootstrapTests(unittest.TestCase):
             "src/lib.rs",
             "tests/baseline_tests.rs",
             ".openfarm/config.toml",
-            ".openfarm/PROJECT_SPEC.md",
             ".openfarm/test-conventions.md",
             "AGENTS.md",
-            "cards/.gitkeep",
         ):
             self.assertTrue((repo / rel).is_file(), f"missing scaffold file {rel}")
 

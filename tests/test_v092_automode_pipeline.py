@@ -17,6 +17,7 @@ from openfarm_core.automode import (
     save_worker_key_atomic,
 )
 from openfarm_core.errors import Refused
+from tests.storehelp import doc
 from tests.test_python_e2e import build_python_toy
 
 
@@ -25,7 +26,7 @@ class _FakeArchitect:
         return json.dumps({
             "files": {
                 ".openfarm/PROJECT_SPEC.md": "# Spec\n\nDetailed specification.\n\n## Invariants\n- Never lose data.\n\n## Slice\n- Golden slice.\n",
-                "cards/CARD-001.md": "---\nid: CARD-001\ntitle: First slice\nstate: ready\n---\n\nDone: Works.\n",
+                "cards/CARD-001.md": "+++\nid = \"CARD-001\"\ntitle = \"First slice\"\nstate = \"ready\"\n+++\n\nDone: Works.\n",
                 # Must be ignored (protected config & path traversal)
                 ".openfarm/config.toml": "hacked = true\n",
                 "../escape.txt": "nope\n",
@@ -54,8 +55,11 @@ class AutomodePipelineTests(unittest.TestCase):
             answers=[{"id": "goal", "question": "Goal", "answer": "Build photos of the day"}],
             backend=_FakeArchitect(),
         )
-        self.assertIn(".openfarm/PROJECT_SPEC.md", res["written"])
-        self.assertIn("cards/CARD-001.md", res["written"])
+        # The spec and the card go to the cards branch; nothing of the plan is written to the repository.
+        self.assertEqual(res["written"], [])
+        self.assertEqual(res["new_cards"], ["CARD-001"])
+        self.assertIn("Detailed specification.", doc(toy.root, "spec").read_text())
+        self.assertFalse((toy.root / "cards" / "CARD-001.md").exists())
         self.assertNotIn(".openfarm/config.toml", res["written"])
         self.assertFalse((toy.root.parent / "escape.txt").exists())
 

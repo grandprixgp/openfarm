@@ -13,6 +13,7 @@ from unittest import mock
 
 from openfarm_core.adapters.files import FileCardSource
 from openfarm_core.config import load_config
+from tests.storehelp import cards_dir
 from openfarm_tui import textual_available
 from tests.test_python_e2e import build_python_toy
 
@@ -138,6 +139,7 @@ def _two_card_toy(case: unittest.TestCase):
             title=f"Add part {cid[-1]}",
             category="small-feature",
             touches=["tally/bounded.py"],
+            reference="tally/bounded.py",
             tests=[{"name": "test_a", "file": "tests/test_a.py", "asserts": "returns 3"}],
             done_text="## Done\n\n- `push` returns 3 for a full bundle.",
             depends=deps,
@@ -165,7 +167,6 @@ class CardEditTests(_RegistryIsolation):
         self.assertEqual(src.read("CARD-1")["card"]["state"], "blocked")
 
         src.release("CARD-1", reason="retry")
-        src.sync_ready_cards_from_base()  # what drafting more cards does later
         self.assertEqual(src.next()["cards"], ["CARD-1"])
         self.assertIn("returns 4", src.read("CARD-1")["card"]["done_text"])
 
@@ -390,11 +391,11 @@ class ArchitectFailureTests(_RegistryIsolation):
             await settle()
             self._assert_failure_shown(app, "timed out after 600.0s")
             self.assertEqual(_git_state(toy.root), before)
-            self.assertFalse(list((toy.root / "cards").glob("W*.md")), "no template card by itself")
+            self.assertFalse(list(cards_dir(toy.root).glob("W*.md")), "no template card by itself")
 
             app._arch_template_clicked()
             await settle()
-            self.assertTrue((toy.root / "cards" / "W1-01.md").is_file())
+            self.assertTrue((cards_dir(toy.root) / "W1-01.md").is_file())
             self.assertTrue(app.query_one("#btn-arch-retry").has_class("hidden"))
             self.assertIn("Plan ready (basic template)", " | ".join(n.message for n in app._notifications))
             self.assertIn("Basic template (the Architect is not asked): splitting chunk C1 into cards...", said)

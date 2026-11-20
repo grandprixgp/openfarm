@@ -305,8 +305,8 @@ def check_card(card: Card, cfg, root: Path, cards: list[Card] | None = None) -> 
         _check_seams(card, by_id),
     ]
     try:
-        failures = check_eligibility(card, cfg, worktree=root).failures
-        results.append(_result("rules", [str(f.get("detail") or f.get("rule")) for f in failures]))
+        broken = check_eligibility(card, cfg, worktree=root).failures
+        results.append(dict(_result("rules", [str(f.get("detail") or f.get("rule")) for f in broken]), rules=broken))
     except Exception as exc:  # noqa: BLE001 - an odd card is reported, not raised
         results.append(_result("rules", [f"could not be checked: {exc}"]))
     for item in results:
@@ -318,6 +318,14 @@ def check_card(card: Card, cfg, root: Path, cards: list[Card] | None = None) -> 
 
 def failures(checks: list[dict]) -> list[dict]:
     return [c for c in checks if c["status"] == "fail"]
+
+
+def as_rule_failures(checks: list[dict]) -> list[dict]:
+    """The failed checks as `[{"rule", "detail"}]`, with each broken eligibility rule under its own name."""
+    out: list[dict] = []
+    for item in failures(checks):
+        out.extend(item.get("rules") or [{"rule": item["check"], "detail": item["detail"]}])
+    return out
 
 
 def apply_fixes(header: dict, body: str, checks: list[dict]) -> tuple[dict, str, list[str]]:

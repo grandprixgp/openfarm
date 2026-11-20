@@ -803,6 +803,7 @@ class TypeScriptE2ETests(unittest.TestCase):
 
             Calling `push` on a full `Bounded(1)` throws `FullError`.
         """)
+        (root / "cards").mkdir(exist_ok=True)
         (root / "cards" / "CARD-1.md").write_text(card_text, encoding="utf-8")
         Git(root).commit_all("adopt and add CARD-1")
         return root, state

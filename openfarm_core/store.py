@@ -141,17 +141,11 @@ class Store:
         `kind` is `idea`, `answer`, `iteration` or `feature`. An entry whose text is
         already in the log is not written twice. Returns whether it was added.
         """
-        text = str(text or "").strip()
-        if not text:
-            return False
         old = self.read_doc("decisions")
-        if text in old:
+        new = decision_entry(old, kind, text, question)
+        if new == old:
             return False
-        label = {"idea": "The idea", "answer": question.strip() or "Answer",
-                 "iteration": "Something's wrong", "feature": "New feature"}.get(kind, kind)
-        head = "" if old.strip() else "# Decisions\n\nEverything the owner said, in order. Entries are added, never changed.\n"
-        entry = f"\n## {utc_now()[:10]} · {label}\n\n{text}\n"
-        self.write_doc("decisions", (old.rstrip("\n") + "\n" if old.strip() else head) + entry, why=f"{kind} added")
+        self.write_doc("decisions", new, why=f"{kind} added")
         return True
 
     # -- cards -----------------------------------------------------------------
@@ -211,8 +205,10 @@ class Store:
                 header = dict(header, id=card_id)
                 header.setdefault("state", "ready")
                 header.setdefault("created_at", utc_now())
+                header, checks = self._park_or_ready(header, body)
                 self._note(card_id, kind, by, why, _content(header, body))
                 self.src._write(card_id, header, body, f"{card_id}: created by {by}")
+                return self._outcome(card_id, header, checks)
             else:
                 old_header, old_body = self.read(card_id)
                 state = str(old_header.get("state") or "ready")
@@ -226,11 +222,13 @@ class Store:
                                       f"{card_id} {_REFUSALS.get(state, _REFUSALS['in_progress'])}")
                 if kind == "edit":
                     header, body = apply(dict(old_header), old_body)
+                    header, checks = self._park_or_ready(header, body)
                     after = _content(header, body)
                     changed = {k: [before.get(k), after.get(k)] for k in sorted(set(before) | set(after))
                                if before.get(k) != after.get(k)}
                     self._note(card_id, kind, by, why, changed)
                     self.src._write(card_id, header, body, f"{card_id}: edited by {by}")
+                    return self._outcome(card_id, header, checks)
                 elif kind in ("skip", "drop", "split"):
                     new_state = "split" if kind == "split" else "dropped"
                     header, body = dict(old_header), old_body
@@ -251,8 +249,31 @@ class Store:
                 else:
                     raise Invalid("bad-change", f"unknown card change {kind!r}")
             checks = check_card(card_from(header, body), self.cfg, self.root, self.cards())
+        return self._outcome(card_id, header, checks)
+
+    @staticmethod
+    def _outcome(card_id: str, header: dict, checks: list[dict]) -> dict:
         return {"id": card_id, "state": str(header.get("state") or ""), "checks": checks,
                 "ok": not any(c["status"] == "fail" for c in checks)}
+
+    def _park_or_ready(self, header: dict, body: str) -> tuple[dict, list[dict]]:
+        """Run the plan checks on a card about to be written.
+
+        A ready card that fails goes to `backlog` with the reasons in `preflight`, so
+        the farm never claims a card it can't build. A card parked that way comes back
+        to `ready` once it passes. Any other state is left alone.
+        """
+        from .preflight import check_card
+
+        checks = check_card(card_from(header, body), self.cfg, self.root, self.cards())
+        failed = [f"{c['check']}: {c['detail']}" for c in checks if c["status"] == "fail"]
+        state = str(header.get("state") or "ready")
+        header = dict(header)
+        if failed and state in ("ready", "backlog"):
+            header.update(state="backlog", preflight=failed)
+        elif not failed and header.pop("preflight", None) and state == "backlog":
+            header["state"] = "ready"
+        return header, checks
 
     def next_card_id(self, wave: int) -> str:
         return self.src.next_id(f"W{int(wave)}-", 2)
@@ -285,7 +306,7 @@ class Store:
                 b_header, b_body = parse_card_file(path.read_text(encoding="utf-8", errors="replace"))
                 s_header, s_body = self.read(str(b_header.get("id") or path.stem))
             except (Invalid, Refused, OSError):
-                continue
+                continue  # opening the store already copied over any card only the base branch had
             if _content(b_header, b_body) != _content(s_header, s_body):
                 differences.append({
                     "id": str(s_header.get("id") or path.stem),
@@ -330,7 +351,7 @@ class Store:
         worktree = self.src.worktree
         for store_rel, legacy_rel in DOCS.values():
             legacy, target = self.root / legacy_rel, worktree / store_rel
-            if legacy.is_file() and not target.exists():
+            if legacy.is_file():  # until now the base branch's copy was the live one
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(legacy, target)
         folder = self.src.legacy_base_cards()
@@ -367,3 +388,48 @@ class Store:
 
 def open_store(root: Path, cfg) -> Store:
     return Store(root, cfg)
+
+
+def store_or_none(root: Path, cfg) -> Store | None:
+    """The store, for a folder that is a git repository with an openfarm config."""
+    if cfg is None or not (Path(root) / ".git").exists():
+        return None
+    return Store(root, cfg)
+
+
+def decision_entry(old: str, kind: str, text: str, question: str = "") -> str:
+    """The decisions log with one dated entry added, or `old` when the text is already in it."""
+    text = str(text or "").strip()
+    if not text or text in old:
+        return old
+    label = {"idea": "The idea", "answer": question.strip() or "Answer",
+             "iteration": "Something's wrong", "feature": "New feature"}.get(kind, kind)
+    head = "# Decisions\n\nEverything the owner said, in order. Entries are added, never changed.\n"
+    return (old.rstrip("\n") + "\n" if old.strip() else head) + f"\n## {utc_now()[:10]} · {label}\n\n{text}\n"
+
+
+def write_doc(root: Path, cfg, name: str, text: str, why: str = "") -> Path:
+    """Write a planning document where it lives now (see `doc_path`)."""
+    store = store_or_none(root, cfg)
+    if store is not None:
+        return store.write_doc(name, text, why)
+    path = Path(root) / DOCS[name][1]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def log_decisions(root: Path, cfg, entries: list[tuple[str, str, str]]) -> tuple[Path, str]:
+    """Append `(kind, question, text)` entries to the decisions log. Returns its path and full text."""
+    store = store_or_none(root, cfg)
+    path = store.doc_path("decisions") if store is not None else Path(root) / DOCS["decisions"][1]
+    try:
+        old = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        old = ""
+    text = old
+    for kind, question, body in entries:
+        text = decision_entry(text, kind, body, question)
+    if text != old:
+        write_doc(root, cfg, "decisions", text, why="entries added")
+    return path, text
