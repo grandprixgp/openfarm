@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1280" height="340" viewBox="0 0 1280 340" role="img" aria-labelledby="banner-t banner-d">
 <title id="banner-t">openfarm: Frontier thinks. The farm grinds. Code decides.</title>
-<desc id="banner-d">Banner for openfarm v0.8.5, a pre-release portable coding farm where frontier models architect and review, tiered worker models run parallel non-colliding cards over a shared board with a stdlib TUI, and plain code enforces every Rust, Python, and TypeScript gate.</desc>
+<desc id="banner-d">Banner for openfarm v0.14.0, a portable coding factory where frontier models grill ideas into living specs and chunks, worker models run DAG-scheduled cards via TUI, detached daemon, or Tailscale Web Companion, and stdlib Python code enforces every Rust, Python, TypeScript, and Go gate.</desc>
 <defs>
   <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
     <stop offset="0" stop-color="#0b1220"/><stop offset="1" stop-color="#17233d"/>
@@ -146,14 +146,12 @@
 <text x="74" y="196" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="28" font-weight="600" fill="#f1f5f9" text-anchor="start" >Frontier thinks. The farm grinds. Code decides.</text>
 <text x="74" y="236" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="18" font-weight="400" fill="#9fb0c8" text-anchor="start" >Your best model designs and reviews. A cheaper model does the grind.</text>
 <text x="74" y="262" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="18" font-weight="400" fill="#9fb0c8" text-anchor="start" >Every gate is run by plain code, so no model ever grades its own work.</text>
-<rect x="74" y="286" width="69" height="27" rx="13.5" fill="#34d399" fill-opacity="0.14" stroke="#34d399" stroke-opacity="0.6"/>
-<text x="108.5" y="304" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#34d399" text-anchor="middle" >v0.8.5</text>
-<rect x="151" y="286" width="98" height="27" rx="13.5" fill="#fbbf24" fill-opacity="0.14" stroke="#fbbf24" stroke-opacity="0.6"/>
-<text x="200.0" y="304" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#fbbf24" text-anchor="middle" >pre-release</text>
-<rect x="257" y="286" width="196" height="27" rx="13.5" fill="#a78bfa" fill-opacity="0.14" stroke="#a78bfa" stroke-opacity="0.6"/>
-<text x="355.0" y="304" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#a78bfa" text-anchor="middle" >Python 3.11+, stdlib only</text>
-<rect x="461" y="286" width="166" height="27" rx="13.5" fill="#f97316" fill-opacity="0.14" stroke="#f97316" stroke-opacity="0.6"/>
-<text x="544.0" y="304" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#f97316" text-anchor="middle" >Rust · Python · TS</text>
-<rect x="635" y="286" width="122" height="27" rx="13.5" fill="#38bdf8" fill-opacity="0.14" stroke="#38bdf8" stroke-opacity="0.6"/>
-<text x="696.0" y="304" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#38bdf8" text-anchor="middle" >Swarm + TUI</text>
+<rect x="74" y="286" width="76" height="27" rx="13.5" fill="#34d399" fill-opacity="0.14" stroke="#34d399" stroke-opacity="0.6"/>
+<text x="112.0" y="304" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#34d399" text-anchor="middle" >v0.14.0</text>
+<rect x="158" y="286" width="194" height="27" rx="13.5" fill="#a78bfa" fill-opacity="0.14" stroke="#a78bfa" stroke-opacity="0.6"/>
+<text x="255.0" y="304" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#a78bfa" text-anchor="middle" >Python 3.11+ stdlib core</text>
+<rect x="360" y="286" width="196" height="27" rx="13.5" fill="#f97316" fill-opacity="0.14" stroke="#f97316" stroke-opacity="0.6"/>
+<text x="458.0" y="304" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#f97316" text-anchor="middle" >Rust · Python · TS · Go</text>
+<rect x="564" y="286" width="218" height="27" rx="13.5" fill="#38bdf8" fill-opacity="0.14" stroke="#38bdf8" stroke-opacity="0.6"/>
+<text x="673.0" y="304" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#38bdf8" text-anchor="middle" >TUI · Tailscale Web · Daemon</text>
 </svg>

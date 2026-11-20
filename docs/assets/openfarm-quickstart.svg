@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="206" viewBox="0 0 1280 206" role="img" aria-labelledby="qs-t qs-d">
-<title id="qs-t">openfarm quickstart flow</title>
-<desc id="qs-d">Five steps from an empty folder or existing repository to reviewed branches: New or existing repo (Rust, Python, or TypeScript via init or adopt), 1. Install (Read and install this skill), 2. Initialize (/openfarm-initialize or openfarm adopt), Checked queue (invariants, golden slice, and baseline-checked cards), and Swarm + TUI (parallel gated branches, inspect in openfarm tui or drive, and merge locally).</desc>
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="224" viewBox="0 0 1280 224" role="img" aria-labelledby="qs-t qs-d">
+<title id="qs-t">openfarm v0.14.0 iterative workflow</title>
+<desc id="qs-d">Five-stage iterative loop: 1. Idea and Stack (TypeScript/Web, Python, Rust, or Go in an empty folder or existing repo), 2. Grill and Spec (Frontier Architect conversational grill into Living Spec and ordered Chunks), 3. Split into Cards (DAG-ordered cards with baseline tests green and live Architect log), 4. Farm Run (workers run deterministic gates in TUI, detached daemon, or swarm), and 5. Review and Local Land (review in TUI or Tailscale Web Companion, land locally with zero push, and iterate on the next chunk).</desc>
 <defs>
   <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
     <stop offset="0" stop-color="#0b1220"/><stop offset="1" stop-color="#17233d"/>
@@ -9,51 +9,60 @@
     <path d="M0,0 L10,5 L0,10 z" fill="#9fb0c8"/>
   </marker>
 </defs>
-<rect x="0" y="0" width="1280" height="206" rx="18" fill="url(#bg)"/>
-<rect x="0.5" y="0.5" width="1279" height="205" rx="18" fill="none" stroke="#ffffff" stroke-opacity="0.08"/>
+<rect x="0" y="0" width="1280" height="224" rx="18" fill="url(#bg)"/>
+<rect x="0.5" y="0.5" width="1279" height="223" rx="18" fill="none" stroke="#ffffff" stroke-opacity="0.08"/>
 
-<text x="40" y="46" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="20" font-weight="700" fill="#f1f5f9" text-anchor="start">From empty folder or existing repo to gated branches</text>
+<text x="40" y="44" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="20" font-weight="700" fill="#f1f5f9" text-anchor="start">Idea → Grill → Living Spec &amp; Chunks → Cards → Run → Land → Iterate</text>
 
-<rect x="862" y="26" width="124" height="26" rx="13" fill="#a78bfa" fill-opacity="0.14" stroke="#a78bfa" stroke-opacity="0.6"/>
-<text x="924" y="43" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#a78bfa" text-anchor="middle">frontier skill</text>
+<rect x="854" y="24" width="132" height="26" rx="13" fill="#a78bfa" fill-opacity="0.14" stroke="#a78bfa" stroke-opacity="0.6"/>
+<text x="920" y="41" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#a78bfa" text-anchor="middle">frontier architect</text>
 
-<rect x="998" y="26" width="126" height="26" rx="13" fill="#fbbf24" fill-opacity="0.14" stroke="#fbbf24" stroke-opacity="0.6"/>
-<text x="1061" y="43" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#fbbf24" text-anchor="middle">gated by code</text>
+<rect x="996" y="24" width="126" height="26" rx="13" fill="#fbbf24" fill-opacity="0.14" stroke="#fbbf24" stroke-opacity="0.6"/>
+<text x="1059" y="41" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#fbbf24" text-anchor="middle">gated by code</text>
 
-<rect x="1136" y="26" width="112" height="26" rx="13" fill="#34d399" fill-opacity="0.14" stroke="#34d399" stroke-opacity="0.6"/>
-<text x="1192" y="43" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#34d399" text-anchor="middle">swarm + tui</text>
+<rect x="1132" y="24" width="116" height="26" rx="13" fill="#34d399" fill-opacity="0.14" stroke="#34d399" stroke-opacity="0.6"/>
+<text x="1190" y="41" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#34d399" text-anchor="middle">tui · web · daemon</text>
 
 <rect x="32" y="68" width="224" height="112" rx="14" fill="#38bdf8" fill-opacity="0.10" stroke="#38bdf8" stroke-opacity="0.75" stroke-width="1.5"/>
-<text x="144" y="104" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="16.5" font-weight="700" fill="#f1f5f9" text-anchor="middle">New or existing repo</text>
-<text x="144" y="129" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#9fb0c8" text-anchor="middle">Rust, Python, or TypeScript</text>
-<text x="144" y="151" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#5b6b85" text-anchor="middle">init or openfarm adopt</text>
+<circle cx="62" cy="98" r="13" fill="#38bdf8"/>
+<text x="62" y="103" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="14" font-weight="800" fill="#0b1220" text-anchor="middle">1</text>
+<text x="84" y="103" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="16.5" font-weight="700" fill="#f1f5f9" text-anchor="start">Idea &amp; Stack</text>
+<text x="144" y="132" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#9fb0c8" text-anchor="middle">TS/Web · Python · Rust · Go</text>
+<text x="144" y="153" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#64748b" text-anchor="middle">empty folder or existing repo</text>
 
 <rect x="280" y="68" width="224" height="112" rx="12" fill="#a78bfa" fill-opacity="0.12" stroke="#a78bfa" stroke-opacity="0.75" stroke-width="1.5"/>
-<circle cx="310" cy="99" r="13" fill="#a78bfa"/>
-<text x="310" y="104" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="14" font-weight="800" fill="#0b1220" text-anchor="middle">1</text>
-<text x="332" y="104" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="17" font-weight="700" fill="#f1f5f9" text-anchor="start">Install</text>
-<text x="392" y="132" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="400" fill="#9fb0c8" text-anchor="middle">"Read and install</text>
-<text x="392" y="152" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="400" fill="#9fb0c8" text-anchor="middle">this skill &lt;repo&gt;"</text>
+<circle cx="310" cy="98" r="13" fill="#a78bfa"/>
+<text x="310" y="103" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="14" font-weight="800" fill="#0b1220" text-anchor="middle">2</text>
+<text x="332" y="103" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="16.5" font-weight="700" fill="#f1f5f9" text-anchor="start">Grill &amp; Spec</text>
+<text x="392" y="132" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#9fb0c8" text-anchor="middle">Conversational Grill →</text>
+<text x="392" y="153" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="12" font-weight="500" fill="#c4b5fd" text-anchor="middle">PROJECT_SPEC + CHUNKS</text>
 
 <rect x="528" y="68" width="224" height="112" rx="12" fill="#a78bfa" fill-opacity="0.12" stroke="#a78bfa" stroke-opacity="0.75" stroke-width="1.5"/>
-<circle cx="558" cy="99" r="13" fill="#a78bfa"/>
-<text x="558" y="104" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="14" font-weight="800" fill="#0b1220" text-anchor="middle">2</text>
-<text x="580" y="104" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="17" font-weight="700" fill="#f1f5f9" text-anchor="start">Initialize</text>
-<text x="640" y="132" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="13" font-weight="600" fill="#f1f5f9" text-anchor="middle">/openfarm-initialize</text>
-<text x="640" y="152" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="13" font-weight="400" fill="#9fb0c8" text-anchor="middle">or openfarm adopt</text>
+<circle cx="558" cy="98" r="13" fill="#a78bfa"/>
+<text x="558" y="103" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="14" font-weight="800" fill="#0b1220" text-anchor="middle">3</text>
+<text x="580" y="103" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="16.5" font-weight="700" fill="#f1f5f9" text-anchor="start">Split to Cards</text>
+<text x="640" y="132" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#9fb0c8" text-anchor="middle">Runnable slice + DAG cards</text>
+<text x="640" y="153" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#64748b" text-anchor="middle">live Architect log + green base</text>
 
 <rect x="776" y="68" width="224" height="112" rx="14" fill="#fbbf24" fill-opacity="0.10" stroke="#fbbf24" stroke-opacity="0.75" stroke-width="1.5"/>
-<text x="888" y="104" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="16.5" font-weight="700" fill="#f1f5f9" text-anchor="middle">Checked queue</text>
-<text x="888" y="129" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="400" fill="#9fb0c8" text-anchor="middle">invariants + golden slice</text>
-<text x="888" y="151" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#9fb0c8" text-anchor="middle">+ baseline-checked cards</text>
+<circle cx="806" cy="98" r="13" fill="#fbbf24"/>
+<text x="806" y="103" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="14" font-weight="800" fill="#0b1220" text-anchor="middle">4</text>
+<text x="828" y="103" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="16.5" font-weight="700" fill="#f1f5f9" text-anchor="start">Farm Run</text>
+<text x="888" y="132" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#9fb0c8" text-anchor="middle">Phase A/B + 20+ code gates</text>
+<text x="888" y="153" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="12" font-weight="500" fill="#fde68a" text-anchor="middle">run · daemon · swarm</text>
 
 <rect x="1024" y="68" width="224" height="112" rx="14" fill="#34d399" fill-opacity="0.10" stroke="#34d399" stroke-opacity="0.75" stroke-width="1.5"/>
-<text x="1136" y="104" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="16.5" font-weight="700" fill="#f1f5f9" text-anchor="middle">Swarm + TUI</text>
-<text x="1136" y="129" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="400" fill="#9fb0c8" text-anchor="middle">parallel gated branches</text>
-<text x="1136" y="151" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#34d399" text-anchor="middle">inspect in tui, merge</text>
+<circle cx="1054" cy="98" r="13" fill="#34d399"/>
+<text x="1054" y="103" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="14" font-weight="800" fill="#0b1220" text-anchor="middle">5</text>
+<text x="1076" y="103" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="16.5" font-weight="700" fill="#f1f5f9" text-anchor="start">Review &amp; Land</text>
+<text x="1136" y="132" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#9fb0c8" text-anchor="middle">TUI or Tailscale Web UI</text>
+<text x="1136" y="153" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#34d399" text-anchor="middle">local merge · next chunk ↻</text>
 
 <line x1="258" y1="124" x2="277" y2="124" stroke="#9fb0c8" stroke-width="2" marker-end="url(#ah)"/>
 <line x1="506" y1="124" x2="525" y2="124" stroke="#9fb0c8" stroke-width="2" marker-end="url(#ah)"/>
 <line x1="754" y1="124" x2="773" y2="124" stroke="#9fb0c8" stroke-width="2" marker-end="url(#ah)"/>
 <line x1="1002" y1="124" x2="1021" y2="124" stroke="#9fb0c8" stroke-width="2" marker-end="url(#ah)"/>
+
+<path d="M1136,182 L1136,204 L392,204 L392,184" fill="none" stroke="#34d399" stroke-opacity="0.7" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#ah)"/>
+<text x="764" y="199" font-family="Inter, 'Segoe UI', -apple-system, Helvetica, Arial, sans-serif" font-size="12" font-weight="500" fill="#34d399" text-anchor="middle">Iterate: mark chunk done, split next chunk, or start a new feature idea</text>
 </svg>

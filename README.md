@@ -66,12 +66,9 @@ Frontier models are brilliant at product architecture, scoping, and review, and 
 
 openfarm is designed around the natural product development cycle — whether you're starting from a vague idea in an empty directory or shipping a targeted feature in a mature codebase:
 
-```text
-Idea ──▶ Conversational Grill ──▶ Living Spec & Chunks ──▶ Split Chunk into Cards
-  ▲                                                                │
-  │                                                                ▼
-  └──────────── Iterate (Next Chunk or New Idea) ◀── Review & Local Land ◀── Farm Run
-```
+<p align="center">
+  <img src="docs/assets/openfarm-quickstart.svg" alt="Iterative workflow: Idea &amp; Stack -> Grill &amp; Spec -> Split to Cards -> Farm Run -> Review &amp; Local Land -> Iterate" width="100%">
+</p>
 
 | Stage | Where | What happens |
 | --- | --- | --- |
