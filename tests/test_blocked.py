@@ -39,6 +39,12 @@ class TriageTests(unittest.TestCase):
         self.assertEqual((got["kind"], got["main_label"]), ("check", "Run it myself"))
         self.assertEqual([o["label"] for o in got["others"]], ["Accept anyway", "Retry"])
 
+    def test_a_review_whose_answer_was_cut_off_is_not_the_builders_fault(self) -> None:
+        got = triage(_record("review-cut-off"))  # from the acceptance run: the reviewer hit its token limit
+        self.assertEqual((got["kind"], got["main_label"]), ("check", "Run it myself"))
+        self.assertTrue(got["why"].startswith("The reviewer's answer could not be read, so the work was never judged."))
+        self.assertNotIn("turned the work down", got["why"])
+
     def test_the_same_failure_twice_stops_being_the_builders_fault(self) -> None:
         record = _record("banned-pattern")
         self.assertEqual(triage(record, [dict(record)])["kind"], "task")

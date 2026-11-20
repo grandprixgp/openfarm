@@ -74,14 +74,17 @@ def triage(record: dict, earlier: list[dict] | None = None) -> dict:
     low = detail.lower()
     counter = record.get("counter_tests") or {}
     repeated = _same_way(record, list(earlier or []))
-    if code in _CHECK_CODES or (counter.get("failed") and code in ("checker-reject", "attempts")):
+    # The reviewer's answer was lost (cut off, unreadable): the work was never judged, so no blame falls on it.
+    unjudged = bool(counter.get("unreadable")) or "could not be read" in low
+    if code in _CHECK_CODES or unjudged or (counter.get("failed") and code in ("checker-reject", "attempts")):
         kind = "check"
     elif code in _TASK_CODES or any(word in low for word in _TASK_WORDS) or repeated:
         kind = "task"
     else:
         kind = "builder"
     spec = KINDS[kind]
-    plain = _PLAIN.get(code, "The task stopped")
+    plain = ("The reviewer's answer could not be read, so the work was never judged" if unjudged
+             else _PLAIN.get(code, "The task stopped"))
     if repeated and kind == "task" and code not in _TASK_CODES:
         plain += ", the same way as last time"
     return {

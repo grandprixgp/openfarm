@@ -95,6 +95,7 @@ class AskModal(ModalScreen[str | None]):
     AskModal { align: center middle; }
     AskModal > Vertical { width: 76; max-width: 96%; height: auto; background: $surface; border: round $primary; padding: 1 2; }
     AskModal TextArea { height: 7; margin: 1 0; }
+    AskModal .hint { height: auto; max-height: 12; }
     AskModal .keys { color: $foreground-muted; }
     """
 
@@ -106,7 +107,8 @@ class AskModal(ModalScreen[str | None]):
         with Vertical():
             yield Static(f"[b]{esc(self._title)}[/]")
             if self._hint:
-                yield Static(esc(self._hint), classes="keys")
+                with VerticalScroll(classes="hint"):  # a builder's whole question fits here, scrolled if long
+                    yield Static(esc(self._hint), classes="keys")
             yield TextArea(self._text, id="ask-text", soft_wrap=True)
             yield Static("Ctrl+Enter send · Esc cancel", classes="keys")
 
@@ -1205,8 +1207,8 @@ class Journey(App):
             self.say(f"You answered {target}'s question; it is back in the queue")
             self.refresh_screen(focus=True)
 
-        self.push_screen(AskModal(f"{finding['from_card']} asks: {finding['title']}", finding.get("body_preview") or ""),
-                         answered)
+        self.push_screen(AskModal(f"{finding['from_card']} asks: {finding['title']}",
+                                  (finding.get("body") or finding.get("body_preview") or "")[:3000]), answered)
 
     def do_pause(self) -> None:
         self._run_cli("Pausing the build", [["pause"]], "Paused: tasks being built finish, no new one starts")
