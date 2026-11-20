@@ -1,8 +1,10 @@
-# From Empty Folder to Shipped App (Openfarm v0.8.5 Starter Guide)
+# From Empty Folder to Shipped App (Openfarm v0.14.0 Starter Guide)
 
-This guide shows **both human owners and prospective frontier AI agents** how to go from an **empty folder** and a **plain-English idea** (`"An app to track my calories"`) to a gate-verified, human-reviewed application using **Openfarm v0.8.5**.
+This guide shows **both human owners and prospective frontier AI agents** how to go from an **empty folder** and a **plain-English idea** to a gate-verified, human-reviewed application using **Openfarm v0.14.0**.
 
-> **For related docs:** See [README.md](../README.md) for architecture overview, [docs/USAGE-AND-FIRST-DEPLOYMENT.md](USAGE-AND-FIRST-DEPLOYMENT.md) for detailed configuration & operator runbooks on existing repositories (`tallybox`), and [docs/openfarm-internals.md](openfarm-internals.md) for module internals.
+> **Interactive Studio shortcut (v0.13.0–v0.14.0):** You can also just run bare `openfarm` inside any empty folder (TypeScript/Web, Python, Rust, or Go) to walk through **Idea → Conversational Frontier Architect Grill → Living Spec & Ordered Chunks (`.openfarm/CHUNKS.json`) → Split Chunk into Cards (with Live Architect Log) → Farm Run / `openfarm daemon` → Review & Local Land / `openfarm web --tailscale` → Iterate**. The walkthrough below documents the CLI & slash-command flow using a Rust example (`calorie-log`).
+>
+> **For related docs:** See [README.md](../README.md) for the v0.14.0 overview, [docs/USAGE-AND-FIRST-DEPLOYMENT.md](USAGE-AND-FIRST-DEPLOYMENT.md) for detailed configuration & operator runbooks on existing repositories (`tallybox`), and [docs/openfarm-internals.md](openfarm-internals.md) for module internals.
 
 ---
 
