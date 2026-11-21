@@ -1459,6 +1459,17 @@ class FlowTests(_Folder):
             self.assertIn("effort low  (every project)", str(app.query_one("#mod-now").render()))
             self.assertEqual(load_config(app.repo).micromanager.effort, "low")
 
+            listed = {"frontier": "claude", "endpoint": "https://b.example/v1",
+                      "architect": {"models": ["opus"], "efforts": []}, "reviewer": {"models": ["opus"], "efforts": []},
+                      "builder": {"models": ["acme/coder-1", "acme/coder-2"], "efforts": [], "ok": True, "error": ""}}
+            with mock.patch("openfarm_core.setup_helper.catalogue", return_value=listed):
+                app.do_models_list()
+                await app.workers.wait_for_complete()
+                await pilot.pause(0.2)
+            self.assertIn("2 models on offer: acme/coder-1, acme/coder-2", str(app.query_one("#mod-now").render()))
+            self.assertEqual(await app.query_one("#mod-builder-model").suggester.get_suggestion("acme/coder-2"[:11] + "2"),
+                             "acme/coder-2")
+
             app.do_models_clear()
             await pilot.pause(0.2)
             self.assertEqual(mc.load_choices(mc.global_path()), {})

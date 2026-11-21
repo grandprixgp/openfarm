@@ -362,5 +362,6 @@ def probe_worker_endpoint(
         "model": wanted,
         "model_found": model_found,
         "models_count": len(models),
+        "models": sorted(set(models))[:2000],
         "error": error,
     }

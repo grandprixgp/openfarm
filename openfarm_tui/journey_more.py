@@ -401,7 +401,43 @@ class MorePanes:
         self.query_one("#mod-now", Static).update("\n".join(lines))
 
     def _actions_models(self):
-        return ("models_save", "Save"), [("models_clear", "Clear these choices")], "Tab next field · Esc back"
+        return ("models_save", "Save"), [("models_list", "List the models on offer"),
+                                         ("models_clear", "Clear these choices")], "Tab next field · Esc back"
+
+    def do_models_list(self) -> None:
+        if not self.busy:
+            self._set_busy("Asking the builders' provider which models it offers")
+            self._catalogue_bg()
+
+    @work(thread=True, exit_on_error=False)
+    def _catalogue_bg(self) -> None:
+        from openfarm_core.setup_helper import catalogue
+
+        try:
+            listed = catalogue()
+        except Exception as exc:  # noqa: BLE001 - shown, never raised
+            listed = {"builder": {"ok": False, "error": str(exc), "models": []}, "architect": {"models": []}}
+        self.call_from_thread(self._catalogued, listed)
+
+    def _catalogued(self, listed: dict) -> None:
+        from textual.suggester import SuggestFromList
+
+        names = list(listed["builder"]["models"])
+        frontier = list(listed["architect"]["models"])
+        if names:  # typing in the field now completes to a listed name
+            self.query_one("#mod-builder-model", Input).suggester = SuggestFromList(names, case_sensitive=False)
+        for role in ("architect", "reviewer"):
+            if frontier:
+                self.query_one(f"#mod-{role}-model", Input).suggester = SuggestFromList(frontier, case_sensitive=False)
+        if listed["builder"]["ok"]:
+            shown = ", ".join(esc(n) for n in names[:12]) + (f" and {len(names) - 12} more" if len(names) > 12 else "")
+            self._mod_note = (f"[b]Builders[/]: {len(names)} models on offer: {shown}. Start typing in the field and "
+                              "→ completes the name.")
+        else:
+            self._mod_note = f"[$error]✗[/] The builders' provider did not answer: {esc(listed['builder']['error'] or 'no reason given')}"
+        if frontier:
+            self._mod_note += f"\n[b]Architect and reviewer[/]: {', '.join(frontier)}, or empty for the provider's own default."
+        self._set_busy("")
 
     def do_models_save(self, clear: bool = False) -> None:
         target = self._models_file()
