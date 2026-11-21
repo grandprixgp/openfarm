@@ -42,7 +42,7 @@ from openfarm_core.automode import (
     preflight_plan,
     something_wrong,
 )
-from openfarm_core.blocked import apply_fix_and_retry, propose_fix, run_check
+from openfarm_core.blocked import apply_fix_and_retry, propose_fix, run_check, settle_question
 from openfarm_core.bootstrap import initialize_project
 from openfarm_core.config import CONFIG_PATH, load_config
 from openfarm_core.daemon import daemon_status, read_daemon_logs, start_daemon
@@ -364,6 +364,7 @@ class Journey(App):
         self._slots: dict[str, str] = {}  # button id -> the action it does now
         self._more: list[tuple] = []  # actions of this screen that had no room for a button
         self.shown: dict = {}  # the facts the step on screen was drawn from
+        self._sorting: set[str] = set()  # builders' questions being sorted, or sorted, in this window
         self._auto_tried: set[str] = set()  # goals tried without being asked, so a try that can't be saved isn't repeated
 
     # -- layout ---------------------------------------------------------------
@@ -636,6 +637,10 @@ class Journey(App):
         self._draw_busy()
         self._show_actions(primary, secondary)
         self._render_activity()
+        fresh = [f for f in self.real.get("unsorted") or [] if f["id"] not in self._sorting]
+        if fresh:
+            self._sorting.update(f["id"] for f in fresh)
+            self._sort_questions(fresh)
         if changed or focus:
             self.call_after_refresh(self._focus_for_screen)
         if name == "build" and not changed:
@@ -1145,6 +1150,31 @@ class Journey(App):
             return self._draw_busy()
         self._following = True
         self._build_bg("")
+
+    @work(thread=True, exit_on_error=False, group="sort")
+    def _sort_questions(self, findings: list[dict]) -> None:
+        """A builder's question is shown only if it is the owner's. The rest never interrupt: sorted here, quietly."""
+        try:
+            cfg = self._cfg()
+            backend, _reason = open_architect_backend(self.repo, cfg)
+        except Exception:  # noqa: BLE001 - with no Architect the questions go to the owner
+            backend = None
+        for finding in findings:
+            try:
+                outcome = settle_question(self.repo, cfg, open_store(self.repo, cfg), finding, backend)
+            except Exception as exc:  # noqa: BLE001 - shown in the strip; it is asked again next time the app opens
+                self.call_from_thread(self.say, f"{finding['from_card']}'s question could not be sorted: {exc}")
+                continue
+            self.call_from_thread(self._question_sorted, finding, outcome)
+
+    def _question_sorted(self, finding: dict, outcome: dict) -> None:
+        who = finding["from_card"]
+        if outcome["for"] == "architect":
+            self.say(f"{who} asked a question the Architect could answer; the answer is in the task")
+            return self._resume_build()
+        if outcome["for"] == "nobody":
+            self.say(f"{who} left a note about the tooling; it is filed with the builders' notes")
+        self.refresh_screen()
 
     def _resume_build(self) -> None:
         """The user just unblocked a task: the build goes back to work without a second press."""

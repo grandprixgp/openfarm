@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import difflib
 import json
+import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -207,6 +208,71 @@ def triage_card(state_dir: Path, card_id: str) -> dict | None:
                        "test. " + "; ".join(broke_old) + ". The task has to keep that test passing, or say how.")
     got["checks"] = checks
     return got
+
+
+#: A builder writing about the build's own tooling. That is a note for whoever looks after the tooling, never a
+#: question about the product.
+_TOOLING = re.compile(r"\bharness\b|\bcues?\b|\blessons? (?:file|learned)\b|\bopenfarm\b|\bworktree\b|\bcard format\b",
+                      re.IGNORECASE)
+
+
+def _spec(root: Path, cfg) -> str:
+    from .store import read_doc
+
+    return read_doc(root, cfg, "spec")
+
+
+def settle_question(root: Path, cfg, store, finding: dict, backend=None) -> dict:
+    """Decide who a builder's question is for, and deal with it when it is not the owner's.
+
+    Returns `{"for": "owner" | "architect" | "nobody", "answer"}`. A note about the tooling is filed and nobody is
+    asked. A question the spec, the task or the code settles is answered by the Architect: the answer goes into the
+    task, as the owner's would, and a stopped task goes back in the queue. Only a choice about what the product
+    should do or look like, which nothing written settles, is left for the owner, and is marked so it is asked once.
+    """
+    from .findings import decide_finding
+    from .frontier_review import _extract_json_dict
+
+    fid, target = str(finding["id"]), str(finding.get("from_card") or "")
+    title, body = str(finding.get("title") or ""), str(finding.get("body") or "")
+    if _TOOLING.search(f"{title}\n{body}"):
+        decide_finding(root, cfg, fid, "dismissed", reason="about the build's own tooling, not the product; kept as a note")
+        return {"for": "nobody", "answer": ""}
+
+    def for_owner() -> dict:
+        header, text = store.read(fid)
+        store.src._write(fid, dict(header, audience="owner"), text, f"{fid}: only the owner can answer this")
+        return {"for": "owner", "answer": ""}
+
+    if backend is None or not target:
+        return for_owner()
+    try:
+        task_header, task_body = store.read(target)
+        prompt = (
+            "A builder working on one task of a software project has asked a question. Decide who has to answer it.\n"
+            "The owner is asked ONLY for a choice about what the product should do or how it should look that the spec "
+            "and the task leave open. Everything else you answer yourself, in one to three plain sentences the builder "
+            "can act on: how to implement something, which of two readings of the task is meant, a detail the spec, the "
+            "task or the existing code already settles, a recommendation the builder is only asking to have confirmed "
+            "(confirm it, or say what to do instead).\n"
+            'Return ONLY JSON: {"for": "owner" or "architect", "answer": "<your answer; empty when it is for the owner>"}'
+            f"\n\n## The spec\n\n{_spec(root, cfg)[:6000]}"
+            f"\n\n## The task {target}: {task_header.get('title') or ''}\n\n{task_body[:6000]}"
+            f"\n\n## The builder's question\n\n{title}\n\n{body[:3000]}"
+            + _files_now(root, task_header)
+        )
+        parsed = _extract_json_dict(str(backend.ask(prompt) if hasattr(backend, "ask") else backend(prompt))) or {}
+    except Exception:  # noqa: BLE001 - an Architect that can't be reached leaves the question with the owner
+        return for_owner()
+    answer = str(parsed.get("answer") or "").strip()
+    if str(parsed.get("for") or "").strip().lower() != "architect" or not answer:
+        return for_owner()
+    store.change_card(target, "edit", by="architect", why=f"the Architect's answer to its question ({fid})",
+                      apply=lambda h, b: (h, b.rstrip() + f"\n\n## Answer from the Architect\n\n{title}\n\n{answer}\n"))
+    decide_finding(root, cfg, fid, "folded", reason=answer, target_card=target)
+    if store.states().get(target) == "blocked":
+        store.change_card(target, "retry", by="architect", why="its question was answered")
+    return {"for": "architect", "answer": answer}
 
 
 def given_back(record: dict | None) -> bool:

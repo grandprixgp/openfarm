@@ -151,6 +151,7 @@ def gather(repo: Path, config_path: Path | None = None) -> dict:
     session = load_session(repo)
     facts = {"repo": repo, "name": repo.name, "cfg": None, "spec": False, "spec_text": "", "goals": [],
              "goal": None, "goal_no": 0, "tasks": [], "all_tasks": [], "running": False, "questions": [],
+             "unsorted": [],
              "try_needed": False, "try_plan": {}, "tried": None, "tried_any": None, "session": session,
              "asking": bool(session["asking"] and (session["pending"] or session["history"]))}
     cfg_file = Path(config_path) if config_path else repo / CONFIG_PATH
@@ -184,7 +185,11 @@ def gather(repo: Path, config_path: Path | None = None) -> dict:
     except Exception:  # noqa: BLE001
         waiting = []
     mine = {t["id"] for t in facts["tasks"]}
-    facts["questions"] = [f for f in waiting if f.get("from_card") in mine and f.get("holds_up")]
+    held = [f for f in waiting if f.get("from_card") in mine and f.get("holds_up")]
+    # A builder's question is the owner's only once that is known. The rest are sorted first: answered by the
+    # Architect or filed as a note, and never shown as a question.
+    facts["questions"] = [f for f in held if f.get("audience") == "owner"]
+    facts["unsorted"] = [f for f in held if f.get("audience") != "owner"]
     facts["try_plan"] = how_to_start(repo, cfg)
     facts["try_needed"] = facts["try_plan"].get("kind") == "web"
     if goal:

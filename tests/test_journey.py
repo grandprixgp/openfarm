@@ -699,7 +699,8 @@ class FlowTests(_Folder):
             header, text = store.read("W1-01")
             store.src._write("W1-01", dict(header, state="blocked"), text, "W1-01: blocked")
             store.src._write("FIND-1", {"id": "FIND-1", "title": "Which user-agent string should the feed request send?",
-                                        "state": "backlog", "category": "finding", "from_card": "W1-01"},
+                                        "state": "backlog", "category": "finding", "from_card": "W1-01",
+                                        "audience": "owner"},
                              "Wikimedia asks for one that names the app.", "FIND-1: asked")
             header, text = store.read("W1-02")
             store.src._write("W1-02", dict(header, state="done"), text, "W1-02: done")
@@ -718,6 +719,30 @@ class FlowTests(_Folder):
             await self.settle(app, pilot)
             self.started.assert_called_once()  # and the build goes back to work without being told to
             self.assertIn("Starting the build", "\n".join(app.activity))
+
+        self.drive("build", body)
+
+    def test_a_question_that_is_not_the_owners_is_answered_without_being_shown(self) -> None:
+        async def body(app, pilot) -> None:
+            from openfarm_core.store import Store
+
+            self.backend.ask.return_value = json.dumps({"for": "architect", "answer": "Send openfarm-iotd/1.0."})
+            store = Store(app.repo, app.facts["cfg"])
+            header, text = store.read("W1-01")
+            store.src._write("W1-01", dict(header, state="blocked"), text, "W1-01: blocked")
+            store.src._write("FIND-1", {"id": "FIND-1", "title": "Which user-agent string should the feed request send?",
+                                        "state": "backlog", "category": "finding", "from_card": "W1-01"},
+                             "The existing proxy already sends one.", "FIND-1: asked")
+            app.refresh_screen()
+            self.assertEqual(app.facts["questions"], [])  # not shown while it is being sorted
+            self.assertTrue(app.query_one("#build-question").has_class("hidden"))
+            await self.settle(app, pilot)
+            await self.settle(app, pilot)
+            self.assertIn("## Answer from the Architect", store.read("W1-01")[1])
+            self.assertIn("a question the Architect could answer", "\n".join(app.activity))
+            self.assertEqual(app.facts["questions"], [])
+            self.assertTrue(app.query_one("#build-question").has_class("hidden"))
+            self.started.assert_called_once()  # and the build picked the task up again
 
         self.drive("build", body)
 

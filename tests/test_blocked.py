@@ -176,6 +176,69 @@ class FixTests(_Project):
         self.assertEqual(apply_fix_and_retry(self.store, "W1-01", fix)["state"], "ready")  # no retry needed: it was never blocked
         self.assertEqual(shown()["state"], "ready")
 
+    def _question(self, title: str, body: str = "") -> dict:
+        from openfarm_core.findings import list_findings
+
+        self.store.change_card("W1-01", "create", header=_header("W1-01"), body=BODY)
+        header, text = self.store.read("W1-01")
+        self.store.src._write("W1-01", dict(header, state="blocked"), text, "W1-01: blocked")
+        self.store.src._write("FIND-1", {"id": "FIND-1", "title": title, "state": "backlog", "category": "finding",
+                                         "from_card": "W1-01"}, body, "FIND-1: asked")
+        return list_findings(self.root, self.cfg)["findings"][0]
+
+    def _waiting(self) -> list[dict]:
+        from openfarm_core.findings import list_findings
+
+        return list_findings(self.root, self.cfg, state_filter="waiting")["findings"]
+
+    def test_a_question_the_architect_can_answer_never_reaches_the_owner(self) -> None:
+        # from the acceptance run: "regex case sensitivity differs from sizedImageUrl" was shown as a question for the owner
+        from openfarm_core.blocked import settle_question
+
+        finding = self._question("Should the count ignore case?", "The task says count words; the helper lowercases.")
+        asked = []
+        got = settle_question(self.root, self.cfg, self.store, finding, backend=lambda prompt: asked.append(prompt) or json.dumps(
+            {"for": "architect", "answer": "Yes: lowercase first, as the existing helper does."}))
+        self.assertEqual(got["for"], "architect")
+        self.assertIn("Should the count ignore case?", asked[0])
+        self.assertIn("The owner is asked ONLY for a choice about what the product should do", asked[0])
+        header, body = self.store.read("W1-01")
+        self.assertIn("## Answer from the Architect", body)
+        self.assertIn("lowercase first", body)
+        self.assertNotEqual(header["state"], "blocked")  # back in the queue
+        self.assertEqual(self._waiting(), [])
+
+    def test_a_product_choice_is_left_for_the_owner_and_asked_once(self) -> None:
+        from openfarm_core.blocked import settle_question
+
+        finding = self._question("Should deleted words still be counted?")
+        got = settle_question(self.root, self.cfg, self.store, finding, backend=lambda prompt: json.dumps({"for": "owner", "answer": ""}))
+        self.assertEqual(got["for"], "owner")
+        self.assertEqual([f["audience"] for f in self._waiting()], ["owner"])
+        self.assertEqual(self.store.read("W1-01")[0]["state"], "blocked")
+        self.assertNotIn("Answer from", self.store.read("W1-01")[1])
+
+    def test_with_no_architect_the_question_goes_to_the_owner(self) -> None:
+        from openfarm_core.blocked import settle_question
+
+        def down(prompt):
+            raise TimeoutError("no answer")
+
+        for backend in (None, down, lambda prompt: "not json at all"):
+            finding = self._question("Which separator should the output use?") if backend is None else self._waiting()[0]
+            self.assertEqual(settle_question(self.root, self.cfg, self.store, finding, backend=backend)["for"], "owner")
+        self.assertEqual([f["audience"] for f in self._waiting()], ["owner"])
+
+    def test_a_note_about_the_tooling_is_filed_and_nobody_is_asked(self) -> None:
+        # from the acceptance run: "Harness cues are inconsistent with this card" was shown as a question to answer
+        from openfarm_core.blocked import settle_question
+
+        finding = self._question("Harness cues are inconsistent with this card", "Cue 3 says X, the card says Y.")
+        got = settle_question(self.root, self.cfg, self.store, finding, backend=lambda prompt: self.fail("nobody is asked"))
+        self.assertEqual(got["for"], "nobody")
+        self.assertEqual(self._waiting(), [])
+        self.assertEqual(self.store.read("W1-01")[0]["state"], "blocked")  # it stopped for its own reason: that still shows
+
     def test_no_fix_is_said_plainly(self) -> None:
         self.store.change_card("W1-01", "create", header=_header("W1-01"), body=BODY)
         self.assertIsNone(propose_fix(self.root, self.cfg, self.store, "W1-01"))

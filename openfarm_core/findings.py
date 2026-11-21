@@ -183,6 +183,7 @@ def list_findings(
             "from_card_title": titles_by_id.get(src_id, src_id),
             "from_card_state": states_by_id.get(src_id, ""),
             "holds_up": holds_up(src_id),
+            "audience": str(hdr.get("audience") or ""),  # "owner" once it is known that only the owner can answer
             "created_at": created_at,
             "state": raw_state,
             "decision": decision,
