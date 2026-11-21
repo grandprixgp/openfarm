@@ -344,6 +344,33 @@ One `openfarm` CLI with **37 subcommands**, shared exit codes (`0` ok, `1` refus
 
 ---
 
+## Global learning
+
+- Every project learns lessons from its own cards, as before. Each lesson is marked `project` or `general`. Claude claims one, and plain code keeps it `project` if it names one of the project's files, functions, cards or its name.
+- A general lesson that has helped on 3 or more cards, with fewer hurts than helps, goes to a global library at `~/.openfarm/global/harness`, unless the project sets `share = false`. `[harness] global_dir` moves the library. Notes about openfarm's own bookkeeping, fixed-rule hints, long lessons and lessons with code never go.
+- Other projects import a global lesson as a new lesson of their own and try it like one. A project that finds it hurts switches it off for itself. Two such projects, or a negative combined score, retire it everywhere.
+- `[harness] learn_from = "both" | "project" | "global"` picks which lessons apply. The default is `both`, and `openfarm run --learn-from ...` overrides it for one run.
+- `openfarm harness status --global` lists the global lessons and their source projects. `openfarm harness demote <id> --global` retires one, and `openfarm harness promote <id> --global` brings it back.
+- Bench runs use a throwaway global library of their own, so they never read or change yours.
+- Sharing lessons across a live two-project exchange ran on 17 Nov 2026 (`proj-alpha` promoted `g-52723ab8fa` via `harness promote --global`, and `proj-beta` imported and applied it in a live `tier:dsf` run to pass hidden tests); multi-card organic accumulation across two long-lived external repositories remains **untested**.
+
+## Efficacy bench
+
+`openfarm bench` measures whether the farm pays off, with your own models. It ships 12 tasks in `bench/` (6 Rust, 6 Python, across small features, pinned bug fixes, patterns and refactors), each with a starting project, a card, and hidden tests that the models never see.
+
+```bash
+openfarm bench list
+openfarm bench run --dry-run                      # scripted answers, costs nothing
+openfarm bench run --arm farm=farm.toml --arm solo=solo.toml
+```
+
+Each run starts from a fresh copy of the task's project and runs its card. Then it copies the hidden tests onto the result and runs the whole suite. There are two arms:
+
+- **farm**: your worker model, with a frontier supervisor if you like.
+- **solo**: the frontier model doing every worker role itself, through the same briefs and gates.
+
+An arm file sets only the model and supervisor tables; copy one from [`bench/arms/`](bench/arms/) (Claude, Codex and Antigravity examples; for Codex, set `binary = "codex-exec"` in the copy). Each task runs 3 times per arm by default. The report (`bench-report.md` and `.json`) gives pass rate, tokens, tokens per pass, the worker's share of those tokens and per-category pass rates for each arm, lists any run that did not start with its reason, and stays on your machine. The workers and the supervisor still see each card and starting project, as in any run. Results so far are in [`docs/bench-v0.8.5.md`](docs/bench-v0.8.5.md) (3 repeats) and [`docs/bench-v0.8.1.md`](docs/bench-v0.8.1.md) (one repeat). A 25-card pilot on a real Rust crate, with frontier baselines, is in [`docs/pilot-v0.8.6.md`](docs/pilot-v0.8.6.md).
+
 ## Configuration
 
 Each repository carries `.openfarm/config.toml` on its base branch (`openfarm init` / `openfarm adopt` writes a validated one). Unknown tables or keys are rejected so a typo can never silently disable a gate.
