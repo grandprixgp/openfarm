@@ -966,6 +966,30 @@ class FlowTests(_Folder):
 
         self.drive("build", body)
 
+    def test_a_task_unblocked_while_the_last_build_is_still_ending_is_built_once_it_has_ended(self) -> None:
+        # v0.20 live run: the answer came in the second the build finished, and the task sat at "not started"
+        async def body(app, pilot) -> None:
+            from openfarm_core.store import Store
+
+            store = Store(app.repo, app.facts["cfg"])
+            for card in ("W1-01", "W1-03"):
+                header, text = store.read(card)
+                store.src._write(card, dict(header, state="ready"), text, f"{card}: ready")
+            app._following = True  # the build that stopped it has not let go yet
+            self.started.reset_mock()
+            app._resume_build()
+            await pilot.pause(0.2)
+            self.started.assert_not_called()
+            self.assertTrue(app._resume_wanted)
+            app._following = False
+            app._tick()
+            await app.workers.wait_for_complete()
+            await pilot.pause(0.2)
+            self.started.assert_called_once()
+            self.assertFalse(app._resume_wanted)
+
+        self.drive("build", body)
+
     def test_any_goal_can_be_opened_from_the_keyboard(self) -> None:
         async def body(app, pilot) -> None:
             actions = dict(app.palette_actions())

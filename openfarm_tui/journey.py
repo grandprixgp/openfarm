@@ -375,6 +375,7 @@ class Journey(MorePanes, App):
         self._more: list[tuple] = []  # actions of this screen that had no room for a button
         self.shown: dict = {}  # the facts the step on screen was drawn from
         self._health_len = 26
+        self._resume_wanted = False  # a task was unblocked while the last build was still ending
         self.share = ""  # who spent the tokens, in words; the top bar's tooltip and the log say it
         self._unrecorded = 0  # Architect tokens spent before the folder was a project, so not in its ledger yet
         self._sorting: set[str] = set()  # builders' questions being sorted, or sorted, in this window
@@ -782,6 +783,8 @@ class Journey(MorePanes, App):
         elif len(self.screen_stack) == 1 and self.facts.get("cfg") is not None:
             try:
                 self.refresh_screen()  # picks up what a running build did
+                if self._resume_wanted and not self._following and not self.facts["running"]:
+                    self._resume_build()
             except NoMatches:  # the window is being taken down under this tick: nobody is left to show it to
                 pass
 
@@ -1214,8 +1217,12 @@ class Journey(MorePanes, App):
         """The user just unblocked a task: the build goes back to work without a second press."""
         self.refresh_screen(focus=True)
         waiting = [t for t in self.facts["tasks"] if t["state"] == "ready"]
-        if waiting and not self._following and not self.facts["running"] and not self._refusal():
-            self.do_build()
+        self._resume_wanted = False
+        if waiting and not self._refusal():
+            if self._following or self.facts["running"]:
+                self._resume_wanted = True  # the build that just stopped it is still winding down: the tick restarts it
+            else:
+                self.do_build()
 
     def _refusal(self) -> str:
         cfg = self._cfg()
