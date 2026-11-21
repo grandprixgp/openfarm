@@ -189,7 +189,7 @@ or key is refused, so a typo cannot quietly switch a check off. The tables, budg
 
 ## What has been tested
 
-- **The offline suite:** TESTCOUNT tests, all passing, on Python 3.14 and Linux. Some are skipped when a tool
+- **The offline suite:** 1,912 tests, all passing, on Python 3.14 and Linux. Some are skipped when a tool
   such as `tsc`, `ruff` or `bwrap` is not installed.
 - **A live run on 21 Nov 2026:** a fresh TypeScript project taken from one sentence to three accepted goals
   inside the screen: 11 tasks, the project's 51 tests passing, Try it passing at desktop and phone size. The
