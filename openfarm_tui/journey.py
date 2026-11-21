@@ -1645,8 +1645,15 @@ class Journey(MorePanes, App):
         if kind == "check":
             return ("run_check", "Run it myself"), [("accept_anyway", "Accept anyway"), ("retry_task", "Retry")], \
                 "Enter run the check · " + keys
-        return ("retry_task", "Retry"), [("edit_task", "Edit the task myself"), ("skip_task", "Skip this task")], \
-            "Enter retry · " + keys
+        # the builder fell short. A retry starts from the same task, so after it has failed more than once the
+        # better move is to have the Architect put what the tries found into the task
+        rest = [("edit_task", "Edit the task myself"), ("skip_task", "Skip this task")]
+        if self.fix:
+            return ("apply_fix", "Apply fix and retry"), [("retry_task", "Retry as it is"), *rest], "Enter apply and retry · " + keys
+        learn = ("ask_fix", "Have the Architect rework the task")
+        if task["tries"] >= 2:
+            return learn, [("retry_task", "Retry"), *rest], "Enter ask the Architect · " + keys
+        return ("retry_task", "Retry"), [learn, *rest], "Enter retry · " + keys
 
     def do_apply_fix(self) -> None:
         cfg = self._cfg()
@@ -1660,9 +1667,16 @@ class Journey(MorePanes, App):
         task = self._find()
 
         def step(backend, _progress):
+            from openfarm_core.blocked import records
+
             cfg = self._cfg()
-            return propose_fix(self.repo, cfg, open_store(self.repo, cfg), task["id"],
-                               why=(task["triage"] or {}).get("why", ""), backend=backend)
+            # everything the tries found, not only the last stop: the rewrite should not walk into an earlier one
+            found = [" ".join(str(r.get("detail") or r.get("stop_code") or "").split())[:700]
+                     for r in records(cfg.state_dir, task["id"])]
+            why = (task["triage"] or {}).get("why", "")
+            if len(found) > 1:
+                why += "\nWhat each try so far ended on:\n" + "\n".join(f"- try {n}: {d}" for n, d in enumerate(found, 1) if d)
+            return propose_fix(self.repo, cfg, open_store(self.repo, cfg), task["id"], why=why, backend=backend)
 
         self._step("fix", f"Asking the Architect how to fix {task['id']}", step)
 

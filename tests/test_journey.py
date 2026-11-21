@@ -1081,6 +1081,35 @@ class FlowTests(_Folder):
 
         self.drive("build", body)
 
+    def test_a_task_the_builder_keeps_failing_can_be_reworked_by_the_architect_with_what_the_tries_found(self) -> None:
+        # the owner's report: four tries ended on the same thing and the only offer was another Retry
+        async def body(app, pilot) -> None:
+            app._open("blocked", "W1-04")
+            await pilot.pause(0.2)
+            task = app._find()
+            once = {**task, "triage": {**task["triage"], "kind": "builder"}, "tries": 1}
+            app.fix = None
+            with mock.patch.object(app, "_find", return_value=once):
+                primary, others, _keys = app._actions_blocked()
+            self.assertEqual(primary, ("retry_task", "Retry"))
+            self.assertEqual(others[0], ("ask_fix", "Have the Architect rework the task"))
+            with mock.patch.object(app, "_find", return_value={**once, "tries": 4}):
+                primary, others, _keys = app._actions_blocked()
+                self.assertEqual(primary, ("ask_fix", "Have the Architect rework the task"))  # Retry alone has not worked
+                self.assertEqual(others[0], ("retry_task", "Retry"))
+                tries = [{"claimed_at": "2026-11-21T10:33:00Z", "detail": "tsconfig lacks allowImportingTsExtensions"},
+                         {"claimed_at": "2026-11-21T14:14:00Z", "detail": "the same error signature came back twice"}]
+                with mock.patch("openfarm_core.blocked.records", return_value=tries), \
+                        mock.patch("openfarm_tui.journey.propose_fix", return_value=None) as asked:
+                    app.do_ask_fix()
+                    await app.workers.wait_for_complete()
+                    await pilot.pause(0.2)
+            why = asked.call_args.kwargs["why"]
+            self.assertIn("- try 1: tsconfig lacks allowImportingTsExtensions", why)  # every try's finding reaches the Architect
+            self.assertIn("- try 2: the same error signature came back twice", why)
+
+        self.drive("blocked", body)
+
     def test_the_safety_stop_says_why_and_is_cleared_from_the_build_screen(self) -> None:
         # the message used to point at Settings, which had nothing to clear it with
         async def body(app, pilot) -> None:
