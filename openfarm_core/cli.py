@@ -91,7 +91,14 @@ from .swarm import (
     swarm_status,
     swarm_tiers,
 )
-from .tui import VIEWS as TUI_VIEWS, run_tui
+from . import tui as _tui_mod
+from .tui import run_tui
+
+TUI_VIEWS = getattr(
+    _tui_mod,
+    "CLI_VIEWS",
+    _tui_mod.VIEWS + ("studio", "review", "projects", "findings", "engine", "providers"),
+)
 
 EXIT_OK = 0
 EXIT_REFUSED = 1
@@ -920,6 +927,8 @@ def _do_run(ctx: Context, args, run_id: str, *, on_event=None) -> int:
                     message=str(outcome.get("detail") or outcome.get("final_state") or ""),
                 )
                 final_state = outcome.get("final_state")
+                _maybe_auto_land(ctx, source, card_id, run_id, outcome, event_bus)
+                _notify_card_outcome(cfg, card_id, outcome)
                 if final_state == "released":
                     skip_released[card_id] = str(outcome.get("card_hash") or "")
                 else:
@@ -991,6 +1000,7 @@ def _do_run(ctx: Context, args, run_id: str, *, on_event=None) -> int:
 
             def _record_swarm_outcome(cid: str, outcome: dict) -> bool:
                 nonlocal consecutive
+                _maybe_auto_land(ctx, source, cid, run_id, outcome, event_bus)
                 with rec_lock:
                     final_state = outcome.get("final_state")
                     infra_stop = False
@@ -1014,7 +1024,8 @@ def _do_run(ctx: Context, args, run_id: str, *, on_event=None) -> int:
                             outcome.get("micromanager_spend", 0.0) or 0.0
                         )
                     tripped = _update_breaker(ctx, consecutive)
-                    return infra_stop or tripped
+                _notify_card_outcome(cfg, cid, outcome)
+                return infra_stop or tripped
 
             swarm_runner = SwarmRunner(
                 cfg=cfg,
@@ -1052,6 +1063,20 @@ def _do_run(ctx: Context, args, run_id: str, *, on_event=None) -> int:
             cards_count=len(outcomes),
             message=f"Finished run {run_id} ({len(outcomes)} outcome(s))",
         )
+        if not args.dry_run:
+            in_rev = sum(
+                1 for o in outcomes
+                if str(o.get("final_state") or "").lower().replace("-", "_") == "in_review"
+            )
+            blocked_n = sum(1 for o in outcomes if o.get("final_state") == "blocked")
+            landed_n = sum(
+                1 for o in outcomes
+                if isinstance(o.get("auto_land"), dict) and o["auto_land"].get("landed")
+            )
+            parts = [f"{len(outcomes)} outcome(s)", f"{in_rev} in review", f"{blocked_n} blocked"]
+            if landed_n:
+                parts.append(f"{landed_n} auto-landed")
+            _notify_run_event(cfg, "wave_finished", f"Run {run_id} finished", ", ".join(parts))
 
     notes: list[str] = []
     if not _backend_prices_spend(cfg, script_path):
@@ -1762,6 +1787,84 @@ def _member_token_breakdown(board: Board, split: dict) -> dict:
     return result
 
 
+def _notify_run_event(cfg, event: str, title: str, body: str) -> None:
+    """Best-effort lifecycle notification; never raises into the run loop."""
+    try:
+        from .notify import send_notification
+        send_notification(cfg, event, title, body)
+    except Exception:
+        pass
+
+
+def _notify_card_outcome(cfg, card_id: str, outcome: dict) -> None:
+    final_state = str(outcome.get("final_state") or "").lower().replace("-", "_")
+    if final_state == "in_review":
+        auto_land = outcome.get("auto_land")
+        if isinstance(auto_land, dict) and auto_land.get("landed"):
+            body = f"{card_id} auto-landed onto {auto_land.get('integration_branch', '')}"
+        else:
+            body = str(outcome.get("detail") or f"{card_id} is ready for review")
+        _notify_run_event(cfg, "card_in_review", f"{card_id}: in review", body)
+    elif final_state == "blocked":
+        code = str(outcome.get("stop_code") or "").strip()
+        detail = str(outcome.get("detail") or "").strip()
+        body = f"{code}: {detail}" if (code and detail) else (detail or code or "blocked")
+        _notify_run_event(cfg, "card_blocked", f"{card_id}: blocked", body)
+
+
+def _maybe_auto_land(
+    ctx: Context,
+    source: FileCardSource,
+    card_id: str,
+    run_id: str,
+    outcome: dict,
+    event_bus,
+) -> None:
+    """Attempt opt-in `[factory] auto_land` when a card finishes `in_review`."""
+    fcfg = getattr(ctx.cfg, "factory", None)
+    if fcfg is None or not getattr(fcfg, "auto_land", False):
+        return
+    final_state = str(outcome.get("final_state") or "").lower().replace("-", "_")
+    if final_state != "in_review":
+        return
+    try:
+        from .factory import auto_land_card
+
+        card = Card.from_dict(source.read(card_id)["card"])
+        branch = str(outcome.get("branch") or f"openfarm/{card.id}-{card.slug()}")
+        if isinstance(outcome.get("gates"), list) and outcome["gates"]:
+            gate_record = outcome
+        else:
+            gate_record = read_json(
+                ctx.state.card_dir(card.id, run_id) / "gates" / "summary.json"
+            ) or {}
+        findings = outcome.get("findings")
+        if findings is None:
+            findings = outcome.get("findings_filed") or []
+        landed = auto_land_card(
+            ctx.repo,
+            ctx.cfg,
+            source,
+            card,
+            branch=branch,
+            record=gate_record,
+            findings=list(findings) if findings else [],
+            frontier_report=outcome.get("frontier_report"),
+        )
+        outcome["auto_land"] = landed
+        if landed.get("landed"):
+            event_bus.emit(
+                kind="card_auto_landed",
+                card_id=card.id,
+                branch=branch,
+                integration_branch=landed.get("integration_branch", ""),
+                commit=landed.get("commit", ""),
+                message=f"{card.id} auto-landed onto {landed.get('integration_branch', '')}",
+            )
+    except (Refused, AdapterError, Infra, OSError) as exc:
+        outcome["auto_land"] = {"landed": False, "error": str(exc)}
+
+
 def _update_breaker(ctx: Context, consecutive: list[tuple[str, str, str]]) -> bool:
     limit = ctx.cfg.circuit_breaker
     if not limit:
@@ -1776,9 +1879,15 @@ def _update_breaker(ctx: Context, consecutive: list[tuple[str, str, str]]) -> bo
     reasons = {code for _cid, code, _detail in window}
     if len(reasons) == 1:
         code = reasons.pop()
+        reason = f"{limit} cards blocked in a row for {code}"
         ctx.state.write_breaker(
-            True, [cid for cid, _c, _d in window],
-            f"{limit} cards blocked in a row for {code}")
+            True, [cid for cid, _c, _d in window], reason)
+        _notify_run_event(
+            ctx.cfg,
+            "breaker_tripped",
+            "Circuit breaker tripped",
+            reason,
+        )
         return True
     return False
 
@@ -3546,7 +3655,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="print detected workspace state, next action, and palette without starting curses")
     auto_p.add_argument("--run", dest="run_id", default=None)
     auto_p.add_argument("--refresh", type=float, default=1.0)
-    auto_p.add_argument("--view", default="overview")
+    auto_p.add_argument("--view", choices=TUI_VIEWS, default="overview")
     auto_p.add_argument("--curses", action="store_true", help="force stdlib curses TUI instead of Textual")
 
     tui_p = sub.add_parser(

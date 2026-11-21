@@ -49,6 +49,11 @@ _COORDINATOR_ACTIONS = frozenset({
     "wait",
 })
 
+
+def _breaker_tripped(state) -> bool:
+    reader = getattr(state, "read_breaker", None)
+    return bool(callable(reader) and (reader() or {}).get("tripped"))
+
 _COORDINATOR_SYSTEM_PROMPT = (
     "You are the swarm coordinator for an Openfarm run. Decide which ready, "
     "non-colliding cards to start and how to handle struggling or handed-back "
@@ -230,7 +235,7 @@ class CoordinatorRuntime:
             if (
                 self.state.kill_requested(self.cfg.kill_switch)
                 or self.state.is_paused()
-                or self.state.read_breaker().get("tripped")
+                or _breaker_tripped(self.state)
             ):
                 return 0
             if self.deadline is not None and time.monotonic() >= self.deadline:
@@ -1700,7 +1705,7 @@ class SwarmRunner:
                         if rt.stop_launching or self.state.kill_requested(self.cfg.kill_switch):
                             if self.state.kill_requested(self.cfg.kill_switch):
                                 reason_skip = "the kill switch was set"
-                            elif self.state.read_breaker().get("tripped"):
+                            elif _breaker_tripped(self.state):
                                 reason_skip = "the circuit breaker is tripped"
                             else:
                                 reason_skip = "run stopped"
@@ -1715,7 +1720,7 @@ class SwarmRunner:
                                     cid, {"card": cid, "skipped": "the queue was paused"}
                                 )
                             rt.pending.clear()
-                        elif self.state.read_breaker().get("tripped"):
+                        elif _breaker_tripped(self.state):
                             for cid in list(rt.pending):
                                 outcomes_by_card.setdefault(
                                     cid, {"card": cid, "skipped": "the circuit breaker is tripped"}

@@ -294,7 +294,10 @@ class OpenAICompatibleBackend:
         for attempt in range(self.retries + 1):
             try:
                 with self._opener.open(request, timeout=self.timeout_s) as response:
-                    raw_bytes = response.read(_MAX_RESPONSE_BYTES + 1)
+                    try:
+                        raw_bytes = response.read(_MAX_RESPONSE_BYTES + 1)
+                    except TypeError:
+                        raw_bytes = response.read()
                     if len(raw_bytes) > _MAX_RESPONSE_BYTES:
                         raise Infra("response-too-large",
                                     "the endpoint response exceeded the maximum allowed size")

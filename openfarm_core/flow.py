@@ -614,10 +614,12 @@ class CardRun:
         return True
 
     def _effective_unit(self) -> str:
-        if self.card.unit:
-            return self.card.unit
-        if not self.effective_unit:
-            self.effective_unit = derive_cargo_unit(self.card.touches, self.worktree)
+        unit = getattr(self.card, "unit", "") or ""
+        if unit:
+            return unit
+        if not getattr(self, "effective_unit", ""):
+            touches = getattr(self.card, "touches", None) or ()
+            self.effective_unit = derive_cargo_unit(touches, self.worktree) if touches else ""
         return self.effective_unit
 
     def _file_finding(self, entry: dict) -> str | None:
