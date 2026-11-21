@@ -287,7 +287,20 @@ class FixTests(_Project):
         self.assertEqual(body.count("## Answer from the Architect"), 2)  # the answer is still kept
         self.assertEqual(self._waiting(), [])
         stopped("run-3", "the reviewer turned the work down")
-        self.assertTrue(answered("A third thing?")["retried"])  # a different stop is a new situation
+        third = answered("A third thing?")  # three stops, even if the last is a new kind: no more tries by itself
+        self.assertEqual((third["retried"], third["stuck"]), (False, True))
+
+    def test_a_second_stop_of_a_different_kind_is_still_tried_again(self) -> None:
+        from openfarm_core.blocked import settle_question
+
+        for run, detail in (("run-1", "the test writer left the allowed paths"), ("run-2", "2 counter-tests fail")):
+            folder = Path(self.cfg.state_dir) / "cards" / "W1-01" / run
+            folder.mkdir(parents=True)
+            (folder / "card-record.json").write_text(json.dumps(
+                {"card_id": "W1-01", "claimed_at": run, "final_state": "blocked", "stop_code": "refused", "detail": detail}))
+        got = settle_question(self.root, self.cfg, self.store, self._question("Which way?", "Not said."),
+                              backend=lambda prompt: json.dumps({"for": "architect", "answer": "The plain way."}))
+        self.assertEqual((got["retried"], got["stuck"]), (True, False))  # a different stop is a new situation
 
     def test_with_no_architect_the_question_goes_to_the_owner(self) -> None:
         from openfarm_core.blocked import settle_question

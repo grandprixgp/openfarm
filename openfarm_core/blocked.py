@@ -259,7 +259,8 @@ def settle_question(root: Path, cfg, store, finding: dict, backend=None) -> dict
     """Decide who a builder's question is for, and deal with it when it is not the owner's.
 
     Returns `{"for": "owner" | "architect" | "nobody", "answer", "retried", "stuck"}`. `stuck` is True when the task
-    had already stopped the same way twice running: answering again would only build it again, so it is left stopped. A note about the tooling is filed and nobody is
+    had already stopped the same way twice running, or three times in any way: answering again would only build it
+    again, so it is left stopped. A note about the tooling is filed and nobody is
     asked. A question the spec, the task or the code settles is answered by the Architect: the answer goes into the
     task, as the owner's would, and a stopped task goes back in the queue. Only a choice about what the product
     should do or look like, which nothing written settles, is left for the owner, and is marked so it is asked once.
@@ -307,9 +308,9 @@ def settle_question(root: Path, cfg, store, finding: dict, backend=None) -> dict
     retried = stuck = False
     if store.states().get(target) == "blocked":
         runs = records(cfg.state_dir, target)
-        stuck = len(runs) >= 2 and all(
-            (runs[-1].get(key) or "") == (runs[-2].get(key) or "") for key in ("stop_code", "detail"))
-        if not stuck:  # stopped the same way twice: an answer did not help, so the task waits for a person
+        stuck = len(runs) >= 3 or (len(runs) == 2 and all(
+            (runs[-1].get(key) or "") == (runs[-2].get(key) or "") for key in ("stop_code", "detail")))
+        if not stuck:  # the same stop twice, or three stops of any kind: answers are not helping, a person looks
             store.change_card(target, "retry", by="architect", why="its question was answered")
             retried = True
     return {"for": "architect", "answer": answer, "retried": retried, "stuck": stuck}
