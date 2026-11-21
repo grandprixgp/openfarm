@@ -1007,6 +1007,9 @@ class FlowTests(_Folder):
             app._run_event({"kind": "log", "card_id": "W1-01", "ts": ts,
                             "message": "W1-01: suite pass — 36 existing test(s)"})
             app._run_event({"kind": "log", "card_id": "W1-01", "ts": ts, "message": "W1-01: fail-before fail — 1 passed"})
+            app._run_event({"kind": "log", "card_id": "W1-01", "ts": ts, "message":
+                            "W1-01: lint fail — rt path can only end with '.ts'\ntests/a.test.ts(4,31): error TS5097: An import "
+                            "path can only end with a '.ts' extension when 'allowImportingTsExtensions' is enabled.\nmore"})
             app._run_event({"kind": "log", "card_id": "W1-01", "ts": ts, "message": "W1-01: something new happened"})
             await pilot.pause(0.2)
             self.assertFalse(box.has_class("hidden"))
@@ -1014,7 +1017,11 @@ class FlowTests(_Folder):
             self.assertIn("What the build is doing", shown)
             self.assertIn("10:55  W1-01  running the checks", shown)
             self.assertIn("W1-01  ✓ the whole test suite passes  36 existing test(s)", shown)
-            self.assertIn("✗ not so: the new tests fail on the old code", shown)
+            self.assertIn("✗ failed: the new tests fail on the old code", shown)
+            # a failed check shows its first whole error line in full, not the cut-off start of the tool's output
+            self.assertIn("when 'allowImportingTsExtensions' is enabled.", " ".join(shown.split()))
+            self.assertNotIn("end with '.ts'", shown)  # the cut-off first line (the whole one says "a '.ts'")
+            self.assertIn("and 1 more lines", shown)
             self.assertIn("something new happened", shown)  # a message with no plain words is still shown
             self.assertNotIn("fail-before", shown)
             for n in range(40):
@@ -1026,6 +1033,51 @@ class FlowTests(_Folder):
             app.refresh_screen()
             await pilot.pause(0.2)
             self.assertTrue(box.has_class("hidden"))  # the build ended: the room goes back
+
+        self.drive("build", body)
+
+    def test_waiting_for_the_architect_shows_what_is_done_and_what_is_arriving(self) -> None:
+        async def body(app, pilot) -> None:
+            box = app.query_one("#busy-log")
+            self.assertTrue(box.has_class("hidden"))
+            app._set_busy("Asking the Architect how to fix W1-01")
+            app._progress("Reading the answer.")
+            app._heard("The typecheck fails because tsconfig lacks a setting.\n")
+            app._heard("So the task should also list tsconfig.json")
+            app._draw_busy()
+            await pilot.pause(0.1)
+            self.assertFalse(box.has_class("hidden"))
+            shown = str(box.render())
+            self.assertIn("✓ Asking the Architect how to fix W1-01", shown)  # the stage that is over
+            self.assertIn("The Architect has written 96 characters so far:", shown)
+            self.assertIn("So the task should also list tsconfig.json", shown)
+            self.assertIn("Reading the answer", str(app.query_one("#busy").render()))
+            app._set_busy("")
+            await pilot.pause(0.1)
+            self.assertTrue(box.has_class("hidden"))
+            app._set_busy("Asking again")  # a new wait starts with an empty log
+            app._draw_busy()
+            await pilot.pause(0.1)
+            self.assertTrue(box.has_class("hidden"))
+            app._set_busy("")
+
+        self.drive("build", body)
+
+    def test_a_stopped_tasks_tries_show_the_whole_reason_wrapped(self) -> None:
+        async def body(app, pilot) -> None:
+            from openfarm_core.blocked import records
+
+            cfg = app.facts["cfg"]
+            said = "The blocker is outside this task. " + "The repo-wide typecheck fails because tsconfig lacks a setting. " * 4 + "END-OF-REASON"
+            with mock.patch("openfarm_core.blocked.records",
+                            return_value=[{**(records(cfg.state_dir, "W1-03") or [{}])[-1], "detail": said}]):
+                app._open("blocked", "W1-03")
+                await pilot.pause(0.3)
+                shown = str(app.query_one("#blocked-tries").render())
+            self.assertIn("END-OF-REASON", shown)  # nothing is cut off
+            lines = shown.splitlines()
+            self.assertGreater(len(lines), 4)  # it wraps under itself
+            self.assertTrue(all(len(line) <= 120 for line in lines))
 
         self.drive("build", body)
 
