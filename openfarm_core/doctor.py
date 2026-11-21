@@ -62,20 +62,6 @@ def compute_touches_conflict_matrix(cards: list) -> dict:
     }
 
 
-def _pid_alive(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-
-
 def run_doctor(
     repo: Path | str = ".",
     *,
@@ -142,9 +128,12 @@ def run_doctor(
         mode = stat.S_IMODE(kf.stat().st_mode)
         if mode != 0o600:
             if fix:
-                os.chmod(kf, 0o600)
-                fixes_applied.append(f"chmod 0600 {kf}")
-                _add("key_permissions", "Worker key permissions", "ok", f"fixed to 0600 ({kf})")
+                try:
+                    os.chmod(kf, 0o600)
+                    fixes_applied.append(f"chmod 0600 {kf}")
+                    _add("key_permissions", "Worker key permissions", "ok", f"fixed to 0600 ({kf})")
+                except OSError as exc:
+                    _add("key_permissions", "Worker key permissions", "fail", f"could not chmod 0600 {kf}: {exc}")
             else:
                 _add(
                     "key_permissions",
@@ -218,23 +207,29 @@ def run_doctor(
     # 7. StateDir checks (stale run.lock, paused/breaker, foreign cards-source, orphaned worktrees)
     if cfg is not None:
         st = StateDir(cfg.state_dir)
-        lock_file = st.root / "run.lock"
+        lock_file = st.run_lock
         if lock_file.is_file():
-            pid = 0
-            try:
-                lock_data = json.loads(lock_file.read_text(encoding="utf-8"))
-                pid = int(lock_data.get("pid") or 0) if isinstance(lock_data, dict) else 0
-            except (OSError, ValueError):
-                pid = 0
-            if pid and _pid_alive(pid):
-                _add("run_lock", "Run lock", "ok", f"active run lock held by pid {pid}")
-            else:
+            stale = st.stale_lock_holder()
+            if stale is not None:
+                pid = stale.get("pid")
                 if fix:
-                    lock_file.unlink(missing_ok=True)
-                    fixes_applied.append(f"removed stale {lock_file}")
-                    _add("run_lock", "Run lock", "ok", "stale run.lock removed")
+                    if st.remove_stale_run_lock() is not None:
+                        fixes_applied.append(f"removed stale {lock_file}")
+                        _add("run_lock", "Run lock", "ok", "stale run.lock removed")
+                    else:
+                        _add("run_lock", "Run lock", "ok", "run.lock is now active")
                 else:
                     _add("run_lock", "Run lock", "warn", f"stale run.lock (pid {pid} not running)", fixable=True)
+            else:
+                holder = st.lock_holder() or {}
+                pid = holder.get("pid")
+                host = holder.get("host") or ""
+                detail = (
+                    f"active run lock held by pid {pid}" + (f" on {host}" if host else "")
+                    if pid
+                    else "run.lock present (holder unknown or unreadable)"
+                )
+                _add("run_lock", "Run lock", "ok", detail)
         else:
             _add("run_lock", "Run lock", "ok", "no stale lock")
 
@@ -254,6 +249,10 @@ def run_doctor(
             if not FileCardSource._worktree_belongs_to_repo(cs_dir, root):
                 if fix:
                     shutil.rmtree(cs_dir)
+                    try:
+                        Git(root).worktree_prune()
+                    except Exception:
+                        pass
                     fixes_applied.append(f"removed foreign cards-source {cs_dir}")
                     _add("cards_source", "Cards worktree", "ok", "rebuilt foreign cards-source worktree")
                 else:
@@ -274,6 +273,11 @@ def run_doctor(
                 if fix:
                     for wt in stray_wts:
                         shutil.rmtree(wt, ignore_errors=True)
+                    if (root / ".git").exists():
+                        try:
+                            Git(root).worktree_prune()
+                        except Exception:
+                            pass
                     fixes_applied.append(f"pruned {len(stray_wts)} orphaned worktree(s)")
                     _add("worktrees", "Orphaned worktrees", "ok", f"pruned {len(stray_wts)} orphaned worktree(s)")
                 else:

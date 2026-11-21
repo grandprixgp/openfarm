@@ -114,18 +114,28 @@ _FORBIDDEN_CONFIG_PREFIXES = (
     "core.sshcommand",
     "core.fsmonitor",
     "core.pager",
+    "core.editor",
+    "core.askpass",
+    "credential.",
+    "diff.external",
+    "filter.",
+    "include.",
+    "includeif.",
 )
 
 
 def _check_config_args(args: list[str]) -> None:
-    """Reject global/system/executable-hook git config invocations."""
+    """Reject global/system/file/executable-hook git config invocations."""
     after_double_dash = False
     for token in args:
         if token == "--" and not after_double_dash:
             after_double_dash = True
             continue
-        if not after_double_dash and token in {"--global", "--system"}:
-            raise GitRefused(f"git config flag {token!r} is refused")
+        if not after_double_dash:
+            if (token in {"--global", "--system", "-f", "--file"}
+                    or token.startswith("--file=")
+                    or (token.startswith("-f") and len(token) > 2)):
+                raise GitRefused(f"git config flag {token!r} is refused")
         if after_double_dash or not token.startswith("-"):
             low = token.lower()
             for prefix in _FORBIDDEN_CONFIG_PREFIXES:
@@ -203,7 +213,13 @@ class Git:
         env.update(self.extra_env)
         try:
             result = subprocess.run(
-                ["git", "-c", "core.hooksPath=/dev/null", *args],
+                [
+                    "git",
+                    "-c", "core.hooksPath=/dev/null",
+                    "-c", "core.quotepath=false",
+                    "-c", "core.fsmonitor=false",
+                    *args,
+                ],
                 cwd=self.cwd, capture_output=True, text=True,
                 env=env, timeout=timeout)
         except (OSError, subprocess.TimeoutExpired) as exc:
@@ -335,6 +351,11 @@ class Git:
             if holder is not None:
                 self.worktree_remove(holder)
                 self._run(["branch", "--force", name, commit])
+                return
+            raise Infra(
+                "git-failed",
+                f"git branch --force {name} {commit} failed: {result.stderr.strip()[:500]}",
+            )
 
     def worktree_add(self, path: Path, ref: str) -> None:
         path = Path(path)
@@ -345,6 +366,10 @@ class Git:
     def worktree_remove(self, path: Path) -> None:
         with _git_lock_for(self.cwd):
             self._run(["worktree", "remove", "--force", str(path)], check=False)
+            self._run(["worktree", "prune"], check=False)
+
+    def worktree_prune(self) -> None:
+        with _git_lock_for(self.cwd):
             self._run(["worktree", "prune"], check=False)
 
     def worktree_list(self) -> list[str]:

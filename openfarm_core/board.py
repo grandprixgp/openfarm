@@ -20,7 +20,7 @@ import threading
 import time
 from pathlib import Path
 
-from .errors import Refused
+from .errors import Infra, Refused
 from .harness_memory import sanitize_lesson_text
 from .state import StateDir, utc_now
 
@@ -466,28 +466,26 @@ class Board:
         key = self.board_dir.resolve()
         rlock, cond = _get_lock_pair(key)
         rlock.acquire()
-        depth = _LOCK_DEPTHS.get(key, 0)
-        if depth > 0:
-            _LOCK_DEPTHS[key] = depth + 1
-            try:
-                yield cond
-            finally:
-                _LOCK_DEPTHS[key] = depth
-                rlock.release()
-            return
-
-        self.board_dir.mkdir(parents=True, exist_ok=True)
-        handle = open(self.lock_path, "a+", encoding="utf-8")
         try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            _LOCK_DEPTHS[key] = 1
-            try:
-                yield cond
-            finally:
-                _LOCK_DEPTHS[key] = 0
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            depth = _LOCK_DEPTHS.get(key, 0)
+            if depth > 0:
+                _LOCK_DEPTHS[key] = depth + 1
+                try:
+                    yield cond
+                finally:
+                    _LOCK_DEPTHS[key] = depth
+                return
+
+            self.board_dir.mkdir(parents=True, exist_ok=True)
+            with open(self.lock_path, "a+", encoding="utf-8") as handle:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                _LOCK_DEPTHS[key] = 1
+                try:
+                    yield cond
+                finally:
+                    _LOCK_DEPTHS[key] = 0
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         finally:
-            handle.close()
             rlock.release()
 
     @contextlib.contextmanager
@@ -555,11 +553,26 @@ class Board:
 
     def _load_members_unlocked(self) -> dict[str, dict]:
         try:
-            data = json.loads(self.members_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+            text = self.members_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
             return {}
+        except OSError as exc:
+            raise Infra(
+                "board-members-unreadable",
+                f"cannot read {self.members_path}: {exc}",
+            ) from exc
+        try:
+            data = json.loads(text)
+        except ValueError as exc:
+            raise Infra(
+                "board-members-corrupt",
+                f"corrupt {self.members_path}: {exc}",
+            ) from exc
         if not isinstance(data, dict):
-            return {}
+            raise Infra(
+                "board-members-corrupt",
+                f"{self.members_path} must contain a JSON object",
+            )
         return {str(k): dict(v) for k, v in data.items() if isinstance(v, dict)}
 
     def _save_members_unlocked(self, members: dict[str, dict]) -> dict[str, dict]:
@@ -750,10 +763,24 @@ class Board:
         A torn or unparseable line (a crash mid-write, a stray byte) is skipped
         on its own; the posts after it are still read.
         """
+        posts, _ = self._load_posts_from_offset_unlocked(0)
+        return posts
+
+    def _load_posts_from_offset_unlocked(self, offset: int) -> tuple[list[dict], int]:
+        """Read posts appended at or after byte `offset`, returning `(posts, new_offset)`."""
         if not self.posts_path.is_file():
-            return []
+            return [], 0
+        size = self.posts_path.stat().st_size
+        if size < offset:
+            offset = 0
+        if size == offset:
+            return [], offset
+        with self.posts_path.open("rb") as fh:
+            fh.seek(offset)
+            chunk = fh.read()
+        new_offset = offset + len(chunk)
         posts: list[dict] = []
-        for raw_line in self.posts_path.read_bytes().split(b"\n"):
+        for raw_line in chunk.split(b"\n"):
             stripped = raw_line.strip()
             if not stripped:
                 continue
@@ -763,7 +790,7 @@ class Board:
                 continue
             if isinstance(item, dict) and isinstance(item.get("seq"), int):
                 posts.append(item)
-        return posts
+        return posts, new_offset
 
     def _last_seq_unlocked(self) -> int:
         if not self.posts_path.is_file():
@@ -1214,11 +1241,19 @@ class Board:
                     if since is None
                     else int(since)
                 )
-                posts = self._matching_posts_unlocked(
+                initial_posts, tail_offset = self._load_posts_from_offset_unlocked(0)
+                matched = [
+                    post
+                    for post in initial_posts
+                    if int(post.get("seq", 0) or 0) > effective_since
+                    and _post_addresses_member(post, member)
+                ]
+                if limit is not None:
+                    matched = matched[:limit]
+                posts = self._clean_posts_for_viewer(
+                    matched,
                     members,
-                    member,
-                    effective_since=effective_since,
-                    limit=limit,
+                    viewer_member=member,
                     for_model=None,
                     viewer_kind="",
                 )
@@ -1251,20 +1286,29 @@ class Board:
                             raise Refused(
                                 "unknown-member", f"unknown board member {as_name!r}"
                             )
-                        posts = self._matching_posts_unlocked(
-                            members,
-                            member,
-                            effective_since=effective_since,
-                            limit=limit,
-                            for_model=None,
-                            viewer_kind="",
-                        )
-                        if posts:
-                            return {
-                                "woke": True,
-                                "posts": posts,
-                                "last_seq": int(posts[-1]["seq"]),
-                            }
+                        new_posts, tail_offset = self._load_posts_from_offset_unlocked(tail_offset)
+                        if new_posts:
+                            matched = [
+                                post
+                                for post in new_posts
+                                if int(post.get("seq", 0) or 0) > effective_since
+                                and _post_addresses_member(post, member)
+                            ]
+                            if limit is not None:
+                                matched = matched[:limit]
+                            if matched:
+                                posts = self._clean_posts_for_viewer(
+                                    matched,
+                                    members,
+                                    viewer_member=member,
+                                    for_model=None,
+                                    viewer_kind="",
+                                )
+                                return {
+                                    "woke": True,
+                                    "posts": posts,
+                                    "last_seq": int(posts[-1]["seq"]),
+                                }
                         if self._is_ended_unlocked():
                             return {"woke": False, "reason": "run-ended", "posts": []}
             finally:

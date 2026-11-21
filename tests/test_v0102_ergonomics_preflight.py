@@ -169,8 +169,12 @@ class ErgonomicsPreflightV0102Tests(unittest.TestCase):
                 commit=True,
             )
             cfg = load_config(repo)
-            # Create a stale run.lock (dead PID) and world-readable key file
-            (st / "run.lock").write_text(json.dumps({"run_id": "stale", "pid": 999999, "host": "dead"}), encoding="utf-8")
+            # Create a stale run.lock (dead PID on this host) and world-readable key file
+            import platform
+            (st / "run.lock").write_text(
+                json.dumps({"run_id": "stale", "pid": 999999, "host": platform.node()}),
+                encoding="utf-8",
+            )
             kf = cfg.key_file
             assert kf is not None
             kf.write_text("sk-test-secret\n", encoding="utf-8")

@@ -12,21 +12,72 @@ strictly disjoint from `repo/`.
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import json
 import os
 import re
 import shutil
 import tempfile
+import threading
 import tomllib
 from pathlib import Path
 
 from .config import CONFIG_PATH, load_config
+from .daemon import _daemon_is_running
 from .errors import ConfigError, Refused
-from .state import utc_now
+from .state import StateDir, utc_now
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _SECTION_RE = re.compile(r"^\s*\[([^\]]+)\]\s*$")
 _KV_RE = re.compile(r"^(\s*)([A-Za-z0-9_-]+)(\s*=\s*)(.*)$")
+
+_REGISTRY_LOCKS_GUARD = threading.Lock()
+_REGISTRY_LOCKS: dict[Path, threading.RLock] = {}
+_REGISTRY_THREAD_DEPTHS = threading.local()
+
+
+def _registry_thread_lock(key: Path) -> threading.RLock:
+    with _REGISTRY_LOCKS_GUARD:
+        lock = _REGISTRY_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _REGISTRY_LOCKS[key] = lock
+        return lock
+
+
+def _registry_depth_map() -> dict[Path, int]:
+    depths = getattr(_REGISTRY_THREAD_DEPTHS, "depths", None)
+    if depths is None:
+        depths = {}
+        _REGISTRY_THREAD_DEPTHS.depths = depths
+    return depths
+
+
+@contextlib.contextmanager
+def _registry_lock(path: Path | None = None):
+    target = Path(path).expanduser() if path is not None else default_projects_path()
+    parent = target.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    lock_path = (parent.resolve() / f".{target.name}.lock")
+    tlock = _registry_thread_lock(lock_path)
+    with tlock:
+        depths = _registry_depth_map()
+        depth = depths.get(lock_path, 0)
+        if depth > 0:
+            depths[lock_path] = depth + 1
+            try:
+                yield
+            finally:
+                depths[lock_path] = depth
+            return
+        with lock_path.open("a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            depths[lock_path] = 1
+            try:
+                yield
+            finally:
+                depths.pop(lock_path, None)
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def default_projects_path() -> Path:
@@ -46,18 +97,37 @@ def _toml_str(value: str) -> str:
     return json.dumps(str(value))
 
 
-def _load_raw_registry(path: Path | None = None) -> dict[str, dict]:
+def _load_raw_registry(path: Path | None = None, *, strict: bool = False) -> dict[str, dict]:
     target = Path(path).expanduser() if path is not None else default_projects_path()
-    if not target.is_file() or target.is_symlink():
+    if target.is_symlink():
+        if strict:
+            raise Refused("symlink-projects", f"refusing to read symlink {target}")
+        return {}
+    if not target.exists():
+        return {}
+    if not target.is_file():
+        if strict:
+            raise Refused("corrupt-projects", f"projects registry {target} is not a regular file")
         return {}
     try:
         parsed = tomllib.loads(target.read_text(encoding="utf-8"))
-    except (OSError, tomllib.TOMLDecodeError):
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        if strict:
+            raise Refused(
+                "corrupt-projects",
+                f"cannot read projects registry {target}: {exc}",
+            ) from exc
         return {}
     if not isinstance(parsed, dict):
+        if strict:
+            raise Refused("corrupt-projects", f"projects registry {target} must be a TOML table")
         return {}
     projects = parsed.get("projects")
+    if projects is None:
+        return {}
     if not isinstance(projects, dict):
+        if strict:
+            raise Refused("corrupt-projects", f"projects registry {target} has invalid [projects] table")
         return {}
     result: dict[str, dict] = {}
     for pid, entry in projects.items():
@@ -105,8 +175,20 @@ def _save_raw_registry(entries: dict[str, dict], path: Path | None = None) -> Pa
     parent = target.parent
     parent.mkdir(parents=True, exist_ok=True)
     resolved_parent = parent.resolve()
-    if str(resolved_parent) not in ("/", "/tmp", "/var/tmp"):
-        os.chmod(resolved_parent, 0o700)
+    protected_parents = {
+        Path("/").resolve(),
+        Path("/tmp").resolve(),
+        Path("/var/tmp").resolve(),
+        Path(tempfile.gettempdir()).resolve(),
+        Path.home().resolve(),
+        (Path.home() / ".config").resolve(),
+    }
+    xdg_config = os.environ.get("XDG_CONFIG_HOME", "").strip()
+    if xdg_config:
+        protected_parents.add(Path(xdg_config).expanduser().resolve())
+    if resolved_parent not in protected_parents:
+        with contextlib.suppress(OSError):
+            os.chmod(resolved_parent, 0o700)
 
     fd, tmp_name = tempfile.mkstemp(prefix=".openfarm-projects-", dir=str(resolved_parent))
     try:
@@ -204,45 +286,46 @@ def register_project(
             "last_opened": utc_now(),
         })
 
-    entries = _load_raw_registry(path)
+    with _registry_lock(path):
+        entries = _load_raw_registry(path, strict=True)
 
-    existing_id = ""
-    for pid, item in entries.items():
-        if Path(item["repo"]).expanduser().resolve() == repo_path:
-            existing_id = pid
-            break
+        existing_id = ""
+        for pid, item in entries.items():
+            if Path(item["repo"]).expanduser().resolve() == repo_path:
+                existing_id = pid
+                break
 
-    if existing_id and not project_id:
-        pid = existing_id
-    else:
-        base_pid = _slugify(project_id or name or meta["name"] or repo_path.name)
-        pid = base_pid
-        suffix = 2
-        while pid in entries and Path(entries[pid]["repo"]).expanduser().resolve() != repo_path:
-            pid = f"{base_pid}-{suffix}"
-            suffix += 1
+        if existing_id and not project_id:
+            pid = existing_id
+        else:
+            base_pid = _slugify(project_id or name or meta["name"] or repo_path.name)
+            pid = base_pid
+            suffix = 2
+            while pid in entries and Path(entries[pid]["repo"]).expanduser().resolve() != repo_path:
+                pid = f"{base_pid}-{suffix}"
+                suffix += 1
 
-    prev = entries.get(pid, {})
-    resolved_state = ""
-    if state_dir is not None and str(state_dir).strip():
-        resolved_state = str(Path(state_dir).expanduser().resolve())
-    elif meta["state_dir"]:
-        resolved_state = meta["state_dir"]
-    elif prev.get("state_dir"):
-        resolved_state = str(prev["state_dir"])
+        prev = entries.get(pid, {})
+        resolved_state = ""
+        if state_dir is not None and str(state_dir).strip():
+            resolved_state = str(Path(state_dir).expanduser().resolve())
+        elif meta["state_dir"]:
+            resolved_state = meta["state_dir"]
+        elif prev.get("state_dir"):
+            resolved_state = str(prev["state_dir"])
 
-    entries[pid] = {
-        "id": pid,
-        "name": str(name or prev.get("name") or meta["name"] or repo_path.name).strip() or pid,
-        "repo": str(repo_path),
-        "state_dir": resolved_state,
-        "language": str(language or meta["language"] or prev.get("language") or "").strip(),
-        "base_branch": str(base_branch or meta["base_branch"] or prev.get("base_branch") or "main").strip() or "main",
-        "idea": str(idea or prev.get("idea") or "").strip(),
-        "last_opened": utc_now(),
-    }
-    _save_raw_registry(entries, path)
-    return _enrich_entry(entries[pid])
+        entries[pid] = {
+            "id": pid,
+            "name": str(name or prev.get("name") or meta["name"] or repo_path.name).strip() or pid,
+            "repo": str(repo_path),
+            "state_dir": resolved_state,
+            "language": str(language or meta["language"] or prev.get("language") or "").strip(),
+            "base_branch": str(base_branch or meta["base_branch"] or prev.get("base_branch") or "main").strip() or "main",
+            "idea": str(idea or prev.get("idea") or "").strip(),
+            "last_opened": utc_now(),
+        }
+        _save_raw_registry(entries, path)
+        return _enrich_entry(entries[pid])
 
 
 def list_projects(*, path: Path | None = None) -> list[dict]:
@@ -312,11 +395,19 @@ def _update_project_section_in_config(repo_path: Path, updates: dict[str, str]) 
     updated_text = "".join(out_lines)
     if updated_text == original:
         return
-    cfg_file.write_text(updated_text, encoding="utf-8")
+    fd, tmp_name = tempfile.mkstemp(prefix=".config-", suffix=".toml.tmp", dir=str(cfg_file.parent))
+    tmp_path = Path(tmp_name)
     try:
-        load_config(repo_path, cfg_file)
-    except (ConfigError, OSError):
-        cfg_file.write_text(original, encoding="utf-8")
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(updated_text)
+            handle.flush()
+        with contextlib.suppress(OSError):
+            shutil.copymode(cfg_file, tmp_path)
+        load_config(repo_path, tmp_path)
+        os.replace(tmp_path, cfg_file)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            tmp_path.unlink(missing_ok=True)
         raise
 
 
@@ -332,35 +423,52 @@ def edit_project(
 ) -> dict:
     """Update project metadata in `projects.toml` (and `[project]` in config.toml when applicable)."""
     pid = str(project_id or "").strip()
-    entries = _load_raw_registry(path)
-    if pid not in entries:
-        raise Refused("project-not-found", f"no registered project {pid!r}")
+    with _registry_lock(path):
+        entries = _load_raw_registry(path, strict=True)
+        if pid not in entries:
+            raise Refused("project-not-found", f"no registered project {pid!r}")
 
-    item = dict(entries[pid])
-    if name is not None and name.strip():
-        item["name"] = name.strip()
-    if repo is not None and str(repo).strip():
-        item["repo"] = str(Path(repo).expanduser().resolve())
-    if language is not None:
-        item["language"] = language.strip()
-    if base_branch is not None and base_branch.strip():
-        item["base_branch"] = base_branch.strip()
-    if idea is not None:
-        item["idea"] = idea.strip()
-    item["last_opened"] = utc_now()
+        item = dict(entries[pid])
+        if name is not None and name.strip():
+            item["name"] = name.strip()
+        if repo is not None and str(repo).strip():
+            item["repo"] = str(Path(repo).expanduser().resolve())
+        if language is not None:
+            item["language"] = language.strip()
+        if base_branch is not None and base_branch.strip():
+            item["base_branch"] = base_branch.strip()
+        if idea is not None:
+            item["idea"] = idea.strip()
+        item["last_opened"] = utc_now()
 
-    repo_path = Path(item["repo"]).expanduser()
-    cfg_updates: dict[str, str] = {}
-    if base_branch is not None and base_branch.strip():
-        cfg_updates["base_branch"] = item["base_branch"]
-    if name is not None and name.strip():
-        cfg_updates["name"] = item["name"]
-    if cfg_updates and repo_path.is_dir():
-        _update_project_section_in_config(repo_path, cfg_updates)
+        repo_path = Path(item["repo"]).expanduser()
+        cfg_updates: dict[str, str] = {}
+        if base_branch is not None and base_branch.strip():
+            cfg_updates["base_branch"] = item["base_branch"]
+        if name is not None and name.strip():
+            cfg_updates["name"] = item["name"]
+        if cfg_updates and repo_path.is_dir():
+            _update_project_section_in_config(repo_path, cfg_updates)
 
-    entries[pid] = item
-    _save_raw_registry(entries, path)
-    return _enrich_entry(item)
+        entries[pid] = item
+        _save_raw_registry(entries, path)
+        return _enrich_entry(item)
+
+
+def _active_state_dir_reason(sd: Path) -> str:
+    """Return a non-empty reason if `sd` has a live run.lock or running daemon."""
+    st = StateDir(sd)
+    if st.run_lock.exists() and st.stale_lock_holder() is None:
+        return "an active run.lock exists"
+    daemon_meta_path = sd / "daemon.json"
+    if daemon_meta_path.is_file() and not daemon_meta_path.is_symlink():
+        try:
+            meta = json.loads(daemon_meta_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            meta = {}
+        if isinstance(meta, dict) and _daemon_is_running(meta):
+            return f"a daemon (pid {meta.get('pid')}) is still running"
+    return ""
 
 
 def remove_project(
@@ -374,47 +482,60 @@ def remove_project(
 
     If `clear_state_dir=True`, Openfarm's external state cache (e.g. `~/.openfarm/<slug>`)
     is deleted ONLY when verified to live strictly inside `allowed_state_root` (default
-    `~/.openfarm`) and strictly disjoint from the project's repository directory.
+    `~/.openfarm`), strictly disjoint from the project's repository directory, and not
+    in use by a live `run.lock` or running daemon.
     """
     pid = str(project_id or "").strip()
-    entries = _load_raw_registry(path)
-    if pid not in entries:
-        raise Refused("project-not-found", f"no registered project {pid!r}")
+    with _registry_lock(path):
+        entries = _load_raw_registry(path, strict=True)
+        if pid not in entries:
+            raise Refused("project-not-found", f"no registered project {pid!r}")
 
-    entry = entries.pop(pid)
-    _save_raw_registry(entries, path)
+        entry = entries[pid]
+        state_str = str(entry.get("state_dir") or "").strip()
+        sd_to_clear: Path | None = None
+        if clear_state_dir and state_str:
+            raw_sd = Path(state_str).expanduser()
+            if not raw_sd.is_symlink() and raw_sd.is_dir():
+                sd = raw_sd.resolve()
+                root = (
+                    Path(allowed_state_root).expanduser().resolve()
+                    if allowed_state_root is not None
+                    else (Path.home() / ".openfarm").resolve()
+                )
+                rp = Path(entry["repo"]).expanduser().resolve()
+                inside_allowed_root = sd != root and sd.is_relative_to(root)
+                disjoint_from_repo = (
+                    sd != rp
+                    and not sd.is_relative_to(rp)
+                    and not rp.is_relative_to(sd)
+                )
+                if inside_allowed_root and disjoint_from_repo:
+                    active_reason = _active_state_dir_reason(sd)
+                    if active_reason:
+                        raise Refused(
+                            "state-dir-active",
+                            f"cannot clear state dir {sd}: {active_reason}",
+                        )
+                    sd_to_clear = sd
 
-    state_cleared = False
-    state_str = str(entry.get("state_dir") or "").strip()
-    if clear_state_dir and state_str:
-        raw_sd = Path(state_str).expanduser()
-        if not raw_sd.is_symlink() and raw_sd.is_dir():
-            sd = raw_sd.resolve()
-            root = (
-                Path(allowed_state_root).expanduser().resolve()
-                if allowed_state_root is not None
-                else (Path.home() / ".openfarm").resolve()
-            )
-            rp = Path(entry["repo"]).expanduser().resolve()
-            inside_allowed_root = sd != root and sd.is_relative_to(root)
-            disjoint_from_repo = (
-                sd != rp
-                and not sd.is_relative_to(rp)
-                and not rp.is_relative_to(sd)
-            )
-            if inside_allowed_root and disjoint_from_repo:
-                shutil.rmtree(sd)
-                state_cleared = True
+        entries.pop(pid)
+        _save_raw_registry(entries, path)
 
-    return {
-        "id": pid,
-        "name": entry.get("name", pid),
-        "repo": entry["repo"],
-        "removed": True,
-        "repo_touched": False,
-        "state_dir": state_str,
-        "state_cleared": state_cleared,
-    }
+        state_cleared = False
+        if sd_to_clear is not None:
+            shutil.rmtree(sd_to_clear)
+            state_cleared = True
+
+        return {
+            "id": pid,
+            "name": entry.get("name", pid),
+            "repo": entry["repo"],
+            "removed": True,
+            "repo_touched": False,
+            "state_dir": state_str,
+            "state_cleared": state_cleared,
+        }
 
 
 def _detect_folder_language(folder: Path) -> str:
