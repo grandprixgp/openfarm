@@ -374,6 +374,7 @@ class Journey(MorePanes, App):
         self._slots: dict[str, str] = {}  # button id -> the action it does now
         self._more: list[tuple] = []  # actions of this screen that had no room for a button
         self.shown: dict = {}  # the facts the step on screen was drawn from
+        self._health_len = 26
         self.share = ""  # who spent the tokens, in words; the top bar's tooltip and the log say it
         self._unrecorded = 0  # Architect tokens spent before the folder was a project, so not in its ledger yet
         self._sorting: set[str] = set()  # builders' questions being sorted, or sorted, in this window
@@ -644,7 +645,8 @@ class Journey(MorePanes, App):
         finally:
             self.shown, self.facts = self.facts, self.real
         where = self._where(picked)
-        room = self.size.width - len(f"openfarm · {facts['name']}") - 36
+        self._draw_health()  # first: how much room the middle has depends on how long the token count is
+        room = self.size.width - len(f"openfarm · {facts['name']}") - self._health_len - 8
         while len(where) > room and where.count(" · ") > 1:  # the last part (minutes, then the count) goes before a word is cut
             where = where.rpartition(" · ")[0]
         self.query_one("#where", Static).update(esc(where if len(where) <= room else where[: max(8, room - 1)] + "…"))
@@ -652,7 +654,6 @@ class Journey(MorePanes, App):
         if not view and not self.overlay and len(line) + 12 <= self.size.width - 2:  # said where there is room; Ctrl+K has it too
             line = f"{keys} · [ ] steps · Ctrl+K everything else"
         self.query_one("#keys", Static).update(esc(line))
-        self._draw_health()
         self._draw_busy()
         self._show_actions(primary, secondary)
         self._render_activity()
@@ -755,6 +756,7 @@ class Journey(MorePanes, App):
         tokens = f"   {total // 1000}k tokens" if total >= 1000 else (f"   {total} tokens" if total else "")
         health = self.query_one("#health", Static)
         health.update("   ".join(f"{marks[ok]} {name}" for name, ok in self.health.items()) + tokens)
+        self._health_len = len("   ".join(f"● {name}" for name in self.health) + tokens)
         self.share = (" · ".join(f"{name} {spent[key]:,} tokens ({100 * spent[key] // total}%)" for key, name in (
             ("builders", "builders"), ("reviewers", "reviewers"), ("architect", "Architect")))
                       if total else "no tokens spent on this project yet")

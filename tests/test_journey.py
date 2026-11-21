@@ -951,6 +951,25 @@ class FlowTests(_Folder):
 
         self.drive("questions", body)
 
+    def test_the_top_bar_keeps_its_gaps_when_the_token_count_grows(self) -> None:
+        # v0.20 live run: at 491k tokens the middle ran into the project's name and its last word was cut
+        async def body(app, pilot) -> None:
+            from openfarm_core.automode import record_architect_use
+
+            record_architect_use(app.facts["cfg"].state_dir, 480_000, 11_000)
+            app._build_started = time.time() - 200
+            with mock.patch.dict(app.real, {"running": True}):
+                app.refresh_screen()
+                await pilot.pause(0.2)
+                where = app.query_one("#where")
+                shown = str(where.render())
+                self.assertIn("491k tokens", str(app.query_one("#health").render()))
+                self.assertLessEqual(len(shown) + 2, where.size.width)
+                self.assertNotIn("…", shown)  # a whole part is dropped before a word is cut
+                self.assertTrue(shown.startswith("Goal 1 of 3"))
+
+        self.drive("build", body, size=(100, 30))
+
     def test_try_it_shows_the_pages_colours_as_swatches(self) -> None:
         async def body(app, pilot) -> None:
             panel = app.query_one("#try-colours")
