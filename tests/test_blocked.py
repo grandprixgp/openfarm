@@ -45,6 +45,34 @@ class TriageTests(unittest.TestCase):
         self.assertTrue(got["why"].startswith("The reviewer's answer could not be read, so the work was never judged."))
         self.assertNotIn("turned the work down", got["why"])
 
+    def test_a_refused_stub_is_named_as_the_cause_and_retry_is_offered(self) -> None:
+        # v0.20 live run: "the test writer left the allowed paths" was shown as "the task is wrong", with only the
+        # Architect to ask; the reviewer's stub had been refused and nothing said so
+        import tempfile
+        from pathlib import Path
+
+        from openfarm_core.blocked import triage_card
+
+        state = Path(tempfile.mkdtemp())
+        for run in ("run-1", "run-2"):
+            gates = state / "cards" / "W1-03" / run / "gates" / "1"
+            gates.mkdir(parents=True)
+            (gates / "micromanager-scaffold.json").write_text(json.dumps({
+                "name": "micromanager-scaffold", "result": "fail",
+                "detail": "scaffold_contract degraded (Refused): src/render.ts: a TypeScript scaffold may only declare: imports "
+                          "and functions whose whole body is one `throw new Error(...)` (a body that is not exactly one throw "
+                          "new Error(...))"}))
+            (gates / "fail-before.json").write_text(json.dumps({
+                "name": "fail-before", "result": "fail", "detail": "on base the frozen tests do not compile"}))
+            (state / "cards" / "W1-03" / run / "card-record.json").write_text(json.dumps({
+                "run_id": run, "card_id": "W1-03", "claimed_at": run, "stop_code": "refused", "attempts": 2,
+                "detail": "the test writer left the allowed paths: src/render.ts"}))
+        got = triage_card(state, "W1-03")
+        self.assertEqual((got["kind"], got["title"], got["main_label"]), ("builder", "The starting stub was refused", "Retry"))
+        self.assertIn("What was wrong with the stub: a body that is not exactly one throw new Error(...)", got["why"])
+        self.assertIn("The task itself may be fine", got["why"])
+        self.assertTrue(got["repeated"])
+
     def test_the_check_that_really_failed_is_named_when_the_stop_reason_hides_it(self) -> None:
         # from the acceptance run: "planner step 1 failed twice" hid a build rule broken on every try
         import tempfile

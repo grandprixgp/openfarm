@@ -162,6 +162,29 @@ def failed_checks(state_dir: Path, record: dict) -> list[str]:
     return lines
 
 
+def stub_refused(state_dir: Path, record: dict) -> str:
+    """Why the reviewer's starting stub was refused in a run, or "" when it was not.
+
+    Without the stub the new tests have nothing to import, so the run ends as "the tests do not compile" or "the
+    test writer wrote outside its files", neither of which says what went wrong.
+    """
+    folder = Path(state_dir) / "cards" / str(record.get("card_id")) / str(record.get("run_id")) / "gates"
+    for path in sorted(folder.glob("*/micromanager-scaffold.json")):
+        try:
+            gate = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if gate.get("result") == "fail":
+            detail = str(gate.get("detail") or "")
+            depth = 0
+            for at in range(len(detail) - 1, -1, -1):  # the reason is the last bracketed part, which may hold brackets
+                depth += (detail[at] == ")") - (detail[at] == "(")
+                if depth == 0:
+                    return detail[at + 1:-1] if detail.endswith(")") else detail[:200]
+            return detail[:200]
+    return ""
+
+
 def guard_tests(state_dir: Path, record: dict) -> list[str]:
     """Named tests that already passed before any code was written in this run: guards, which can never 'fail first'."""
     folder = Path(state_dir) / "cards" / str(record.get("card_id")) / str(record.get("run_id")) / "gates"
@@ -190,6 +213,16 @@ def triage_card(state_dir: Path, card_id: str) -> dict | None:
                    why="The task lists a test that already passes before any code is written, so it can never be shown "
                        "to test the new code: " + "; ".join(guards) + ". It can stay in the test file as a guard, off the "
                        "task's list.")
+        return got
+    stub = stub_refused(state_dir, runs[-1])
+    if stub and str(runs[-1].get("stop_code")) in ("refused", "tests-unprovable", "fail-before"):
+        # The task and the builder are not at fault: the stub the tests import was never put in place.
+        spec = KINDS["builder"]
+        got.update(kind="builder", title="The starting stub was refused", main=spec["main"], main_label=ACTIONS[spec["main"]],
+                   others=[{"id": a, "label": ACTIONS[a]} for a in spec["others"]], checks=[],
+                   why="The reviewer's starting stub for this task was refused, so the new tests had nothing to import "
+                       f"and the build could not go on. What was wrong with the stub: {stub}. The task itself may be "
+                       "fine: a retry asks for the stub again.")
         return got
     checks = failed_checks(state_dir, runs[-1])
     if checks and got["kind"] != "check":
