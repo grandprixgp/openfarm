@@ -200,7 +200,8 @@ Security defaults:
 - **`v0.20.0` — Go anywhere on the journey, and what v0.15.0 left open:**
   - **The journey can be walked**: `[` and `]`, the mouse, or `Ctrl+K` open any step already reached and any goal, as it stands. Looking changes nothing, a step not reached yet says what has to happen first, and `n` or `Esc` returns to the step that needs you.
   - **Three more plan checks**, each with its repair shown on the Plan step: a task whose work needs the network without `network = true`, a task listing a test that already exists and passes, and a task that contradicts a test already in the project.
-  - **A build restarts by itself** after a builder's question is answered, a fix is applied or a task is retried.
+  - **A build restarts by itself** after a builder's question is answered, a fix is applied or a task is retried. A task that stops the same way twice, or three times in any way, waits for you instead of retrying. A build that paused itself says why, and Resume carries on building.
+  - **Starting stubs are repaired, not refused**: a TypeScript stub with a parameter default or `void name;` lines is tidied and accepted, a member added to an existing interface counts as a declaration, and a stub that is still refused is named as that on the stopped-task screen, with Retry.
   - **Builders' questions are sorted first**: the Architect answers what it can from the spec, a note about tooling is filed, and only a question that is yours is shown as one.
   - **Try it judges the first screen**, at desktop and phone size separately: what you would have to scroll to is not "seen". It also shows the page's main colours as swatches.
   - **The token share counts the Architect** too (questions, spec, plans, fixes, answers), beside builders and reviewers.
@@ -416,6 +417,7 @@ Full schema, stop codes, and record formats are in [`docs/USAGE-AND-FIRST-DEPLOY
 
 ### Live end-to-end verification
 
+- **v0.20.0 Live Run (21 Nov 2026, TypeScript/Web):** a fresh project (an "on this day" page) taken from an idea through **two accepted goals** inside the TUI: 7 tasks over 17 task runs, the project's 36 tests passing, Try it passing at desktop and phone size. No task stopped for the three reasons the new plan checks cover, and every earlier step was opened and left again without changing anything. Token share: **67% builders / 25% reviewers / 8% Architect** of 1.68M tokens.
 - **v0.14.0 Live Dogfood (20 Nov 2026, TypeScript/Web):**
   - Fresh repo (`pulse-app`): `init` (inherited Command Code + `x-cmd-zdr: 1`) → `doctor ok=True` → live Claude ACP Grill → Spec & 3 Chunks → 4 DAG-tiered Wave 1 Cards (`eligibility_ok=True`, `baseline_ok=True`, clean git, `0` `.rs` files) → live Web Companion HTTP/SSE → live DeepSeek V4.1 Flash Worker + Claude ACP Supervisor passing **22/22 deterministic gates** (`W1-01 ✓ in-review`, **77% worker / 23% supervisor**) → live `routing` & `timeline` telemetry.
   - **Live Tailscale HTTPS (`20 Nov 2026`):** `tailscale serve --bg --https=8787 http://127.0.0.1:8787` verified serving live `/api/state` over a private tailnet HTTPS URL (`https://<your-node>.ts.net:8787/`).
@@ -428,6 +430,8 @@ Full schema, stop codes, and record formats are in [`docs/USAGE-AND-FIRST-DEPLOY
 ## Not yet tested
 
 > [!WARNING]
+> - The terminal background query (OSC 11) in a real light terminal; it is tested against recorded replies.
+> - Mouse navigation of the journey in a real terminal (covered by `Pilot` tests).
 > - Live execution against real `go`, `vitest`, and `jest` binaries (offline-tested via stand-ins).
 > - Live desktop `notify-send` alerts on a GUI desktop session (webhook POSTs verified against live local HTTP server).
 > - Everything Antigravity (`agy`) unattended (never run `agy` unattended here).
