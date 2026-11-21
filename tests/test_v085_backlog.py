@@ -220,10 +220,13 @@ class SpawnRetryTests(unittest.TestCase):
             self.assertEqual(retry_delays(), SPAWN_RETRY_DELAYS)
 
     def test_the_bridges_and_the_driver_use_it(self) -> None:
-        for name in ("adapters/claude_native_acp.py", "adapters/codex_native_acp.py",
-                     "adapters/agy_native_acp.py", "driver.py"):
+        for name in ("adapters/native_acp_base.py", "driver.py"):
             text = (ROOT / "openfarm_core" / name).read_text()
             self.assertIn("popen_with_retry(", text, name)
+        for name in ("adapters/claude_native_acp.py", "adapters/codex_native_acp.py",
+                     "adapters/agy_native_acp.py"):
+            text = (ROOT / "openfarm_core" / name).read_text()
+            self.assertIn("BaseNativeAcpServer", text, name)
 
 
 class ConfineLinkTests(unittest.TestCase):

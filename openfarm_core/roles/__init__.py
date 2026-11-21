@@ -13,8 +13,7 @@ import random
 import re
 from pathlib import Path
 
-from ..briefs import (Brief, checker_pass1_brief, checker_pass2_brief,
-                      implementer_brief, planner_brief, test_writer_brief)
+from ..briefs import Brief, implementer_brief, test_writer_brief
 from ..cards import Card
 from ..edits import Edit, parse_edits, parse_handback
 from ..errors import Invalid, Refused
@@ -916,10 +915,6 @@ def _json_block(text: str) -> dict | None:
 
 # -- briefs, built here so the flow doesn't need to know the shapes ------------
 
-def build_planner_brief(card, book, harness_guidance: str = "") -> Brief:
-    return planner_brief(card, book, harness_guidance=harness_guidance)
-
-
 def build_test_writer_brief(card, book, pack, conventions="", attempt=1,
                             previous_failure="", guidance: str = "",
                             context_files: list[str] | None = None,
@@ -940,14 +935,3 @@ def build_implementer_brief(card, book, frozen_tests, attempt=1, diff="",
                              step_context=step_context,
                              context_files=context_files,
                              harness_guidance=harness_guidance)
-
-
-def build_checker_pass1_brief(card, test_diff) -> Brief:
-    return checker_pass1_brief(card, test_diff)
-
-
-def build_checker_pass2_brief(card, full_diff, gate_results,
-                              modified_files, answer_form: str = "",
-                              retry_problem: str = "") -> Brief:
-    return checker_pass2_brief(card, full_diff, gate_results, modified_files,
-                               answer_form=answer_form, retry_problem=retry_problem)

@@ -197,30 +197,6 @@ def banned_patterns(added_lines: list[dict], cfg,
     return GateResult("banned-patterns", PASS, detail, evidence)
 
 
-def banned_patterns_any(added_lines: list[dict], cfg,
-                        production_paths: set[str]) -> GateResult:
-    """Non-Rust fallback: the generic pattern list, no language rules."""
-    banned: list[dict] = []
-    generic = (
-        (r"#\s*\[\s*allow\b", "suppression-allow"),
-        (r"eslint-disable", "suppression-eslint"),
-        (r"@ts-ignore", "suppression-ts"),
-        (r"\.skip\s*\(", "test-skip"),
-        (r"\.only\s*\(", "test-only"),
-        (r"\btodo!\s*\(", "leftover-stub"),
-        (r"\bunimplemented!\s*\(", "leftover-stub"),
-        (r"\bdbg!\s*\(", "debug-macro"),
-    )
-    for entry in added_lines:
-        for pattern, label in generic:
-            if re.search(pattern, str(entry.get("text", ""))):
-                banned.append({"pattern": label, "file": entry.get("path", ""),
-                               "line": entry.get("line", 0)})
-    return GateResult("banned-patterns", FAIL if banned else PASS,
-                      f"{len(banned)} banned pattern(s)" if banned else "none",
-                      {"banned": banned})
-
-
 def test_loss(before: dict, after: dict,
               known_failing: list[str] | None = None) -> GateResult:
     """No test may vanish, be skipped, or be newly ignored.

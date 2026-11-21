@@ -171,14 +171,6 @@ class CmdAdapter:
         return result
 
 
-def is_cmd_adapter(spec: str) -> bool:
-    return str(spec).startswith("cmd:")
-
-
-def error_from(exc: AdapterError) -> dict:
-    return make_error("r-0", exc.kind, exc.code, exc.message, exc.retry_after_s)
-
-
 def _safe_int(value) -> int:
     if value is None or isinstance(value, bool):
         return 0
