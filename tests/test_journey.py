@@ -990,6 +990,42 @@ class FlowTests(_Folder):
 
         self.drive("build", body)
 
+    def test_a_build_that_paused_itself_says_why_and_resume_carries_on(self) -> None:
+        # v0.20 live run: the build paused itself on a reviewer answer it could not read; the main button was still
+        # "Build 1 task", which only said "use Resume"
+        async def body(app, pilot) -> None:
+            from openfarm_core.store import Store
+
+            store = Store(app.repo, app.facts["cfg"])
+            for card in ("W1-01", "W1-03"):
+                header, text = store.read(card)
+                store.src._write(card, dict(header, state="ready"), text, f"{card}: ready")
+            header, text = store.read("W1-02")
+            store.src._write("W1-02", dict(header, state="done"), text, "W1-02: done")
+            state = Path(app.facts["cfg"].state_dir)
+            (state / "paused").write_text(json.dumps({"reason": "infra error on W1-03: the reviewer's answer was not JSON"}))
+            app.refresh_screen()
+            await pilot.pause(0.2)
+            self.assertEqual(self.label(app), "▶ Resume and build 2 tasks")
+            self.assertIn("The build can't go on: it is paused (infra error on W1-03", str(app.query_one("#build-title").render()))
+            self.assertNotIn("Resume", self.others(app))  # one Resume, the main one
+            self.started.reset_mock()
+
+            def resumed(commands, done, then=None):
+                (state / "paused").unlink()
+                app.say(done)
+                app._set_busy("")
+                then()
+
+            with mock.patch.object(app, "_cli_bg", side_effect=resumed) as cli:
+                await pilot.press("enter")
+                await app.workers.wait_for_complete()
+                await pilot.pause(0.2)
+            self.assertEqual(cli.call_args.args[0], [["resume"]])
+            self.started.assert_called_once()  # resumed, and the waiting tasks are being built
+
+        self.drive("build", body)
+
     def test_any_goal_can_be_opened_from_the_keyboard(self) -> None:
         async def body(app, pilot) -> None:
             actions = dict(app.palette_actions())

@@ -1230,7 +1230,11 @@ class Journey(MorePanes, App):
         if state.kill_requested(cfg.kill_switch):
             return "it was stopped (use Resume)"
         if state.is_paused():
-            return "it is paused (use Resume)"
+            try:  # the build pauses itself when something outside the task went wrong, and says what
+                why = str(json.loads((Path(cfg.state_dir) / "paused").read_text(encoding="utf-8")).get("reason") or "")
+            except (OSError, ValueError, AttributeError):
+                why = ""
+            return "it is paused" + (f" ({why[:140]})" if why else "") + ": use Resume"
         if state.read_breaker().get("tripped"):
             return "too many tasks failed in a row, so the safety stop is on (Ctrl+K, Settings)"
         return ""
@@ -1368,8 +1372,10 @@ class Journey(MorePanes, App):
         tasks = [t for t in facts["tasks"] if t["state"] != "dropped"]
         accepted = sum(1 for t in tasks if t["state"] == "done")
         started = sum(1 for t in tasks if t["state"] in ("in_progress", "in_review", "blocked", "done"))
+        held = "" if facts["running"] or self.view or facts.get("cfg") is None else self._refusal()
         self.query_one("#build-title", Static).update(
             esc(f"Building {started} of {len(tasks)} tasks" if facts["running"]
+                else f"The build can't go on: {held}" if held.startswith(("it is paused", "it was stopped"))
                 else f"The build is not running · {accepted} of {len(tasks)} tasks accepted"))
         rows = []
         for task in tasks:
@@ -1417,6 +1423,8 @@ class Journey(MorePanes, App):
             primary = ("open_blocked", f"See why {blocked['id']} stopped")
         elif waiting and not facts["running"] and not self._following:
             primary = ("build", f"Build {len(waiting)} task{'s' if len(waiting) != 1 else ''}")
+            if self._refusal().startswith("it is paused") or self._refusal().startswith("it was stopped"):
+                primary = ("resume", f"Resume and build {len(waiting)} task{'s' if len(waiting) != 1 else ''}")
         elif not facts["running"] and not self._following and self._first("backlog"):  # parked by the plan checks
             parked = sum(1 for t in facts["tasks"] if t["state"] == "backlog")
             primary = ("fix_parked", f"Repair {parked} task{'s' if parked != 1 else ''}")
@@ -1427,7 +1435,7 @@ class Journey(MorePanes, App):
             others.append(("open_blocked", f"See why {blocked['id']} stopped"))
         cfg = facts["cfg"]
         held = cfg is not None and (StateDir(cfg.state_dir).is_paused() or StateDir(cfg.state_dir).kill_requested(cfg.kill_switch))
-        if held:
+        if held and not (primary and primary[0] == "resume"):
             others.append(("resume", "Resume"))
         elif facts["running"] or self._following:  # nothing to pause when nothing runs
             others.append(("pause", "Pause"))
@@ -1466,7 +1474,7 @@ class Journey(MorePanes, App):
         self._run_cli("Pausing the build", [["pause"]], "Paused: tasks being built finish, no new one starts")
 
     def do_resume(self) -> None:
-        self._run_cli("Resuming", [["resume"]], "Resumed")
+        self._run_cli("Resuming", [["resume"]], "Resumed", then=self._resume_build)  # and on with what was waiting
 
     def do_open_blocked(self) -> None:
         task = self._selected_task()
@@ -2090,13 +2098,13 @@ class Journey(MorePanes, App):
         self.say("Cancelled")
         self.refresh_screen(focus=True)
 
-    def _run_cli(self, doing: str, commands: list[list[str]], done: str) -> None:
+    def _run_cli(self, doing: str, commands: list[list[str]], done: str, then=None) -> None:
         if not self.busy:
             self._set_busy(doing)
-            self._cli_bg(commands, done)
+            self._cli_bg(commands, done, then)
 
     @work(thread=True, exit_on_error=False)
-    def _cli_bg(self, commands: list[list[str]], done: str) -> None:
+    def _cli_bg(self, commands: list[list[str]], done: str, then=None) -> None:
         base = [sys.executable, "-m", "openfarm_core.cli", "--repo", str(self.repo)]
         if self.config_path is not None:
             base += ["--config", str(self.config_path)]
@@ -2111,6 +2119,8 @@ class Journey(MorePanes, App):
                 break
         self.call_from_thread(self.say, said)
         self.call_from_thread(self._set_busy, "")
+        if then is not None and said == done:
+            self.call_from_thread(then)
 
     # -- keys ---------------------------------------------------------------------
 
