@@ -992,6 +992,43 @@ class FlowTests(_Folder):
 
         self.drive("build", body)
 
+    def test_the_safety_stop_says_why_and_is_cleared_from_the_build_screen(self) -> None:
+        # the message used to point at Settings, which had nothing to clear it with
+        async def body(app, pilot) -> None:
+            from openfarm_core.state import StateDir
+            from openfarm_core.store import Store
+
+            store = Store(app.repo, app.facts["cfg"])
+            for card in ("W1-01", "W1-03"):
+                header, text = store.read(card)
+                store.src._write(card, dict(header, state="ready"), text, f"{card}: ready")
+            header, text = store.read("W1-02")
+            store.src._write("W1-02", dict(header, state="done"), text, "W1-02: done")
+            state = StateDir(app.facts["cfg"].state_dir)
+            state.write_breaker(True, ["W1-01", "W1-03"], "2 cards blocked in a row for phase-b-exhausted")
+            app.refresh_screen()
+            await pilot.pause(0.2)
+            self.assertEqual(self.label(app), "▶ Clear the safety stop and build 2 tasks")
+            title = str(app.query_one("#build-title").render())
+            self.assertIn("the safety stop is on: W1-01, W1-03 stopped one after another", title)
+            self.assertIn("phase-b-exhausted", title)
+            self.assertNotIn("Settings", title)
+            self.started.reset_mock()
+
+            def cleared(commands, done, then=None):
+                state.write_breaker(False, [])
+                app._set_busy("")
+                then()
+
+            with mock.patch.object(app, "_cli_bg", side_effect=cleared) as cli:
+                await pilot.press("enter")
+                await app.workers.wait_for_complete()
+                await pilot.pause(0.2)
+            self.assertEqual(cli.call_args.args[0], [["resume", "--clear-breaker", "--clear-kill"]])
+            self.started.assert_called_once()  # and the build goes on without a second press
+
+        self.drive("build", body)
+
     def test_a_build_that_paused_itself_says_why_and_resume_carries_on(self) -> None:
         # v0.20 live run: the build paused itself on a reviewer answer it could not read; the main button was still
         # "Build 1 task", which only said "use Resume"
@@ -1023,7 +1060,7 @@ class FlowTests(_Folder):
                 await pilot.press("enter")
                 await app.workers.wait_for_complete()
                 await pilot.pause(0.2)
-            self.assertEqual(cli.call_args.args[0], [["resume"]])
+            self.assertEqual(cli.call_args.args[0], [["resume", "--clear-breaker", "--clear-kill"]])
             self.started.assert_called_once()  # resumed, and the waiting tasks are being built
 
         self.drive("build", body)

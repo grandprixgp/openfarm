@@ -1184,7 +1184,7 @@ class Journey(MorePanes, App):
             return
         refusal = self._refusal()
         if refusal:
-            self.note = f"The build can't start: {refusal}."
+            self.note = f"The build can't start: {refusal.rstrip('.')}."
             return self._draw_busy()
         self._following = True
         self._build_bg("")
@@ -1240,8 +1240,12 @@ class Journey(MorePanes, App):
             except (OSError, ValueError, AttributeError):
                 why = ""
             return "it is paused" + (f" ({why[:140]})" if why else "") + ": use Resume"
-        if state.read_breaker().get("tripped"):
-            return "too many tasks failed in a row, so the safety stop is on (Ctrl+K, Settings)"
+        breaker = state.read_breaker()
+        if breaker.get("tripped"):
+            cards = ", ".join(str(c) for c in breaker.get("cards") or []) or "several tasks"
+            code = str(breaker.get("reason") or "").rpartition(" for ")[2]
+            return (f"the safety stop is on: {cards} stopped one after another for the same reason"
+                    + (f" ({code})" if code else "") + ". Clear it once the cause is dealt with")
         return ""
 
     def _attach_running_build(self) -> None:
@@ -1380,7 +1384,7 @@ class Journey(MorePanes, App):
         held = "" if facts["running"] or self.view or facts.get("cfg") is None else self._refusal()
         self.query_one("#build-title", Static).update(
             esc(f"Building {started} of {len(tasks)} tasks" if facts["running"]
-                else f"The build can't go on: {held}" if held.startswith(("it is paused", "it was stopped"))
+                else f"The build can't go on: {held}" if held
                 else f"The build is not running · {accepted} of {len(tasks)} tasks accepted"))
         rows = []
         for task in tasks:
@@ -1428,8 +1432,8 @@ class Journey(MorePanes, App):
             primary = ("open_blocked", f"See why {blocked['id']} stopped")
         elif waiting and not facts["running"] and not self._following:
             primary = ("build", f"Build {len(waiting)} task{'s' if len(waiting) != 1 else ''}")
-            if self._refusal().startswith("it is paused") or self._refusal().startswith("it was stopped"):
-                primary = ("resume", f"Resume and build {len(waiting)} task{'s' if len(waiting) != 1 else ''}")
+            if self._refusal():
+                primary = ("resume", f"{self._resume_word()} and build {len(waiting)} task{'s' if len(waiting) != 1 else ''}")
         elif not facts["running"] and not self._following and self._first("backlog"):  # parked by the plan checks
             parked = sum(1 for t in facts["tasks"] if t["state"] == "backlog")
             primary = ("fix_parked", f"Repair {parked} task{'s' if parked != 1 else ''}")
@@ -1439,9 +1443,9 @@ class Journey(MorePanes, App):
         if blocked and primary and primary[0] != "open_blocked":
             others.append(("open_blocked", f"See why {blocked['id']} stopped"))
         cfg = facts["cfg"]
-        held = cfg is not None and (StateDir(cfg.state_dir).is_paused() or StateDir(cfg.state_dir).kill_requested(cfg.kill_switch))
+        held = cfg is not None and bool(self._refusal())
         if held and not (primary and primary[0] == "resume"):
-            others.append(("resume", "Resume"))
+            others.append(("resume", self._resume_word()))
         elif facts["running"] or self._following:  # nothing to pause when nothing runs
             others.append(("pause", "Pause"))
         verb = primary[1].split()[0].lower() if primary else ""
@@ -1478,8 +1482,14 @@ class Journey(MorePanes, App):
     def do_pause(self) -> None:
         self._run_cli("Pausing the build", [["pause"]], "Paused: tasks being built finish, no new one starts")
 
+    def _resume_word(self) -> str:
+        return "Clear the safety stop" if self._refusal().startswith("the safety stop") else "Resume"
+
     def do_resume(self) -> None:
-        self._run_cli("Resuming", [["resume"]], "Resumed", then=self._resume_build)  # and on with what was waiting
+        # the press is the person's say-so, so it clears whatever is holding the build: `resume` alone refuses
+        # while the safety stop or the stop file is there
+        self._run_cli("Resuming", [["resume", "--clear-breaker", "--clear-kill"]], "Resumed",
+                      then=self._resume_build)  # and on with what was waiting
 
     def do_open_blocked(self) -> None:
         task = self._selected_task()
