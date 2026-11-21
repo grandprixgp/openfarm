@@ -1946,6 +1946,7 @@ class CardRun:
                                   {"cached": True})
                 self._record_gate(gate)
                 self.base_test_list = cached.get("list", {"tests": []})
+                self._refuse_unfixable_base_lint(cached.get("lint_fail"))
                 return
 
             runs = []
@@ -2013,6 +2014,46 @@ class CardRun:
                 f"existing test(s)",
                 {"cached": False, "existing_tests": len(self.base_test_list["tests"])}))
             self._write_baseline_cache(unit, self.base_test_list)
+            self._refuse_unfixable_base_lint(None)
+
+    def _refuse_unfixable_base_lint(self, known: str | None) -> None:
+        """Stop before any model is called when the project fails its own lint in files this task can't change.
+
+        Such a task can never pass its end checks, however often it is retried. It is only done where the
+        language pack has a way out to offer (`base_lint_fix`), so the refusal never leaves the owner stuck.
+        `known` is the failure remembered for this base commit, "" for a clean one, None when not yet run.
+        """
+        fix = getattr(self.pack, "base_lint_fix", None)
+        if not callable(fix) or not fix():
+            return
+        said = known
+        if said is None:
+            purpose = "ws-lint" if self.cfg.workspace_lint else "lint"
+            result = self._run(runner_kind(purpose), self.pack.commands(purpose, unit=self._effective_unit())["argv"],
+                               counted="fixed")
+            if result.cls == INFRA:
+                return  # the tool did not finish: nothing is known, so nothing is refused
+            out, err = self._output(result)
+            said = "" if result.cls == PASS else ((err or out).strip()[:4000] or "lint failed")
+            self._note_base_lint(said)
+        if not said or any(path and path in said for path in self.card.touches):
+            return  # clean, or the failure is in a file this task may change, so the task may be what fixes it
+        first = next((line.strip() for line in said.splitlines() if line.strip()), "lint failed")
+        detail = ("base lint: the project fails its own lint before this task changes anything, in files the task "
+                  f"may not change, so no try can pass. {first[:400]}")
+        self._record_gate(GateResult("baseline-lint", FAIL, detail, {"output": said[:2000]}))
+        raise GateFailure(StopCode.DIRTY_BASELINE, detail)
+
+    def _note_base_lint(self, said: str) -> None:
+        """Keep the base's lint result with its cached test run, so later tasks on this commit don't rerun it."""
+        from .state import read_json, write_json
+
+        if not self.cfg.baseline_cache:
+            return
+        path = self._cache_file(self._effective_unit())
+        payload = read_json(path)
+        if isinstance(payload, dict):
+            write_json(path, {**payload, "lint_fail": said})
 
     def _cache_file(self, unit: str) -> Path:
         return self.state.cache_path(

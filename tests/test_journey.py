@@ -1110,6 +1110,37 @@ class FlowTests(_Folder):
 
         self.drive("blocked", body)
 
+    def test_a_project_failing_its_own_lint_stops_the_task_with_the_way_out_as_the_main_button(self) -> None:
+        async def body(app, pilot) -> None:
+            app._open("blocked", "W1-04")
+            await pilot.pause(0.2)
+            task = app._find()
+            stopped = {**task, "triage": {**task["triage"], "kind": "builder", "base_lint": True}}
+            fix = {"label": "Check syntax only", "table": "runner", "key": "typescript_typecheck", "value": "syntax",
+                   "why": "the full TypeScript check is switched off for this project"}
+            pack = mock.Mock(base_lint_fix=mock.Mock(return_value=fix))
+            with mock.patch.object(app, "_find", return_value=stopped), \
+                    mock.patch("openfarm_core.cli._configured_pack", return_value=pack):
+                primary, others, _keys = app._actions_blocked()
+                self.assertEqual(primary, ("base_lint_fix", "Check syntax only and retry"))
+                self.assertEqual(others[0], ("retry_task", "Retry"))
+                app.refresh_screen()
+                await pilot.pause(0.2)
+                shown = str(app.query_one("#blocked-fix").render())
+                self.assertIn("The way out: check syntax only", shown)
+                self.assertIn('typescript_typecheck = "syntax"', " ".join(shown.split()))
+                with mock.patch.object(app, "do_retry_task") as retried:
+                    app.do_base_lint_fix()
+                retried.assert_called_once()
+            config = (app.repo / ".openfarm" / "config.toml").read_text()
+            self.assertIn('typescript_typecheck = "syntax"', config)
+            self.assertEqual(config.count("typescript_typecheck ="), 1)  # set where it stood, not added twice
+            from openfarm_core.config import load_config
+
+            self.assertEqual(load_config(app.repo).typescript_typecheck, "syntax")
+
+        self.drive("blocked", body)
+
     def test_the_safety_stop_says_why_and_is_cleared_from_the_build_screen(self) -> None:
         # the message used to point at Settings, which had nothing to clear it with
         async def body(app, pilot) -> None:

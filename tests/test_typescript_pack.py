@@ -822,6 +822,46 @@ class TypeScriptE2ETests(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
         return json.loads(res.stdout)["outcomes"][0]
 
+    def test_a_project_that_fails_its_own_typecheck_is_refused_up_front_with_a_way_out(self) -> None:
+        # the owner's project: tsc failed on an untouched test file, the task could not change tsconfig, and four
+        # tries each ended on the same lint error after spending tokens
+        from openfarm_core.blocked import set_project_setting, triage
+
+        root, state = self._prepare_adopted_repo_with_card(via_cli=True)
+        (root / ".gitignore").write_text("node_modules/\n", encoding="utf-8")
+        (root / "tsconfig.json").write_text('{"compilerOptions": {"noEmit": true}}\n', encoding="utf-8")
+        fake = root / "node_modules" / ".bin" / "tsc"
+        fake.parent.mkdir(parents=True)
+        fake.write_text("#!/bin/sh\necho \"tests/existing.test.ts(1,1): error TS5097: An import path can only end "
+                        "with a '.ts' extension when 'allowImportingTsExtensions' is enabled.\"\nexit 2\n", encoding="utf-8")
+        fake.chmod(0o755)
+        Git(root).commit_all("a tsconfig the real compiler refuses")
+        set_project_setting(root, "runner", "typescript_typecheck", "tsc", "test")
+        self.assertIn('typescript_typecheck = "tsc"', (root / ".openfarm" / "config.toml").read_text())
+        self.assertEqual(subprocess.run(["git", "status", "--porcelain"], cwd=root, capture_output=True,
+                                        text=True).stdout.strip(), "")  # the setting is committed, nothing else
+
+        outcome = self._run_card(root, GOOD_TS_TEST, GOOD_TS_IMPL)
+        self.assertEqual(outcome["final_state"], "blocked")
+        self.assertEqual(outcome["stop_code"], "dirty-baseline")
+        self.assertTrue(outcome["detail"].startswith("base lint: the project fails its own lint"), outcome["detail"])
+        self.assertIn("allowImportingTsExtensions", outcome["detail"])
+        self.assertEqual(int(outcome.get("worker_tokens") or 0), 0)  # refused before any model was called
+        self.assertTrue(triage(outcome)["base_lint"])
+
+        # the way out the pack offers, then the same task builds
+        from openfarm_core.packs.typescript import TypeScriptPack
+
+        fix = TypeScriptPack(tsc=True).base_lint_fix()
+        self.assertIsNone(TypeScriptPack(tsc=False).base_lint_fix())
+        set_project_setting(root, fix["table"], fix["key"], fix["value"], fix["label"].lower())
+        from openfarm_core.config import load_config
+        from openfarm_core.store import open_store
+
+        open_store(root, load_config(root)).change_card("CARD-1", "retry", why="with the way out")  # what Retry does
+        outcome = self._run_card(root, GOOD_TS_TEST, GOOD_TS_IMPL)
+        self.assertEqual(outcome["final_state"], "in-review", f"{outcome.get('stop_code')}: {outcome.get('detail')}")
+
     def test_adopt_check_and_run_card_end_to_end(self) -> None:
         root, state = self._prepare_adopted_repo_with_card(via_cli=True)
         check = self._run_cli(root, "check", "CARD-1")

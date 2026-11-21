@@ -533,6 +533,8 @@ def initialize_project(
                             "moduleResolution": "NodeNext",
                             "strict": True,
                             "noEmit": True,
+                            # the scaffold's own imports end in `.ts`, which tsc refuses without this
+                            "allowImportingTsExtensions": True,
                         },
                         "include": ["src/**/*.ts", "tests/**/*.ts"],
                     },
