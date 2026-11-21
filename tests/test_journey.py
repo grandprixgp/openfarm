@@ -992,6 +992,39 @@ class FlowTests(_Folder):
 
         self.drive("build", body)
 
+    def test_a_running_build_shows_a_live_log_of_its_checks_in_plain_words(self) -> None:
+        async def body(app, pilot) -> None:
+            box = app.query_one("#build-log")
+            self.assertTrue(box.has_class("hidden"))  # nothing is being built
+            app._following = True
+            ts = "2026-11-21T10:55:13Z"
+            app._run_event({"kind": "run_start", "ts": ts, "message": "Starting run r (2 card(s))"})
+            app._run_event({"kind": "phase", "card_id": "W1-01", "phase": "check", "ts": ts})
+            app._run_event({"kind": "log", "card_id": "W1-01", "ts": ts,
+                            "message": "W1-01: suite pass — 36 existing test(s)"})
+            app._run_event({"kind": "log", "card_id": "W1-01", "ts": ts, "message": "W1-01: fail-before fail — 1 passed"})
+            app._run_event({"kind": "log", "card_id": "W1-01", "ts": ts, "message": "W1-01: something new happened"})
+            await pilot.pause(0.2)
+            self.assertFalse(box.has_class("hidden"))
+            shown = str(box.render())
+            self.assertIn("What the build is doing", shown)
+            self.assertIn("10:55  W1-01  running the checks", shown)
+            self.assertIn("W1-01  ✓ the whole test suite passes  36 existing test(s)", shown)
+            self.assertIn("✗ not so: the new tests fail on the old code", shown)
+            self.assertIn("something new happened", shown)  # a message with no plain words is still shown
+            self.assertNotIn("fail-before", shown)
+            for n in range(40):
+                app._run_event({"kind": "log", "ts": ts, "message": f"W1-01: lint pass — {n}"})
+            await pilot.pause(0.2)
+            self.assertEqual(len(str(box.render()).splitlines()), 8)  # the title and the newest lines; fewer
+            # here because a task is waiting to be accepted above it, and both should stay in view
+            app._following = False
+            app.refresh_screen()
+            await pilot.pause(0.2)
+            self.assertTrue(box.has_class("hidden"))  # the build ended: the room goes back
+
+        self.drive("build", body)
+
     def test_the_safety_stop_says_why_and_is_cleared_from_the_build_screen(self) -> None:
         # the message used to point at Settings, which had nothing to clear it with
         async def body(app, pilot) -> None:

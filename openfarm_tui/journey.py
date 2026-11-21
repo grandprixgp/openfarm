@@ -99,6 +99,32 @@ PHASES = {  # what the build reports -> what it means for the reader
     "pre-review": "being reviewed", "catch-up": "catching up with main", "finish": "finishing",
 }
 
+CHECKS_RUN = {  # each check a build reports -> what it found out
+    "eligibility": "the task fits the project's rules", "baseline": "the project's tests are green before any change",
+    "micromanager-shape": "the reviewer shaped the task", "micromanager-scaffold": "the reviewer wrote the starting stubs",
+    "micromanager-coach": "the reviewer coached the builder", "micromanager-pre-review": "the reviewer read the change",
+    "named-tests-exist": "the task's tests are written", "fail-before": "the new tests fail on the old code",
+    "pass-after": "the task's tests pass", "suite": "the whole test suite passes",
+    "tests-frozen": "the tests were not touched after being written", "banned-patterns": "no forbidden shortcut in the change",
+    "diff-within-touches": "only the task's own files changed", "lint": "lint", "workspace-lint": "lint across the project",
+    "no-test-loss": "no test went missing", "revert-check": "taking the change out breaks the tests again",
+    "mutation": "the tests catch small breakages", "checker-pass1": "a second model tried to break it",
+    "checker-pass2": "a second model tried to break it again", "catch-up": "caught up with main",
+    "harness-efficiency": "lessons noted",
+}
+LOG_LINES = 14  # how much of the live log the Build step shows
+
+
+def log_line(message: str) -> str:
+    """One build log message (`W1-02: suite pass — 36 tests`) in the reader's words, as markup."""
+    task, _, rest = message.partition(": ")
+    what, _, detail = rest.partition(" — ")
+    name, _, verdict = what.rpartition(" ")
+    if verdict not in ("pass", "fail") or name not in CHECKS_RUN:
+        return f"{esc(task)}  [$foreground-muted]{esc(rest[:110])}[/]"
+    mark = "[$success]✓[/]" if verdict == "pass" else "[$error]✗ not so:[/]"
+    return f"{esc(task)}  {mark} {esc(CHECKS_RUN[name])}" + (f"  [$foreground-muted]{esc(detail[:44])}[/]" if detail else "")
+
 
 def terminal_is_light() -> bool:
     """Follow the terminal: ask it for its background colour, and where it does not say, read `COLORFGBG`."""
@@ -359,6 +385,7 @@ class Journey(MorePanes, App):
         self.busy_since = 0.0
         self.failure: dict | None = None  # the Architect step that failed, for Retry
         self.activity: list[str] = []
+        self.build_log: list[str] = []  # markup lines: every check of the build being followed
         self.health = {"Architect": None, "Builders": None}
         self.tokens = {"worker": 0, "frontier": 0}
         self.phases: dict[str, str] = {}
@@ -437,6 +464,7 @@ class Journey(MorePanes, App):
             yield OptionList(id="build-tasks")
             yield Static("", id="build-question", classes="card ask")
             yield Static("", id="build-ready", classes="card ok")
+            yield Static("", id="build-log", classes="card")
         with VerticalScroll(id="blocked"):
             yield Static("", id="blocked-title", classes="h1")
             yield Static("", id="blocked-why", classes="sub")
@@ -1353,10 +1381,20 @@ class Journey(MorePanes, App):
             line = "Build started" + (": " + message.partition("; ")[2] if "; " in message else "")
         elif kind in ("run_more", "run_waiting", "question") and message:
             line = message.replace("card(s)", "task(s)")
+        stamp = stamp or time.strftime("%H:%M")
+        if kind == "run_start":
+            self.build_log.clear()
+        if kind == "log" and message:
+            self.build_log.append(f"[$foreground-muted]{stamp}[/]  {log_line(message)}")
+        elif line:
+            self.build_log.append(f"[$foreground-muted]{stamp}[/]  [b]{esc(line)}[/]")
+        del self.build_log[:-300]
         if line:
-            self.activity.append(f"{stamp or time.strftime('%H:%M')}  {line}")
+            self.activity.append(f"{stamp}  {line}")
             if not quiet:
                 self.refresh_screen()
+        elif kind == "log" and not quiet:
+            self._draw_build_log()
 
     def _state_words(self, task: dict) -> tuple[str, str, str]:
         """Glyph, colour and sentence for a task's state."""
@@ -1410,6 +1448,17 @@ class Journey(MorePanes, App):
             box.update(f"[b]{esc(ready['id'])} · {esc(ready['title'])}[/]   [$success]ready to accept[/]\n"
                        f"{esc(self._evidence(ready))}\n"
                        "[$foreground-muted]Accept merges it into main on this machine. Nothing is pushed.[/]")
+        self._draw_build_log()
+
+    def _draw_build_log(self) -> None:
+        """The live log fills the room under the task list while a build runs."""
+        box = self.query_one("#build-log", Static)
+        live = bool(self.build_log) and (self.facts["running"] or self._following) and not self.view
+        box.set_class(not live, "hidden")
+        if live:
+            crowded = self.facts["questions"] or self._first("in_review")  # another card is above: keep both in view
+            box.update("[b]What the build is doing[/]\n"
+                       + "\n".join(self.build_log[-(LOG_LINES // 2 if crowded else LOG_LINES):]))
 
     @staticmethod
     def _evidence(task: dict) -> str:
