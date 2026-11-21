@@ -613,6 +613,10 @@ class FlowTests(_Folder):
             text = str(app.query_one("#details-text").render())
             for part in ("W1-04", "Spec", "Tests", "Plan checks", "History", "openfarm/preflight", "Diff"):
                 self.assertIn(part, text)
+            # "Space: why" is answered before the spec, where it used to sit below three sections
+            self.assertLess(text.index("Why it can't be built yet"), text.index("Spec"))
+            self.assertLess(text.index("W1-03 serves the page with `#art`"), text.index("Spec"))
+            self.assertNotIn("(Space: why)", text)
             await pilot.press("escape")
             await pilot.pause(0.1)
             self.assertEqual(app.screen_name, "plan")
@@ -991,6 +995,120 @@ class FlowTests(_Folder):
             self.assertFalse(app._resume_wanted)
 
         self.drive("build", body)
+
+    def test_a_running_build_shows_a_live_log_of_its_checks_in_plain_words(self) -> None:
+        async def body(app, pilot) -> None:
+            box = app.query_one("#build-log")
+            self.assertTrue(box.has_class("hidden"))  # nothing is being built
+            app._following = True
+            ts = "2026-11-21T10:55:13Z"
+            app._run_event({"kind": "run_start", "ts": ts, "message": "Starting run r (2 card(s))"})
+            app._run_event({"kind": "phase", "card_id": "W1-01", "phase": "check", "ts": ts})
+            app._run_event({"kind": "log", "card_id": "W1-01", "ts": ts,
+                            "message": "W1-01: suite pass — 36 existing test(s)"})
+            app._run_event({"kind": "log", "card_id": "W1-01", "ts": ts, "message": "W1-01: fail-before fail — 1 passed"})
+            app._run_event({"kind": "log", "card_id": "W1-01", "ts": ts, "message":
+                            "W1-01: lint fail — rt path can only end with '.ts'\ntests/a.test.ts(4,31): error TS5097: An import "
+                            "path can only end with a '.ts' extension when 'allowImportingTsExtensions' is enabled.\nmore"})
+            app._run_event({"kind": "log", "card_id": "W1-01", "ts": ts, "message": "W1-01: something new happened"})
+            await pilot.pause(0.2)
+            self.assertFalse(box.has_class("hidden"))
+            shown = str(box.render())
+            self.assertIn("What the build is doing", shown)
+            self.assertIn("10:55  W1-01  running the checks", shown)
+            self.assertIn("W1-01  ✓ the whole test suite passes  36 existing test(s)", shown)
+            self.assertIn("✗ failed: the new tests fail on the old code", shown)
+            # a failed check shows its first whole error line in full, not the cut-off start of the tool's output
+            self.assertIn("when 'allowImportingTsExtensions' is enabled.", " ".join(shown.split()))
+            self.assertNotIn("end with '.ts'", shown)  # the cut-off first line (the whole one says "a '.ts'")
+            self.assertIn("and 1 more lines", shown)
+            self.assertIn("something new happened", shown)  # a message with no plain words is still shown
+            self.assertNotIn("fail-before", shown)
+            for n in range(40):
+                app._run_event({"kind": "log", "ts": ts, "message": f"W1-01: lint pass — {n}"})
+            await pilot.pause(0.2)
+            self.assertEqual(len(str(box.render()).splitlines()), 8)  # the title and the newest lines; fewer
+            # here because a task is waiting to be accepted above it, and both should stay in view
+            app._following = False
+            app.refresh_screen()
+            await pilot.pause(0.2)
+            self.assertTrue(box.has_class("hidden"))  # the build ended: the room goes back
+
+        self.drive("build", body)
+
+    def test_waiting_for_the_architect_shows_what_is_done_and_what_is_arriving(self) -> None:
+        async def body(app, pilot) -> None:
+            box = app.query_one("#busy-log")
+            self.assertTrue(box.has_class("hidden"))
+            app._set_busy("Asking the Architect how to fix W1-01")
+            app._progress("Reading the answer.")
+            app._heard("The typecheck fails because tsconfig lacks a setting.\n")
+            app._heard("So the task should also list tsconfig.json")
+            app._draw_busy()
+            await pilot.pause(0.1)
+            self.assertFalse(box.has_class("hidden"))
+            shown = str(box.render())
+            self.assertIn("✓ Asking the Architect how to fix W1-01", shown)  # the stage that is over
+            self.assertIn("The Architect has written 96 characters so far:", shown)
+            self.assertIn("So the task should also list tsconfig.json", shown)
+            self.assertIn("Reading the answer", str(app.query_one("#busy").render()))
+            app._set_busy("")
+            await pilot.pause(0.1)
+            self.assertTrue(box.has_class("hidden"))
+            app._set_busy("Asking again")  # a new wait starts with an empty log
+            app._draw_busy()
+            await pilot.pause(0.1)
+            self.assertTrue(box.has_class("hidden"))
+            app._set_busy("")
+
+        self.drive("build", body)
+
+    def test_a_stopped_tasks_tries_show_the_whole_reason_wrapped(self) -> None:
+        async def body(app, pilot) -> None:
+            from openfarm_core.blocked import records
+
+            cfg = app.facts["cfg"]
+            said = "The blocker is outside this task. " + "The repo-wide typecheck fails because tsconfig lacks a setting. " * 4 + "END-OF-REASON"
+            with mock.patch("openfarm_core.blocked.records",
+                            return_value=[{**(records(cfg.state_dir, "W1-03") or [{}])[-1], "detail": said}]):
+                app._open("blocked", "W1-03")
+                await pilot.pause(0.3)
+                shown = str(app.query_one("#blocked-tries").render())
+            self.assertIn("END-OF-REASON", shown)  # nothing is cut off
+            lines = shown.splitlines()
+            self.assertGreater(len(lines), 4)  # it wraps under itself
+            self.assertTrue(all(len(line) <= 120 for line in lines))
+
+        self.drive("build", body)
+
+    def test_a_task_the_builder_keeps_failing_can_be_reworked_by_the_architect_with_what_the_tries_found(self) -> None:
+        # the owner's report: four tries ended on the same thing and the only offer was another Retry
+        async def body(app, pilot) -> None:
+            app._open("blocked", "W1-04")
+            await pilot.pause(0.2)
+            task = app._find()
+            once = {**task, "triage": {**task["triage"], "kind": "builder"}, "tries": 1}
+            app.fix = None
+            with mock.patch.object(app, "_find", return_value=once):
+                primary, others, _keys = app._actions_blocked()
+            self.assertEqual(primary, ("retry_task", "Retry"))
+            self.assertEqual(others[0], ("ask_fix", "Have the Architect rework the task"))
+            with mock.patch.object(app, "_find", return_value={**once, "tries": 4}):
+                primary, others, _keys = app._actions_blocked()
+                self.assertEqual(primary, ("ask_fix", "Have the Architect rework the task"))  # Retry alone has not worked
+                self.assertEqual(others[0], ("retry_task", "Retry"))
+                tries = [{"claimed_at": "2026-11-21T10:33:00Z", "detail": "tsconfig lacks allowImportingTsExtensions"},
+                         {"claimed_at": "2026-11-21T14:14:00Z", "detail": "the same error signature came back twice"}]
+                with mock.patch("openfarm_core.blocked.records", return_value=tries), \
+                        mock.patch("openfarm_tui.journey.propose_fix", return_value=None) as asked:
+                    app.do_ask_fix()
+                    await app.workers.wait_for_complete()
+                    await pilot.pause(0.2)
+            why = asked.call_args.kwargs["why"]
+            self.assertIn("- try 1: tsconfig lacks allowImportingTsExtensions", why)  # every try's finding reaches the Architect
+            self.assertIn("- try 2: the same error signature came back twice", why)
+
+        self.drive("blocked", body)
 
     def test_the_safety_stop_says_why_and_is_cleared_from_the_build_screen(self) -> None:
         # the message used to point at Settings, which had nothing to clear it with

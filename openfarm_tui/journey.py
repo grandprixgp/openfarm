@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import webbrowser
 from pathlib import Path
@@ -98,6 +99,40 @@ PHASES = {  # what the build reports -> what it means for the reader
     "check": "running the checks", "gates": "running the checks", "checker": "being reviewed", "review": "being reviewed",
     "pre-review": "being reviewed", "catch-up": "catching up with main", "finish": "finishing",
 }
+
+CHECKS_RUN = {  # each check a build reports -> what it found out
+    "eligibility": "the task fits the project's rules", "baseline": "the project's tests are green before any change",
+    "micromanager-shape": "the reviewer shaped the task", "micromanager-scaffold": "the reviewer wrote the starting stubs",
+    "micromanager-coach": "the reviewer coached the builder", "micromanager-pre-review": "the reviewer read the change",
+    "named-tests-exist": "the task's tests are written", "fail-before": "the new tests fail on the old code",
+    "pass-after": "the task's tests pass", "suite": "the whole test suite passes",
+    "tests-frozen": "the tests were not touched after being written", "banned-patterns": "no forbidden shortcut in the change",
+    "diff-within-touches": "only the task's own files changed", "lint": "lint", "workspace-lint": "lint across the project",
+    "no-test-loss": "no test went missing", "revert-check": "taking the change out breaks the tests again",
+    "mutation": "the tests catch small breakages", "checker-pass1": "a second model tried to break it",
+    "checker-pass2": "a second model tried to break it again", "catch-up": "caught up with main",
+    "harness-efficiency": "lessons noted",
+}
+LOG_LINES = 14  # how much of the live log the Build step shows
+
+
+def log_line(message: str) -> str:
+    """One build log message (`W1-02: suite pass — 36 tests`) in the reader's words, as markup."""
+    task, _, rest = message.partition(": ")
+    what, _, detail = rest.partition(" — ")
+    name, _, verdict = what.rpartition(" ")
+    if verdict not in ("pass", "fail") or name not in CHECKS_RUN:
+        return f"{esc(task)}  [$foreground-muted]{esc(rest[:110])}[/]"
+    if verdict == "fail":
+        # a failed check's output is the end of what the tool printed, so its first line may start mid-word:
+        # show the first whole line, in full, under the check's name
+        said = [line.strip() for line in detail.splitlines() if line.strip()]
+        said = said[1:] if len(said) > 1 else said
+        more = f"  (and {len(said) - 1} more lines: Space on the task shows all)" if len(said) > 1 else ""
+        return (f"{esc(task)}  [$error]✗ failed: {esc(CHECKS_RUN[name])}[/]"
+                + (f"\n          [$foreground-muted]{esc(said[0][:400])}{esc(more)}[/]" if said else ""))
+    mark = "[$success]✓[/]"
+    return f"{esc(task)}  {mark} {esc(CHECKS_RUN[name])}" + (f"  [$foreground-muted]{esc(detail[:44])}[/]" if detail else "")
 
 
 def terminal_is_light() -> bool:
@@ -305,6 +340,7 @@ class Journey(MorePanes, App):
     .diff { background: $surface; padding: 0 1; margin-bottom: 1; height: auto; }
     .hidden { display: none; }
     #busy { height: 1; padding: 0 3; color: $accent; }
+    #busy-log { height: auto; max-height: 12; padding: 0 3; color: $foreground-muted; }
     #actions { height: 3; padding: 0 3; align: right middle; background: $background; }
     #actions Button { margin-left: 1; min-width: 6; border: none; height: 3; background: $panel; }
     #actions Button:focus { text-style: bold; background-tint: transparent; }
@@ -359,6 +395,9 @@ class Journey(MorePanes, App):
         self.busy_since = 0.0
         self.failure: dict | None = None  # the Architect step that failed, for Retry
         self.activity: list[str] = []
+        self.build_log: list[str] = []  # markup lines: every check of the build being followed
+        self.busy_log: list[str] = []  # what the step being waited for has done so far
+        self._answer, self._answer_len = "", 0  # the end of the Architect's answer as it arrives, and its size
         self.health = {"Architect": None, "Builders": None}
         self.tokens = {"worker": 0, "frontier": 0}
         self.phases: dict[str, str] = {}
@@ -398,6 +437,7 @@ class Journey(MorePanes, App):
             with Vertical(id="main"):
                 with ContentSwitcher(initial="idea", id="panes"):
                     yield from self._panes()
+                yield Static("", id="busy-log", classes="hidden")
                 yield Static("", id="busy")
                 with Horizontal(id="actions"):
                     for index in range(4):
@@ -437,6 +477,7 @@ class Journey(MorePanes, App):
             yield OptionList(id="build-tasks")
             yield Static("", id="build-question", classes="card ask")
             yield Static("", id="build-ready", classes="card ok")
+            yield Static("", id="build-log", classes="card")
         with VerticalScroll(id="blocked"):
             yield Static("", id="blocked-title", classes="h1")
             yield Static("", id="blocked-why", classes="sub")
@@ -779,6 +820,24 @@ class Journey(MorePanes, App):
         elif self.note:
             text = esc(self.note)
         self.query_one("#busy", Static).update(text)
+        self._draw_busy_log()
+
+    def _draw_busy_log(self) -> None:
+        """While a step runs, the room above the busy line shows what it has done and what is arriving."""
+        box = self.query_one("#busy-log", Static)
+        lines = [esc(line) for line in self.busy_log[-5:]] if self.busy else []
+        if self.busy and self._answer_len:
+            width = max(20, self.size.width - 36)
+            tail = [line.strip()[:width] for line in self._answer.splitlines() if line.strip()][-5:]
+            lines += [f"[b]The Architect has written {self._answer_len:,} characters so far:[/]", *[f"  {esc(line)}" for line in tail]]
+        box.set_class(not lines, "hidden")
+        if lines:
+            box.update("\n".join(lines))
+
+    def _heard(self, chunk: str) -> None:
+        # called from the Architect's thread for every piece of its answer: only kept here, the tick draws it
+        self._answer_len += len(chunk)
+        self._answer = (self._answer + chunk)[-3000:]
 
     def _tick(self) -> None:
         if self._gone():
@@ -1353,10 +1412,20 @@ class Journey(MorePanes, App):
             line = "Build started" + (": " + message.partition("; ")[2] if "; " in message else "")
         elif kind in ("run_more", "run_waiting", "question") and message:
             line = message.replace("card(s)", "task(s)")
+        stamp = stamp or time.strftime("%H:%M")
+        if kind == "run_start":
+            self.build_log.clear()
+        if kind == "log" and message:
+            self.build_log.append(f"[$foreground-muted]{stamp}[/]  {log_line(message)}")
+        elif line:
+            self.build_log.append(f"[$foreground-muted]{stamp}[/]  [b]{esc(line)}[/]")
+        del self.build_log[:-300]
         if line:
-            self.activity.append(f"{stamp or time.strftime('%H:%M')}  {line}")
+            self.activity.append(f"{stamp}  {line}")
             if not quiet:
                 self.refresh_screen()
+        elif kind == "log" and not quiet:
+            self._draw_build_log()
 
     def _state_words(self, task: dict) -> tuple[str, str, str]:
         """Glyph, colour and sentence for a task's state."""
@@ -1410,6 +1479,17 @@ class Journey(MorePanes, App):
             box.update(f"[b]{esc(ready['id'])} · {esc(ready['title'])}[/]   [$success]ready to accept[/]\n"
                        f"{esc(self._evidence(ready))}\n"
                        "[$foreground-muted]Accept merges it into main on this machine. Nothing is pushed.[/]")
+        self._draw_build_log()
+
+    def _draw_build_log(self) -> None:
+        """The live log fills the room under the task list while a build runs."""
+        box = self.query_one("#build-log", Static)
+        live = bool(self.build_log) and (self.facts["running"] or self._following) and not self.view
+        box.set_class(not live, "hidden")
+        if live:
+            crowded = self.facts["questions"] or self._first("in_review")  # another card is above: keep both in view
+            box.update("[b]What the build is doing[/]\n"
+                       + "\n".join(self.build_log[-(LOG_LINES // 2 if crowded else LOG_LINES):]))
 
     @staticmethod
     def _evidence(task: dict) -> str:
@@ -1545,8 +1625,12 @@ class Journey(MorePanes, App):
         tries = records(cfg.state_dir, task["id"])
         lines = ["[b]Tries[/]"]
         for number, record in enumerate(tries, start=1):
-            lines.append(f"[$error]✗[/] {number}  {esc(str(record.get('claimed_at') or '')[11:16])}  "
-                         f"{esc(str(record.get('detail') or record.get('stop_code') or 'stopped')[:150])}")
+            # the whole reason, wrapped under itself: it used to be cut at 150 characters mid-word
+            said = " ".join(str(record.get("detail") or record.get("stop_code") or "stopped").split())[:1200]
+            head = f"{number}  {str(record.get('claimed_at') or '')[11:16]}  "
+            first, *rest = textwrap.wrap(said, max(30, self.size.width - 40 - len(head))) or ["stopped"]
+            lines.append(f"[$error]✗[/] {esc(head)}{esc(first)}")
+            lines += [" " * (len(head) + 2) + esc(line) for line in rest]
         lines.append("[$foreground-muted]  nothing was merged[/]")
         self.query_one("#blocked-tries", Static).update("\n".join(lines))
 
@@ -1561,8 +1645,15 @@ class Journey(MorePanes, App):
         if kind == "check":
             return ("run_check", "Run it myself"), [("accept_anyway", "Accept anyway"), ("retry_task", "Retry")], \
                 "Enter run the check · " + keys
-        return ("retry_task", "Retry"), [("edit_task", "Edit the task myself"), ("skip_task", "Skip this task")], \
-            "Enter retry · " + keys
+        # the builder fell short. A retry starts from the same task, so after it has failed more than once the
+        # better move is to have the Architect put what the tries found into the task
+        rest = [("edit_task", "Edit the task myself"), ("skip_task", "Skip this task")]
+        if self.fix:
+            return ("apply_fix", "Apply fix and retry"), [("retry_task", "Retry as it is"), *rest], "Enter apply and retry · " + keys
+        learn = ("ask_fix", "Have the Architect rework the task")
+        if task["tries"] >= 2:
+            return learn, [("retry_task", "Retry"), *rest], "Enter ask the Architect · " + keys
+        return ("retry_task", "Retry"), [learn, *rest], "Enter retry · " + keys
 
     def do_apply_fix(self) -> None:
         cfg = self._cfg()
@@ -1576,9 +1667,16 @@ class Journey(MorePanes, App):
         task = self._find()
 
         def step(backend, _progress):
+            from openfarm_core.blocked import records
+
             cfg = self._cfg()
-            return propose_fix(self.repo, cfg, open_store(self.repo, cfg), task["id"],
-                               why=(task["triage"] or {}).get("why", ""), backend=backend)
+            # everything the tries found, not only the last stop: the rewrite should not walk into an earlier one
+            found = [" ".join(str(r.get("detail") or r.get("stop_code") or "").split())[:700]
+                     for r in records(cfg.state_dir, task["id"])]
+            why = (task["triage"] or {}).get("why", "")
+            if len(found) > 1:
+                why += "\nWhat each try so far ended on:\n" + "\n".join(f"- try {n}: {d}" for n, d in enumerate(found, 1) if d)
+            return propose_fix(self.repo, cfg, open_store(self.repo, cfg), task["id"], why=why, backend=backend)
 
         self._step("fix", f"Asking the Architect how to fix {task['id']}", step)
 
@@ -1843,13 +1941,18 @@ class Journey(MorePanes, App):
         store = open_store(self.repo, cfg)
         header, body = store.read(task["id"])
         glyph, colour, words = self._state_words(task)
-        out = [f"[b]{esc(task['id'])} · {esc(task['title'])}[/]   [{colour}]{glyph} {esc(words)}[/]", "",
-               "[b]Spec[/]", esc(body.strip()), "", "[b]Tests[/]"]
+        out = [f"[b]{esc(task['id'])} · {esc(task['title'])}[/]   [{colour}]{glyph} {esc(words.replace(' (Space: why)', ''))}[/]", ""]
+        if task["state"] == "backlog":  # "Space: why" is answered first, not under the spec
+            out += ["[b]Why it can't be built yet[/]",
+                    *([f"  [$error]✗[/] {esc(r)}" for r in task["parked"]] or ["  A plan check held it back, and left no reason."]),
+                    "[$foreground-muted]  Esc, then Repair asks the Architect to fix it (offered once nothing is being built), "
+                    "or e to edit the task yourself.[/]", ""]
+        out += ["[b]Spec[/]", esc(body.strip()), "", "[b]Tests[/]"]
         out += [f"  {esc(t.get('name', ''))}  [$foreground-muted]{esc(t.get('file', ''))}[/]" for t in header.get("tests") or []] or ["  none named"]
         out += ["", "[b]Files it may touch[/]", *[f"  {esc(f)}" for f in task["files"]]]
-        if task["repairs"] or task["parked"]:
+        if task["repairs"] or (task["parked"] and task["state"] != "backlog"):
             out += ["", "[b]Plan checks[/]", *[f"  [$accent]↻[/] {esc(r)}" for r in task["repairs"]],
-                    *[f"  [$error]✗[/] {esc(r)}" for r in task["parked"]]]
+                    *[f"  [$error]✗[/] {esc(r)}" for r in task["parked"] if task["state"] != "backlog"]]
         tries = records(cfg.state_dir, task["id"])
         if task["triage"]:
             out += ["", "[b]Why it stopped[/]", esc(task["triage"]["why"])]
@@ -2000,6 +2103,8 @@ class Journey(MorePanes, App):
     # -- running things -----------------------------------------------------------
 
     def _set_busy(self, doing: str) -> None:
+        if not self.busy or not doing:  # a new wait, or the end of one: its log starts empty
+            self.busy_log, self._answer, self._answer_len = [], "", 0
         self.busy, self.busy_since = doing, time.monotonic()
         self.refresh_screen(focus=not doing)
 
@@ -2024,6 +2129,8 @@ class Journey(MorePanes, App):
                     self.health["Architect"] = False
                     return self.call_from_thread(self._step_failed, step, f"The Architect can't be reached: {reason}")
                 self._backend = backend
+                if hasattr(backend, "stream_to"):
+                    backend.stream_to(self._heard)
             result = fn(backend, lambda message: self.call_from_thread(self._progress, str(message)))
             if self._cancelled:
                 return
@@ -2067,6 +2174,7 @@ class Journey(MorePanes, App):
 
     def _progress(self, message: str) -> None:
         if self.busy and message.strip():
+            self.busy_log.append(f"{time.strftime('%H:%M:%S')}  ✓ {self.busy}")  # what was being done is done
             self.busy = message.strip().rstrip(".")[:90]
             self._draw_busy()
 
