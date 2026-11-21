@@ -551,7 +551,7 @@ def _read_cards_readonly(ctx: TuiContext) -> tuple[list[Card], str]:
                     if not header.get("id"):
                         header["id"] = Path(rel).stem
                     merged = dict(header)
-                    fields_block = getattr(ctx.cfg, "cards_fields_block", "")
+                    fields_block = getattr(ctx.cfg, "fields_block", "")
                     if fields_block == "toml":
                         block_fields, body = extract_fenced_fields(body, fields_block)
                         if block_fields:
@@ -571,7 +571,7 @@ def _read_cards_readonly(ctx: TuiContext) -> tuple[list[Card], str]:
                         "done_text": body,
                         "body": body,
                     }))
-                except (OSError, ValueError, KeyError, TypeError) as exc:
+                except (Invalid, OSError, ValueError, KeyError, TypeError) as exc:
                     _ = exc
         return cards, "cards-source"
     if cards_dir.is_dir():

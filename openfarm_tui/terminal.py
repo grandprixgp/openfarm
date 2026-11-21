@@ -46,7 +46,10 @@ def ask_background(fd: int | None = None, wait_s: float = 1.0) -> bool | None:
         until = time.monotonic() + wait_s
         while time.monotonic() < until and not re.search(r"\033\[\?[0-9;]*c", reply):
             if select.select([fd], [], [], max(0.0, until - time.monotonic()))[0]:
-                reply += os.read(fd, 256).decode("latin-1")
+                chunk = os.read(fd, 256)
+                if not chunk:
+                    break
+                reply += chunk.decode("latin-1")
     except OSError:
         pass
     finally:

@@ -115,7 +115,7 @@ class SetupTests(unittest.TestCase):
         self.assertIn("2. acme/coder-2", text)
         self.assertIn("Everything is ready", text)
         self.assertEqual(result["choices"], {"architect": {"model": "opus", "effort": "xhigh"},
-                                             "builder": {"model": "", "effort": "high"}})
+                                             "builder": {"model": "acme/coder-2", "effort": "high"}})
         saved = load_global_providers()["worker"]
         self.assertEqual((saved["preset"], saved["endpoint"], saved["model"], saved["zdr"]),
                          ("custom", self.address, "acme/coder-2", True))
@@ -184,6 +184,16 @@ class SetupTests(unittest.TestCase):
         code, _out, err = self._cli("setup")  # no terminal here
         self.assertEqual(code, 2)
         self.assertIn("needs a terminal", err)
+
+    def test_unknown_preset_raises_refused_cleanly(self) -> None:
+        from openfarm_core.errors import Refused
+
+        with self.assertRaises(Refused) as caught:
+            run_setup(_args(yes=True, preset="nonexistent-preset"), signed_in=lambda p: True)
+        self.assertEqual(caught.exception.code, "unknown-preset")
+        code, _out, err = self._cli("setup", "--yes", "--preset", "nonexistent-preset")
+        self.assertEqual(code, 2)
+        self.assertIn("invalid choice", err)
 
 
 if __name__ == "__main__":

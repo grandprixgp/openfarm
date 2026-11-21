@@ -872,6 +872,37 @@ global_dir = "{self.global_harness}"
             found = pack.patterns(added, [], test_files)
             self.assertEqual(found["banned"], [], f"banned patterns in {rel}: {found['banned']}")
 
+    def test_read_cards_readonly_uses_fields_block_and_catches_invalid(self) -> None:
+        from openfarm_core.tui import _load_tui_context, _read_cards_readonly
+
+        # Commit a fenced-TOML card and a malformed card directly onto the cards branch.
+        cards_wt = self.state.root / "cards-source"
+        cards_dir = cards_wt / "cards"
+        cards_dir.mkdir(parents=True, exist_ok=True)
+        (cards_dir / "CARD-FENCED.md").write_text(
+            '+++\nid = "CARD-FENCED"\ntitle = "Fenced card"\nstate = "ready"\n+++\n\n'
+            "```toml\n"
+            'category = "small-feature"\n'
+            'touches = ["pkg/fenced.py"]\n'
+            "```\n\nBody text.\n",
+            encoding="utf-8",
+        )
+        (cards_dir / "CARD-BROKEN.md").write_text(
+            "+++\nid = [broken toml\n+++\n",
+            encoding="utf-8",
+        )
+        Git(cards_wt).commit_all("add fenced and broken cards")
+
+        ctx = _load_tui_context(self.repo)
+        ctx.cfg.fields_block = "toml"
+        cards, mode = _read_cards_readonly(ctx)
+        self.assertEqual(mode, "cards-source")
+        by_id = {c.id: c for c in cards}
+        self.assertIn("CARD-FENCED", by_id)
+        self.assertEqual(by_id["CARD-FENCED"].touches, ["pkg/fenced.py"])
+        self.assertEqual(by_id["CARD-FENCED"].category, "small-feature")
+        self.assertNotIn("CARD-BROKEN", by_id)
+
 
 class PrettifiedTuiThemeAndControllerTests(unittest.TestCase):
     """Tests for color themes, visual chrome, selection/search, responsive layout, and hotkeys."""

@@ -7,6 +7,7 @@ last button, and Enter does it.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shlex
@@ -15,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import webbrowser
 from pathlib import Path
@@ -400,12 +402,17 @@ class Journey(MorePanes, App):
         self._answer, self._answer_len = "", 0  # the end of the Architect's answer as it arrives, and its size
         self.health = {"Architect": None, "Builders": None}
         self.tokens = {"worker": 0, "frontier": 0}
+        self._live_tokens: dict[str, tuple[int, int]] = {}
+        self._done_tokens: dict[str, tuple[int, int]] = {}
         self.phases: dict[str, str] = {}
         self.fix: dict | None = None
+        self._from_blocked = False
         self.check_output: dict | None = None
         self.note = ""  # one line under the heading: what just happened on this screen
         self._backend = None
         self._cancelled = False
+        self._step_seq = 0
+        self._step_cancel: threading.Event | None = None
         self._following = False
         self._actions_shown: tuple = ()
         self._lists: dict[str, tuple] = {}
@@ -795,9 +802,11 @@ class Journey(MorePanes, App):
     def _draw_health(self) -> None:
         marks = {True: "[$success]●[/]", False: "[$error]✗[/]", None: "[$foreground-muted]○[/]"}
         spent = dict(self.real.get("tokens") or {})
-        # a running build's own count is ahead of the records, which are written as each task ends
-        spent["builders"] = max(int(spent.get("builders") or 0), self.tokens["worker"])
-        spent["reviewers"] = max(int(spent.get("reviewers") or 0), self.tokens["frontier"])
+        # a running build's in-flight cards haven't written card-record.json yet: add their live totals
+        live_w = sum(w for w, _s in self._live_tokens.values())
+        live_s = sum(s for _w, s in self._live_tokens.values())
+        spent["builders"] = max(int(spent.get("builders") or 0) + live_w, self.tokens["worker"])
+        spent["reviewers"] = max(int(spent.get("reviewers") or 0) + live_s, self.tokens["frontier"])
         spent["architect"] = int(spent.get("architect") or 0) + self._unrecorded
         total = spent["builders"] + spent["reviewers"] + spent["architect"]
         tokens = f"   {total // 1000}k tokens" if total >= 1000 else (f"   {total} tokens" if total else "")
@@ -1166,12 +1175,17 @@ class Journey(MorePanes, App):
 
     def _draw_plan(self) -> None:
         facts = self.facts
-        tasks = [t for t in facts["tasks"] if t["state"] != "dropped"]
+        tasks = [t for t in facts["tasks"] if t["state"] not in ("dropped", "split")]
         parked = [t for t in tasks if t["state"] == "backlog"]
         verdict = "all checked" if not parked else f"{len(parked)} can't be built yet"
-        self.query_one("#plan-title", Static).update(
-            esc(f"Goal {facts['goal_no']} · {facts['goal']['title']}: {len(tasks)} tasks, {verdict}"))
-        self.query_one("#plan-sub", Static).update(esc(facts["goal"].get("goal") or ""))
+        goal = facts.get("goal")
+        if goal is None:
+            self.query_one("#plan-title", Static).update(esc(f"{len(tasks)} tasks, {verdict}"))
+            self.query_one("#plan-sub", Static).update("")
+        else:
+            self.query_one("#plan-title", Static).update(
+                esc(f"Goal {facts['goal_no']} · {goal['title']}: {len(tasks)} tasks, {verdict}"))
+            self.query_one("#plan-sub", Static).update(esc(goal.get("goal") or ""))
         self._set_list("plan-tasks", [
             (t["id"], self._row(*(("✗", "$error") if t["state"] == "backlog" else ("◇", "$foreground-muted")), t,
                                 f"{len(t['files'])} files · {self._order(t)}")) for t in tasks])
@@ -1254,20 +1268,26 @@ class Journey(MorePanes, App):
     @work(thread=True, exit_on_error=False, group="sort")
     def _sort_questions(self, findings: list[dict]) -> None:
         """A builder's question is shown only if it is the owner's. The rest never interrupt: sorted here, quietly."""
+        backend = None
         try:
             cfg = self._cfg()
-            backend, _reason = open_architect_backend(self.repo, cfg)
-        except Exception:  # noqa: BLE001 - with no Architect the questions go to the owner
-            backend = None
-        for finding in findings:
             try:
-                outcome = settle_question(self.repo, cfg, open_store(self.repo, cfg), finding, backend)
-            except Exception as exc:  # noqa: BLE001 - shown in the strip
-                self.call_from_thread(self.say, f"{finding['from_card']}'s question could not be sorted: {exc}")
-                # e.g. its task went back to building on an earlier answer: sorted again if it ever holds the task up
-                self.call_from_thread(self._sorting.discard, finding["id"])
-                continue
-            self.call_from_thread(self._question_sorted, finding, outcome)
+                backend, _reason = open_architect_backend(self.repo, cfg)
+            except Exception:  # noqa: BLE001 - with no Architect the questions go to the owner
+                backend = None
+            for finding in findings:
+                try:
+                    outcome = settle_question(self.repo, cfg, open_store(self.repo, cfg), finding, backend)
+                except Exception as exc:  # noqa: BLE001 - shown in the strip
+                    self.call_from_thread(self.say, f"{finding['from_card']}'s question could not be sorted: {exc}")
+                    # e.g. its task went back to building on an earlier answer: sorted again if it ever holds the task up
+                    self.call_from_thread(self._sorting.discard, finding["id"])
+                    continue
+                self.call_from_thread(self._question_sorted, finding, outcome)
+        finally:
+            if backend is not None and hasattr(backend, "close"):
+                with contextlib.suppress(Exception):
+                    backend.close()
 
     def _question_sorted(self, finding: dict, outcome: dict) -> None:
         who = finding["from_card"]
@@ -1331,6 +1351,7 @@ class Journey(MorePanes, App):
                     self._run_event(json.loads(line), quiet=True)
                 except ValueError:
                     continue
+            self._live_tokens.clear()
 
     @work(thread=True, exit_on_error=False)
     def _build_bg(self, attach_run_id: str) -> None:
@@ -1388,9 +1409,29 @@ class Journey(MorePanes, App):
     def _run_event(self, event: dict, quiet: bool = False) -> None:
         kind, task_id = str(event.get("kind") or ""), str(event.get("card_id") or "")
         phase, message = str(event.get("phase") or ""), str(event.get("message") or "")
+        if kind == "run_start":
+            self._live_tokens.clear()
+            self._done_tokens.clear()
+            self.tokens = {"worker": 0, "frontier": 0}
         if event.get("worker_tokens") or event.get("supervisor_tokens"):
-            self.tokens["worker"] = max(self.tokens["worker"], int(event.get("worker_tokens") or 0))
-            self.tokens["frontier"] = max(self.tokens["frontier"], int(event.get("supervisor_tokens") or 0))
+            wt = int(event.get("worker_tokens") or 0)
+            st = int(event.get("supervisor_tokens") or 0)
+            if task_id and kind == "card_done":
+                self._live_tokens.pop(task_id, None)
+                prev_w, prev_s = self._done_tokens.get(task_id, (0, 0))
+                self._done_tokens[task_id] = (max(prev_w, wt), max(prev_s, st))
+            else:
+                key = task_id or ""
+                prev_w, prev_s = self._live_tokens.get(key, (0, 0))
+                self._live_tokens[key] = (max(prev_w, wt), max(prev_s, st))
+            self.tokens["worker"] = (
+                sum(w for w, _s in self._live_tokens.values())
+                + sum(w for w, _s in self._done_tokens.values())
+            )
+            self.tokens["frontier"] = (
+                sum(s for _w, s in self._live_tokens.values())
+                + sum(s for _w, s in self._done_tokens.values())
+            )
             self.health["Builders"] = True
         stamp = str(event.get("ts") or "")[11:16]
         line = ""
@@ -1450,7 +1491,7 @@ class Journey(MorePanes, App):
 
     def _draw_build(self) -> None:
         facts = self.facts
-        tasks = [t for t in facts["tasks"] if t["state"] != "dropped"]
+        tasks = [t for t in facts["tasks"] if t["state"] not in ("dropped", "split")]
         accepted = sum(1 for t in tasks if t["state"] == "done")
         started = sum(1 for t in tasks if t["state"] in ("in_progress", "in_review", "blocked", "done"))
         held = "" if facts["running"] or self.view or facts.get("cfg") is None else self._refusal()
@@ -1582,8 +1623,11 @@ class Journey(MorePanes, App):
             self._open("blocked", task["id"])
 
     def _open(self, overlay: str, task_id: str = "") -> None:
+        keep_fix = overlay == "details" and self.overlay == "blocked" and (not task_id or task_id == self.task_id)
         self.overlay, self.task_id = overlay, task_id or self.task_id
-        self.fix = self.check_output = None
+        self._from_blocked = keep_fix
+        if not keep_fix:
+            self.fix = self.check_output = None
         self.refresh_screen(focus=True)
 
     # blocked task --------------------------------------------------------------
@@ -1746,10 +1790,15 @@ class Journey(MorePanes, App):
         self.push_screen(AskModal(f"Why is {self.task_id} right although a check failed?",
                                   "Your reason is kept with the task."), accepted)
 
-    @work(thread=True, exit_on_error=False)
     def do_run_check(self) -> None:
+        if self.busy or not self.task_id:
+            return
         task_id = self.task_id
-        self.call_from_thread(self._set_busy, f"Running {task_id}'s tests on its own branch")
+        self._set_busy(f"Running {task_id}'s tests on its own branch")
+        self._run_check_bg(task_id)
+
+    @work(thread=True, exit_on_error=False)
+    def _run_check_bg(self, task_id: str) -> None:
         try:
             cfg = self._cfg()
             header, body = open_store(self.repo, cfg).read(task_id)
@@ -1830,16 +1879,20 @@ class Journey(MorePanes, App):
         return ("looks_right", "Looks right"), [*common, ("try_again", "Try again"), ("open_browser", "Open in browser")], \
             "Enter looks right · o desktop shot · p phone shot · w open in browser"
 
-    @work(thread=True, exit_on_error=False)
     def do_try_again(self) -> None:
         goal = self.facts.get("goal")
         if goal is None or self.busy:
             return
-        self.call_from_thread(self._set_busy, "Starting the app and looking at it")
+        goal_no = self.facts.get("goal_no")
+        self._set_busy("Starting the app and looking at it")
+        self._try_again_bg(goal, goal_no)
+
+    @work(thread=True, exit_on_error=False)
+    def _try_again_bg(self, goal: dict, goal_no: int) -> None:
         try:
             result = try_it(self.repo, self._cfg(), goal)
             failed = sum(1 for c in result["checks"] if c["ok"] is False)
-            self.call_from_thread(self.say, f"Tried goal {self.facts['goal_no']}: "
+            self.call_from_thread(self.say, f"Tried goal {goal_no}: "
                                   + (f"{failed} of {len(result['checks'])} checks failed" if failed else "every check passed"))
         except Exception as exc:  # noqa: BLE001
             self.failure = {"step": "try", "reason": f"The app could not be tried: {exc}"}
@@ -1854,6 +1907,8 @@ class Journey(MorePanes, App):
 
     def _iterate(self, text: str) -> None:
         goal = self.facts["goal"] or (self.facts["goals"][-1] if self.facts["goals"] else None)
+        if goal is None:
+            return
 
         def step(backend, progress):
             return something_wrong(self.repo, text, chunk_id=goal["id"], backend=backend, on_progress=progress)
@@ -1907,10 +1962,15 @@ class Journey(MorePanes, App):
 
     def on_unmount(self) -> None:
         if self._app_server is not None and self._app_server.poll() is None:
-            try:
+            with contextlib.suppress(OSError):
                 os.killpg(self._app_server.pid, 15)
-            except OSError:
-                pass
+            try:
+                self._app_server.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                with contextlib.suppress(OSError):
+                    os.killpg(self._app_server.pid, 9)
+                with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+                    self._app_server.wait(timeout=1)
 
     # accept --------------------------------------------------------------------
 
@@ -1922,7 +1982,7 @@ class Journey(MorePanes, App):
                 "\n".join(f"[$success]✓[/] {n}  {esc(g['title'])}" for n, g in enumerate(facts["goals"], start=1))
                 + "\n\n[$foreground-muted]Add a feature to keep going. It becomes the next goal.[/]")
             return
-        tasks = [t for t in facts["tasks"] if t["state"] != "dropped"]
+        tasks = [t for t in facts["tasks"] if t["state"] not in ("dropped", "split")]
         tests = sum(len((t["last"] or {}).get("named_tests") or []) for t in tasks)
         result = facts["tried"]
         lines = [esc(facts["goal"].get("goal") or ""), "", f"[b]Tasks[/]  {len(tasks)} built and merged"]
@@ -2026,7 +2086,7 @@ class Journey(MorePanes, App):
         columns: dict[str, list[tuple[str, str]]] = {"waiting": [], "building": [], "needs": [], "done": []}
         for task in self.facts["all_tasks"]:
             state = task["state"]
-            if state == "dropped":
+            if state in ("dropped", "split"):
                 continue
             key = {"done": "done", "in_progress": "building", "in_review": "needs", "blocked": "needs"}.get(state, "waiting")
             why = {"in_review": "ready to accept", "done": "accepted",
@@ -2095,7 +2155,7 @@ class Journey(MorePanes, App):
         if order:
             at = order.index(current) if current in order else 0
             self.query_one(f"#{order[(at + step) % len(order)]}").focus()
-            self.call_after_refresh(lambda: self._show_actions(*self._actions()[:2]))
+            self.call_after_refresh(lambda: None if self._gone() else self._show_actions(*self._actions()[:2]))
 
     def _draw_log(self) -> None:
         self.query_one("#log-text", Static).update(
@@ -2131,8 +2191,13 @@ class Journey(MorePanes, App):
         if self.failure:
             return self.do_dismiss_failure()
         if self.overlay:
-            self.overlay = "blocked" if (self.overlay == "details" and (self._find() or {}).get("state") == "blocked"
-                                         and self.fix is not None) else ""
+            return_blocked = (
+                self.overlay == "details"
+                and (self._find() or {}).get("state") == "blocked"
+                and (self._from_blocked or self.fix is not None)
+            )
+            self._from_blocked = False
+            self.overlay = "blocked" if return_blocked else ""
             self.refresh_screen(focus=True)
         elif self.view:
             self.action_now()
@@ -2153,36 +2218,44 @@ class Journey(MorePanes, App):
         self._last_step = (step, doing, fn)
         self._template = template
         self._cancelled = False
+        self._step_seq += 1
+        step_id = self._step_seq
+        cancel = threading.Event()
+        self._step_cancel = cancel
         self._set_busy(doing if not template else f"{doing} (basic version, the Architect is not asked)")
-        self._step_bg(step, fn, template)
+        self._step_bg(step, fn, template, step_id, cancel)
 
     @work(thread=True, exit_on_error=False)
-    def _step_bg(self, step: str, fn, template: bool) -> None:
+    def _step_bg(self, step: str, fn, template: bool, step_id: int, cancel: threading.Event) -> None:
         backend = None
+        stale = lambda: cancel.is_set() or self._step_seq != step_id  # noqa: E731
         try:
             if not template:
                 backend, reason = open_architect_backend(self.repo, self._cfg())
+                if stale():
+                    return
                 if backend is None:
                     self.health["Architect"] = False
-                    return self.call_from_thread(self._step_failed, step, f"The Architect can't be reached: {reason}")
+                    return self.call_from_thread(self._step_failed, step, f"The Architect can't be reached: {reason}", step_id)
                 self._backend = backend
                 if hasattr(backend, "stream_to"):
-                    backend.stream_to(self._heard)
-            result = fn(backend, lambda message: self.call_from_thread(self._progress, str(message)))
-            if self._cancelled:
+                    backend.stream_to(lambda chunk: None if stale() else self._heard(chunk))
+            result = fn(backend, lambda message: None if stale() else self.call_from_thread(self._progress, str(message), step_id))
+            if stale():
                 return
             if backend is not None:
                 self.health["Architect"] = True
-            self.call_from_thread(self._step_done, step, result)
+            self.call_from_thread(self._step_done, step, result, step_id)
         except Exception as exc:  # noqa: BLE001 - every failure is shown with a way forward
-            if not self._cancelled:
+            if not stale():
                 if backend is not None:
                     self.health["Architect"] = False
                 self.call_from_thread(self._step_failed, step,
                                       f"{'The Architect did not answer' if backend is not None else 'That did not work'}: "
-                                      f"{getattr(exc, 'message', None) or exc}")
+                                      f"{getattr(exc, 'message', None) or exc}", step_id)
         finally:
-            self._backend = None
+            if backend is not None and self._backend is backend:
+                self._backend = None
             self._settle_architect_use(backend)
             if backend is not None and hasattr(backend, "close"):
                 try:
@@ -2209,19 +2282,25 @@ class Journey(MorePanes, App):
         except Exception as exc:  # noqa: BLE001 - counting never gets in the way of the work
             self.log.warning(f"could not note the Architect's tokens: {exc}")
 
-    def _progress(self, message: str) -> None:
+    def _progress(self, message: str, step_id: int | None = None) -> None:
+        if step_id is not None and step_id != self._step_seq:
+            return
         if self.busy and message.strip():
             self.busy_log.append(f"{time.strftime('%H:%M:%S')}  ✓ {self.busy}")  # what was being done is done
             self.busy = message.strip().rstrip(".")[:90]
             self._draw_busy()
 
-    def _step_failed(self, step: str, reason: str) -> None:
+    def _step_failed(self, step: str, reason: str, step_id: int | None = None) -> None:
+        if step_id is not None and step_id != self._step_seq:
+            return
         self.busy = ""
         self.failure = {"step": step, "reason": reason}
         self.say(reason)
         self.refresh_screen(focus=True)
 
-    def _step_done(self, step: str, result) -> None:
+    def _step_done(self, step: str, result, step_id: int | None = None) -> None:
+        if step_id is not None and step_id != self._step_seq:
+            return
         self.busy = ""
         if step == "ask":
             return self._asked(result)
@@ -2258,7 +2337,11 @@ class Journey(MorePanes, App):
 
     def do_cancel(self) -> None:
         self._cancelled = True
+        if self._step_cancel is not None:
+            self._step_cancel.set()
+        self._step_seq += 1
         backend = self._backend
+        self._backend = None
         if backend is not None and hasattr(backend, "close"):
             try:
                 backend.close()
