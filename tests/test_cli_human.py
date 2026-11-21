@@ -224,7 +224,7 @@ class HumanCliCommandsTests(unittest.TestCase):
 
         code, _, err = _run_cli("statsu")
         self.assertEqual(code, EXIT_USAGE)
-        self.assertIn("Did you mean: status?", err)
+        self.assertIn("Did you mean: status", err)  # `setup` is close too, and is offered second
 
         code_b, _, err_b = _run_cli("board", "red")
         self.assertEqual(code_b, EXIT_USAGE)

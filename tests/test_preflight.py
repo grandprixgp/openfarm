@@ -58,6 +58,15 @@ class DogfoodCardsTests(unittest.TestCase):
         again = check_card(card_from(header, body), _cfg(), self.root, list(self.cards.values()))
         self.assertEqual(next(c for c in again if c["check"] == "scaffold")["status"], "pass")
 
+    def test_a_version_string_is_not_a_file(self) -> None:
+        # the v0.20 live run: a user-agent `onthisday/0.1` was added to the files a task may write
+        from types import SimpleNamespace
+
+        from openfarm_core.preflight import named_files
+
+        card = SimpleNamespace(done_text="Send `onthisday/0.1` as the User-Agent from `src/wiki.ts`, see `docs/v2/notes.md`.")
+        self.assertEqual(named_files(card), ["src/wiki.ts", "docs/v2/notes.md"])
+
     def test_the_files_the_text_names_must_be_in_touches(self) -> None:
         touches = self._checks("W1-04")["touches"]
         self.assertEqual(touches["status"], "fail")
@@ -78,7 +87,64 @@ class DogfoodCardsTests(unittest.TestCase):
     def test_sound_cards_pass(self) -> None:
         for cid in ("W1-02", "W1-03"):
             for name, check in self._checks(cid).items():
-                self.assertEqual(check["status"], "pass", f"{cid} {name}: {check['detail']}")
+                if (cid, name) != ("W1-03", "network"):  # the server card: see the network test below
+                    self.assertEqual(check["status"], "pass", f"{cid} {name}: {check['detail']}")
+
+    def _one(self, header_changes: dict, body: str = "") -> tuple[dict, str]:
+        header, old_body = self.raw["W1-02"]
+        return dict(header, **header_changes), body or old_body
+
+    def _repaired(self, header: dict, body: str, check: str) -> tuple[dict, dict, list[str]]:
+        """One check's verdict on a card, and the card after the checks' own repairs."""
+        from openfarm_core.preflight import apply_fixes
+
+        found = check_card(card_from(header, body), _cfg(), self.root, [])
+        fixed, new_body, notes = apply_fixes(header, body, found)
+        again = {c["check"]: c for c in check_card(card_from(fixed, new_body), _cfg(), self.root, [])}
+        self.assertEqual(again[check]["status"], "pass", again[check]["detail"])
+        return {c["check"]: c for c in found}[check], fixed, notes
+
+    def test_a_task_that_needs_the_network_is_caught_before_the_build_and_marked(self) -> None:
+        # the acceptance run: the server task stopped in the build, because nothing said it may use the network
+        header, body = self.raw["W1-03"]
+        self.assertNotIn("network", header)
+        verdict, fixed, notes = self._repaired(header, body, "network")
+        self.assertEqual(verdict["status"], "fail")
+        self.assertIn("not marked `network = true`", verdict["detail"])
+        self.assertIs(fixed["network"], True)
+        self.assertIn("marked as allowed to use the network", notes[-1])
+        quiet = self._checks("W1-02")["network"]  # a pure helper: nothing to mark
+        self.assertEqual(quiet["status"], "pass")
+
+    def test_a_listed_test_that_is_in_the_project_already_is_taken_off_the_list(self) -> None:
+        # the acceptance run: a guard test passed before any code was written, and the build wants a fail first
+        (self.root / "tests/slice.test.ts").write_text("test('answers 400 for a missing src', () => {});\n")
+        tests = [{"file": "tests/slice.test.ts", "name": "answers 400 for a missing src", "asserts": "status is 400"},
+                 {"file": "tests/new.test.ts", "name": "builds the url from imageUrl", "asserts": "url has src"}]
+        header, body = self._one({"tests": tests})
+        verdict, fixed, notes = self._repaired(header, body, "guards")
+        self.assertIn("is in the project already and passes", verdict["detail"])
+        self.assertEqual([t["name"] for t in fixed["tests"]], ["builds the url from imageUrl"])
+        self.assertIn("it still has to keep passing", notes[-1])
+        only = check_card(card_from(dict(header, tests=tests[:1]), body), _cfg(), self.root, [])
+        guards = {c["check"]: c for c in only}["guards"]
+        self.assertEqual(guards["status"], "fail")
+        self.assertNotIn("fix", guards)  # nothing would be left to prove the task: a person or the Architect decides
+        allowed = check_card(card_from(dict(header, test_edits=["tests/slice.test.ts"]), body), _cfg(), self.root, [])
+        self.assertEqual({c["check"]: c for c in allowed}["guards"]["status"], "pass")  # the task says it changes that test
+
+    def test_a_task_that_changes_what_an_existing_test_checks_gets_leave_to_change_that_test(self) -> None:
+        # the acceptance run: `id="hero"` moved off the image, an existing test checked it, and Retry could never work
+        (self.root / "tests/page.test.ts").write_text("assert.match(html, /<img id=\"hero\"/);\n")
+        header, body = self._one({}, "## Done means\n- The hero id moves: `#hero` is removed from the image and put on "
+                                     "the new `<section>`.\n- `src/shared/palette.ts` keeps its exports.\n")
+        verdict, fixed, notes = self._repaired(header, body, "frozen")
+        self.assertIn("which the existing test `tests/page.test.ts` checks", verdict["detail"])
+        self.assertEqual(fixed["test_edits"], ["tests/page.test.ts"])
+        self.assertIn("tests/page.test.ts", fixed["touches"])
+        self.assertIn("may change the existing test `tests/page.test.ts`", notes[-1])
+        adds, _fixed, _notes = self._repaired(*self._one({}, "## Done means\n- Adds `#plate` beside `#hero`.\n"), "frozen")
+        self.assertEqual(adds["status"], "pass")  # adding beside it contradicts nothing
         self.assertEqual(self._checks("W1-01")["touches"]["status"], "pass")
         self.assertEqual(self._checks("W1-01")["seams"]["status"], "pass")
 
@@ -184,3 +250,49 @@ class PlanTests(unittest.TestCase):
         self.assertTrue(plan["W1-04"]["eligible"], plan["W1-04"]["failures"])
         self.assertTrue(any("the Architect rewrote it: the stylesheet now names" in n for n in plan["W1-04"]["repairs"]))
         self.assertEqual(self.store.read("W1-04")[0]["state"], "ready")
+
+    def test_a_forbidden_file_taken_off_a_task_holds_it_until_its_words_stop_asking_for_it(self) -> None:
+        # v0.20 live run: `package.json` came off the task's files, the words still asked for an npm start script,
+        # and the task stopped twice at build time on "the config forbids this path"
+        import json
+
+        from openfarm_core.adapters.files import render_card_file
+
+        self.assertTrue(any("package.json" in f for f in self.cfg.forbidden_files), self.cfg.forbidden_files)
+        ask = "\n  - add a `start` script to `package.json`"
+        self.store.change_card("W1-02", "edit", by="architect", why="test", apply=lambda h, b: (
+            dict(h, touches=[*h["touches"], "package.json"]), b.rstrip("\n") + ask + "\n"))
+
+        plan = self._plan()
+        header = self.store.read("W1-02")[0]
+        self.assertNotIn("package.json", header["touches"])
+        self.assertEqual(header["taken_off"], ["package.json"])
+        self.assertFalse(plan["W1-02"]["eligible"])
+        self.assertEqual(header["state"], "backlog")
+        self.assertTrue(any(r.startswith("forbidden:") and "still asks for `package.json`" in r for r in header["preflight"]))
+        self.assertIn({"check": "forbidden", "status": "fail"}, plan["_checks"])
+
+        asked: list[str] = []
+
+        def architect(prompt: str) -> str:
+            asked.append(prompt)
+            header, body = self.store.read("W1-02")
+            return json.dumps({"cards": {"W1-02": render_card_file(header, body.replace(ask, ""))},
+                               "changes": {"W1-02": "the server is started with node, no start script"}})
+
+        plan = self._plan(architect)
+        self.assertIn("forbidden: the text still asks for `package.json`", asked[0])
+        self.assertIn("do not name the file at all", asked[0])
+        self.assertTrue(plan["W1-02"]["eligible"], plan["W1-02"]["failures"])
+        self.assertEqual(self.store.read("W1-02")[0]["state"], "ready")
+        self.assertIn({"check": "forbidden", "status": "pass"}, plan["_checks"])
+
+
+class LanguageWordTests(unittest.TestCase):
+    def test_a_word_of_the_language_is_not_something_a_task_renames(self) -> None:
+        # v0.20 goal 3 run: "returns `undefined` instead of ..." gave the task leave to change three unrelated tests
+        from openfarm_core.preflight import _spellings
+
+        for word in ("undefined", "null", "Promise", "string"):
+            self.assertEqual(_spellings(word), [], word)
+        self.assertEqual(_spellings("pickNotable"), ["pickNotable"])

@@ -2870,6 +2870,92 @@ class _ScaffoldParser:
         self.end_statement()
 
 
+def typescript_without_param_defaults(text: str) -> str:
+    """`text` with every parameter default taken out and that parameter made optional: `n: number = 3` -> `n?: number`.
+
+    A default is code that runs, which a scaffold may not hold; an optional parameter says the same to a caller.
+    Strings, templates and comments are skipped. What comes back is judged by `typescript_scaffold_problem` as usual.
+    """
+    out: list[str] = []
+    groups: list[dict] = []  # open "(": where the current parameter's text starts in `out`, and its nesting inside
+    i, n = 0, len(text)
+
+    def end_param(group: dict) -> None:
+        cut = group.pop("default_at", None)
+        if cut is None:
+            return
+        del out[cut:]
+        while out and out[-1] in " \t":
+            out.pop()
+        mark = group.get("colon_at")
+        at = mark if mark is not None else len(out)
+        while at > group["start"] and out[at - 1] in " \t":
+            at -= 1
+        if at > group["start"] and out[at - 1] != "?":
+            out.insert(at, "?")
+
+    while i < n:
+        ch = text[i]
+        two = text[i:i + 2]
+        if two == "//":
+            end = text.find("\n", i)
+            end = n if end < 0 else end
+            out.append(text[i:end]); i = end
+            continue
+        if two == "/*":
+            end = text.find("*/", i + 2)
+            end = n if end < 0 else end + 2
+            out.append(text[i:end]); i = end
+            continue
+        if ch in "'\"`":
+            j = i + 1
+            while j < n and text[j] != ch:
+                j += 2 if text[j] == "\\" else 1
+            out.append(text[i:j + 1]); i = j + 1
+            continue
+        group = groups[-1] if groups else None
+        if ch == "(":
+            groups.append({"start": len(out) + 1, "depth": 0})
+        elif ch == ")" and group is not None:
+            if group["depth"] == 0:
+                end_param(group)
+            groups.pop()
+        elif group is not None and "default_at" not in group or group is None:
+            if group is not None:
+                if ch in "[{<":
+                    group["depth"] += 1
+                elif ch in "]}" or (ch == ">" and text[i - 1:i] != "=" and group["depth"]):
+                    group["depth"] = max(0, group["depth"] - 1)
+                elif group["depth"] == 0 and ch == ",":
+                    group.update(start=len(out) + 1, colon_at=None)
+                elif group["depth"] == 0 and ch == ":" and group.get("colon_at") is None:
+                    group["colon_at"] = len(out)
+                elif group["depth"] == 0 and ch == "=" and two not in ("=>", "==") and text[i - 1:i] not in ("=", "!", "<", ">"):
+                    group["default_at"] = len(out)
+        elif ch in "[{":
+            group["depth"] += 1
+        elif ch in "]}":
+            group["depth"] = max(0, group["depth"] - 1)
+        elif ch == "," and group["depth"] == 0:  # the default ends here
+            end_param(group)
+            group.update(start=len(out) + 1, colon_at=None)
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+_VOID_NAME = re.compile(r"^[ \t]*void[ \t]+[A-Za-z_$][\w$]*[ \t]*;[ \t]*\r?\n", re.M)
+
+
+def typescript_stub_tidied(text: str) -> str:
+    """A stub with what a model adds out of habit taken out: parameter defaults, and `void name;` lines.
+
+    Neither changes what a caller sees. Anything else that is not a declaration or a throwing stub is left in,
+    for `typescript_scaffold_problem` to refuse.
+    """
+    return _VOID_NAME.sub("", typescript_without_param_defaults(text))
+
+
 def typescript_scaffold_problem(body: str, in_class: bool = False) -> str:
     """Why `body` is not a TypeScript scaffold, or "" when it is one.
 
@@ -2928,16 +3014,20 @@ def typescript_scaffold_edit_problem(fmt: str, search: str, replace: str,
         return "it is inserted in the middle of a statement"
     if after and not (after[0].isalnum() or after[0] in "_$#}@;"):
         return "it is inserted in the middle of a statement"
+    if _opens_class_body(before, "interface"):
+        # Members added to an interface that is already there: judged as an interface of their own, so a line
+        # that closes the body and goes on with code is still seen as code.
+        return typescript_scaffold_problem("interface _Added {\n" + added + "\n}\n")
     return typescript_scaffold_problem(added, in_class=_opens_class_body(before))
 
 
-def _opens_class_body(masked: str) -> bool:
-    """True when the innermost `{` still open at the end of `masked` is a class's."""
+def _opens_class_body(masked: str, word: str = "class") -> bool:
+    """True when the innermost `{` still open at the end of `masked` is a class's (or, with `word`, an interface's)."""
     stack: list[bool] = []
     header = ""
     for ch in masked:
         if ch == "{":
-            stack.append(bool(re.search(r"\bclass\b", header)))
+            stack.append(bool(re.search(rf"\b{word}\b", header)))
             header = ""
         elif ch == "}":
             if not stack:

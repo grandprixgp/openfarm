@@ -11,6 +11,7 @@ import json
 import os
 import re
 import tempfile
+import time
 from pathlib import Path
 
 from . import adopt
@@ -40,6 +41,47 @@ AUTOMODE_PALETTE: tuple[dict, ...] = (
     {"id": "acp", "group": "power", "label": "Provider OAuth & probe status", "command": "acp status"},
     {"id": "bench", "group": "power", "label": "Run efficacy bench", "command": "bench list"},
 )
+
+
+ARCHITECT_LEDGER = "architect-usage.jsonl"
+
+
+def record_architect_use(state_dir: Path, tokens_in: int, tokens_out: int) -> None:
+    """Note one Architect call's tokens beside the project's other state, so the share counts them."""
+    path = Path(state_dir) / ARCHITECT_LEDGER
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                             "tokens_in": int(tokens_in), "tokens_out": int(tokens_out)}) + "\n")
+
+
+def token_share(state_dir: Path) -> dict:
+    """Every token the project has spent, by who spent it: `{"builders", "reviewers", "architect", "total"}`.
+
+    Builders and reviewers come from each task run's record; the Architect (questions, spec, plan, fixes,
+    answers to builders) from its own ledger.
+    """
+    state_dir = Path(state_dir)
+    share = {"builders": 0, "reviewers": 0, "architect": 0}
+    for rec_path in (state_dir / "cards").glob("*/*/card-record.json"):
+        try:
+            rec = json.loads(rec_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(rec, dict):
+            share["builders"] += int(rec.get("tokens_in", 0) or 0) + int(rec.get("tokens_out", 0) or 0)
+            share["reviewers"] += int(rec.get("micromanager_tokens_in", 0) or 0) + int(rec.get("micromanager_tokens_out", 0) or 0)
+    try:
+        lines = (state_dir / ARCHITECT_LEDGER).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        try:
+            entry = json.loads(line)
+            share["architect"] += int(entry.get("tokens_in", 0) or 0) + int(entry.get("tokens_out", 0) or 0)
+        except (ValueError, AttributeError, TypeError):
+            continue
+    return {**share, "total": sum(share.values())}
 
 
 def _recent_economics(state: StateDir) -> dict:
@@ -416,9 +458,28 @@ def compute_pipeline_stages(
 class _AcpArchitectBackend:
     """Thin Frontier ACP Architect wrapper over `open_acp_worker`."""
 
-    def __init__(self, worker, model: str = "") -> None:
+    def __init__(self, worker, model: str = "", root: Path | None = None, state_dir: Path | None = None) -> None:
         self._worker = worker
         self._model = model
+        self._root = root
+        self._state_dir = state_dir
+        self._unwritten: list[tuple[int, int]] = []  # calls made before the folder was a project
+        self.spent = 0
+
+    def _spend(self, comp) -> None:
+        """Count this call. Nothing about counting may fail the call itself."""
+        try:
+            used = (int(getattr(comp, "tokens_in", 0) or 0), int(getattr(comp, "tokens_out", 0) or 0))
+            self.spent += sum(used)
+            self._unwritten.append(used)
+            if self._state_dir is None and self._root is not None:
+                self._state_dir = load_config(self._root).state_dir
+            if self._state_dir is not None:
+                for tokens_in, tokens_out in self._unwritten:
+                    record_architect_use(self._state_dir, tokens_in, tokens_out)
+                self._unwritten.clear()
+        except Exception:  # noqa: BLE001 - not a project yet, or the state folder can't be written: kept for the next call
+            pass
 
     def ask(self, prompt: str, *, system_prompt: str | None = None) -> str:
         comp = self._worker.complete(
@@ -433,6 +494,7 @@ class _AcpArchitectBackend:
                 "Match the repository's configured language stack and never emit files for another language."
             ),
         )
+        self._spend(comp)
         return str(comp.content or "")
 
     def stream_to(self, on_chunk) -> None:
@@ -526,7 +588,12 @@ def open_architect_backend(
         if timeout_s and timeout_s > 0:
             worker.timeout_s = min(float(getattr(worker, "timeout_s", timeout_s)), float(timeout_s))
         mm_model = str(getattr(getattr(cfg, "micromanager", None), "model", "") or "")
-        return _AcpArchitectBackend(worker, model=mm_model), name
+        chosen = (getattr(cfg, "model_choices", None) or {}).get("architect") or {}
+        if chosen.get("model_from", "config") != "config":
+            mm_model = chosen["model"]
+        if chosen.get("effort_from", "config") != "config":
+            worker.effort = chosen["effort"]
+        return _AcpArchitectBackend(worker, model=mm_model, root=root, state_dir=getattr(cfg, "state_dir", None)), name
     except Exception as exc:
         return None, f"couldn't start {name}: {exc}"
 
@@ -1697,6 +1764,9 @@ def preflight_plan(root: Path, cfg, store, *, backend=None, max_repairs: int = 2
         if any(c["check"] == "rules" for c in failures(checks)):
             fixed_header, fixed_body, did = _repair_card_for_eligibility(root, cfg, new_header, new_body)
             if did:
+                gone = [t for t in (new_header.get("touches") or []) if t not in (fixed_header.get("touches") or [])]
+                if gone:  # the `forbidden` check holds the task until its words stop asking for them
+                    fixed_header["taken_off"] = sorted({*(header.get("taken_off") or []), *map(str, gone)})
                 notes += _structure_notes(new_header, fixed_header)
                 if fixed_body.strip() != new_body.strip():
                     notes.append("a line was added to the Done text so it states a result that can be checked")
@@ -1762,7 +1832,7 @@ def preflight_plan(root: Path, cfg, store, *, backend=None, max_repairs: int = 2
             "repairs": list(header.get("repairs") or []),
             "state": str(header.get("state") or "ready"),
         })
-    names = ("scaffold", "touches", "depends", "seams", "rules")
+    names = ("scaffold", "touches", "forbidden", "depends", "seams", "rules")
     plan_checks = [{"check": name,
                     "status": "fail" if any(c["check"] == name and c["status"] == "fail"
                                             for e in cards for c in e["checks"]) else "pass"}
@@ -1812,6 +1882,8 @@ def _architect_repairs(root: Path, cfg, store, backend, failing: dict[str, list[
         "- seams: a card that writes a stylesheet for a page another card serves must quote that page's element ids "
         "exactly (`#id`) in its stylesheet section, style every one of them, and name no selector the page lacks.\n"
         "- depends: only existing card IDs, no loops.\n"
+        "- forbidden: the project forbids changing that file, so the task must deliver its result without it. "
+        "Reword the task, drop what cannot be done without the file, and do not name the file at all.\n"
         'Return ONLY JSON: {"cards": {"<ID>": "<the whole card file, +++ TOML header and body>"}, '
         '"changes": {"<ID>": "<one sentence on what you changed>"}}\n\n'
         + "\n\n".join(blocks) + ("\n\nCards they depend on:\n" + context if context else "")

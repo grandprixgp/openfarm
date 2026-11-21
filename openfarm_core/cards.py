@@ -71,6 +71,7 @@ OPTIONAL_CARD_FIELDS = (
     "complexity",
     "profile",
     "network",
+    "taken_off",
     "wave",
     "from_card",
     "created_at",

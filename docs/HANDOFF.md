@@ -1,10 +1,29 @@
-# Openfarm v0.14.0 Engineering Handoff
+# Openfarm Engineering Handoff (v0.20.0)
 
-Concise entry point for engineers reviewing, testing, or extending Openfarm v0.14.0.
+Concise entry point for engineers reviewing, testing, or extending Openfarm.
 
 For greenfield empty-folder initialization (`"Read and install this skill <link>"` -> `/openfarm-grill-me` -> `"/openfarm-initialize calorie-log ..."`), see [docs/FROM-IDEA-TO-SHIPPED-APP.md](FROM-IDEA-TO-SHIPPED-APP.md). For step-by-step operator instructions, config table reference, provider setup, card authoring rules, and the executable `tallybox` first-deployment runbook on existing repos, see [docs/USAGE-AND-FIRST-DEPLOYMENT.md](USAGE-AND-FIRST-DEPLOYMENT.md). Module-level detail is in [docs/openfarm-internals.md](openfarm-internals.md).
 
-## Current State (v0.14.0, 20 Nov 2026)
+## Current State (v0.20.0, 21 Nov 2026)
+
+- **v0.15.0** replaced the five-tab workbench with one screen (`openfarm_tui/journey.py`, state rule in
+  `journey_state.py`), moved tasks, spec and decisions to the `openfarm-cards` branch behind `Store.change_card`
+  (`openfarm_core/store.py`), and added the plan checks (`preflight.py`), stopped-task triage (`blocked.py`) and
+  Try it (`tryit.py`).
+- **v0.20.0** made the journey walkable (any reached step, any goal, read-only), added the plan checks `network`,
+  `guards`, `frozen` and `forbidden`, restarts a build after an answered question, sorts builders' questions before
+  showing them, judges Try it on the first screen at two sizes, counts the Architect's tokens
+  (`architect-usage.jsonl`), and moved projects, providers, models, settings and notes into panes of the one
+  screen (`openfarm_tui/journey_more.py`).
+- **Models and setup (v0.20.0)**: `openfarm_core/model_choices.py` lays `.openfarm/models.toml` (project) and the
+  global `models.toml` over the config data in `load_config`, before validation, so every existing reader sees the
+  chosen model and effort. The Architect's own choice is applied in `open_architect_backend`.
+  `openfarm_core/setup_helper.py` is `openfarm setup`; its questions are plain functions taking `ask` and `out`,
+  which is how the tests drive it.
+- Start reading at `openfarm_tui/journey_state.py` (`screen_for`), then `journey.py`.
+- Not seen live: a light terminal, the mouse, a different model for Architect and reviewer in a real build.
+
+## Earlier State (v0.14.0, 20 Nov 2026)
 
 `v0.10.0`–`v0.14.0` turn Openfarm into a multi-project autonomous software factory while keeping `openfarm_core/` **100% Python 3.11+ stdlib-only** (`dependencies = []`, optional `openfarm_tui/` Textual extra with automatic `curses` fallback) and strictly local-only merges (zero `git push` in core, zero `$` spend displayed in TUI or Web UI):
 

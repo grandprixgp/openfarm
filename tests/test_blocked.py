@@ -45,6 +45,34 @@ class TriageTests(unittest.TestCase):
         self.assertTrue(got["why"].startswith("The reviewer's answer could not be read, so the work was never judged."))
         self.assertNotIn("turned the work down", got["why"])
 
+    def test_a_refused_stub_is_named_as_the_cause_and_retry_is_offered(self) -> None:
+        # v0.20 live run: "the test writer left the allowed paths" was shown as "the task is wrong", with only the
+        # Architect to ask; the reviewer's stub had been refused and nothing said so
+        import tempfile
+        from pathlib import Path
+
+        from openfarm_core.blocked import triage_card
+
+        state = Path(tempfile.mkdtemp())
+        for run in ("run-1", "run-2"):
+            gates = state / "cards" / "W1-03" / run / "gates" / "1"
+            gates.mkdir(parents=True)
+            (gates / "micromanager-scaffold.json").write_text(json.dumps({
+                "name": "micromanager-scaffold", "result": "fail",
+                "detail": "scaffold_contract degraded (Refused): src/render.ts: a TypeScript scaffold may only declare: imports "
+                          "and functions whose whole body is one `throw new Error(...)` (a body that is not exactly one throw "
+                          "new Error(...))"}))
+            (gates / "fail-before.json").write_text(json.dumps({
+                "name": "fail-before", "result": "fail", "detail": "on base the frozen tests do not compile"}))
+            (state / "cards" / "W1-03" / run / "card-record.json").write_text(json.dumps({
+                "run_id": run, "card_id": "W1-03", "claimed_at": run, "stop_code": "refused", "attempts": 2,
+                "detail": "the test writer left the allowed paths: src/render.ts"}))
+        got = triage_card(state, "W1-03")
+        self.assertEqual((got["kind"], got["title"], got["main_label"]), ("builder", "The starting stub was refused", "Retry"))
+        self.assertIn("What was wrong with the stub: a body that is not exactly one throw new Error(...)", got["why"])
+        self.assertIn("The task itself may be fine", got["why"])
+        self.assertTrue(got["repeated"])
+
     def test_the_check_that_really_failed_is_named_when_the_stop_reason_hides_it(self) -> None:
         # from the acceptance run: "planner step 1 failed twice" hid a build rule broken on every try
         import tempfile
@@ -175,6 +203,125 @@ class FixTests(_Project):
         self.assertIn("### tally/core.py (as it is now)", asked[0])
         self.assertEqual(apply_fix_and_retry(self.store, "W1-01", fix)["state"], "ready")  # no retry needed: it was never blocked
         self.assertEqual(shown()["state"], "ready")
+
+    def _question(self, title: str, body: str = "") -> dict:
+        from openfarm_core.findings import list_findings
+
+        self.store.change_card("W1-01", "create", header=_header("W1-01"), body=BODY)
+        header, text = self.store.read("W1-01")
+        self.store.src._write("W1-01", dict(header, state="blocked"), text, "W1-01: blocked")
+        self.store.src._write("FIND-1", {"id": "FIND-1", "title": title, "state": "backlog", "category": "finding",
+                                         "from_card": "W1-01"}, body, "FIND-1: asked")
+        return list_findings(self.root, self.cfg)["findings"][0]
+
+    def _waiting(self) -> list[dict]:
+        from openfarm_core.findings import list_findings
+
+        return list_findings(self.root, self.cfg, state_filter="waiting")["findings"]
+
+    def test_a_question_the_architect_can_answer_never_reaches_the_owner(self) -> None:
+        # from the acceptance run: "regex case sensitivity differs from sizedImageUrl" was shown as a question for the owner
+        from openfarm_core.blocked import settle_question
+
+        finding = self._question("Should the count ignore case?", "The task says count words; the helper lowercases.")
+        asked = []
+        got = settle_question(self.root, self.cfg, self.store, finding, backend=lambda prompt: asked.append(prompt) or json.dumps(
+            {"for": "architect", "answer": "Yes: lowercase first, as the existing helper does."}))
+        self.assertEqual(got["for"], "architect")
+        self.assertIn("Should the count ignore case?", asked[0])
+        self.assertIn("The owner is asked ONLY for a choice about what the product should do", asked[0])
+        header, body = self.store.read("W1-01")
+        self.assertIn("## Answer from the Architect", body)
+        self.assertIn("lowercase first", body)
+        self.assertNotEqual(header["state"], "blocked")  # back in the queue
+        self.assertEqual(self._waiting(), [])
+
+    def test_a_product_choice_is_left_for_the_owner_and_asked_once(self) -> None:
+        from openfarm_core.blocked import settle_question
+
+        finding = self._question("Should deleted words still be counted?")
+        got = settle_question(self.root, self.cfg, self.store, finding, backend=lambda prompt: json.dumps({"for": "owner", "answer": ""}))
+        self.assertEqual(got["for"], "owner")
+        self.assertEqual([f["audience"] for f in self._waiting()], ["owner"])
+        self.assertEqual(self.store.read("W1-01")[0]["state"], "blocked")
+        self.assertNotIn("Answer from", self.store.read("W1-01")[1])
+
+    def test_an_answer_does_not_rebuild_a_task_that_stopped_the_same_way_twice(self) -> None:
+        # v0.20 live run: a task stopped three times for one reason while each try's question was answered and retried
+        from openfarm_core.blocked import settle_question
+
+        def stopped(run: str, detail: str) -> None:
+            folder = Path(self.cfg.state_dir) / "cards" / "W1-01" / run
+            folder.mkdir(parents=True)
+            (folder / "card-record.json").write_text(json.dumps(
+                {"card_id": "W1-01", "claimed_at": run, "final_state": "blocked", "stop_code": "refused", "detail": detail}))
+
+        asked = []
+
+        def answered(title: str) -> dict:
+            from openfarm_core.findings import list_findings
+
+            if not asked:
+                finding = self._question(title, "It is not said.")
+            else:
+                fid = f"FIND-{len(asked) + 1}"
+                self.store.src._write(fid, {"id": fid, "title": title, "state": "backlog", "category": "finding",
+                                            "from_card": "W1-01"}, "It is not said.", f"{fid}: asked")
+                finding = next(f for f in list_findings(self.root, self.cfg)["findings"] if f["id"] == fid)
+            asked.append(title)
+            return settle_question(self.root, self.cfg, self.store, finding,
+                                   backend=lambda prompt: json.dumps({"for": "architect", "answer": "Do it the plain way."}))
+
+        stopped("run-1", "the test writer left the allowed paths: src/select.ts")
+        first = answered("Which way round?")
+        self.assertEqual(self.store.read("W1-01")[0]["state"], "ready")
+        self.assertTrue(first["retried"])  # one stop: the answer may be what was missing
+        header, text = self.store.read("W1-01")
+        self.store.src._write("W1-01", dict(header, state="blocked"), text, "W1-01: blocked again")
+        stopped("run-2", "the test writer left the allowed paths: src/select.ts")
+        second = answered("And the other thing?")
+        self.assertEqual((second["for"], second["retried"], second["stuck"]), ("architect", False, True))
+        self.assertFalse(first["stuck"])
+        header, body = self.store.read("W1-01")
+        self.assertEqual(header["state"], "blocked")  # it waits for a person now
+        self.assertEqual(body.count("## Answer from the Architect"), 2)  # the answer is still kept
+        self.assertEqual(self._waiting(), [])
+        stopped("run-3", "the reviewer turned the work down")
+        third = answered("A third thing?")  # three stops, even if the last is a new kind: no more tries by itself
+        self.assertEqual((third["retried"], third["stuck"]), (False, True))
+
+    def test_a_second_stop_of_a_different_kind_is_still_tried_again(self) -> None:
+        from openfarm_core.blocked import settle_question
+
+        for run, detail in (("run-1", "the test writer left the allowed paths"), ("run-2", "2 counter-tests fail")):
+            folder = Path(self.cfg.state_dir) / "cards" / "W1-01" / run
+            folder.mkdir(parents=True)
+            (folder / "card-record.json").write_text(json.dumps(
+                {"card_id": "W1-01", "claimed_at": run, "final_state": "blocked", "stop_code": "refused", "detail": detail}))
+        got = settle_question(self.root, self.cfg, self.store, self._question("Which way?", "Not said."),
+                              backend=lambda prompt: json.dumps({"for": "architect", "answer": "The plain way."}))
+        self.assertEqual((got["retried"], got["stuck"]), (True, False))  # a different stop is a new situation
+
+    def test_with_no_architect_the_question_goes_to_the_owner(self) -> None:
+        from openfarm_core.blocked import settle_question
+
+        def down(prompt):
+            raise TimeoutError("no answer")
+
+        for backend in (None, down, lambda prompt: "not json at all"):
+            finding = self._question("Which separator should the output use?") if backend is None else self._waiting()[0]
+            self.assertEqual(settle_question(self.root, self.cfg, self.store, finding, backend=backend)["for"], "owner")
+        self.assertEqual([f["audience"] for f in self._waiting()], ["owner"])
+
+    def test_a_note_about_the_tooling_is_filed_and_nobody_is_asked(self) -> None:
+        # from the acceptance run: "Harness cues are inconsistent with this card" was shown as a question to answer
+        from openfarm_core.blocked import settle_question
+
+        finding = self._question("Harness cues are inconsistent with this card", "Cue 3 says X, the card says Y.")
+        got = settle_question(self.root, self.cfg, self.store, finding, backend=lambda prompt: self.fail("nobody is asked"))
+        self.assertEqual(got["for"], "nobody")
+        self.assertEqual(self._waiting(), [])
+        self.assertEqual(self.store.read("W1-01")[0]["state"], "blocked")  # it stopped for its own reason: that still shows
 
     def test_no_fix_is_said_plainly(self) -> None:
         self.store.change_card("W1-01", "create", header=_header("W1-01"), body=BODY)

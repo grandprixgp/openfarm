@@ -34,8 +34,10 @@ _STOP_WORDS = frozenset("""
 """.split())
 
 # Runs in the page. For each word the goal names, find the element that carries it
-# (by id or class) and say whether a person could see it: it has size, is not
-# hidden, its text differs from what is behind it, and nothing else covers it.
+# (by id or class) and say whether a person could see it without scrolling: it
+# has size, is not hidden, its text differs from what is behind it, nothing else
+# covers it, and it is on the first screen. Also the colours the first screen is
+# made of: the largest backgrounds and the most used text colours.
 _LOOK = r"""
 (words) => {
   const rgb = (c) => { const m = (c || '').match(/[\d.]+/g) || []; return m.map(Number); };
@@ -58,7 +60,8 @@ _LOOK = r"""
     }
     const x = Math.min(Math.max(r.left + r.width / 2, 0), innerWidth - 1);
     const y = Math.min(Math.max(r.top + r.height / 2, 0), innerHeight - 1);
-    if (r.bottom < 0 || r.right < 0) return 'it is off the screen';
+    if (r.bottom < 0 || r.right < 0 || r.left >= innerWidth) return 'it is off the screen';
+    if (r.top >= innerHeight) return 'it is below the first screen, so you have to scroll to see it';
     if (r.top < innerHeight && r.left < innerWidth) {
       const top = document.elementFromPoint(x, y);
       if (top && top !== el && !el.contains(top) && !top.contains(el)) {
@@ -78,7 +81,21 @@ _LOOK = r"""
   const imgs = [...document.querySelectorAll('img')].filter((i) => i.getAttribute('src'));
   const pictures = { total: imgs.length, pending: imgs.filter((i) => !i.complete).length,
                      broken: imgs.filter((i) => i.complete && i.naturalWidth === 0).length };
-  return JSON.stringify({ named, readable, pictures, title: document.title, text: document.body ? document.body.innerText.length : 0 });
+  const hex = (c) => '#' + c.slice(0, 3).map((v) => Math.round(v).toString(16).padStart(2, '0')).join('');
+  const paper = new Map(), ink = new Map();
+  for (const el of [...document.querySelectorAll('body, body *')].slice(0, 1500)) {
+    const s = getComputedStyle(el), r = el.getBoundingClientRect();
+    if (s.display === 'none' || s.visibility === 'hidden' || r.width < 1 || r.height < 1 || r.top >= innerHeight) continue;
+    const area = (Math.min(r.right, innerWidth) - Math.max(r.left, 0)) * (Math.min(r.bottom, innerHeight) - Math.max(r.top, 0));
+    const bg = rgb(s.backgroundColor);
+    if (area > 0 && bg.length >= 3 && (bg.length < 4 || bg[3] > 0.5)) paper.set(hex(bg), (paper.get(hex(bg)) || 0) + area);
+    const own = [...el.childNodes].filter((n) => n.nodeType === 3).map((n) => n.textContent.trim()).join('').length;
+    if (own) ink.set(hex(rgb(s.color)), (ink.get(hex(rgb(s.color))) || 0) + own);
+  }
+  if (!paper.size) paper.set('#ffffff', 1);  // nothing painted: the browser's own white page
+  const most = (m, n) => [...m.entries()].sort((a, b) => b[1] - a[1]).slice(0, n).map((e) => e[0]);
+  const colours = [...most(paper, 4).map((c) => ({ hex: c, use: 'background' })), ...most(ink, 3).map((c) => ({ hex: c, use: 'text' }))];
+  return JSON.stringify({ named, readable, pictures, colours, title: document.title, text: document.body ? document.body.innerText.length : 0 });
 }
 """
 
@@ -197,9 +214,10 @@ class _Browser:
 
 
 def look_at(url: str, words: list[str], out_dir: Path, browser: Path | None = None) -> dict:
-    """Open `url`, take both screenshots into `out_dir`, and run the three checks.
+    """Open `url` at each screen size, take a screenshot of each into `out_dir`, and run the checks.
 
-    Returns `{"browser", "screenshots", "checks": [{"name", "ok", "detail"}]}`.
+    Returns `{"browser", "screenshots", "colours", "checks": [{"name", "ok", "detail"}]}`. A word has to be seen
+    on the first screen at every size: what a phone only shows after scrolling is not seen.
     Without a browser the load check still runs, over plain HTTP, and the result
     says the page was not looked at.
     """
@@ -225,7 +243,7 @@ def look_at(url: str, words: list[str], out_dir: Path, browser: Path | None = No
         session = chrome.call("Target.attachToTarget", {"targetId": target, "flatten": True})["sessionId"]
         for domain in ("Page", "Runtime", "Log", "Network"):
             chrome.call(f"{domain}.enable", session=session)
-        looked: dict = {}
+        looks: dict[str, dict] = {}
         status = 0
         for name, width, height in VIEWPORTS:
             chrome.call("Emulation.setDeviceMetricsOverride",
@@ -239,15 +257,15 @@ def look_at(url: str, words: list[str], out_dir: Path, browser: Path | None = No
                     "expression": "[...document.images].some((i) => i.getAttribute('src') && !i.complete)",
                     "returnByValue": True}, session)["result"].get("value"):
                 chrome.settle(0.5)
-            if not looked:
+            if not looks:
                 for event in chrome.events:
                     reply = (event.get("params") or {}).get("response") or {}
                     if event.get("method") == "Network.responseReceived" and (event["params"].get("type") == "Document"):
                         status = int(reply.get("status") or 0)
                         break
-                value = chrome.call("Runtime.evaluate", {"expression": f"({_LOOK})({json.dumps(words)})",
-                                                         "returnByValue": True}, session)
-                looked = json.loads(value["result"]["value"])
+            value = chrome.call("Runtime.evaluate", {"expression": f"({_LOOK})({json.dumps(words)})",
+                                                     "returnByValue": True}, session)
+            looks[name] = json.loads(value["result"]["value"])
             png = chrome.call("Page.captureScreenshot", {"format": "png"}, session)["data"]
             path = out_dir / f"{name}-{width}x{height}.png"
             path.write_bytes(base64.b64decode(png))
@@ -270,8 +288,22 @@ def look_at(url: str, words: list[str], out_dir: Path, browser: Path | None = No
     finally:
         chrome.close()
 
-    hidden = [n for n in looked.get("named", []) if n["why"]]
-    shown = [n["word"] for n in looked.get("named", []) if not n["why"]]
+    looked = next(iter(looks.values()), {})  # the first size: the page's pictures and colours are read from it
+    places = {"desktop": "on a desktop screen", "phone": "on a phone"}
+    whys: dict[str, dict[str, str]] = {}
+    for size, look in looks.items():
+        for item in look.get("named", []):
+            whys.setdefault(item["word"], {})[size] = item["why"]
+    hidden = []
+    for word, by_size in whys.items():
+        bad = {size: why for size, why in by_size.items() if why}
+        if bad:
+            same = len(set(bad.values())) == 1 and len(bad) == len(by_size)
+            hidden.append({"word": word, "why": next(iter(bad.values())) if same else "; ".join(
+                f"{places.get(size, size)} {why}" for size, why in bad.items())})
+    shown = [word for word, by_size in whys.items() if not any(by_size.values())]
+    readable = bool(looks) and all(look.get("readable") for look in looks.values())
+    looked = dict(looked, readable=readable)
     if hidden:
         detail = ("; ".join(f"{n['word']} is on the page but can't be seen ({n['why']})" for n in hidden)
                   + (f". Visible: {', '.join(shown)}." if shown else ""))
@@ -280,7 +312,7 @@ def look_at(url: str, words: list[str], out_dir: Path, browser: Path | None = No
     elif looked.get("readable"):
         detail = "the page shows readable text (nothing on it carries the goal's own words, so those were not checked)"
     else:
-        detail = "the page shows no text a person could read"
+        detail = "the first screen shows no text a person could read"
     pictures = looked.get("pictures") or {}
     bad = [f"{pictures[key]} {words}" for key, words in (
         ("broken", "did not load"), ("pending", f"still loading after {int(PICTURE_WAIT)} seconds (too large or too slow)"))
@@ -288,7 +320,7 @@ def look_at(url: str, words: list[str], out_dir: Path, browser: Path | None = No
     picture_checks = [{"name": "pictures", "ok": not bad,
                        "detail": ("of the page's pictures: " + ", ".join(bad)) if bad else "the page's pictures loaded"}
                       ] if pictures.get("total") else []
-    return {"browser": str(browser), "screenshots": shots, "checks": [
+    return {"browser": str(browser), "screenshots": shots, "colours": looked.get("colours") or [], "checks": [
         {"name": "loads", "ok": 200 <= status < 400, "detail": f"the page answered {status or 'nothing'}"},
         {"name": "seen", "ok": not hidden and (bool(shown) or bool(looked.get("readable"))), "detail": detail,
          "hidden": [n["word"] for n in hidden], "shown": shown},
@@ -339,7 +371,7 @@ def try_it(root: Path, cfg, goal: dict | None = None, *, out_dir: Path | None = 
            browser: Path | None = None) -> dict:
     """Run the app and report what a person would find.
 
-    Returns `{"kind", "command", "url", "checks", "screenshots", "output", "ok",
+    Returns `{"kind", "command", "url", "checks", "screenshots", "colours", "output", "ok",
     "words", "goal"}` and writes the same to `result.json` beside the screenshots.
     `ok` is False when any check failed and None when nothing could be tried.
     """
@@ -350,7 +382,7 @@ def try_it(root: Path, cfg, goal: dict | None = None, *, out_dir: Path | None = 
     out_dir.mkdir(parents=True, exist_ok=True)
     plan = how_to_start(root, cfg)
     result = {"kind": plan.get("kind", ""), "goal": goal_id, "command": "", "url": "", "checks": [],
-              "screenshots": [], "output": "", "words": []}
+              "screenshots": [], "output": "", "words": [], "colours": []}
     if not plan:
         result["checks"] = [{"name": "start", "ok": None,
                              "detail": "openfarm doesn't know how to start this app; set [try] start or sample in the config"}]
@@ -381,7 +413,8 @@ def try_it(root: Path, cfg, goal: dict | None = None, *, out_dir: Path | None = 
                 try:
                     if _wait_for_port(port, server, 30):
                         looked = look_at(result["url"], result["words"], out_dir, browser)
-                        result.update(checks=looked["checks"], screenshots=looked["screenshots"])
+                        result.update(checks=looked["checks"], screenshots=looked["screenshots"],
+                                      colours=looked.get("colours") or [])
                     else:
                         result["checks"] = [{"name": "start", "ok": False,
                                              "detail": f"the app did not start listening on port {port}"}]
@@ -410,13 +443,13 @@ def code_version(root: Path) -> str:
     return done.stdout.strip() if done.returncode == 0 else ""
 
 
-def last_result(root: Path, cfg, goal_id: str) -> dict | None:
-    """The saved result of trying this goal, if the code has not changed since."""
+def last_result(root: Path, cfg, goal_id: str, any_code: bool = False) -> dict | None:
+    """The saved result of trying this goal, if the code has not changed since (`any_code`: whatever the code is now)."""
     try:
         result = json.loads((Path(cfg.state_dir) / "tryit" / goal_id / "result.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    return result if result.get("head") == code_version(root) else None
+    return result if any_code or result.get("head") == code_version(root) else None
 
 
 def looks_right(cfg, goal_id: str, why: str = "") -> None:

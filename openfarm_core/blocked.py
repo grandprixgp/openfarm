@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import difflib
 import json
+import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -161,6 +162,29 @@ def failed_checks(state_dir: Path, record: dict) -> list[str]:
     return lines
 
 
+def stub_refused(state_dir: Path, record: dict) -> str:
+    """Why the reviewer's starting stub was refused in a run, or "" when it was not.
+
+    Without the stub the new tests have nothing to import, so the run ends as "the tests do not compile" or "the
+    test writer wrote outside its files", neither of which says what went wrong.
+    """
+    folder = Path(state_dir) / "cards" / str(record.get("card_id")) / str(record.get("run_id")) / "gates"
+    for path in sorted(folder.glob("*/micromanager-scaffold.json")):
+        try:
+            gate = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if gate.get("result") == "fail":
+            detail = str(gate.get("detail") or "")
+            depth = 0
+            for at in range(len(detail) - 1, -1, -1):  # the reason is the last bracketed part, which may hold brackets
+                depth += (detail[at] == ")") - (detail[at] == "(")
+                if depth == 0:
+                    return detail[at + 1:-1] if detail.endswith(")") else detail[:200]
+            return detail[:200]
+    return ""
+
+
 def guard_tests(state_dir: Path, record: dict) -> list[str]:
     """Named tests that already passed before any code was written in this run: guards, which can never 'fail first'."""
     folder = Path(state_dir) / "cards" / str(record.get("card_id")) / str(record.get("run_id")) / "gates"
@@ -190,6 +214,16 @@ def triage_card(state_dir: Path, card_id: str) -> dict | None:
                        "to test the new code: " + "; ".join(guards) + ". It can stay in the test file as a guard, off the "
                        "task's list.")
         return got
+    stub = stub_refused(state_dir, runs[-1])
+    if stub and str(runs[-1].get("stop_code")) in ("refused", "tests-unprovable", "fail-before"):
+        # The task and the builder are not at fault: the stub the tests import was never put in place.
+        spec = KINDS["builder"]
+        got.update(kind="builder", title="The starting stub was refused", main=spec["main"], main_label=ACTIONS[spec["main"]],
+                   others=[{"id": a, "label": ACTIONS[a]} for a in spec["others"]], checks=[],
+                   why="The reviewer's starting stub for this task was refused, so the new tests had nothing to import "
+                       f"and the build could not go on. What was wrong with the stub: {stub}. The task itself may be "
+                       "fine: a retry asks for the stub again.")
+        return got
     checks = failed_checks(state_dir, runs[-1])
     if checks and got["kind"] != "check":
         if runs[-1].get("stop_code") == "cannot-split":  # "too big to split" is how it ended, not why
@@ -207,6 +241,79 @@ def triage_card(state_dir: Path, card_id: str) -> dict | None:
                        "test. " + "; ".join(broke_old) + ". The task has to keep that test passing, or say how.")
     got["checks"] = checks
     return got
+
+
+#: A builder writing about the build's own tooling. That is a note for whoever looks after the tooling, never a
+#: question about the product.
+_TOOLING = re.compile(r"\bharness\b|\bcues?\b|\blessons? (?:file|learned)\b|\bopenfarm\b|\bworktree\b|\bcard format\b",
+                      re.IGNORECASE)
+
+
+def _spec(root: Path, cfg) -> str:
+    from .store import read_doc
+
+    return read_doc(root, cfg, "spec")
+
+
+def settle_question(root: Path, cfg, store, finding: dict, backend=None) -> dict:
+    """Decide who a builder's question is for, and deal with it when it is not the owner's.
+
+    Returns `{"for": "owner" | "architect" | "nobody", "answer", "retried", "stuck"}`. `stuck` is True when the task
+    had already stopped the same way twice running, or three times in any way: answering again would only build it
+    again, so it is left stopped. A note about the tooling is filed and nobody is
+    asked. A question the spec, the task or the code settles is answered by the Architect: the answer goes into the
+    task, as the owner's would, and a stopped task goes back in the queue. Only a choice about what the product
+    should do or look like, which nothing written settles, is left for the owner, and is marked so it is asked once.
+    """
+    from .findings import decide_finding
+    from .frontier_review import _extract_json_dict
+
+    fid, target = str(finding["id"]), str(finding.get("from_card") or "")
+    title, body = str(finding.get("title") or ""), str(finding.get("body") or "")
+    if _TOOLING.search(f"{title}\n{body}"):
+        decide_finding(root, cfg, fid, "dismissed", reason="about the build's own tooling, not the product; kept as a note")
+        return {"for": "nobody", "answer": ""}
+
+    def for_owner() -> dict:
+        header, text = store.read(fid)
+        store.src._write(fid, dict(header, audience="owner"), text, f"{fid}: only the owner can answer this")
+        return {"for": "owner", "answer": ""}
+
+    if backend is None or not target:
+        return for_owner()
+    try:
+        task_header, task_body = store.read(target)
+        prompt = (
+            "A builder working on one task of a software project has asked a question. Decide who has to answer it.\n"
+            "The owner is asked ONLY for a choice about what the product should do or how it should look that the spec "
+            "and the task leave open. Everything else you answer yourself, in one to three plain sentences the builder "
+            "can act on: how to implement something, which of two readings of the task is meant, a detail the spec, the "
+            "task or the existing code already settles, a recommendation the builder is only asking to have confirmed "
+            "(confirm it, or say what to do instead).\n"
+            'Return ONLY JSON: {"for": "owner" or "architect", "answer": "<your answer; empty when it is for the owner>"}'
+            f"\n\n## The spec\n\n{_spec(root, cfg)[:6000]}"
+            f"\n\n## The task {target}: {task_header.get('title') or ''}\n\n{task_body[:6000]}"
+            f"\n\n## The builder's question\n\n{title}\n\n{body[:3000]}"
+            + _files_now(root, task_header)
+        )
+        parsed = _extract_json_dict(str(backend.ask(prompt) if hasattr(backend, "ask") else backend(prompt))) or {}
+    except Exception:  # noqa: BLE001 - an Architect that can't be reached leaves the question with the owner
+        return for_owner()
+    answer = str(parsed.get("answer") or "").strip()
+    if str(parsed.get("for") or "").strip().lower() != "architect" or not answer:
+        return for_owner()
+    store.change_card(target, "edit", by="architect", why=f"the Architect's answer to its question ({fid})",
+                      apply=lambda h, b: (h, b.rstrip() + f"\n\n## Answer from the Architect\n\n{title}\n\n{answer}\n"))
+    decide_finding(root, cfg, fid, "folded", reason=answer, target_card=target)
+    retried = stuck = False
+    if store.states().get(target) == "blocked":
+        runs = records(cfg.state_dir, target)
+        stuck = len(runs) >= 3 or (len(runs) == 2 and all(
+            (runs[-1].get(key) or "") == (runs[-2].get(key) or "") for key in ("stop_code", "detail")))
+        if not stuck:  # the same stop twice, or three stops of any kind: answers are not helping, a person looks
+            store.change_card(target, "retry", by="architect", why="its question was answered")
+            retried = True
+    return {"for": "architect", "answer": answer, "retried": retried, "stuck": stuck}
 
 
 def given_back(record: dict | None) -> bool:

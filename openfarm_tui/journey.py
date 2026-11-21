@@ -23,6 +23,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.command import Hit, Hits, Provider
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.theme import Theme
 from textual.widgets import Button, ContentSwitcher, Input, OptionList, Select, Static, TextArea
@@ -38,10 +39,11 @@ from openfarm_core.automode import (
     new_feature,
     next_goal,
     open_architect_backend,
+    record_architect_use,
     preflight_plan,
     something_wrong,
 )
-from openfarm_core.blocked import apply_fix_and_retry, propose_fix, run_check
+from openfarm_core.blocked import apply_fix_and_retry, propose_fix, run_check, settle_question
 from openfarm_core.bootstrap import initialize_project
 from openfarm_core.config import CONFIG_PATH, load_config
 from openfarm_core.daemon import daemon_status, read_daemon_logs, start_daemon
@@ -50,7 +52,20 @@ from openfarm_core.state import StateDir
 from openfarm_core.store import card_from, open_store, read_doc, write_doc
 from openfarm_core.tryit import fix_request, looks_right, try_it
 
-from .journey_state import STEP_OF, STEPS, gather, load_session, save_session, screen_for, session_path
+from .journey_more import MORE, MORE_LABELS, MorePanes
+from .terminal import ask_background
+from .journey_state import (
+    PROJECT_STEPS,
+    STEP_OF,
+    STEPS,
+    gather,
+    load_session,
+    looking_at,
+    reached,
+    save_session,
+    screen_for,
+    session_path,
+)
 from .markup import esc
 
 THEMES = [
@@ -66,8 +81,12 @@ STACKS = [("Work it out from the idea", "auto"), ("TypeScript / Web", "typescrip
 CHECKS = [  # the plan checks, in the words the Plan screen uses
     ("scaffold", "Every function in the specs can be scaffolded"),
     ("touches", "Every file a task names is one it may touch"),
+    ("forbidden", "No task asks for a file the project forbids changing"),
     ("depends", "The order works: nothing waits on a task that comes later"),
     ("seams", "Shared pieces agree: files that must match name the same things"),
+    ("network", "A task that needs the network says so"),
+    ("guards", "Every test a task lists is new, so it can fail before the code is written"),
+    ("frozen", "No task changes what an existing test checks without leave to change that test"),
     ("rules", "Every task is small and exact enough to build"),
 ]
 STOPPED = {"task": "the task is wrong, not the code", "builder": "the builder fell short, the task is sound",
@@ -82,7 +101,10 @@ PHASES = {  # what the build reports -> what it means for the reader
 
 
 def terminal_is_light() -> bool:
-    """Follow the terminal where it says what it is (`COLORFGBG` ends in the background colour)."""
+    """Follow the terminal: ask it for its background colour, and where it does not say, read `COLORFGBG`."""
+    asked = ask_background() if sys.stdin.isatty() and sys.stdout.isatty() else None
+    if asked is not None:
+        return asked
     last = os.environ.get("COLORFGBG", "").rpartition(";")[2]
     return last.isdigit() and int(last) in (7, 15)
 
@@ -196,33 +218,58 @@ class Everything(Provider):
             yield Hit(1, label, action)
 
 
+STEP_NAMES = list(STEP_OF)  # the steps in order, by their pane's name
+LOOK_ONLY = {"now", "back", "details", "open_task", "shot_desktop", "shot_phone", "full_diff", "tries", "cancel"}
+
+
 class Rail(Vertical):
+    """The steps and the goals. Both are lists: Enter or a click looks at one."""
+
     def compose(self) -> ComposeResult:
         yield Static("JOURNEY", classes="rail-head")
-        for index, name in enumerate(STEPS):
-            yield Static(name, id=f"step-{index}", classes="step")
+        yield OptionList(id="rail-steps")
         yield Static("GOALS", classes="rail-head gap")
-        yield Static("", id="goals")
+        yield OptionList(id="rail-goals")
+        yield Static("none yet", id="goals-none")
+        self._drawn: dict[str, tuple] = {}
 
-    def show(self, step: int, flag: bool, goals: list[dict], current: int) -> None:
+    def _fill(self, list_id: str, rows: list[tuple[str, str]], at: int | None) -> None:
+        key = (tuple(rows), at)
+        if self._drawn.get(list_id) == key:
+            return
+        self._drawn[list_id] = key
+        widget = self.query_one(f"#{list_id}", OptionList)
+        widget.clear_options()
+        widget.add_options([Option(prompt, id=option_id) for option_id, prompt in rows])
+        widget.set_class(not rows, "hidden")
+        if rows and at is not None:
+            widget.highlighted = at
+
+    def show(self, step: int, flag: bool, goals: list[dict], current: int, open_steps: dict[str, str],
+             look_step: int | None = None, look_goal: int = 0) -> None:
+        rows = []
         for index, name in enumerate(STEPS):
-            row = self.query_one(f"#step-{index}", Static)
-            row.set_classes("step " + ("done" if index < step else "now" if index == step else "todo"))
-            glyph = "✓" if index < step else "●" if index == step else "○"
+            glyph, colour = ("✓", "$success") if index < step else ("●", "b $accent") if index == step else (
+                "○", "$foreground-muted")
+            if index > step and not open_steps.get(STEP_NAMES[index]):
+                glyph, colour = "◌", "$foreground"  # ahead of where the project is, but there is something to see
             if index == step and flag:
-                glyph, name = "!", f"{name} · needs you"
-                row.add_class("alert")
-            row.update(f"{glyph}  {name}")
-        lines = []
+                glyph, name, colour = "!", f"{name} · needs you", "b $error"
+            here = "  ◂" if index == look_step else ""
+            rows.append((f"step-{index}", f"[{colour}]{glyph}  {esc(name)}[/]{here}"))
+        self._fill("rail-steps", rows, step if look_step is None else look_step)
+        rows = []
         for number, goal in enumerate(goals, start=1):
             mark = "✓" if goal["status"] == "done" else str(number)
             text = f"{mark}  {goal['title']}"
-            text = esc(text if len(text) <= 22 else text[:21] + "…")
-            lines.append(f"[b $foreground]{text}[/]" if number == current else text)
-        self.query_one("#goals", Static).update("\n".join(lines) or "none yet")
+            text = esc(text if len(text) <= 19 else text[:18] + "…")
+            text = f"[b $foreground]{text}[/]" if number == current else f"[$foreground-muted]{text}[/]"
+            rows.append((f"goal-{number}", text + ("  ◂" if number == look_goal else "")))
+        self._fill("rail-goals", rows, (look_goal or current or 1) - 1 if goals else None)
+        self.query_one("#goals-none", Static).set_class(bool(goals), "hidden")
 
 
-class Journey(App):
+class Journey(MorePanes, App):
     TITLE = "openfarm"
     COMMANDS = {Everything}
     CSS = """
@@ -235,12 +282,9 @@ class Journey(App):
     Rail { width: 26; padding: 1 1 0 2; background: $surface; border-right: tall $panel; }
     .rail-head { color: $foreground-muted; text-style: bold; margin-bottom: 1; }
     .rail-head.gap { margin-top: 2; }
-    .step { height: 1; }
-    #goals { color: $foreground-muted; }
-    .step.done { color: $success; }
-    .step.todo { color: $foreground-muted; }
-    .step.now { color: $accent; text-style: bold; background: $accent 12%; }
-    .step.now.alert { color: $error; background: $error 14%; }
+    Rail OptionList { border: none; background: transparent; margin-bottom: 0; padding: 0; max-height: 9; }
+    Rail OptionList:focus { border: none; background: $accent 10%; }
+    #goals-none { color: $foreground-muted; }
     #main { width: 1fr; }
     #panes { height: 1fr; padding: 1 3 0 3; }
     #panes > VerticalScroll { height: 1fr; scrollbar-size-vertical: 1; }
@@ -252,6 +296,9 @@ class Journey(App):
     OptionList { height: auto; max-height: 10; border: tall $panel; background: $surface; margin-bottom: 1; }
     OptionList:focus { border: tall $primary; }
     .card { border: round $panel; padding: 0 1; margin-bottom: 1; height: auto; }
+    .mod-row { height: auto; }
+    .mod-row Input { width: 2fr; }
+    .mod-row Select { width: 1fr; }
     .card.ok { border: round $success 60%; }
     .card.bad { border: round $error; }
     .card.ask { border: round $accent; }
@@ -275,6 +322,9 @@ class Journey(App):
         Binding("ctrl+j,ctrl+enter", "go", "Do it", priority=True),
         Binding("enter", "go", "Do it"),
         Binding("escape", "back", "Back"),
+        Binding("n", "now", "Where the project is"),
+        Binding("left_square_bracket", "step(-1)", "Earlier step"),
+        Binding("right_square_bracket", "step(1)", "Later step"),
         Binding("b", "board", "Board"),
         Binding("l", "log", "Log"),
         Binding("space", "details", "Details"),
@@ -289,14 +339,21 @@ class Journey(App):
         Binding("f9", "toggle_theme", "Theme"),
     ]
 
-    def __init__(self, repo: Path, config_path: Path | None = None, theme: str = "") -> None:
+    def __init__(self, repo: Path, config_path: Path | None = None, theme: str = "", open_at: str = "") -> None:
         super().__init__()
+        self._open_at = open_at if open_at in MORE else ""  # a pane beside the journey to start on
+        self._doctor: dict | None = None  # the last check-up, for Settings
+        self._prov_note, self._prov_preset = "", ""
+        self._signin: tuple[str, bool] | None = None  # (provider, signed in) once it has been checked
         self.repo = Path(repo)
         self.config_path = config_path
         self._theme_name = theme or ("openfarm-light" if terminal_is_light() else "openfarm-dark")
         self.facts: dict = {}
         self.screen_name = ""
         self.overlay = ""  # "", "blocked", "details", "board" or "log": a look aside, Esc returns
+        self.view: dict | None = None  # {"step", "goal", "why"}: a step the user went to look at; nothing changes from there
+        self.real: dict = {}  # the project's facts; `facts` is what the drawn step shows (another goal's, when looking)
+        self.now = "idea"  # the step the project is at
         self.task_id = ""
         self.busy = ""
         self.busy_since = 0.0
@@ -320,6 +377,13 @@ class Journey(App):
         self._build_started = 0.0  # when the build being shown began, for the top bar
         self._slots: dict[str, str] = {}  # button id -> the action it does now
         self._more: list[tuple] = []  # actions of this screen that had no room for a button
+        self.shown: dict = {}  # the facts the step on screen was drawn from
+        self._health_len = 26
+        self._mod_note = ""
+        self._resume_wanted = False  # a task was unblocked while the last build was still ending
+        self.share = ""  # who spent the tokens, in words; the top bar's tooltip and the log say it
+        self._unrecorded = 0  # Architect tokens spent before the folder was a project, so not in its ledger yet
+        self._sorting: set[str] = set()  # builders' questions being sorted, or sorted, in this window
         self._auto_tried: set[str] = set()  # goals tried without being asked, so a try that can't be saved isn't repeated
 
     # -- layout ---------------------------------------------------------------
@@ -382,10 +446,14 @@ class Journey(App):
             yield Static("", id="try-title", classes="h1")
             yield Static("", id="try-sub", classes="sub")
             yield Static("", id="try-checks", classes="card")
+            yield Static("", id="try-colours", classes="card")
             yield Static("", id="try-shots")
         with VerticalScroll(id="accept"):
             yield Static("", id="accept-title", classes="h1")
             yield Static("", id="accept-text")
+        with VerticalScroll(id="ahead"):
+            yield Static("", id="ahead-title", classes="h1")
+            yield Static("", id="ahead-text")
         with VerticalScroll(id="details"):
             yield Static("", id="details-text")
         with VerticalScroll(id="board"):
@@ -399,6 +467,7 @@ class Journey(App):
         with VerticalScroll(id="log"):
             yield Static("Everything that happened", classes="h1")
             yield Static("", id="log-text")
+        yield from self.compose_more()
 
     def on_resize(self) -> None:
         if self.screen_name:
@@ -413,10 +482,13 @@ class Journey(App):
         except OSError:
             pass
         self.query_one("#stack", Select).value = load_session(self.repo)["stack"]
+        self._unrecorded = sum(int(a) + int(b) for a, b in load_session(self.repo)["spent"])
         self._load_last_run()
         self.refresh_screen(focus=True)
         self.set_interval(1.0, self._tick)
         self._attach_running_build()
+        if self._open_at:
+            self.call_after_refresh(lambda: self.open_more(self._open_at))
         try:
             if self.facts["cfg"] is not None and open_store(self.repo, self.facts["cfg"]).migration()["needed"]:
                 self.call_after_refresh(self.offer_migration)
@@ -486,9 +558,11 @@ class Journey(App):
         self._render_activity()
 
     def _render_activity(self) -> None:
+        if self._gone():
+            return
         self.query_one("#activity", Static).update("\n".join(esc(line) for line in self.activity[-3:]))
         if self.overlay == "log":
-            self.query_one("#log-text", Static).update("\n".join(esc(line) for line in self.activity) or "Nothing yet.")
+            self._draw_log()
 
     def _set_list(self, list_id: str, rows: list[tuple[str, str]]) -> None:
         """Fill an option list, keeping the highlighted row when the rows did not change."""
@@ -540,12 +614,25 @@ class Journey(App):
 
     # -- which screen, and drawing it --------------------------------------------
 
+    def _gone(self) -> bool:
+        """A timer or a finished thread can call in after the window has gone: there is nothing to draw on."""
+        return not self._screen_stack or self._exit or self._closing or self._closed
+
     def refresh_screen(self, focus: bool = False) -> None:
-        self.facts = gather(self.repo, self.config_path)
+        if self._gone():
+            return
+        self.real = self.facts = gather(self.repo, self.config_path)
         picked = screen_for(self.facts)
+        self.now = picked["screen"]
         if self.overlay in ("blocked", "details") and self._find() is None:
             self.overlay = ""
-        name = self.overlay or picked["screen"]
+        view = self.view
+        if view:
+            view["why"] = reached(self.real, view["goal"])[view["step"]]
+            if view["step"] == self.now and (view["step"] in PROJECT_STEPS or view["goal"] == self.real["goal_no"]):
+                view = self.view = None  # the project is where the user was looking
+        self._lock(bool(view))
+        name = self.overlay or ((("ahead" if view["why"] else view["step"]) if view else picked["screen"]))
         changed = name != self.screen_name
         self.screen_name = name
         if changed:
@@ -553,17 +640,33 @@ class Journey(App):
         facts = self.facts
         self.query_one("#brand", Static).update(esc(f"openfarm · {facts['name']}"))
         self.query_one("#panes", ContentSwitcher).current = name
-        self.query_one(Rail).show(STEP_OF[picked["screen"]], picked["flag"], facts["goals"], facts["goal_no"])
-        getattr(self, f"_draw_{name}")()
-        primary, secondary, keys = self._actions()
+        self.query_one(Rail).show(STEP_OF[picked["screen"]], picked["flag"], facts["goals"], facts["goal_no"],
+                                  reached(facts), STEP_OF[view["step"]] if view else None,
+                                  view["goal"] if view and view["step"] not in PROJECT_STEPS else 0)
+        if view and view["step"] not in PROJECT_STEPS:
+            self.facts = looking_at(self.real, view["goal"])  # drawn from that goal's tasks; put back below
+        try:
+            getattr(self, f"_draw_{name}")()
+            primary, secondary, keys = self._actions()
+        finally:
+            self.shown, self.facts = self.facts, self.real
         where = self._where(picked)
-        room = self.size.width - len(f"openfarm · {facts['name']}") - 34
+        self._draw_health()  # first: how much room the middle has depends on how long the token count is
+        room = self.size.width - len(f"openfarm · {facts['name']}") - self._health_len - 8
+        while len(where) > room and where.count(" · ") > 1:  # the last part (minutes, then the count) goes before a word is cut
+            where = where.rpartition(" · ")[0]
         self.query_one("#where", Static).update(esc(where if len(where) <= room else where[: max(8, room - 1)] + "…"))
-        self.query_one("#keys", Static).update(esc(f"{keys} · Ctrl+K everything else"))
-        self._draw_health()
+        line = f"{keys} · Ctrl+K everything else"
+        if not view and not self.overlay and len(line) + 12 <= self.size.width - 2:  # said where there is room; Ctrl+K has it too
+            line = f"{keys} · [ ] steps · Ctrl+K everything else"
+        self.query_one("#keys", Static).update(esc(line))
         self._draw_busy()
         self._show_actions(primary, secondary)
         self._render_activity()
+        fresh = [f for f in self.real.get("unsorted") or [] if f["id"] not in self._sorting]
+        if fresh:
+            self._sorting.update(f["id"] for f in fresh)
+            self._sort_questions(fresh)
         if changed or focus:
             self.call_after_refresh(self._focus_for_screen)
         if name == "build" and not changed:
@@ -571,10 +674,68 @@ class Journey(App):
         if changed:
             self.call_after_refresh(lambda: self.query_one(f"#{name}").scroll_home(animate=False))
 
+    def _lock(self, looking: bool) -> None:
+        """Looking at an earlier step: its fields can be read, not typed in."""
+        self.query_one("#idea-text", TextArea).read_only = looking
+        self.query_one("#stack", Select).disabled = looking
+        self.query_one("#q-own", Input).disabled = looking
+
+    def look(self, step: str = "", goal: int = 0) -> None:
+        """Show a step of a goal as it stands. Looking changes nothing; `n` or Esc returns."""
+        if self.busy or self.failure or len(self.screen_stack) > 1:
+            return
+        current = int(self.real.get("goal_no") or 0)
+        was = self.view or {}
+        if not step:  # a goal was picked: where that goal is
+            done = 0 < goal <= len(self.real["goals"]) and self.real["goals"][goal - 1]["status"] == "done"
+            step = self.now if goal == current else "accept" if done else "plan"
+        goal = goal or was.get("goal") or current
+        self.view = {"step": step, "goal": goal, "why": ""}
+        self.overlay = ""
+        self.refresh_screen(focus=True)
+
+    def action_step(self, by: int) -> None:
+        at = STEP_OF[(self.view or {}).get("step") or self.now] + by
+        if 0 <= at < len(STEP_NAMES):
+            self.look(STEP_NAMES[at])
+
+    def action_now(self) -> None:
+        if self.view or self.overlay:
+            self.view, self.overlay = None, ""
+            self.refresh_screen(focus=True)
+
+    def do_now(self) -> None:
+        self.action_now()
+
+    @on(OptionList.OptionSelected, "#rail-steps")
+    def _rail_step(self, event: OptionList.OptionSelected) -> None:
+        self.look(STEP_NAMES[int(str(event.option.id).split("-")[1])])
+
+    @on(OptionList.OptionSelected, "#rail-goals")
+    def _rail_goal(self, event: OptionList.OptionSelected) -> None:
+        self.look(goal=int(str(event.option.id).split("-")[1]))
+
+    def _draw_ahead(self) -> None:
+        view = self.view or {}
+        name = STEPS[STEP_OF[view["step"]]]
+        goals, number = self.real["goals"], view["goal"]
+        ahead = view["step"] not in PROJECT_STEPS and number != self.real["goal_no"] and 0 < number <= len(goals)
+        self.query_one("#ahead-title", Static).update(esc(f"{name}: not yet" + (f" for goal {number}" if ahead else "")))
+        lines = [esc(view["why"])]
+        if ahead:
+            lines += ["", f"[b]{number}  {esc(goals[number - 1]['title'])}[/]", esc(goals[number - 1].get("goal") or "")]
+        self.query_one("#ahead-text", Static).update("\n".join(lines))
+
     def _where(self, picked: dict) -> str:
-        facts = self.facts
+        facts = self.real
+        if self.view and self.overlay != "board":
+            step = STEPS[STEP_OF[self.view["step"]]]
+            of_goal = "" if self.view["step"] in PROJECT_STEPS or not self.view["goal"] else f" of goal {self.view['goal']}"
+            return f"Looking at {step}{of_goal} · nothing changes from here"
         if self.overlay == "board":
             return "Board · all goals"
+        if self.overlay in MORE:
+            return f"{MORE[self.overlay]} · Esc goes back to the project"
         if not facts["spec"]:
             history, pending = facts["session"]["history"], facts["session"]["pending"]
             return f"Questions · {len(history) + 1}" if (pending and picked["screen"] == "questions") else "new project"
@@ -592,13 +753,20 @@ class Journey(App):
 
     def _draw_health(self) -> None:
         marks = {True: "[$success]●[/]", False: "[$error]✗[/]", None: "[$foreground-muted]○[/]"}
-        total = self.tokens["worker"] + self.tokens["frontier"]
+        spent = dict(self.real.get("tokens") or {})
+        # a running build's own count is ahead of the records, which are written as each task ends
+        spent["builders"] = max(int(spent.get("builders") or 0), self.tokens["worker"])
+        spent["reviewers"] = max(int(spent.get("reviewers") or 0), self.tokens["frontier"])
+        spent["architect"] = int(spent.get("architect") or 0) + self._unrecorded
+        total = spent["builders"] + spent["reviewers"] + spent["architect"]
         tokens = f"   {total // 1000}k tokens" if total >= 1000 else (f"   {total} tokens" if total else "")
         health = self.query_one("#health", Static)
         health.update("   ".join(f"{marks[ok]} {name}" for name, ok in self.health.items()) + tokens)
-        share = (f"builders {self.tokens['worker']:,} tokens ({100 * self.tokens['worker'] // total}%) · "
-                 f"Architect and reviewers {self.tokens['frontier']:,} ({100 * self.tokens['frontier'] // total}%)"
-                 if total else "no tokens spent in this build yet")
+        self._health_len = len("   ".join(f"● {name}" for name in self.health) + tokens)
+        self.share = (" · ".join(f"{name} {spent[key]:,} tokens ({100 * spent[key] // total}%)" for key, name in (
+            ("builders", "builders"), ("reviewers", "reviewers"), ("architect", "Architect")))
+                      if total else "no tokens spent on this project yet")
+        share = self.share
         words = {True: "answered last time it was asked", False: "did not answer last time", None: "not asked yet"}
         health.tooltip = share + "\n" + "\n".join(f"{name}: {words[ok]}" for name, ok in self.health.items())
 
@@ -613,10 +781,17 @@ class Journey(App):
         self.query_one("#busy", Static).update(text)
 
     def _tick(self) -> None:
+        if self._gone():
+            return
         if self.busy:
             self._draw_busy()
         elif len(self.screen_stack) == 1 and self.facts.get("cfg") is not None:
-            self.refresh_screen()  # picks up what a running build did
+            try:
+                self.refresh_screen()  # picks up what a running build did
+                if self._resume_wanted and not self._following and not self.facts["running"]:
+                    self._resume_build()
+            except NoMatches:  # the window is being taken down under this tick: nobody is left to show it to
+                pass
 
     def _show_actions(self, primary: tuple | None, secondary: list[tuple]) -> None:
         # Nothing is cut off: what doesn't fit beside the main button stays on its key and under Ctrl+K.
@@ -652,13 +827,14 @@ class Journey(App):
 
     def _focus_for_screen(self) -> None:
         """One focus: the input the user needs, else the main button."""
-        if len(self.screen_stack) > 1:
+        if self._gone() or len(self.screen_stack) > 1:
             return
         if self.busy or self.failure:  # the way forward is the button
             target = "#go" if self.failure else "#act-3"
             return self.query_one(target).focus()
         target = {"idea": "#idea-text", "questions": "#q-options", "plan": "#plan-tasks", "build": "#build-tasks",
-                  "board": "#col-needs"}.get(self.screen_name, "#go")
+                  "board": "#col-needs", "projects": "#proj-list", "notes": "#notes-list",
+                  "providers": "#prov-architect", "models": "#mod-scope"}.get(self.screen_name, "#go")
         if self.screen_name == "questions" and not self.query_one("#q-options", OptionList).option_count:
             target = "#q-own" if self.facts["session"]["pending"] else "#go"
         if self.screen_name == "build":  # start on the task that needs the user, not the first row
@@ -670,11 +846,15 @@ class Journey(App):
         for selector in (target, "#go", "#act-3"):
             widget = self.query_one(selector)
             if widget.display and not widget.has_class("hidden") and not getattr(widget, "disabled", False):
-                widget.focus()
+                widget.focus(scroll_visible=self.screen_name not in MORE)  # those open at their heading
+                if self.screen_name == "board" and not self.busy:  # its main button names the row the focus landed on
+                    self.call_after_refresh(lambda: self._gone() or self._show_actions(*self._actions()[:2]))
                 return
 
     def _follow_needs(self) -> None:
         """Move the build list to the task that needs the user, once each time that task changes."""
+        if self._gone():
+            return
         tasks = self.facts.get("tasks") or []
         questions = self.facts.get("questions") or []
         needs = self._first("in_review") or next((t for t in tasks if questions and t["id"] == questions[0]["from_card"]),
@@ -691,11 +871,19 @@ class Journey(App):
         if self.failure:
             others = [("template", "Go on without the Architect")] if self.failure["step"] in ("ask", "spec", "plan") else []
             return ("retry", "Retry"), [*others, ("dismiss_failure", "Back")], "Enter retry"
+        if self.view and self.overlay in ("details", "blocked"):
+            return ("back", "Back"), [], "Esc back · ↑↓ scroll"
+        if self.view and not self.overlay:
+            keys = {"plan": " · Space details", "build": " · Space details", "try": " · o desktop shot · p phone shot"}
+            return ("now", f"Back to {STEPS[STEP_OF[self.now]]}"), [], \
+                "n back to where the project is · [ ] other steps" + keys.get(self.screen_name, "")
         return getattr(self, f"_actions_{self.screen_name}")()
 
     # idea ----------------------------------------------------------------------
 
     def _draw_idea(self) -> None:
+        if self.view:
+            return self.query_one("#idea-next", Static).update("This is the idea the project started from.")
         self.query_one("#idea-next", Static).update(
             "Next the Architect asks a few questions, one at a time, then writes a spec you can read "
             "before anything is built.")
@@ -745,7 +933,8 @@ class Journey(App):
         self.query_one("#q-progress", Static).update(
             f"[$foreground-muted]Question {len(history) + 1} of {total}[/]   {dots}" if pending else dots)
         self.query_one("#q-title", Static).update(esc(pending.get("question") or (
-            "Asking the Architect about your idea..." if self.busy else "No question is open.")))
+            "Asking the Architect about your idea..." if self.busy else
+            ("The questions you answered" if history else "No questions were asked.") if self.view else "No question is open.")))
         self.query_one("#q-why", Static).update(esc(pending.get("why") or ""))
         suggested = str(pending.get("recommended") or "").strip().lower()
         self._set_list("q-options", [
@@ -753,7 +942,8 @@ class Journey(App):
                 option.lower().startswith(suggested[:24]) or suggested.startswith(option.lower()[:24])) else ""))
             for i, option in enumerate(pending.get("options") or [])])
         self._set_list("q-answered", [(f"ans-{i}", f"[$success]✓[/] {esc(turn['question'])}\n   {esc(turn['answer'])}"
-                                       "   [$foreground-muted](Enter: change)[/]") for i, turn in enumerate(history)])
+                                       + ("" if self.view else "   [$foreground-muted](Enter: change)[/]"))
+                                      for i, turn in enumerate(history)])
 
     def _actions_questions(self):
         if not self.facts["session"]["pending"]:
@@ -781,11 +971,13 @@ class Journey(App):
 
     @on(Input.Submitted, "#q-own")
     def _own_answer_sent(self) -> None:
-        self.do_answer()
+        self.action_act("answer")
 
     @on(OptionList.OptionSelected, "#q-answered")
     def _change_answer(self, event: OptionList.OptionSelected) -> None:
         """Reopen an earlier question: it and what followed are asked again."""
+        if self.view:
+            return
         session = self._session()
         index = int(str(event.option.id).split("-")[1])
         turn = session["history"][index]
@@ -997,13 +1189,57 @@ class Journey(App):
         self._following = True
         self._build_bg("")
 
+    @work(thread=True, exit_on_error=False, group="sort")
+    def _sort_questions(self, findings: list[dict]) -> None:
+        """A builder's question is shown only if it is the owner's. The rest never interrupt: sorted here, quietly."""
+        try:
+            cfg = self._cfg()
+            backend, _reason = open_architect_backend(self.repo, cfg)
+        except Exception:  # noqa: BLE001 - with no Architect the questions go to the owner
+            backend = None
+        for finding in findings:
+            try:
+                outcome = settle_question(self.repo, cfg, open_store(self.repo, cfg), finding, backend)
+            except Exception as exc:  # noqa: BLE001 - shown in the strip
+                self.call_from_thread(self.say, f"{finding['from_card']}'s question could not be sorted: {exc}")
+                # e.g. its task went back to building on an earlier answer: sorted again if it ever holds the task up
+                self.call_from_thread(self._sorting.discard, finding["id"])
+                continue
+            self.call_from_thread(self._question_sorted, finding, outcome)
+
+    def _question_sorted(self, finding: dict, outcome: dict) -> None:
+        who = finding["from_card"]
+        if outcome["for"] == "architect":
+            if not outcome.get("stuck"):
+                self.say(f"{who} asked a question the Architect could answer; the answer is in the task")
+                return self._resume_build()
+            self.say(f"{who} asked a question the Architect answered, but it keeps stopping: it waits for you")
+        if outcome["for"] == "nobody":
+            self.say(f"{who} left a note about the tooling; it is filed with the builders' notes")
+        self.refresh_screen()
+
+    def _resume_build(self) -> None:
+        """The user just unblocked a task: the build goes back to work without a second press."""
+        self.refresh_screen(focus=True)
+        waiting = [t for t in self.facts["tasks"] if t["state"] == "ready"]
+        self._resume_wanted = False
+        if waiting and not self._refusal():
+            if self._following or self.facts["running"]:
+                self._resume_wanted = True  # the build that just stopped it is still winding down: the tick restarts it
+            else:
+                self.do_build()
+
     def _refusal(self) -> str:
         cfg = self._cfg()
         state = StateDir(cfg.state_dir)
         if state.kill_requested(cfg.kill_switch):
             return "it was stopped (use Resume)"
         if state.is_paused():
-            return "it is paused (use Resume)"
+            try:  # the build pauses itself when something outside the task went wrong, and says what
+                why = str(json.loads((Path(cfg.state_dir) / "paused").read_text(encoding="utf-8")).get("reason") or "")
+            except (OSError, ValueError, AttributeError):
+                why = ""
+            return "it is paused" + (f" ({why[:140]})" if why else "") + ": use Resume"
         if state.read_breaker().get("tripped"):
             return "too many tasks failed in a row, so the safety stop is on (Ctrl+K, Settings)"
         return ""
@@ -1141,8 +1377,10 @@ class Journey(App):
         tasks = [t for t in facts["tasks"] if t["state"] != "dropped"]
         accepted = sum(1 for t in tasks if t["state"] == "done")
         started = sum(1 for t in tasks if t["state"] in ("in_progress", "in_review", "blocked", "done"))
+        held = "" if facts["running"] or self.view or facts.get("cfg") is None else self._refusal()
         self.query_one("#build-title", Static).update(
             esc(f"Building {started} of {len(tasks)} tasks" if facts["running"]
+                else f"The build can't go on: {held}" if held.startswith(("it is paused", "it was stopped"))
                 else f"The build is not running · {accepted} of {len(tasks)} tasks accepted"))
         rows = []
         for task in tasks:
@@ -1190,6 +1428,8 @@ class Journey(App):
             primary = ("open_blocked", f"See why {blocked['id']} stopped")
         elif waiting and not facts["running"] and not self._following:
             primary = ("build", f"Build {len(waiting)} task{'s' if len(waiting) != 1 else ''}")
+            if self._refusal().startswith("it is paused") or self._refusal().startswith("it was stopped"):
+                primary = ("resume", f"Resume and build {len(waiting)} task{'s' if len(waiting) != 1 else ''}")
         elif not facts["running"] and not self._following and self._first("backlog"):  # parked by the plan checks
             parked = sum(1 for t in facts["tasks"] if t["state"] == "backlog")
             primary = ("fix_parked", f"Repair {parked} task{'s' if parked != 1 else ''}")
@@ -1200,7 +1440,7 @@ class Journey(App):
             others.append(("open_blocked", f"See why {blocked['id']} stopped"))
         cfg = facts["cfg"]
         held = cfg is not None and (StateDir(cfg.state_dir).is_paused() or StateDir(cfg.state_dir).kill_requested(cfg.kill_switch))
-        if held:
+        if held and not (primary and primary[0] == "resume"):
             others.append(("resume", "Resume"))
         elif facts["running"] or self._following:  # nothing to pause when nothing runs
             others.append(("pause", "Pause"))
@@ -1230,7 +1470,7 @@ class Journey(App):
             if store.states().get(target) == "blocked":
                 store.change_card(target, "retry", why="its question was answered")
             self.say(f"You answered {target}'s question; it is back in the queue")
-            self.refresh_screen(focus=True)
+            self._resume_build()
 
         self.push_screen(AskModal(f"{finding['from_card']} asks: {finding['title']}",
                                   (finding.get("body") or finding.get("body_preview") or "")[:3000]), answered)
@@ -1239,7 +1479,7 @@ class Journey(App):
         self._run_cli("Pausing the build", [["pause"]], "Paused: tasks being built finish, no new one starts")
 
     def do_resume(self) -> None:
-        self._run_cli("Resuming", [["resume"]], "Resumed")
+        self._run_cli("Resuming", [["resume"]], "Resumed", then=self._resume_build)  # and on with what was waiting
 
     def do_open_blocked(self) -> None:
         task = self._selected_task()
@@ -1317,7 +1557,7 @@ class Journey(App):
         self.say(f"{self.task_id}: fix applied, " + ("back in the queue" if outcome["state"] == "ready"
                                                     else "but it still fails the plan checks"))
         self.overlay = ""
-        self.refresh_screen(focus=True)
+        self._resume_build()
 
     def do_ask_fix(self) -> None:
         task = self._find()
@@ -1335,7 +1575,7 @@ class Journey(App):
         self.say(f"{self.task_id} is back in the queue" if outcome["state"] == "ready"
                  else f"{self.task_id} still fails the plan checks")
         self.overlay = ""
-        self.refresh_screen(focus=True)
+        self._resume_build()
 
     def do_skip_task(self) -> None:
         def skipped(why: str | None) -> None:
@@ -1384,11 +1624,18 @@ class Journey(App):
     def _draw_try(self) -> None:
         facts, result = self.facts, self.facts["tried"]
         number = facts["goal_no"]
+        if result is None and self.view:
+            self.query_one("#try-title", Static).update(esc(f"Goal {number} was not tried here."))
+            for part in ("#try-sub", "#try-checks", "#try-shots"):
+                self.query_one(part, Static).update("")
+            self.query_one("#try-colours", Static).add_class("hidden")
+            return
         if result is None:
             self.query_one("#try-title", Static).update(esc(f"Goal {number} is built. Starting it to have a look."))
             self.query_one("#try-sub", Static).update("")
             self.query_one("#try-checks", Static).update("[$foreground-muted]◌ not tried yet[/]")
             self.query_one("#try-shots", Static).update("")
+            self.query_one("#try-colours", Static).add_class("hidden")
             if not self.busy and not self.failure and facts["goal"]["id"] not in self._auto_tried:
                 self._auto_tried.add(facts["goal"]["id"])
                 self.call_after_refresh(self.do_try_again)
@@ -1409,6 +1656,16 @@ class Journey(App):
         box = self.query_one("#try-checks", Static)
         box.update("\n".join(lines))
         box.set_classes("card " + ("bad" if result["ok"] is False else "ok" if result["ok"] else ""))
+        colours = [c for c in result.get("colours") or [] if len(str(c.get("hex"))) == 7 and str(c["hex"]).startswith("#")]
+        swatches = self.query_one("#try-colours", Static)
+        swatches.set_class(not colours, "hidden")
+        if colours:  # the page's own colours, so "themed from the picture" can be judged without opening a screenshot
+            rows = ["[b]Colours on the first screen[/]  [$foreground-muted]largest first[/]"]
+            for use, label in (("background", "Backgrounds"), ("text", "Text")):
+                chips = [f"[on {c['hex']}]      [/] {c['hex']}" for c in colours if c.get("use") == use]
+                if chips:
+                    rows.append(f"{label:<12}" + "   ".join(chips))
+            swatches.update("\n".join(rows))
         names = [Path(shot).stem.replace("-", " ") for shot in result["screenshots"]]
         self.query_one("#try-shots", Static).update(
             "[b]Screenshots[/]   " + "   ".join(f"{esc(name)} [$foreground-muted]({key})[/]" for name, key in zip(names, "op"))
@@ -1471,7 +1728,7 @@ class Journey(App):
         self.refresh_screen(focus=True)
 
     def _shot(self, index: int) -> None:
-        shots = (self.facts.get("tried") or {}).get("screenshots") or []
+        shots = (self.shown.get("tried") or {}).get("screenshots") or []
         if self.screen_name == "try" and index < len(shots):
             webbrowser.open(Path(shots[index]).as_uri())
             self.note = f"Opened {shots[index]}"
@@ -1532,7 +1789,8 @@ class Journey(App):
             lines += [f"{'[$success]✓[/]' if c['ok'] else '[$error]✗[/]'} {esc(str(c['detail']).partition(' (')[0])}"
                       for c in result["checks"]]
         self.query_one("#accept-title", Static).update(
-            esc(f"Goal {facts['goal_no']} · {facts['goal']['title']} is ready to accept"))
+            esc(f"Goal {facts['goal_no']} · {facts['goal']['title']} "
+                + ("was accepted" if facts["goal"]["status"] == "done" else "is ready to accept")))
         self.query_one("#accept-text", Static).update("\n".join(lines))
 
     def _actions_accept(self):
@@ -1653,8 +1911,27 @@ class Journey(App):
 
     @on(OptionList.OptionHighlighted)
     def _row_moved(self, event: OptionList.OptionHighlighted) -> None:
-        if self.screen_name == "board" and not self.busy:
+        if self.screen_name == "board" and not self.busy and not self._gone():
             self._show_actions(*self._actions()[:2])
+        if self.screen_name in ("projects", "notes") and not self.busy and not self._gone() and len(self.screen_stack) == 1:
+            self.refresh_screen()  # the card under the list is about the row picked
+
+    @on(Select.Changed, "#prov-preset")
+    def _preset_changed(self, event: Select.Changed) -> None:
+        if self.overlay == "providers":
+            self.preset_picked(str(event.value))
+
+    @on(Select.Changed, "#mod-scope")
+    def _models_scope_changed(self, _event: Select.Changed) -> None:
+        if self.overlay == "models":
+            self._mod_note = ""
+            self._load_models()
+            self.refresh_screen()
+
+    @on(Select.Changed, "#prov-architect")
+    def _architect_changed(self, event: Select.Changed) -> None:
+        if self.overlay == "providers":
+            self.architect_picked(str(event.value))
 
     def action_column(self, step: int) -> None:
         if self.screen_name != "board":
@@ -1668,7 +1945,8 @@ class Journey(App):
             self.call_after_refresh(lambda: self._show_actions(*self._actions()[:2]))
 
     def _draw_log(self) -> None:
-        self.query_one("#log-text", Static).update("\n".join(esc(line) for line in self.activity) or "Nothing yet.")
+        self.query_one("#log-text", Static).update(
+            f"[$foreground-muted]Tokens so far: {esc(self.share)}[/]\n\n" + ("\n".join(esc(line) for line in self.activity) or "Nothing yet."))
 
     def _actions_log(self):
         return ("back", "Back"), [], "Esc back · ↑↓ scroll"
@@ -1703,6 +1981,8 @@ class Journey(App):
             self.overlay = "blocked" if (self.overlay == "details" and (self._find() or {}).get("state") == "blocked"
                                          and self.fix is not None) else ""
             self.refresh_screen(focus=True)
+        elif self.view:
+            self.action_now()
 
     # -- running things -----------------------------------------------------------
 
@@ -1746,11 +2026,31 @@ class Journey(App):
                                       f"{getattr(exc, 'message', None) or exc}")
         finally:
             self._backend = None
+            self._settle_architect_use(backend)
             if backend is not None and hasattr(backend, "close"):
                 try:
                     backend.close()
                 except Exception:  # noqa: BLE001
                     pass
+
+    def _settle_architect_use(self, backend) -> None:
+        """Calls made before the folder was a project are kept with the idea, and put in its ledger once it is one."""
+        try:
+            session = self._session()
+            unwritten = getattr(backend, "_unwritten", None)
+            owed = [*session["spent"], *[list(pair) for pair in (unwritten if isinstance(unwritten, list) else [])]]
+            if isinstance(unwritten, list):
+                unwritten.clear()
+            cfg = self._cfg()
+            if cfg is not None:
+                for tokens_in, tokens_out in owed:
+                    record_architect_use(cfg.state_dir, tokens_in, tokens_out)
+                owed = []
+            if owed != session["spent"]:
+                save_session(self.repo, {**session, "spent": owed})
+            self._unrecorded = sum(int(a) + int(b) for a, b in owed)
+        except Exception as exc:  # noqa: BLE001 - counting never gets in the way of the work
+            self.log.warning(f"could not note the Architect's tokens: {exc}")
 
     def _progress(self, message: str) -> None:
         if self.busy and message.strip():
@@ -1810,13 +2110,13 @@ class Journey(App):
         self.say("Cancelled")
         self.refresh_screen(focus=True)
 
-    def _run_cli(self, doing: str, commands: list[list[str]], done: str) -> None:
+    def _run_cli(self, doing: str, commands: list[list[str]], done: str, then=None) -> None:
         if not self.busy:
             self._set_busy(doing)
-            self._cli_bg(commands, done)
+            self._cli_bg(commands, done, then)
 
     @work(thread=True, exit_on_error=False)
-    def _cli_bg(self, commands: list[list[str]], done: str) -> None:
+    def _cli_bg(self, commands: list[list[str]], done: str, then=None) -> None:
         base = [sys.executable, "-m", "openfarm_core.cli", "--repo", str(self.repo)]
         if self.config_path is not None:
             base += ["--config", str(self.config_path)]
@@ -1831,15 +2131,17 @@ class Journey(App):
                 break
         self.call_from_thread(self.say, said)
         self.call_from_thread(self._set_busy, "")
+        if then is not None and said == done:
+            self.call_from_thread(then)
 
     # -- keys ---------------------------------------------------------------------
 
     def check_action(self, action: str, parameters: tuple) -> bool | None:
         """Single keys never steal typing: in a text field only the Ctrl keys and Esc act."""
-        if len(self.screen_stack) > 1 and action in ("go", "back", "board", "log", "details", "act", "column"):
+        if len(self.screen_stack) > 1 and action in ("go", "back", "board", "log", "details", "act", "column", "now", "step"):
             return False  # a dialog is open: its own keys act
-        typing = isinstance(self.focused, (Input, TextArea))
-        if typing and action in ("board", "log", "details", "act", "column", "go") and not (
+        typing = isinstance(self.focused, (Input, TextArea)) and not self.view
+        if typing and action in ("board", "log", "details", "act", "column", "go", "now", "step") and not (
                 action == "go" and isinstance(self.focused, TextArea)):
             return False
         if action == "go" and isinstance(self.focused, (Button, OptionList)):
@@ -1854,6 +2156,9 @@ class Journey(App):
             self.action_act(self._slots["go"])
 
     def action_act(self, name: str) -> None:
+        if self.view and name not in LOOK_ONLY:  # every button and key comes through here
+            self.note = f"You are looking back: nothing changes from here. n returns to {STEPS[STEP_OF[self.now]]}."
+            return self._draw_busy()
         if len(self.screen_stack) == 1 and (not self.busy or name == "cancel"):
             getattr(self, f"do_{name}")()
 
@@ -1864,7 +2169,7 @@ class Journey(App):
     @on(OptionList.OptionSelected)
     def _row_chosen(self, event: OptionList.OptionSelected) -> None:
         list_id = event.option_list.id or ""
-        if list_id == "q-answered":
+        if list_id in ("q-answered", "rail-steps", "rail-goals"):
             return
         self.action_go()  # Enter always does the main action; Space looks at the row
 
@@ -1875,13 +2180,14 @@ class Journey(App):
         items = [(label.rstrip("…"), lambda name=name: self.action_act(name)) for name, label in self._more]
         items += [("Board: every task of every goal", self.action_board), ("Log: everything that happened", self.action_log),
                  ("Switch between the light and dark theme", self.action_toggle_theme)]
+        items += [(f"Look at the {name} step", lambda step=step: self.look(step)) for step, name in zip(STEP_NAMES, STEPS)]
+        items += [(f"Look at goal {number}: {goal['title']}", lambda number=number: self.look(goal=number))
+                  for number, goal in enumerate(self.real.get("goals") or [], 1)]
+        more = [(label, lambda name=name: self.open_more(name)) for name, label in MORE_LABELS]
+        if self.view:
+            return [("Back to where the project is", self.action_now), *items, *more, ("Quit", self.exit)]
         if self.facts.get("spec"):
             items += [("Something's wrong: ask for fix tasks", self.do_something_wrong),
                       ("New feature: add a goal", self.do_new_feature)]
         items.append(("Move this project's tasks and spec off the main branch (once)", self.offer_migration))
-        items += [(label, lambda view=view: self.exit(("classic", view))) for label, view in (
-            ("Projects: switch, add or remove a project", "projects"),
-            ("Providers and sign-in", "providers"),
-            ("Settings, doctor and the old screens", "engine"),
-            ("Questions and notes from builders (all of them)", "findings"))]
-        return [*items, ("Quit", self.exit)]
+        return [*items, *more, ("Quit", self.exit)]

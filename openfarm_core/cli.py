@@ -2752,8 +2752,8 @@ _CLI_EPILOG = """\
 Words: a task is a card, a goal is a chunk, the plan is the wave plan, and "build" runs it.
 Questions from the builders are findings. Accept merges a finished task locally; nothing is ever pushed.
 
-Command groups (39 commands):
-  Setup & Auth          init, adopt, install-skill, acp, providers, projects, doctor
+Command groups (41 commands):
+  Setup & Auth          setup, init, adopt, install-skill, acp, providers, models, projects, doctor
   Plan & Tasks          plan, card, check, triage
   Build & Monitor       auto, run, daemon, web, status, pause, resume, stop, tui
   Try, Review & Accept  try, review, land, findings, replay, routing, timeline, frontier-review, dossier, verdict, done, release, escape, supervise, harness
@@ -3284,6 +3284,44 @@ def build_parser() -> argparse.ArgumentParser:
     prov_p.add_argument("--no-zdr", action="store_true")
     prov_p.add_argument("--timeout", type=float, default=5.0)
 
+    setup_p = sub.add_parser(
+        "setup",
+        help="set openfarm up step by step: who plans, who builds, which models and how much effort",
+        formatter_class=raw_fmt,
+        epilog="Asks each thing in turn. Every answer is also a flag, and --yes asks nothing:\n"
+               "  openfarm setup\n"
+               "  openfarm setup --yes --frontier claude --preset openrouter --api-key \"$KEY\" \\\n"
+               "      --builder-model qwen/qwen3-coder --architect-effort high --builder-effort medium\n"
+               "  openfarm setup --project     (models and efforts for this project only)",
+    )
+    setup_p.add_argument("--yes", action="store_true", help="ask nothing: use the flags, keep everything else")
+    setup_p.add_argument("--frontier", choices=("claude", "codex"), default=None, help="who plans and reviews")
+    setup_p.add_argument("--preset", choices=("openrouter", "fireworks", "together", "ollama", "custom"), default=None)
+    setup_p.add_argument("--endpoint", default=None, help="the address the builders' requests go to")
+    setup_p.add_argument("--api-key", default=None, help="the builders' API key (stored in a 0600 file, never printed)")
+    setup_p.add_argument("--key-file", default=None)
+    setup_p.add_argument("--no-zdr", action="store_true", help="let the provider keep what is sent")
+    setup_p.add_argument("--timeout", type=float, default=8.0)
+    setup_p.add_argument("--project", action="store_true", help="save models and efforts for this project, not all")
+    for _job in ("architect", "reviewer", "builder"):
+        setup_p.add_argument(f"--{_job}-model", default=None)
+        setup_p.add_argument(f"--{_job}-effort", default=None)
+
+    models_p = sub.add_parser(
+        "models",
+        help="show or choose the model and effort for the Architect, the reviewer and the builders",
+        formatter_class=raw_fmt,
+        epilog="Examples:\n  openfarm models\n  openfarm models set architect --effort high\n"
+               "  openfarm models set builder --model deepseek/deepseek-v4.1-flash --effort medium --global\n"
+               "  openfarm models clear reviewer\n  openfarm models catalogue   (what each job can be given)",
+    )
+    models_p.add_argument("action", nargs="?", default="show", choices=("show", "set", "clear", "catalogue"))
+    models_p.add_argument("role", nargs="?", default="", choices=("", "architect", "reviewer", "builder"))
+    models_p.add_argument("--model", default=None, help="the model's name as the provider spells it")
+    models_p.add_argument("--effort", default=None, help="low, medium, high, xhigh (not builders) or max")
+    models_p.add_argument("--global", dest="for_all", action="store_true",
+                          help="for every project, instead of this one")
+
     proj_p = sub.add_parser(
         "projects",
         help="list, add, edit, remove, or discover Openfarm projects (non-destructive to project files)",
@@ -3718,6 +3756,129 @@ def cmd_drive(ctx: Context, args) -> int:
     return EXIT_OK if payload.get("ok") else EXIT_TROUBLE
 
 
+def cmd_setup(args) -> int:
+    """Set openfarm up step by step. Unattended with `--yes` or `--json`; a terminal is needed otherwise."""
+    from .acp_setup import inspect_acp_status
+    from .setup_helper import run_setup
+
+    repo = (Path(args.repo) if getattr(args, "repo", None) else Path.cwd()).expanduser().resolve()
+    asks = not (args.yes or args.json)
+    if asks and not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print("openfarm setup asks questions, so it needs a terminal. Use --yes with flags to run it unattended "
+              "(see `openfarm setup --help`).", file=sys.stderr)
+        return EXIT_USAGE
+    if args.project and not (repo / ".openfarm" / "config.toml").is_file():
+        print(f"{repo} is not an openfarm project, so --project has nothing to save into", file=sys.stderr)
+        return EXIT_USAGE
+    for job in ("architect", "reviewer", "builder"):
+        effort = getattr(args, f"{job}_effort")
+        from .model_choices import efforts_for
+
+        if effort is not None and effort not in efforts_for(job):
+            print(f"--{job}-effort {effort!r} is not one of {', '.join(efforts_for(job))}", file=sys.stderr)
+            return EXIT_USAGE
+
+    def signed_in(provider: str) -> bool:
+        try:
+            status = inspect_acp_status(repo, provider=provider)
+        except (OSError, ValueError, Refused):
+            return False  # a sign-in that can't be read is one that is not ready
+        return bool(status.get("oauth_ready") or status.get("ok"))
+
+    def sign_in(provider: str) -> None:
+        run_acp_login(provider=provider)
+
+    try:
+        result = run_setup(args, signed_in=signed_in, sign_in=sign_in)
+    except (ValueError, Refused, ConfigError, OSError) as exc:
+        print(f"setup stopped: {getattr(exc, 'message', None) or exc}", file=sys.stderr)
+        return EXIT_USAGE
+    except (EOFError, KeyboardInterrupt):
+        print("\nsetup left unfinished; what was answered up to the last step is saved", file=sys.stderr)
+        return EXIT_USAGE
+    if args.json:
+        print(json.dumps(result, indent=2))
+    elif args.yes:
+        print(f"Saved. Planner {result['frontier']} ({'signed in' if result['signed_in'] else 'NOT signed in'}), "
+              f"builders at {result['endpoint']} ({'answering' if result['builders_answer'] else 'not answering'}, "
+              f"{result['models_listed']} models listed). See `openfarm models`.")
+    return EXIT_OK
+
+
+def cmd_models(args) -> int:
+    """Show or choose which model does which job: for this project, or with `--global` for every project."""
+    import tomllib
+
+    from . import model_choices as mc
+    from .config import CONFIG_PATH
+
+    repo = (Path(args.repo) if getattr(args, "repo", None) else Path.cwd()).expanduser().resolve()
+    in_project = (repo / CONFIG_PATH).is_file()
+    for_all = bool(getattr(args, "for_all", False))
+    action = str(getattr(args, "action", "show") or "show")
+    if action == "catalogue":
+        from .setup_helper import catalogue
+
+        listed = catalogue()
+        if args.json:
+            print(json.dumps(listed, indent=2))
+            return EXIT_OK
+        for role in mc.ROLES:
+            names = listed[role]["models"]
+            print(f"{mc.ROLE_WORDS[role]}")
+            print(f"  efforts: {', '.join(listed[role]['efforts'])}")
+            if role == "builder" and not listed[role]["ok"]:
+                print(f"  models:  {listed['endpoint'] or 'no address set'} did not answer ({listed[role]['error']})")
+            elif names:
+                print(f"  models:  {len(names)}" + (f" at {listed['endpoint']}" if role == "builder" else f" names {listed['frontier']} takes"))
+                for name in names:
+                    print(f"    {name}")
+            else:
+                print(f"  models:  any name {listed['frontier']} takes; empty is its own default")
+        return EXIT_OK
+    if action in ("set", "clear"):
+        if not args.role:
+            print("say which job: architect, reviewer or builder", file=sys.stderr)
+            return EXIT_USAGE
+        if not for_all and not in_project:
+            print(f"{repo} is not an openfarm project; use --global to choose for every project", file=sys.stderr)
+            return EXIT_USAGE
+        target = mc.global_path() if for_all else mc.project_path(repo)
+        current = mc.load_choices(target).get(args.role, {})
+        try:
+            if action == "clear":
+                mc.save_choice(target, args.role)
+            else:
+                if args.model is None and args.effort is None:
+                    print("give --model, --effort or both", file=sys.stderr)
+                    return EXIT_USAGE
+                mc.save_choice(target, args.role,
+                               model=current.get("model", "") if args.model is None else args.model,
+                               effort=current.get("effort", "") if args.effort is None else args.effort)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return EXIT_USAGE
+    data: dict = {}
+    if in_project:
+        try:
+            data = tomllib.loads((repo / CONFIG_PATH).read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError):
+            data = {}
+    resolved = mc.resolve(data, repo if in_project else None)
+    if args.json:
+        print(json.dumps({"project": str(repo) if in_project else "", "global_file": str(mc.global_path()),
+                          "project_file": str(mc.project_path(repo)) if in_project else "", "jobs": resolved}, indent=2))
+        return EXIT_OK
+    words = {"project": "this project", "global": "every project", "config": "config.toml" if in_project else "each project's config.toml"}
+    print(f"Models for {repo.name}" if in_project else "Models for every project (not in a project folder)")
+    for role in mc.ROLES:
+        got = resolved[role]
+        print(f"  {mc.ROLE_WORDS[role]:<10} model  {got['model'] or '(the provider default)':<34} from {words[got['model_from']]}")
+        print(f"  {'':<10} effort {got['effort'] or '(none)':<34} from {words[got['effort_from']]}")
+    print("Change one with: openfarm models set <architect|reviewer|builder> [--model M] [--effort E] [--global]")
+    return EXIT_OK
+
+
 def cmd_providers(args) -> int:
     from .providers import load_global_providers, probe_worker_endpoint, save_global_providers
 
@@ -4072,6 +4233,8 @@ PRE_CONFIG_COMMANDS = {
     "install-skill": cmd_install_skill,
     "acp": cmd_acp,
     "providers": cmd_providers,
+    "models": cmd_models,
+    "setup": cmd_setup,
     "projects": cmd_projects,
     "replay": cmd_replay,
     "routing": cmd_routing,

@@ -1552,4 +1552,10 @@ def load_config(repo: Path, path: Path | None = None) -> Config:
         raise ConfigError(f"{config_path}: {exc}") from exc
     if not isinstance(data, dict):
         raise ConfigError(f"{config_path}: not a TOML table")
-    return Config(data, repo, config_path)
+    from .model_choices import overlay
+
+    # v0.20: the models and efforts chosen for this project or for every project win over the file
+    data, chosen = overlay(data, repo)
+    cfg = Config(data, repo, config_path)
+    cfg.model_choices = chosen
+    return cfg

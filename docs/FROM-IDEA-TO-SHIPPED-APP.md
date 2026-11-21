@@ -1,6 +1,6 @@
-# From Empty Folder to Shipped App (Openfarm v0.15.0 Starter Guide)
+# From Empty Folder to Shipped App (Openfarm v0.20.0 Starter Guide)
 
-This guide shows **both human owners and prospective frontier AI agents** how to go from an **empty folder** and a **plain-English idea** to a gate-verified, human-reviewed application using **Openfarm v0.14.0**.
+This guide shows **both human owners and prospective frontier AI agents** how to go from an **empty folder** and a **plain-English idea** to a gate-verified, human-reviewed application using **Openfarm v0.20.0**.
 
 ## The seven steps, whichever door you use
 
@@ -23,11 +23,11 @@ is the step that catches this: its check fails with "can't be seen (it is covere
 turns that sentence into fix tasks under goal 1. The four finished tasks stay as they are.
 
 Words: a **task** is a card, a **goal** is a chunk, a **plan** is a wave plan, and **accept** is what used to be
-approve, land and merge. Commands and file names keep the older words. Part 2 below is the agent-skill route in
-detail; its worked example is a calorie log, written before the steps above were named, so it says "card" and
-"wave" where this section says "task" and "plan".
+approve, land and merge. Commands, file names and settings keep the older words (`cards/CARD-001.md`,
+`openfarm verdict`, `wave = 1`). Part 2 below is the agent-skill route in detail, with a calorie log as its
+worked example. It uses the same words as this section, and the older ones only inside code.
 >
-> **For related docs:** See [README.md](../README.md) for the v0.14.0 overview, [docs/USAGE-AND-FIRST-DEPLOYMENT.md](USAGE-AND-FIRST-DEPLOYMENT.md) for detailed configuration & operator runbooks on existing repositories (`tallybox`), and [docs/openfarm-internals.md](openfarm-internals.md) for module internals.
+> **For related docs:** See [README.md](../README.md) for the overview, [docs/USAGE-AND-FIRST-DEPLOYMENT.md](USAGE-AND-FIRST-DEPLOYMENT.md) for detailed configuration & operator runbooks on existing repositories (`tallybox`), and [docs/openfarm-internals.md](openfarm-internals.md) for module internals.
 
 ---
 
@@ -59,9 +59,13 @@ You do **not** need to hand-write `.openfarm/config.toml`, memorize card schemas
 
 ---
 
-## Part 2 — Step-by-Step Guide (Human & Frontier Agent Playbook)
+## Part 2 — Step-by-Step Guide (Owner & Agent Playbook)
 
 This walkthrough uses the example idea `"An app to track my calories"` -> **`calorie-log`**.
+
+The steps are the seven above, done by an agent through the CLI: the **Architect** (Claude, Codex or Antigravity,
+signed in) plans and reviews, **builders** (a cheaper model behind an API key) write the code, each **task** is one
+file under `cards/`, and the tasks of one **goal** are built together and then accepted.
 
 ### Step 1: Install Openfarm & Agent Skills (`openfarm install-skill`)
 
@@ -85,16 +89,25 @@ Ensure `~/.local/bin` is on your `PATH`, then verify:
 openfarm --help
 ```
 
-You should see all **22 subcommands**: `init`, `adopt`, `bench`, `install-skill`, `acp`, `tui`, `run`, `status`, `pause`, `resume`, `stop`, `release`, `done`, `dossier`, `check`, `verdict`, `escape`, `supervise`, `harness`, `board`, `swarm`, `drive`.
+You should see the commands (41 in all, listed in [commands.md](commands.md)), among them: `init`, `adopt`, `bench`, `install-skill`, `acp`, `tui`, `run`, `status`, `pause`, `resume`, `stop`, `release`, `done`, `dossier`, `check`, `verdict`, `escape`, `supervise`, `harness`, `board`, `swarm`, `drive`.
 
-Sign in once with your Claude OAuth subscription for Frontier ACP supervision (no Frontier API key needed; Workers remain API-key authenticated):
+Sign in once with your Claude OAuth subscription for the Architect (it needs no API key; the builders use an API key):
 
 ```bash
 openfarm acp status --json
 openfarm acp login          # optional if already signed into Claude Code
 ```
 
-Codex and Antigravity can supervise instead (`--provider codex|antigravity`). Read [Frontier Providers](USAGE-AND-FIRST-DEPLOYMENT.md#5-frontier-providers-claude-codex-and-antigravity) first: Antigravity needs bubblewrap (and Codex wants it), Codex should use `binary = "codex-exec"`, and you must check that your Antigravity plan's terms allow openfarm to start `agy` without a person typing before you use it on OAuth.
+Or do all of the setup in one go. `openfarm setup` asks who plans, where the builders' requests go and with which
+key, which of the models on offer builds, and how much effort each job gets. With `--yes` it asks nothing and uses
+the flags, which is the form an agent should use ([models.md](models.md)):
+
+```bash
+openfarm setup --yes --frontier claude --preset openrouter --api-key "$KEY" --builder-model qwen/qwen3-coder
+openfarm models             # which model and effort each job uses, and where each choice comes from
+```
+
+Codex and Antigravity can be the Architect instead (`--provider codex|antigravity`). Read [Architect providers](USAGE-AND-FIRST-DEPLOYMENT.md#5-frontier-providers-claude-codex-and-antigravity) first: Antigravity needs bubblewrap (and Codex wants it), Codex should use `binary = "codex-exec"`, and you must check that your Antigravity plan's terms allow openfarm to start `agy` without a person typing before you use it on OAuth.
 
 #### Option B — Package Install (`uv`, `pipx`, or `pip`)
 
@@ -119,7 +132,7 @@ Create and enter an empty directory, then run `/openfarm-initialize calorie-log 
 
 #### Stage 1 — Environment Check & `openfarm init`
 
-First, check available local tools and Frontier OAuth readiness once:
+First, check available local tools and the Architect's sign-in once:
 
 ```bash
 rustc --version && cargo --version && cargo clippy --version && rustfmt --version
@@ -138,9 +151,9 @@ openfarm init calorie-log \
 ```
 
 Useful optional flags on `openfarm init`:
-- `--endpoint https://<your-zdr-provider>/v1 --model <model-id>` — configure your Zero Data Retention (ZDR) OpenAI-compatible Worker coding model endpoint and model name.
-- `--profile auto|solo|advisory|active` — `auto` selects `active` (`claude-acp`, `auth = "oauth"`, `binary = "auto"`) as the default way to plug the Frontier supervisor in (`openfarm acp configure` adjusts settings later; `--profile solo` disables Frontier ACP).
-- `--acp-provider claude|antigravity|codex` — which provider supervises (default `claude`).
+- `--endpoint https://<your-zdr-provider>/v1 --model <model-id>` — configure your Zero Data Retention (ZDR) OpenAI-compatible endpoint and model for the builders.
+- `--profile auto|solo|advisory|active` — `auto` selects `active` (`claude-acp`, `auth = "oauth"`, `binary = "auto"`) as the default way to connect the Architect (`openfarm acp configure` adjusts settings later; `--profile solo` runs without an Architect).
+- `--acp-provider claude|antigravity|codex` — which provider is the Architect (default `claude`).
 - `--mutation auto|off|report|required` — `auto` selects `report` if `cargo-mutants` is on `PATH`, else `off`.
 - `--state-dir PATH` / `--key-file PATH` — override external state/key paths (enforced strictly **outside** the repository, created with `0o700` permissions).
 - `--force` — allow scaffolding into a non-empty directory (without `--force`, `openfarm init` refuses non-empty dirs with exit code `1`).
@@ -160,10 +173,10 @@ Useful optional flags on `openfarm init`:
 
 ---
 
-#### Stage 2 — Frontier Architect Pass (Seam + Thin Skeleton + Golden Reference Slice)
+#### Stage 2 — The Architect's Pass (Seam + Thin Skeleton + Golden Reference Slice)
 
-Now spend one focused frontier pass implementing:
-1. **`src/invariants.rs`** (`never_touch` seam — lesser models can never view or modify this file): domain bounds (`MAX_KCAL_PER_DAY`), `DomainError`, validated `Kcal`, checked `MacroGrams::to_kcal()` (4/4/9 Atwater math), and `ensure_non_empty_label`.
+Now spend one focused Architect pass implementing:
+1. **`src/invariants.rs`** (`never_touch` seam — builders can never view or modify this file): domain bounds (`MAX_KCAL_PER_DAY`), `DomainError`, validated `Kcal`, checked `MacroGrams::to_kcal()` (4/4/9 Atwater math), and `ensure_non_empty_label`.
 2. **`src/goals.rs`** (**Golden Reference Slice**): one clean, idiomatic module (`DailyTarget` and `CalorieBudgetStatus`) demonstrating checked math, `Result<T, DomainError>`, doc comments, and zero `.unwrap()` / `.expect()` / `#[allow(...)]`.
 3. **Thin sibling modules** (`src/entry.rs`, `src/logbook.rs`) + `pub` re-exports in `src/lib.rs` (required because `[eligibility] rust_tests_in_separate_files = true` puts every integration test in `tests/<subject>_tests.rs`).
 
@@ -248,7 +261,7 @@ pub fn ensure_non_empty_label(label: &str) -> Result<String, DomainError> {
 }
 ```
 
-**`src/goals.rs`** (Golden Reference Slice for `pattern` / `small-feature` cards):
+**`src/goals.rs`** (Golden Reference Slice for `pattern` / `small-feature` tasks):
 
 ```rust
 //! Golden reference vertical slice: daily calorie targets and budget evaluation.
@@ -325,13 +338,13 @@ impl DailyTarget {
 
 > **Note:** Openfarm scans production diffs for `.unwrap()`, `.expect(...)`, `todo!()`, `dbg!()`, and `#[allow(...)]`. Using `Kcal::ZERO` and checked arithmetic keeps `src/` completely clean for both `clippy` and Openfarm's banned-pattern gate.
 
-**`src/entry.rs`** (thin stub module for Wave 1 `CARD-001`):
+**`src/entry.rs`** (thin stub module for Goal 1 `CARD-001`):
 
 ```rust
 //! Food entry records (implemented in Wave 1).
 ```
 
-**`src/logbook.rs`** (thin stub module for Wave 1–2 cards):
+**`src/logbook.rs`** (thin stub module for tasks of goals 1–2):
 
 ```rust
 //! Daily calorie logbook aggregation (implemented in Wave 1–2).
@@ -404,7 +417,7 @@ fn baseline_golden_slice_evaluates_daily_target() {
 }
 ```
 
-Verify every baseline gate passes with zero warnings before creating cards:
+Verify every baseline gate passes with zero warnings before creating tasks:
 
 ```bash
 cargo test
@@ -414,16 +427,16 @@ rustfmt --edition 2021 --check src/*.rs tests/*.rs
 
 ---
 
-#### Stage 3 — Decompose into Verified Wave 1–3 Cards (`cards/CARD-001.md`..`CARD-008.md`)
+#### Stage 3 — Decompose into Verified Tasks for Goals 1–3 (`cards/CARD-001.md`..`CARD-008.md`)
 
-Key card hygiene rules enforced by `openfarm check`:
-- Place one distinct `tests/<subject>_tests.rs` per card (`rust_tests_in_separate_files = true`) so branches merge cleanly without file collisions.
+Key task hygiene rules enforced by `openfarm check`:
+- Place one distinct `tests/<subject>_tests.rs` per task (`rust_tests_in_separate_files = true`) so branches merge cleanly without file collisions.
 - Never reference `src/invariants.rs` in `touches`, `reference`, or `context_files`.
 - Never use vague verbs/phrases (`"handle"`, `"properly"`, `"robust"`, `"decide how"`, `"design"`, `"choose an approach"`, `"figure out how"`) in `## Done`. State exact `pub` items, inputs, errors, and outputs.
-- Disallow `new_symbols = true` on `pinned-bugfix` and `test-backfill` cards; set `type_changes = true` when `new_symbols = true` spans multiple files in `touches`.
-- Keep `[gates] mutation = "off"` (the default of `openfarm init` when `cargo-mutants` is absent) or omit blocking `test-backfill` cards until `cargo-mutants` is installed.
+- Disallow `new_symbols = true` on `pinned-bugfix` and `test-backfill` tasks; set `type_changes = true` when `new_symbols = true` spans multiple files in `touches`.
+- Keep `[gates] mutation = "off"` (the default of `openfarm init` when `cargo-mutants` is absent) or omit blocking `test-backfill` tasks until `cargo-mutants` is installed.
 
-**Wave 1 (`CARD-001`, `CARD-002` — Contrast Seed & Pipeline Proof):**
+**Goal 1 (`CARD-001`, `CARD-002` — Contrast Seed & Pipeline Proof):**
 
 `cards/CARD-001.md` (`small-feature`):
 
@@ -494,9 +507,9 @@ asserts = "Adding entries whose sum exceeds MAX_KCAL_PER_DAY returns Err(DomainE
 - Reject additions that would exceed `MAX_KCAL_PER_DAY` before pushing to `self`, returning `Err(DomainError::OutOfRange)`.
 ```
 
-**Wave 2 & Wave 3 Plan (`CARD-003`..`CARD-008` — full TOML files following the same pattern):**
+**Plans for Goals 2 and 3 (`CARD-003`..`CARD-008` — full TOML files following the same pattern):**
 
-| Card | Category | Depends | Touches & Test File | Scope Summary |
+| Task | Category | Depends | Touches & Test File | Scope Summary |
 | --- | --- | --- | --- | --- |
 | `CARD-003` | `pinned-bugfix` (`new_symbols = false`) | `CARD-001` | `src/entry.rs`, `tests/entry_scale_tests.rs` | Pin decimal serving scaling / zero-macro rounding behavior on `FoodEntry` |
 | `CARD-004` | `feature` | `CARD-002` | `src/logbook.rs`, `tests/meal_summary_tests.rs` | Add `pub fn kcal_for_meal(&self, meal: MealSlot) -> Kcal` and `pub fn macro_totals(&self) -> Result<MacroGrams, DomainError>` |
@@ -507,7 +520,7 @@ asserts = "Adding entries whose sum exceeds MAX_KCAL_PER_DAY returns Err(DomainE
 
 **Negative Seam Control (`CARD-900` — verify `never_touch` refusal, then delete before committing `main`):**
 
-If a card accidentally lists `src/invariants.rs` in `touches`, `openfarm check` refuses it before any LLM call runs:
+If a task accidentally lists `src/invariants.rs` in `touches`, `openfarm check` refuses it before any LLM call runs:
 
 ```markdown
 +++
@@ -531,7 +544,7 @@ new_symbols = false
 
 #### Stage 4 — Commit Baseline on `main` & Run 100% Pre-Flight Checks
 
-`FileCardSource` creates `openfarm-cards` from `main`, so **always commit your baseline architecture and cards on `main` before checking or running cards**:
+`FileCardSource` creates `openfarm-cards` from `main`, so **always commit your baseline architecture and tasks on `main` before checking or running tasks**:
 
 ```bash
 git add .
@@ -546,14 +559,14 @@ openfarm run --dry-run --cards 2 --json
 ```
 
 Expected:
-- Every Wave card (`CARD-001`..`CARD-008`) returns exit code `0` (`"eligible": true`).
+- Every task (`CARD-001`..`CARD-008`) returns exit code `0` (`"eligible": true`).
 - `CARD-900` (if tested before removal) returns exit code `1` with reason containing `never-touch`.
 
 ---
 
-#### Stage 5 — Run Waves Out of Context, Review Dossiers, Verdict & Merge Locally
+#### Stage 5 — Build the Goals Out of Context, Read the Task Reports & Accept Locally
 
-Follow the installed `openfarm` skill (`wave_operator.md`) to execute cards cleanly without polluting frontier context:
+Follow the installed `openfarm` skill (`wave_operator.md`) to execute tasks cleanly without filling the Architect's context:
 
 ```bash
 # 1. Inspect queue & optionally prepare cards via ACP micromanager
@@ -579,7 +592,7 @@ openfarm harness status --json
 openfarm harness index
 ```
 
-Repeat wave-by-wave (`--cards 3 --spend 10.00`) until all Wave 1–3 cards have landed on `main`, then verify the completed app with:
+Repeat goal by goal (`--cards 3 --spend 10.00`) until all tasks of goals 1–3 are accepted onto `main`, then verify the completed app with:
 
 ```bash
 cargo test
@@ -595,7 +608,7 @@ rustfmt --edition 2021 --check src/*.rs tests/*.rs
 | --- | --- | --- |
 | `dirty-baseline` | Base branch failed a test before Phase A | Inspect `openfarm dossier <ID>`, fix test on `main`, clear stale cache if needed, re-run `--dry-run`. |
 | `infra` | Disk `< min_free_mb`, network `429`/`5xx`, or ACP timeout (`HarnessLibrary` ignores `infra`) | Free space or fix endpoint/credentials -> `openfarm resume` -> `openfarm release <ID> --reason "infra retry"`. |
-| `circuit_breaker` (`3` consecutive blocks) | Three cards in a row hit the same block reason | Read `<state_dir>/breaker.json` -> `openfarm supervise --triage-blocked --json` -> fix card on `main` -> `openfarm release <ID> --reason "rescoped"` -> `openfarm resume --clear-breaker`. |
+| `circuit_breaker` (`3` consecutive blocks) | Three tasks in a row hit the same block reason | Read `<state_dir>/breaker.json` -> `openfarm supervise --triage-blocked --json` -> fix task on `main` -> `openfarm release <ID> --reason "rescoped"` -> `openfarm resume --clear-breaker`. |
 | Noisy or unhelpful Harness² cue | A promoted cue hurt efficiency (auto-demotes after `probe_window`, or intervene manually) | `openfarm harness show <ENTRY_ID>` -> `openfarm harness demote <ENTRY_ID_OR_REV> --reason "noisy cue"`. |
 
 ---

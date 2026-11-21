@@ -108,6 +108,50 @@ class TryItTests(_Project):
         self.assertIn("did not load", fix_request(result))
 
     @unittest.skipUnless(find_browser(), "no headless browser on this machine")
+    def test_words_below_the_first_screen_are_not_seen(self) -> None:
+        # the acceptance run: title, story and credit sat under a full-screen picture, a scroll away, and the check passed
+        self._serve(f'''<!doctype html><title>t</title><style>body{{margin:0}}img{{display:block;width:100vw;height:100vh}}</style>
+<img id="art" src="{PIXEL}"><h1 id="title">Glacier</h1><p id="story">A long story.</p><small id="credit">Ann</small>''')
+        result = try_it(self.root, self.cfg, GOAL)
+        seen = {c["name"]: c for c in result["checks"]}["seen"]
+        self.assertFalse(seen["ok"])
+        self.assertEqual(seen["hidden"], ["title", "story", "credit"])
+        self.assertIn("title is on the page but can't be seen (it is below the first screen, so you have to scroll to see it)",
+                      seen["detail"])
+        self.assertIn("below the first screen", fix_request(result))
+
+    @unittest.skipUnless(find_browser(), "no headless browser on this machine")
+    def test_each_screen_size_is_judged_on_its_own(self) -> None:
+        # 860px down fits a 900px desktop screen and is a scroll away on an 844px phone
+        self._serve('''<!doctype html><title>t</title><meta name="viewport" content="width=device-width,initial-scale=1">
+<style>body{margin:0;height:3000px}
+#title{position:absolute;top:10px}#credit{position:absolute;top:860px}</style>
+<h1 id="title">Glacier</h1><small id="credit">Ann</small>''')
+        seen = {c["name"]: c for c in try_it(self.root, self.cfg, GOAL)["checks"]}["seen"]
+        self.assertFalse(seen["ok"])
+        self.assertEqual((seen["hidden"], seen["shown"]), (["credit"], ["title"]))
+        self.assertIn("credit is on the page but can't be seen (on a phone it is below the first screen", seen["detail"])
+        self.assertNotIn("on a desktop screen", seen["detail"])
+
+    @unittest.skipUnless(find_browser(), "no headless browser on this machine")
+    def test_the_colours_of_the_first_screen_are_reported(self) -> None:
+        self._serve(SHOWN.replace("</style>", "body{background:#102030}</style>"))
+        result = try_it(self.root, self.cfg, GOAL)
+        colours = {(c["hex"], c["use"]) for c in result["colours"]}
+        self.assertIn(("#102030", "background"), colours)
+        self.assertIn(("#000000", "background"), colours)  # the plate behind the words
+        self.assertIn(("#ffffff", "text"), colours)
+        saved = json.loads((Path(self.cfg.state_dir) / "tryit" / "C1" / "result.json").read_text())
+        self.assertEqual(saved["colours"], result["colours"])
+
+    @unittest.skipUnless(find_browser(), "no headless browser on this machine")
+    def test_a_page_that_paints_nothing_is_shown_on_white(self) -> None:
+        # v0.20 live run: the panel listed text colours and no background at all
+        self._serve("<!doctype html><title>t</title><h1 id='title'>Plain</h1><p id='story'>s</p><small id='credit'>c</small>")
+        plain = try_it(self.root, self.cfg, GOAL)["colours"]
+        self.assertEqual(plain, [{"hex": "#ffffff", "use": "background"}, {"hex": "#000000", "use": "text"}])
+
+    @unittest.skipUnless(find_browser(), "no headless browser on this machine")
     def test_a_page_error_is_reported(self) -> None:
         self._serve(SHOWN + "<script>throw new Error('boom in the page')</script>")
         result = try_it(self.root, self.cfg, GOAL)
