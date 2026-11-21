@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.14.0-16a34a?style=flat-square" alt="version 0.14.0">
+  <img src="https://img.shields.io/badge/version-0.15.0-16a34a?style=flat-square" alt="version 0.15.0">
   <img src="https://img.shields.io/badge/status-pre--release-d97706?style=flat-square" alt="status: pre-release">
   <img src="https://img.shields.io/badge/python-3.11%2B-7c3aed?style=flat-square" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/core%20deps-stdlib%20only-0284c7?style=flat-square" alt="core dependencies: Python standard library only">
@@ -35,7 +35,7 @@
 </p>
 
 > [!IMPORTANT]
-> **Pre-release (v0.14.0).** `openfarm_core/` is **100% Python 3.11+ stdlib-only** (`dependencies = []`). An optional Textual workbench (`pip install "openfarm[tui]"`) automatically falls back to the stdlib `curses` TUI when Textual is not installed. Merges are strictly local-only (the core has **no `git push` code path**), and neither the TUI nor the Web Companion displays dollar spend.
+> **Pre-release (v0.15.0).** `openfarm_core/` is **100% Python 3.11+ stdlib-only** (`dependencies = []`). An optional Textual workbench (`pip install "openfarm[tui]"`) automatically falls back to the stdlib `curses` TUI when Textual is not installed. Merges are strictly local-only (the core has **no `git push` code path**), and neither the TUI nor the Web Companion displays dollar spend.
 
 ---
 
@@ -62,23 +62,32 @@ Frontier models are brilliant at product architecture, scoping, and review, and 
 
 ---
 
-## The iterative loop
+## From an idea to a running app
 
-openfarm is designed around the natural product development cycle — whether you're starting from a vague idea in an empty directory or shipping a targeted feature in a mature codebase:
+Run `openfarm` in a folder, empty or not. One screen takes you through seven steps, and always shows the one thing
+that is yours to do next. The same steps, in the same words, are what the agent skills (`/openfarm-initialize`)
+and the CLI follow.
 
 <p align="center">
-  <img src="docs/assets/openfarm-quickstart.svg" alt="Iterative workflow: Idea &amp; Stack -> Grill &amp; Spec -> Split to Cards -> Farm Run -> Review &amp; Local Land -> Iterate" width="100%">
+  <img src="docs/assets/openfarm-quickstart.svg" alt="The steps: Idea, Questions, Spec, Plan, Build, Try it, Accept" width="100%">
 </p>
 
-| Stage | Where | What happens |
+| Step | What happens | Your one action |
 | --- | --- | --- |
-| **1. Idea & Stack** | `1 Studio` (`openfarm`) | Pick your stack (`TypeScript / Web`, `Python`, `Rust`, `Go`, or `Auto-detect`) and describe what you want to build in plain English. |
-| **2. Grill** | Frontier Architect | Click **Ask Architect to Grill Me**. Frontier asks 1 sharp product/UX/data question at a time with recommended options (never forces Rust invariants onto web apps). |
-| **3. Spec & Chunks** | `#studio-spec` | Click **Flesh Out Spec & Chunks** to generate an editable `.openfarm/PROJECT_SPEC.md` and ordered milestones in `.openfarm/CHUNKS.json`. |
-| **4. Split into Cards** | `#studio-plan` | Click **Split Chunk into Cards** (with a live ticking Architect progress banner & streaming log). Architect builds a runnable vertical slice, runs baseline tests, creates placeholder modules for new files, commits cleanly, and checks card eligibility. |
-| **5. Farm Run** | `#studio-run` / `openfarm daemon` | Worker models write failing named tests (Phase A), freeze them by hash, implement the code (Phase B), and clear all deterministic gates + counter-tests + optional invariants/acceptance/replays. |
-| **6. Review & Local Land** | `2 Review` / `openfarm web` / `openfarm land` | Inspect the dossier, diff, and worker findings (`3 Findings`), record `clean` verdict, and merge locally (`git merge --no-ff` or `openfarm land`, zero push). |
-| **7. Iterate** | **Next Chunk / Iterate** | Mark Chunk 1 done, automatically activate Chunk 2, or type a new iteration idea and repeat. |
+| **1. Idea** | You say what you want to build, in a sentence or a full spec, and pick a stack (or let it be worked out). The text is saved as you type. | **Continue** |
+| **2. Questions** | The Architect (a frontier model) asks a few questions, one at a time, each with suggested answers and a line on why it matters. If it can't be reached, the screen says why and offers Retry. | **Answer** |
+| **3. Spec** | A spec you can read in full, split into ordered **goals**. Change it in words, or edit it in `$EDITOR`. | **Plan goal 1** |
+| **4. Plan** | The current goal is split into **tasks**. Before you see them they are checked (can each be scaffolded, does each list every file it names, does the order work, do files that must agree name the same things). What can be repaired is repaired and shown; what can't is held back with the reason. | **Build N tasks** |
+| **5. Build** | Lesser models build the tasks in a background service: tests first, then code, then a row of checks. Closing the window does not stop it. Each task shows its state in a sentence. A task that stopped says which of three things went wrong (the task is wrong, the builder fell short, or a check may be wrong) and offers the action that fits. | **Accept W1-02** (merges it locally, never pushes) |
+| **6. Try it** | When every task of the goal is accepted, the app is started and looked at: screenshots at desktop and phone size, and checks that what the goal promises can actually be seen. | **Fix this**, or **Looks right** |
+| **7. Accept** | The goal's summary: tasks, tests, what trying it showed. | **Accept goal 1**, which moves on to the next goal's plan |
+
+Something not right after that? **Something's wrong…** turns what you say into fix tasks under the same goal.
+**New feature…** adds a goal. Nothing already built is thrown away, and the record of what was decided only grows.
+
+Words used here and their older names, which the CLI and file names still use: a **task** is a card, a **goal** is a
+chunk, a **plan** is a wave plan, **questions from builders** are findings, and **accept** covers what used to be
+approve, land and merge.
 
 ---
 
@@ -128,7 +137,8 @@ Global settings live in `~/.config/openfarm/providers.toml` (mode `0600`; raw ke
 
 ### 3. Build or adopt a project
 
-- **Interactive Studio (recommended):** run `openfarm` in any project folder — switch, add, discover, edit, or non-destructively remove projects in **`0 Projects`**, run Idea → Grill → Spec & Chunks → Cards → Run in **`1 Studio`**, review & land locally in **`2 Review`**, triage worker findings in **`3 Findings`**, and inspect Board / Swarm / Harness / Doctor / Living Spec / Adaptive Routing in **`4 Engine`** (press `Ctrl+K` for the Command Palette).
+- **The screen (recommended):** run `openfarm` in the project folder and follow the steps above. Projects,
+  providers, settings and the older screens are behind `Ctrl+K`; `b` shows every task on a board.
 - **Greenfield CLI:**
   ```bash
   openfarm init my-web-app --lang typescript --idea "Focus timer web app with presets" --commit
@@ -160,7 +170,7 @@ openfarm daemon logs --tail 80
 openfarm daemon stop                        # drops kill-switch + SIGTERM process group
 ```
 
-You can also start/stop the detached daemon directly inside `1 Studio -> Live Run` in the Textual TUI.
+The screen's **Build** button starts the same background service, so a build keeps going when the window closes, and reopening `openfarm` shows it again.
 
 ### Stdlib Web Companion & Tailscale (`openfarm web`)
 
@@ -185,7 +195,17 @@ Security defaults:
 
 ---
 
-## What changed in v0.10.0–v0.14.0
+## What changed in v0.10.0–v0.15.0
+
+- **`v0.15.0` — One screen, one home for tasks, try it:**
+  - **One screen** (`openfarm_tui/journey.py`) replaces the five tabs: a journey rail (Idea, Questions, Spec, Plan, Build, Try it, Accept), the one thing in front of you, one main button that Enter presses, a fixed activity strip, and two themes. Which step shows is worked out from the project's state (`openfarm_tui/journey_state.py`), so reopening lands where the project is. The older screens are behind `Ctrl+K`.
+  - **Tasks, the spec and the decisions log live in one place**, the `openfarm-cards` branch, and every change goes through one function that records who changed what and why (`openfarm_core/store.py`, `openfarm card add|show|history|skip|migrate`). Nothing is written to `cards/` or `.openfarm/PROJECT_SPEC.md` on your main branch any more; an older project is moved over once with `openfarm card migrate`, which shows any task whose two copies differ and waits for your choice.
+  - **Plan checks** (`openfarm_core/preflight.py`) run before a plan is shown: scaffolding, files named but not listed, order, and shared names two tasks must agree on. Repairs are shown with their reason; a task that still fails is held back, not built.
+  - **A stopped task says what kind of stop it is** (`openfarm_core/blocked.py`): the task is wrong (apply a shown fix and retry), the builder fell short (retry), or a check may be wrong (run it yourself and see the raw output).
+  - **Try it** (`openfarm_core/tryit.py`, `openfarm try`): starts the app, takes desktop and phone screenshots with a headless Chromium, and checks that what the goal names can be seen, not merely that it is in the page.
+  - **Iteration keeps what exists**: "Something's wrong" becomes fix tasks under the current goal, "New feature" adds a goal, and task numbers are never reused.
+  - **Builds belong to the background service** and `openfarm run --follow` carries one build through tasks that wait on each other.
+  - Words: task, goal, plan, build, accept in the UI and help; `card`, `chunk` and `wave` stay in file names and commands.
 
 - **`v0.14.0` — Detached Daemon, Tailscale Web Companion & Notifications:**
   - `openfarm daemon {start,stop,status,logs}` (`openfarm_core/daemon.py`) + TUI detached controls & `● DAEMON` pill.
@@ -286,8 +306,10 @@ One `openfarm` CLI with **37 subcommands**, shared exit codes (`0` ok, `1` refus
 | --- | --- |
 | `openfarm` / `openfarm auto` / `openfarm tui` | Launch the interactive Textual Workbench (`--curses` for stdlib fallback, `--once` for snapshot) |
 | `openfarm plan [--draft]` | Display Cards-as-the-DAG topological tiers, parallel batches, and cycle checks (or draft a wave plan) |
+| `openfarm card [add\|show\|history\|skip\|migrate]` | Add, read and drop tasks where they live (the cards branch), see who changed one and why, or move an older project's cards and spec off `main` |
+| `openfarm try [--goal C1]` | Try it: start the app, screenshot it at desktop and phone size, and check the goal's content can be seen |
 | `openfarm check CARD [--baseline]` | Verify card eligibility, configured tooling, and optional green baseline |
-| `openfarm run` | Execute Ready cards (`--cards`, `--card`, `--spend`, `--profile lean\|balanced\|strict`, `--for`, `--until`, `--dry-run`) |
+| `openfarm run` | Execute Ready cards (`--follow` to carry on into tasks that were waiting, `--cards`, `--card`, `--spend`, `--profile lean\|balanced\|strict`, `--for`, `--until`, `--dry-run`) |
 | `openfarm daemon [start\|stop\|status\|logs]` | Run and manage a detached background `openfarm run` session (`<state_dir>/daemon.log`) |
 | `openfarm web [--tailscale] [--bind HOST] [--port 8787]` | Serve the stdlib Factory Companion Web UI (loopback by default; `--tailscale` exposes HTTPS via `tailscale serve`; `--bind tailscale` binds tailnet IPv4) |
 | `openfarm status` | Show farm, card queue, and harness-memory status |
@@ -299,7 +321,7 @@ One `openfarm` CLI with **37 subcommands**, shared exit codes (`0` ok, `1` refus
 | --- | --- |
 | `openfarm triage [CARDS...]` | Score card complexity (`low`/`medium`/`high`/`split`) and recommend supervision profiles |
 | `openfarm review` | Interactive (or `--json`) wave review of `in-review` cards, diffs, and dossiers |
-| `openfarm land CARD... [--promote-integration]` | Local-only serial merge queue (trial-merge/rebase + full test gate + `git merge --no-ff` + cleanup; zero push) |
+| `openfarm land CARD... [--promote-integration]` | Local-only serial merge queue (trial-merge/rebase + full test gate + `git merge --no-ff` + cleanup; zero push). `--accept-blocked --note "what I checked"` lands a blocked card a person has checked, recording who and why |
 | `openfarm findings [list\|pick\|dismiss\|fold]` | Manage worker-filed findings inbox across waves |
 | `openfarm frontier-review` | Mixture-of-Frontiers review across multiple providers (`--providers claude,codex`) |
 | `openfarm dossier CARD` | Print a card's reviewer dossier as Markdown or JSON |
@@ -331,13 +353,15 @@ Each repository carries `.openfarm/config.toml` on its base branch (`openfarm in
 
 <br>
 
-**Tables (`20`):** `[project]`, `[adapters]`, `[model]`, `[policy]`, `[eligibility]`, `[brief]`, `[runner]`, `[budget]`, `[gates]`, `[cards]`, `[micromanager]`, `[state]`, `[harness]`, `[swarm]`, `[tiers.*]`, `[units.*]`, `[factory]`, `[invariants]`, `[acceptance]`, and `[notifications]`.
+**Tables (`21`):** `[project]`, `[adapters]`, `[model]`, `[policy]`, `[eligibility]`, `[brief]`, `[runner]`, `[budget]`, `[gates]`, `[cards]`, `[micromanager]`, `[state]`, `[harness]`, `[swarm]`, `[tiers.*]`, `[units.*]`, `[factory]`, `[invariants]`, `[acceptance]`, and `[notifications]`, `[try]`.
 
 - **Polyglot units (`[units.<name>]`):** set per-unit `language = "rust" | "python" | "typescript" | "go"`.
 - **Factory auto-land (`[factory]`):** opt-in `auto_land = true`, `integration_branch = "openfarm/integration"`, `auto_land_profiles`, `require_zero_findings`, `require_frontier_consensus`.
 - **Architectural invariants (`[invariants]`):** declarative `forbidden_imports`, `max_file_bytes`, and `require_exports` rules enforced deterministically.
 - **Runtime acceptance (`[acceptance]`):** declarative CLI and ephemeral loopback HTTP `{PORT}` smoke checks with process-group cleanup.
 - **Notifications (`[notifications]`):** optional `webhook_url`, `desktop = true|false`, and `events` filter.
+- **Network permission (per task):** the build refuses new code that uses the network. A task that must (the HTTP server, the one client of a remote API) carries `network = true` in its header; the Plan screen shows it before you build, and the reviewer still sees every such line. No other rule can be switched off this way.
+- **Try it (`[try]`):** optional. `start = "npm start"` (a web app, told its port through `PORT`), `port`, `path = "/"`, or `sample = "python3 app.py --demo"` for an app with no page. Without it the language pack works out how to start the app.
 - **Budgets & hooks:** per-card attempt/build/token/wall-clock caps, spend caps, circuit breaker, kill switch, `[[gates.extra]]`, `[runner.env]`, and `[brief] test_conventions`.
 
 Full schema, stop codes, and record formats are in [`docs/USAGE-AND-FIRST-DEPLOYMENT.md`](docs/USAGE-AND-FIRST-DEPLOYMENT.md) and [`docs/openfarm-internals.md`](docs/openfarm-internals.md).

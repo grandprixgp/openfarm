@@ -269,6 +269,11 @@ class PythonPack(OwnMutationMixin, Pack):
         if note and note not in self.notes:
             self.notes.append(note)
 
+    def try_it(self, worktree: Path) -> dict:
+        for main in sorted(Path(worktree).glob("*/__main__.py")) + sorted(Path(worktree).glob("src/*/__main__.py")):
+            return {"kind": "cli", "sample": [self.python, "-m", main.parent.name, "--help"]}
+        return {}
+
     def configure(self, worktree: Path) -> None:
         self.worktree = Path(worktree)
         if not self._runner_fixed:

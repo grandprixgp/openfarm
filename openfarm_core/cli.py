@@ -19,9 +19,11 @@ import contextlib
 import datetime as _dt
 import difflib
 import functools
+import getpass
 import inspect
 import io
 import json
+import os
 import re
 import sys
 import threading
@@ -59,6 +61,7 @@ from .bootstrap import (
 from .briefs import BriefBook
 from .budget import NightBudget, token_split
 from .cards import Card
+from .store import record as record_change
 from .config import load_config, parse_duration
 from .coordinator import SwarmRunner
 from .dossier import build_dossier, render_markdown
@@ -507,11 +510,23 @@ def _do_run(ctx: Context, args, run_id: str, *, on_event=None) -> int:
     identifiers = ([_check_id(args.card, "card id")]
                    if args.card else source.next(cfg.lane,
                                                  limit=args.cards)["cards"])
+    # Say why the run takes fewer cards than are ready, or none: a card behind an
+    # unfinished one is waiting, and `--cards` caps how many one run starts.
+    why: list[str] = []
+    if not args.card and hasattr(source, "all_cards"):
+        from .cards import waiting_on, waiting_text
+        everything = source.all_cards()
+        waiting = waiting_on(everything)
+        if waiting:
+            why.append(waiting_text(waiting))
+        left = sum(1 for c in everything if c.state == "ready" and c.id not in waiting) - len(identifiers)
+        if left > 0 and len(identifiers) >= int(args.cards or 0):
+            why.append(f"{left} more ready card(s) left for the next wave (one wave starts up to {args.cards})")
     event_bus.emit(
         kind="run_start",
         cards=list(identifiers),
         dry_run=bool(args.dry_run),
-        message=f"Starting run {run_id} ({len(identifiers)} card(s))",
+        message=f"Starting run {run_id} ({len(identifiers)} card(s))" + ("; " + "; ".join(why) if why else ""),
     )
     # `--spend` may lower the night's cap but never raise the config's, because the
     # config is the operator's standing limit and the flag is one night's. A zero or
@@ -703,9 +718,45 @@ def _do_run(ctx: Context, args, run_id: str, *, on_event=None) -> int:
         else None
     )
 
+    def _queue():
+        """The run's cards: those it started with, then (`--follow`) each one that can
+        start once the card it waits for is accepted, so one build covers every layer."""
+        from .cards import waiting_on as _waiting_on
+
+        started: set[str] = set()
+        batch = list(identifiers)
+        while True:
+            for cid in batch:
+                started.add(cid)
+                yield cid
+            if not getattr(args, "follow", False) or args.card or args.dry_run:
+                return
+            told = False
+            while True:
+                if (ctx.state.kill_requested(cfg.kill_switch) or ctx.state.is_paused() or night.exhausted()
+                        or (deadline is not None and _time.monotonic() >= deadline)):
+                    return
+                batch = [c for c in source.next(cfg.lane, limit=args.cards)["cards"] if c not in started]
+                if batch:
+                    event_bus.emit(kind="run_more", cards=list(batch),
+                                   message=f"{', '.join(batch)} can start now")
+                    break
+                cards = source.all_cards()
+                in_review = {c.id for c in cards if c.state in ("in_review", "in-review")}
+                held = {cid: [dep for dep, _state in unmet if dep in in_review]
+                        for cid, unmet in _waiting_on(cards).items()}
+                held = {cid: deps for cid, deps in held.items() if deps}
+                if not held:
+                    return
+                if not told:
+                    told = True
+                    event_bus.emit(kind="run_waiting", cards=sorted(held), message="; ".join(
+                        f"{cid} starts when {', '.join(deps)} is accepted" for cid, deps in sorted(held.items())))
+                _time.sleep(float(os.environ.get("OPENFARM_FOLLOW_POLL_S", "2")))
+
     try:
         if not swarm_parallel:
-            for card_id in identifiers:
+            for card_id in _queue():
                 if ctx.state.kill_requested(cfg.kill_switch):
                     # Cards in flight were stopped by CardRun itself, which blocks them with
                     # `killed`. A card not yet claimed is simply left alone.
@@ -1663,6 +1714,7 @@ def cmd_release(ctx: Context, args) -> int:
                         "archived": []}, "release")
         return EXIT_REFUSED
 
+    record_change(source, ctx.repo, card_id, "release", args.reason or "", {"state": ["", "ready"]})
     card_dir = ctx.state.cards / card_id
     archived = []
     if card_dir.exists():
@@ -1699,7 +1751,10 @@ def cmd_done(ctx: Context, args) -> int:
     base = ctx.cfg.base_branch
     branch = f"openfarm/{card.id}-{card.slug()}"
     reason = ""
-    if not git.ref_exists(f"refs/heads/{base}"):
+    if card.state == "blocked":
+        reason = (f"{card_id} is blocked, not in review. If you have checked its work yourself, "
+                  f"accept it with: openfarm land {card_id} --accept-blocked --note \"what you checked\"")
+    elif not git.ref_exists(f"refs/heads/{base}"):
         reason = f"the base branch {base} does not exist"
     elif not git.branch_exists(branch):
         reason = f"there is no branch {branch} to check"
@@ -1712,6 +1767,7 @@ def cmd_done(ctx: Context, args) -> int:
         return EXIT_REFUSED
     try:
         source.mark_done(card_id, note=args.note or "")
+        record_change(source, ctx.repo, card_id, "accept", args.note or "marked done by hand", {"state": ["in_review", "done"]})
     except Refused as exc:
         _emit_ctx(ctx, {"card": card_id, "done": False, "reason": exc.message}, "done")
         return EXIT_REFUSED
@@ -1941,6 +1997,10 @@ def cmd_land(ctx: Context, args) -> int:
     cards_by_id = {c.id: c for c in source.all_cards()}
     landed: list[dict] = []
     dry_run = bool(getattr(args, "dry_run", False))
+    accept_blocked = bool(getattr(args, "accept_blocked", False))
+    accept_note = str(getattr(args, "note", "") or "").strip()
+    if accept_blocked and not accept_note:
+        raise UsageError("--accept-blocked needs --note saying what you checked")
     runner = open_runner(ctx.cfg, ctx.repo)
 
     for cid in card_ids:
@@ -1949,9 +2009,35 @@ def cmd_land(ctx: Context, args) -> int:
             payload = {"landed": landed, "stopped_at": cid, "reason": f"no such card {cid}"}
             _emit_ctx(ctx, payload, "land")
             return EXIT_REFUSED
+        if accept_blocked and card.state == "blocked" and not dry_run:
+            # A person has checked this card's work and overrules the gate that blocked it.
+            # Who and why go on the card and in the run's verdict, then it lands like any card.
+            runs = sorted(ctx.state.cards.glob(f"{cid}/*/card-record.json"))
+            if not runs or not git.branch_exists(f"openfarm/{card.id}-{card.slug()}"):
+                payload = {"landed": landed, "stopped_at": cid,
+                           "reason": f"{cid} has no finished work on a branch to accept"}
+                _emit_ctx(ctx, payload, "land")
+                return EXIT_REFUSED
+            if not hasattr(source, "accept_blocked"):
+                payload = {"landed": landed, "stopped_at": cid,
+                           "reason": "this card source cannot accept a blocked card"}
+                _emit_ctx(ctx, payload, "land")
+                return EXIT_REFUSED
+            who = git._run(["config", "user.name"], check=False).stdout.strip() or getpass.getuser()
+            source.accept_blocked(cid, by=who, note=accept_note)
+            record_change(source, ctx.repo, cid, "accept", accept_note, {"state": ["blocked", "in_review"]},
+                          by=f"person/{who}")
+            write_json(runs[-1].parent / "verdict.json", {
+                "card": cid, "verdict": "clean", "review_tokens": 0, "minutes": None,
+                "note": accept_note, "at": utc_now(), "by": f"person/{who}",
+                "accepted_blocked": True,
+            })
+            card = next(c for c in source.all_cards() if c.id == cid)
         if card.state != "in_review":
+            hint = (f". If you have checked its work yourself: openfarm land {cid} --accept-blocked "
+                    f"--note \"what you checked\"") if card.state == "blocked" else ""
             payload = {"landed": landed, "stopped_at": cid,
-                       "reason": f"{cid} is in state {card.state!r}, not 'in_review'"}
+                       "reason": f"{cid} is in state {card.state!r}, not 'in_review'{hint}"}
             _emit_ctx(ctx, payload, "land")
             return EXIT_REFUSED
         # Require an approved verdict ('clean' or 'minor-fix') in the latest run's verdict.json.
@@ -2036,6 +2122,7 @@ def cmd_land(ctx: Context, args) -> int:
             shutil.rmtree(wt_path, ignore_errors=True)
         try:
             source.mark_done(cid, note=f"landed {branch} onto {base}")
+            record_change(source, ctx.repo, cid, "accept", f"merged {branch} into {base}", {"state": ["in_review", "done"]})
         except Refused as exc:
             payload = {"landed": landed, "stopped_at": cid,
                        "reason": f"merged {branch} onto {base} but mark_done failed: {exc}"}
@@ -2662,23 +2749,28 @@ def cmd_swarm(ctx: Context, args) -> int:
 # -- the parser ----------------------------------------------------------------
 
 _CLI_EPILOG = """\
-Command groups (37 commands):
-  Setup & Auth         init, adopt, install-skill, acp, providers, projects, doctor
-  Run & Monitor        auto, plan, check, run, daemon, web, status, pause, resume, stop, tui
-  Review & Harness     triage, review, land, findings, replay, routing, timeline, frontier-review, dossier, verdict, done, release, escape, supervise, harness
-  Swarm, Board & Bench swarm, board, drive, bench
+Words: a task is a card, a goal is a chunk, the plan is the wave plan, and "build" runs it.
+Questions from the builders are findings. Accept merges a finished task locally; nothing is ever pushed.
+
+Command groups (39 commands):
+  Setup & Auth          init, adopt, install-skill, acp, providers, projects, doctor
+  Plan & Tasks          plan, card, check, triage
+  Build & Monitor       auto, run, daemon, web, status, pause, resume, stop, tui
+  Try, Review & Accept  try, review, land, findings, replay, routing, timeline, frontier-review, dossier, verdict, done, release, escape, supervise, harness
+  Swarm, Board & Bench  swarm, board, drive, bench
 
 Common workflows:
-  Bootstrap & auth     openfarm init my-app --idea "track habits"
-                       openfarm adopt --dir .
-                       openfarm acp status && openfarm acp login
-  Check & run          openfarm check CARD-1 --baseline
-                       openfarm run --dry-run --cards 3
-                       openfarm run --cards 3 --spend 1.00
-  Review & merge       openfarm dossier CARD-1
-                       openfarm verdict CARD-1 clean --review-tokens 1200
-                       git merge --no-ff openfarm/CARD-1-<slug> && openfarm done CARD-1
-  Swarm, board & TUI   openfarm swarm && openfarm board && openfarm tui
+  Start & sign in       openfarm init my-app --idea "track habits"
+                        openfarm adopt --dir .
+                        openfarm acp status && openfarm acp login
+  Plan & check tasks    openfarm plan && openfarm card show W1-01
+                        openfarm check W1-01 --baseline
+  Build                 openfarm run --dry-run --cards 3
+                        openfarm run --cards 3 --follow --spend 1.00
+  Try it & accept       openfarm try
+                        openfarm dossier W1-01 && openfarm verdict W1-01 clean
+                        openfarm land            (accept: merges locally, marks the task done)
+  Swarm, board & TUI    openfarm swarm && openfarm board && openfarm tui
 
 Pass --json with any command for machine-readable JSON output.
 """
@@ -2708,6 +2800,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--cards", type=int, default=3,
                      help="most cards to claim")
+    run.add_argument("--follow", action="store_true",
+                     help="keep going: start tasks as the ones they wait for are accepted, "
+                          "until none is left that could start")
     run.add_argument("--spend", type=float, default=None,
                      help="cap for this run, never above the config's")
     run.add_argument("--for", dest="for_duration", default=None,
@@ -2785,6 +2880,10 @@ def build_parser() -> argparse.ArgumentParser:
                       help="trial-merge and verify only, without modifying base_branch")
     land.add_argument("--promote-integration", action="store_true",
                       help="merge local [factory] integration_branch into base_branch (zero push)")
+    land.add_argument("--accept-blocked", action="store_true",
+                      help="you have checked a blocked card's work yourself: record who and why "
+                           "(--note is required), then land it like a reviewed card")
+    land.add_argument("--note", default=None, help="with --accept-blocked: what you checked")
 
     plan_p = sub.add_parser(
         "plan",
@@ -2795,6 +2894,36 @@ def build_parser() -> argparse.ArgumentParser:
     plan_p.add_argument("--draft", action="store_true", help="draft new wave cards from --idea before rendering DAG")
     plan_p.add_argument("--idea", default="", help="project workflow/goal for --draft")
     plan_p.add_argument("--no-baseline", action="store_true", help="skip baseline test verification when drafting")
+
+    card_p = sub.add_parser(
+        "card",
+        help="add, change and look at tasks (cards) where they live, on the cards branch",
+        formatter_class=raw_fmt,
+        epilog=("Examples:\n  openfarm card add my-task.md\n  openfarm card show W1-02\n"
+                "  openfarm card history W1-02\n  openfarm card skip W1-02 --why 'not needed'\n"
+                "  openfarm card migrate --take W1-02=main"),
+    )
+    card_sub = card_p.add_subparsers(dest="card_command", required=True)
+    card_add = card_sub.add_parser("add", help="add a task from a card file (+++ TOML header and a Done section)")
+    card_add.add_argument("file", help="the card file to add")
+    card_add.add_argument("--why", default="", help="why this task exists, for its history")
+    for name, text in (("show", "print a task as it is now"), ("history", "who changed a task, when and why")):
+        card_sub.add_parser(name, help=text).add_argument("card", help="task id")
+    card_skip = card_sub.add_parser("skip", help="drop a task that will not be built")
+    card_skip.add_argument("card", help="task id")
+    card_skip.add_argument("--why", required=True, help="why it is dropped")
+    card_mig = card_sub.add_parser(
+        "migrate", help="move a project's cards and spec off the main branch, once (shows any differences first)")
+    card_mig.add_argument("--take", action="append", default=[], metavar="ID=main|state",
+                          help="for a task whose text differs, which copy to keep (repeatable)")
+
+    try_p = sub.add_parser(
+        "try",
+        help="try it: start the app, screenshot it and check the goal's content can be seen",
+        formatter_class=raw_fmt,
+        epilog="Examples:\n  openfarm try\n  openfarm try --goal C1 --json",
+    )
+    try_p.add_argument("--goal", default="", help="goal (chunk) id; the current goal when left out")
 
     find_p = sub.add_parser(
         "findings",
@@ -2866,11 +2995,14 @@ def build_parser() -> argparse.ArgumentParser:
     verdict.add_argument("card")
     verdict.add_argument("verdict",
                          choices=("clean", "minor-fix", "bounced", "scrapped"))
-    verdict.add_argument("--review-tokens", type=int, required=True)
+    verdict.add_argument("--review-tokens", type=int, default=0,
+                         help="tokens a model spent reviewing; leave out when a person reviewed")
     verdict.add_argument("--minutes", type=float, default=None)
     verdict.add_argument("--note", default=None)
 
-    escape = sub.add_parser("escape", help="record a later defect")
+    escape = sub.add_parser(
+        "escape",
+        help="record a defect that escaped review and was found later (it does not hand the card to a person)")
     escape.add_argument("card")
     escape.add_argument("--note", required=True)
 
@@ -4016,9 +4148,90 @@ def cmd_plan(ctx: Context, args) -> int:
     return EXIT_OK
 
 
+def cmd_card(ctx: Context, args) -> int:
+    """Add, change and look at tasks in the one place they live."""
+    from .adapters.files import parse_card_file, render_card_file
+    from .store import open_store
+
+    store = open_store(ctx.repo, ctx.cfg)
+    action = args.card_command
+    try:
+        if action == "add":
+            header, body = parse_card_file(Path(args.file).expanduser().read_text(encoding="utf-8"))
+            header["id"] = store.src.reserve_id(str(header.get("id") or store.next_card_id(int(header.get("wave") or 1))))
+            outcome = store.change_card(header["id"], "create", why=args.why or "added by hand", header=header, body=body)
+            failed = [c for c in outcome["checks"] if c["status"] == "fail"]
+            if not ctx.json:
+                print(f"{outcome['id']}: added, {outcome['state']}")
+                for check in failed:
+                    print(f"  not ready ({check['check']}): {check['detail']}")
+            else:
+                print(json.dumps(outcome, indent=2))
+            return EXIT_OK
+        if action == "migrate":
+            take = dict(item.split("=", 1) for item in args.take if "=" in item)
+            status = store.migration()
+            if not status["needed"]:
+                _emit_ctx(ctx, {"migrated": False, "reason": "the cards branch is already the only home"}, "card")
+                return EXIT_OK
+            missing = [d for d in status["differences"] if take.get(d["id"]) not in ("main", "state")]
+            if missing:
+                if ctx.json:
+                    print(json.dumps({"migrated": False, "differences": status["differences"]}, indent=2))
+                else:
+                    for diff in missing:
+                        print(f"{diff['id']} differs.\n--- on main ---\n{diff['main']}\n--- on the cards branch ---\n{diff['state']}")
+                    print("Choose for each: " + " ".join(f"--take {d['id']}=main|state" for d in missing))
+                return EXIT_REFUSED
+            _emit_ctx(ctx, store.migrate(take), "card")
+            return EXIT_OK
+        card_id = _check_id(args.card, "card id")
+        if action == "show":
+            header, body = store.read(card_id)
+            print(json.dumps({"header": header, "body": body}, indent=2) if ctx.json else render_card_file(header, body))
+        elif action == "history":
+            entries = store.history(card_id)
+            if ctx.json:
+                print(json.dumps(entries, indent=2))
+            for entry in ([] if ctx.json else entries):
+                changed = ", ".join(sorted(entry.get("changed") or {}))
+                print(f"{entry['at']}  {entry['by']}  {entry['kind']}  {entry.get('why') or ''}" + (f"  [{changed}]" if changed else ""))
+        elif action == "skip":
+            _emit_ctx(ctx, {k: v for k, v in store.change_card(card_id, "skip", why=args.why).items() if k != "checks"}, "card")
+        return EXIT_OK
+    except (Refused, OSError) as exc:
+        _emit_ctx(ctx, {"ok": False, "reason": getattr(exc, "message", str(exc))}, "card")
+        return EXIT_REFUSED
+
+
+def cmd_try(ctx: Context, args) -> int:
+    """Start the app, look at it, and say what a person would find."""
+    from .automode import load_project_chunks
+    from .tryit import try_it
+
+    goals = load_project_chunks(ctx.repo)
+    goal = (next((g for g in goals if g["id"] == args.goal), None) if args.goal
+            else next((g for g in goals if g["status"] == "active"), goals[-1] if goals else None))
+    result = try_it(ctx.repo, ctx.cfg, goal)
+    if ctx.json:
+        print(json.dumps(result, indent=2))
+    else:
+        print(f"Tried: {result['command'] or 'nothing to start'}" + (f" at {result['url']}" if result["url"] else ""))
+        for check in result["checks"]:
+            mark = {True: "ok ", False: "FAIL", None: "?  "}[check["ok"]]
+            print(f"  {mark} {check['detail']}")
+        for shot in result["screenshots"]:
+            print(f"  screenshot: {shot}")
+        if result["kind"] == "cli" and result["output"]:
+            print(result["output"])
+    return EXIT_OK if result["ok"] is not False else EXIT_REFUSED
+
+
 COMMANDS = {
     "run": cmd_run,
     "plan": cmd_plan,
+    "card": cmd_card,
+    "try": cmd_try,
     "status": cmd_status,
     "pause": cmd_pause,
     "resume": cmd_resume,

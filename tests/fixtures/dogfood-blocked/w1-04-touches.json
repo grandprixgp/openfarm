@@ -1,0 +1,23 @@
+{
+  "run_id": "run-20261120T134417Z",
+  "card_id": "W1-04",
+  "claimed_at": "2026-11-20T13:44:17Z",
+  "ended_at": "2026-11-20T13:44:31Z",
+  "final_state": "released",
+  "stop_code": "ineligible",
+  "attempts": 0,
+  "counter_tests": {
+    "written": 0,
+    "dropped_uncompiled": 0,
+    "passed": 0,
+    "failed": 0,
+    "not_run": 0
+  },
+  "detail": "The card cannot be completed as scoped, because `card.touches` lists only `src/client/main.ts`. The four frozen tests in `tests/client.test.ts` import only `src/client/sample.ts` and `src/client/apply.ts`, and the card also requires `src/client/style.css`. None of those three files is in `card.touches`, so neither the scaffold nor a worker may create them, and the tests cannot pass. No scaffold edits were made: `main.ts` is a browser bootstrap that no test imports, so it needs no stubs. To make the card runnable, add `src/client/sample.ts`, `src/client/apply.ts` and `src/client/style.css` to `touches`. Once that is fixed, the contracts are: `luminanceGrid(rgba, width, height, cols, rows): number[]` (row-major mean WCAG luminance per cell), `themeFromPixels(rgba, width, height): Theme` (using `extractPalette(rgba, 6)`, `luminanceGrid(..., 4, 4)` and `deriveTheme(palette, lums, 4, 4)`), the `StyleTarget` type, `applyTheme(theme, target): void` (six custom properties `--ink`, `--paper`, `--accent`, `--glow`, `--shade`, `--font`, plus `dataset.mode` and `dataset.placement`), and `creditLine(credit, licence): string` (joined with ' \u00b7 ', credit only when the licence is empty). Relative imports must use `.ts` extensions.",
+  "named_tests": [
+    "luminanceGrid averages cells",
+    "applyTheme sets every custom property",
+    "themeFromPixels runs the full pipeline",
+    "creditLine joins credit and licence"
+  ]
+}

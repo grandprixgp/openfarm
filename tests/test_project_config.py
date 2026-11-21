@@ -64,6 +64,7 @@ SPEC_KEYS = {
     "invariants": {"forbidden_imports", "max_file_bytes", "require_exports"},
     "acceptance": {"checks"},
     "notifications": {"webhook_url", "desktop", "events"},
+    "try": {"start", "port", "path", "sample"},
 }
 
 

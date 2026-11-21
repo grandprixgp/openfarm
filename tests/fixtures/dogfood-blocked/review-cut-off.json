@@ -1,0 +1,18 @@
+{
+  "run_id": "run-20261120T212517Z",
+  "card_id": "W1-01",
+  "claimed_at": "2026-11-20T21:25:18Z",
+  "ended_at": "2026-11-20T21:38:53Z",
+  "final_state": "blocked",
+  "stop_code": "checker-reject",
+  "attempts": 4,
+  "counter_tests": {
+    "written": 0,
+    "dropped_uncompiled": 0,
+    "passed": 0,
+    "failed": 0,
+    "not_run": 0,
+    "unreadable": 1
+  },
+  "detail": "the second pass could not be read, even when asked again (the answer was cut off at the token limit before it finished): no counter-test ran, nothing was checked"
+}

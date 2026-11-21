@@ -10,6 +10,25 @@ description: >-
 
 # Openfarm Project Initialization (`/openfarm-initialize`)
 
+## Steps and words (the same in the TUI, the CLI and here)
+
+The work goes through seven steps: **Idea, Questions, Spec, Plan, Build, Try it, Accept**. Use these words with
+the owner, whichever front door they came in by:
+
+| Say | It is | In commands and files |
+|---|---|---|
+| task | one small piece of work a lesser model builds | card (`openfarm card`, `cards/`) |
+| goal | an ordered part of the spec, built and accepted as a whole | chunk (`CHUNKS.json`) |
+| plan | a goal's tasks, checked before they are shown | wave plan (`openfarm plan`) |
+| build | running the plan | `openfarm run --follow`, `openfarm daemon` |
+| questions from builders | what a builder could not decide alone | findings (`openfarm findings`) |
+| try it | start the app and check the goal's content can be seen | `openfarm try` |
+| accept | merge a finished task locally (never pushes) | `openfarm verdict` + `openfarm land` |
+
+Tasks, the spec and the decisions log live on the `openfarm-cards` branch. Add or change a task with
+`openfarm card add|show|history|skip`, never by writing files under `cards/` on the main branch. After the
+owner tries the app, "something's wrong" becomes fix tasks under the same goal; it never restarts the project.
+
 Use this workflow to turn a plain-English project idea inside an empty directory into a validated, gate-enforced Openfarm repository ready for autonomous wave execution by lesser coding models (API key), native Claude ACP Frontier supervision (OAuth default), and Recursive Harness Memory.
 
 > **Token-Efficiency Principle**: Spend ~3–8k frontier tokens **once** on design alignment, protected seam invariants, public API types, and a verified golden reference slice + pre-checked card queue. Do **not** burn frontier tokens implementing routine cards or iterating compiler errors—Openfarm runs lesser models, ACP coaching, and `HarnessLibrary` outside your context window.

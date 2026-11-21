@@ -215,7 +215,7 @@ class HumanCliCommandsTests(unittest.TestCase):
                 cli_main(["--help"])
         self.assertEqual(h_exit.exception.code, 0)
         help_text = help_out.getvalue()
-        for group in ("Setup & Auth", "Run & Monitor", "Review & Harness", "Swarm, Board & Bench"):
+        for group in ("Setup & Auth", "Plan & Tasks", "Build & Monitor", "Try, Review & Accept", "Swarm, Board & Bench"):
             self.assertIn(group, help_text)
         for cmd in ("init", "adopt", "install-skill", "acp", "check", "run", "status",
                     "pause", "resume", "stop", "tui", "dossier", "verdict", "done",
@@ -863,6 +863,26 @@ class HumanCliCommandsTests(unittest.TestCase):
         self.assertEqual(cli_found["banned"], [], f"banned patterns in cli.py additions: {cli_found['banned']}")
         self.assertEqual(cli_found["flagged"], [], f"flagged patterns in cli.py additions: {cli_found['flagged']}")
 
+
+
+class NextWordsTests(unittest.TestCase):
+    """R2.8: a suggested command keeps its name and says what it does in the screen's words."""
+
+    def test_hints_gloss_the_command_in_task_and_build_words(self) -> None:
+        from openfarm_core.human_cli import Style, _render_next
+
+        lines = _render_next(["openfarm run --cards 3", "openfarm land", "git status"], style=Style(enabled=False))
+        self.assertIn("openfarm run --cards 3   (build the tasks that are ready)", lines[1])
+        self.assertIn("openfarm land   (accept: merge finished tasks locally, nothing is pushed)", lines[2])
+        self.assertTrue(lines[3].endswith("git status"))
+
+    def test_help_names_the_words_once(self) -> None:
+        from openfarm_core.cli import build_parser
+
+        text = build_parser().format_help()
+        self.assertIn("a task is a card, a goal is a chunk, the plan is the wave plan", text)
+        self.assertIn("card, check", text)
+        self.assertIn("openfarm try", text)
 
 if __name__ == "__main__":
     unittest.main()

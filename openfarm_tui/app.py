@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-import io
+import hashlib
 import json
+import os
+import subprocess
+import sys
+import tempfile
 import time
-from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
-from types import SimpleNamespace
 
 from rich.markup import escape as rich_escape
 from rich.syntax import Syntax
@@ -16,7 +18,8 @@ from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.command import Hit, Hits, Provider
-from textual.containers import Container, Horizontal, Vertical, VerticalScroll
+from textual.containers import Container, Horizontal, ItemGrid, Vertical, VerticalScroll
+from textual.worker import get_current_worker
 from textual.widgets import (
     Button,
     ContentSwitcher,
@@ -53,9 +56,9 @@ from openfarm_core.automode import (
     update_card_with_eligibility,
 )
 from openfarm_core.bootstrap import initialize_project
-from openfarm_core.cli import Context, cmd_run, main as cli_main
+import openfarm_core
 from openfarm_core.config import CONFIG_PATH, load_config
-from openfarm_core.daemon import daemon_status, start_daemon, stop_daemon
+from openfarm_core.daemon import daemon_status, read_daemon_logs, start_daemon, stop_daemon
 from openfarm_core.doctor import compute_touches_conflict_matrix, run_doctor
 from openfarm_core.routing import compute_routing_recommendations
 from openfarm_core.errors import AdapterError, ConfigError, Refused
@@ -66,9 +69,12 @@ from openfarm_core.findings import (
     is_finding_id_or_header,
     list_findings,
 )
+from openfarm_core.cards import waiting_on, waiting_text
+from openfarm_core.gates.eligibility import check_eligibility
 from openfarm_core.git import Git
 from openfarm_core.projects import (
     _is_ephemeral_tmp_path,
+    default_projects_path,
     discover_workspace_projects,
     edit_project,
     get_project,
@@ -83,9 +89,11 @@ from openfarm_core.providers import (
     save_global_providers,
 )
 from openfarm_core.state import StateDir
+from openfarm_core.store import read_doc, store_or_none, write_doc
 from openfarm_core.triage import triage_card_heuristic
 from openfarm_core.tui import _load_tui_context, _read_cards_readonly
 
+from .markup import esc
 from .modals import (
     BounceNoteModal,
     CardEditorModal,
@@ -99,6 +107,16 @@ from .modals import (
     SplitCardModal,
     WorkspaceDiscoveryModal,
 )
+
+
+ARCHITECT_ON_WORDS = "on: the Architect writes the questions, the spec and the cards"
+ARCHITECT_OFF_WORDS = "off: the plan comes from a basic template, the Architect is not asked"
+STEP_BUTTONS = {
+    "grill": "#btn-grill-ask",
+    "spec": "#btn-draft-spec",
+    "split": "#btn-chunk-to-cards",
+    "plan": "#btn-draft-plan",
+}
 
 
 class OpenfarmPaletteProvider(Provider):
@@ -131,6 +149,15 @@ class OpenfarmPaletteProvider(Provider):
                     lambda a=action_id: app.dispatch_palette_action(a),
                     help=f"{action_id}  ·  {help_text}",
                 )
+
+
+class ButtonRow(ItemGrid):
+    """A row of buttons that wraps onto more lines when its pane is too narrow for one."""
+
+    def on_mount(self) -> None:
+        # Every column is as wide as the longest button, so no label is ever cut.
+        self.min_column_width = max(
+            (len(str(b.label)) + 5 for b in self.query(Button)), default=None)
 
 
 class OpenfarmApp(App):
@@ -247,7 +274,7 @@ class OpenfarmApp(App):
     .pill-purple { width: auto; background: #2f1b47; color: #c084fc; text-style: bold; padding: 0 1; margin-right: 1; }
     .pill-yellow { width: auto; background: #423310; color: #fbbf24; text-style: bold; padding: 0 1; margin-right: 1; }
 
-    .action-row { height: 1; align: left middle; margin-top: 1; }
+    .action-row { height: auto; margin-top: 1; }
     .action-row-tall { height: 3; align: left middle; margin-top: 1; }
     Button.primary-cta {
         width: auto; min-width: 10; height: 1; background: #38bdf8; color: #08101a;
@@ -270,7 +297,8 @@ class OpenfarmApp(App):
         padding: 0 2;
         margin-bottom: 1;
     }
-    #studio-findings-banner.hidden { display: none; }
+    .hidden { display: none; }
+    #architect-switch-row { height: 3; align: left middle; }
 
     /* Providers View */
     #prov-card { width: 100%; max-width: 118; height: 1fr; }
@@ -325,17 +353,16 @@ class OpenfarmApp(App):
     }
     #grill-status.hidden { display: none; }
     #architect-panel {
-        height: auto;
-        max-height: 11;
+        dock: bottom;
+        height: 8;
         background: #0e1c2b;
         border: round #38bdf8;
         padding: 0 2;
-        margin-bottom: 1;
     }
     #architect-panel.hidden { display: none; }
     #architect-panel-head { height: 1; align: left middle; }
     #architect-banner { width: 1fr; color: #e0f2fe; }
-    #architect-log { height: 6; background: #09111b; border: round #1e334a; padding: 0 1; margin-top: 1; }
+    #architect-log { height: 1fr; background: #09111b; padding: 0 1; }
 
     /* Split Panes */
     .split-left  { width: 46; margin-right: 2; height: 1fr; }
@@ -396,6 +423,11 @@ class OpenfarmApp(App):
         self._draft_last_heartbeat = 0
         self._active_architect_backend: object | None = None
         self._architect_cancelled = False
+        self._architect_failure: dict | None = None  # the step to offer Retry for
+        self._busy_button = ""  # only the running step's button shows a spinner
+        self._draft_asked = True  # False while a basic template stands in for the Architect
+        self._draft_doing = ""
+        self._grill_from_template = False
         self._last_baseline_ok: bool | None = None
         self._last_baseline_error = ""
         self._worker_tokens = 0
@@ -405,6 +437,8 @@ class OpenfarmApp(App):
         self._spark_points: list[float] = [0.0, 0.0, 0.0, 0.0, 0.0]
         self._plan_cards: list[dict] = []
         self._selected_plan_id: str = ""
+        self._in_review_count = 0
+        self._startable_count = 0
         self._review_cards: list = []
         self._selected_review_id: str = ""
         self._findings_items: list[dict] = []
@@ -416,15 +450,18 @@ class OpenfarmApp(App):
         self._findings_query: str = ""
         self._approved_to_land: list[str] = []
         self._card_phases: dict[str, str] = {}
+        self._cards_finished: set[str] = set()
+        self._run_start_note = ""  # what the run said when it picked its cards
+        self._busy_labels: dict[str, str] = {}  # buttons of slow actions still running
         self._projects_items: list[dict] = []
         self._selected_project_id: str = ""
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="topbar"):
             yield Static("openfarm", id="brand")
-            yield Static(f"{self.repo.name}", id="repo-title")
+            yield Static(esc(self.repo.name), id="repo-title")
             yield Static("", classes="spacer")
-            yield Static("W —% · F —% (idle)", id="token-summary")
+            yield Static("Token share: worker —% · frontier —% (no run yet)", id="token-summary")
             yield Static("○ READY", id="status-badge", classes="status-pill status-ready")
 
         with Horizontal(id="navstrip"):
@@ -454,12 +491,12 @@ class OpenfarmApp(App):
                 with right_pr:
                     with VerticalScroll(id="project-detail-scroll"):
                         yield Static("No projects registered yet.", id="project-detail")
-                    with Horizontal(classes="action-row"):
-                        yield Button("Switch Project [Enter]", classes="primary-cta", id="btn-proj-switch")
-                        yield Button("Add / New [n]", classes="approve-btn", id="btn-proj-new")
-                        yield Button("Scan ~/projects [S]", classes="soft-btn", id="btn-proj-scan")
-                        yield Button("Edit [e]", classes="soft-btn", id="btn-proj-edit")
-                        yield Button("Remove From Openfarm [d]", classes="soft-btn", id="btn-proj-delete")
+                    with ButtonRow(classes="action-row"):
+                        yield Button("Switch Project \\[Enter]", classes="primary-cta", id="btn-proj-switch")
+                        yield Button("Add / New \\[n]", classes="approve-btn", id="btn-proj-new")
+                        yield Button("Scan ~/projects \\[S]", classes="soft-btn", id="btn-proj-scan")
+                        yield Button("Edit \\[e]", classes="soft-btn", id="btn-proj-edit")
+                        yield Button("Remove From Openfarm \\[d]", classes="soft-btn", id="btn-proj-delete")
 
             # ── VIEW 0: GLOBAL PROVIDER SETUP ────────────────────────────────
             with Container(id="providers"):
@@ -470,7 +507,7 @@ class OpenfarmApp(App):
                     with Horizontal(id="frontier-row"):
                         yield Static("● Claude ACP (OAuth)", id="prov-frontier-status", classes="inline-label")
                         yield Static("", classes="spacer")
-                        yield Button("Login OAuth [l]", id="btn-acp-login", classes="soft-btn")
+                        yield Button("Login OAuth \\[l]", id="btn-acp-login", classes="soft-btn")
 
                     yield Static("WORKER     (Lesser Coding Model · ZDR Header x-cmd-zdr: 1)", classes="section-h")
                     with RadioSet(id="worker-presets"):
@@ -510,8 +547,10 @@ class OpenfarmApp(App):
                 with Vertical(id="architect-panel", classes="hidden"):
                     with Horizontal(id="architect-panel-head"):
                         yield Static("", id="architect-banner")
+                        yield Button("Retry", classes="primary-cta hidden", id="btn-arch-retry")
+                        yield Button("Use a basic template instead", classes="soft-btn hidden", id="btn-arch-template")
                         yield Button("Cancel", classes="soft-btn hidden", id="btn-arch-cancel")
-                        yield Button("Hide Log", classes="soft-btn", id="btn-arch-hide")
+                        yield Button("Hide", classes="soft-btn", id="btn-arch-hide")
                     yield RichLog(id="architect-log", markup=True, wrap=True, min_width=0)
                 with ContentSwitcher(initial="studio-grill", id="studio-switcher"):
                     # 1A: Single-Prompt Studio & Conversational Frontier Architect
@@ -541,13 +580,15 @@ class OpenfarmApp(App):
                                 yield Input(placeholder="Reply to Architect (or click an option above)...", id="inp-grill-answer")
                                 yield Button("Reply", classes="primary-cta", id="btn-grill-send")
                                 yield Button("Reset Chat", classes="soft-btn", id="btn-grill-reset")
-                        with Horizontal(classes="action-row-tall"):
+                        with ButtonRow(classes="action-row"):
                             yield Button("Ask Architect to Grill Me", classes="primary-cta", id="btn-grill-ask")
                             yield Button("Flesh Out Spec & Chunks", classes="approve-btn", id="btn-draft-spec")
                             yield Button("Quick: Draft Cards Now", classes="soft-btn", id="btn-draft-plan")
                             yield Button("Configure Providers", classes="soft-btn", id="btn-open-providers")
-                            yield Static("  Frontier Architect: ", classes="inline-label")
+                        with Horizontal(id="architect-switch-row"):
+                            yield Static("Architect: ", classes="inline-label")
                             yield Switch(value=True, id="sw-use-architect")
+                            yield Static(ARCHITECT_ON_WORDS, id="sw-architect-words", classes="inline-label")
                         yield Static("", id="grill-status", classes="hidden")
 
                     # 1A-2: Living Spec & Ordered Chunks (Idea -> Grill -> Spec -> Chunks -> Cards)
@@ -562,7 +603,7 @@ class OpenfarmApp(App):
                         with right_sp:
                             yield TextArea("", id="ta-spec-editor")
                             yield Static("", id="spec-status", classes="subtext")
-                            with Horizontal(classes="action-row"):
+                            with ButtonRow(classes="action-row"):
                                 yield Button("Split Chunk into Cards", classes="primary-cta", id="btn-chunk-to-cards")
                                 yield Button("Mark Chunk Done", classes="approve-btn", id="btn-chunk-done")
                                 yield Button("Save Spec", classes="soft-btn", id="btn-spec-save")
@@ -571,18 +612,19 @@ class OpenfarmApp(App):
                     # 1B: Pre-Verified Wave Plan Approval
                     with Horizontal(id="studio-plan"):
                         left_p = Vertical(classes="card-focused split-left")
-                        left_p.border_title = "Wave Plan (all cards eligible)"
+                        left_p.border_title = "Wave Plan"
                         with left_p:
                             yield DataTable(id="plan-table")
                             yield Static("", id="plan-preflight", classes="subtext")
-                        right_p = VerticalScroll(classes="card split-right")
+                        right_p = Vertical(classes="card split-right")
                         right_p.border_title = "Card Detail"
                         with right_p:
-                            yield Static("Select a card to inspect its scope and named tests.", id="plan-detail")
-                            with Horizontal(classes="action-row"):
+                            yield VerticalScroll(
+                                Static("Select a card to inspect its scope and named tests.", id="plan-detail"))
+                            with ButtonRow(classes="action-row"):
                                 yield Button("Commit Baseline & Launch Wave", classes="primary-cta", id="btn-launch-wave")
-                                yield Button("Edit Card [e]", classes="soft-btn", id="btn-plan-edit")
-                                yield Button("Split Card [x]", classes="soft-btn", id="btn-plan-split")
+                                yield Button("Edit Card \\[e]", classes="soft-btn", id="btn-plan-edit")
+                                yield Button("Split Card \\[x]", classes="soft-btn", id="btn-plan-split")
                                 yield Button("Spec & Chunks", classes="soft-btn", id="btn-open-spec")
                                 yield Button("Release Blocked", classes="soft-btn", id="btn-plan-release")
                                 yield Button("Iterate / New Idea", classes="soft-btn", id="btn-regrill")
@@ -602,14 +644,14 @@ class OpenfarmApp(App):
                         right_r.border_title = "Live Activity Stream"
                         with right_r:
                             yield RichLog(id="activity-log", markup=True, wrap=True, min_width=0)
-                            with Horizontal(classes="action-row"):
-                                yield Button("Launch Wave", classes="primary-cta", id="btn-run-start")
+                            with ButtonRow(classes="action-row", id="run-controls"):
+                                yield Button("Back to Plan", classes="primary-cta", id="btn-run-back")
+                                yield Button("Pause \\[p]", classes="soft-btn hidden", id="btn-pause")
+                                yield Button("Stop \\[s]", classes="soft-btn hidden", id="btn-stop")
+                                yield Button("Hint \\[h]", classes="soft-btn hidden", id="btn-hint")
+                                yield Button("Resume", classes="soft-btn hidden", id="btn-resume")
                                 yield Button("Start Detached", classes="soft-btn", id="btn-daemon-start")
-                                yield Button("Stop Daemon", classes="soft-btn", id="btn-daemon-stop")
-                                yield Button("Pause [p]", classes="soft-btn", id="btn-pause")
-                                yield Button("Resume", classes="soft-btn", id="btn-resume")
-                                yield Button("Stop [s]", classes="soft-btn", id="btn-stop")
-                                yield Button("Hint [h]", classes="soft-btn", id="btn-hint")
+                                yield Button("Stop Daemon", classes="soft-btn hidden", id="btn-daemon-stop")
                                 yield Button("Open Review [2]", classes="approve-btn", id="btn-jump-review")
 
             # ── VIEW 2: SPLIT-PANE REVIEW & LAND INBOX ───────────────────────
@@ -622,23 +664,25 @@ class OpenfarmApp(App):
                 right_rev = Vertical(classes="card-focused split-right")
                 right_rev.border_title = "Card Dossier"
                 with right_rev:
-                    with TabbedContent():
-                        with TabPane("Summary & Diff"):
+                    with TabbedContent(id="review-tabs"):
+                        with TabPane("Summary & Diff", id="rev-tab-summary"):
                             yield Static("Select a card from the queue.", id="review-gates")
                             yield Static("No findings filed by this card.", id="review-card-findings")
+                            yield Static("", id="review-status", classes="subtext")
                             with VerticalScroll(id="diff-scroll"):
                                 yield Static("(no diff preview)", id="review-diff")
-                            with Horizontal(classes="action-row"):
-                                yield Button("Approve [a]", classes="approve-btn", id="btn-approve")
-                                yield Button("Land Locally [L]", classes="primary-cta", id="btn-land")
+                            with ButtonRow(classes="action-row"):
+                                yield Button("Approve \\[a]", classes="approve-btn", id="btn-approve")
+                                yield Button("Land Locally \\[L]", classes="primary-cta", id="btn-land")
                                 yield Button("Merge Integration → Main", classes="soft-btn", id="btn-promote-int")
-                                yield Button("Bounce [b]", classes="soft-btn", id="btn-bounce")
-                                yield Button("Frontier Review [m]", classes="soft-btn", id="btn-freview")
+                                yield Button("Bounce \\[b]", classes="soft-btn", id="btn-bounce")
+                                yield Button("Accept Blocked...", classes="soft-btn hidden", id="btn-accept-blocked")
+                                yield Button("Frontier Review \\[m]", classes="soft-btn", id="btn-freview")
                                 yield Button("Next Chunk / Iterate", classes="soft-btn", id="btn-next-iter")
-                        with TabPane("Tests & Spec"):
+                        with TabPane("Tests & Spec", id="rev-tab-tests"):
                             yield VerticalScroll(Static("(select a card)", id="review-tests"))
-                        with TabPane("Frontier Review"):
-                            yield VerticalScroll(Static("Press [m] to run Mixture-of-Frontiers review.", id="review-frontier-out"))
+                        with TabPane("Frontier Review", id="rev-tab-frontier"):
+                            yield VerticalScroll(Static("Press \\[m] to run Mixture-of-Frontiers review.", id="review-frontier-out"))
 
             # ── VIEW 3: FINDINGS INBOX ───────────────────────────────────────
             with Vertical(id="findings"):
@@ -654,13 +698,13 @@ class OpenfarmApp(App):
                     with right_f:
                         with VerticalScroll(id="finding-detail-scroll"):
                             yield Static("No waiting findings.", id="finding-detail")
-                        with Horizontal(classes="action-row"):
-                            yield Button("Pick Next Wave [w]", classes="primary-cta", id="btn-find-pick")
-                            yield Button("Dismiss [x]", classes="soft-btn", id="btn-find-dismiss")
-                            yield Button("Bulk Dismiss Card [X]", classes="soft-btn", id="btn-find-bulk-dismiss")
-                            yield Button("Fold Into Card [c]", classes="soft-btn", id="btn-find-fold")
-                            yield Button("Synthesize Wave [W]", classes="approve-btn", id="btn-find-synth")
-                            yield Button("Open Full [Enter]", classes="soft-btn", id="btn-find-full")
+                        with ButtonRow(classes="action-row"):
+                            yield Button("Pick Next Wave \\[w]", classes="primary-cta", id="btn-find-pick")
+                            yield Button("Dismiss \\[x]", classes="soft-btn", id="btn-find-dismiss")
+                            yield Button("Bulk Dismiss Card \\[X]", classes="soft-btn", id="btn-find-bulk-dismiss")
+                            yield Button("Fold Into Card \\[c]", classes="soft-btn", id="btn-find-fold")
+                            yield Button("Synthesize Wave \\[W]", classes="approve-btn", id="btn-find-synth")
+                            yield Button("Open Full \\[Enter]", classes="soft-btn", id="btn-find-full")
 
             # ── VIEW 4: ENGINE DIAGNOSTICS ───────────────────────────────────
             with Container(id="engine"):
@@ -676,11 +720,11 @@ class OpenfarmApp(App):
                             yield Static("(harness status loading...)", id="engine-harness")
                         with TabPane("Providers & Config"):
                             yield Static("", id="engine-providers")
-                            with Horizontal(classes="action-row"):
+                            with ButtonRow(classes="action-row"):
                                 yield Button("Open Global Provider Setup", classes="primary-cta", id="btn-eng-providers")
                         with TabPane("Doctor"):
                             yield Static("Click Run Doctor to inspect repo, OAuth, Worker, bwrap, toolchains & locks.", id="engine-doctor")
-                            with Horizontal(classes="action-row"):
+                            with ButtonRow(classes="action-row"):
                                 yield Button("Run Doctor", classes="primary-cta", id="btn-doc-run")
                                 yield Button("Run Safe Fix", classes="approve-btn", id="btn-doc-fix")
                         with TabPane("Spec"):
@@ -700,7 +744,7 @@ class OpenfarmApp(App):
 
         pt = self.query_one("#plan-table", DataTable)
         pt.cursor_type = "row"
-        pt.add_columns("ID", "Title", "St", "Prof")
+        pt.add_columns("ID", "Title", "State", "Needs", "Prof")
 
         cht = self.query_one("#chunks-table", DataTable)
         cht.cursor_type = "row"
@@ -712,7 +756,7 @@ class OpenfarmApp(App):
 
         ft = self.query_one("#findings-table", DataTable)
         ft.cursor_type = "row"
-        ft.add_columns("ID", "From", "Title")
+        ft.add_columns("ID", "From", "Blocks", "Title")
 
         bt = self.query_one("#board-table", DataTable)
         bt.cursor_type = "row"
@@ -728,14 +772,77 @@ class OpenfarmApp(App):
         self._load_providers_into_form()
         self.refresh_all_views()
         self.set_interval(1.0, self._tick_draft_timer)
+        self._attach_running_build()
 
         # Choose initial screen cleanly
         gp = load_global_providers()
         ws = detect_workspace_state(self.repo, self.config_path)
         target_view = self._initial_view
-        if target_view == "studio" and not gp["configured"] and ws["stage"] == "empty":
+        if target_view in ("studio", "auto") and not gp["configured"] and ws["stage"] == "empty":
             target_view = "providers"
+        elif target_view == "auto":
+            # No tab was asked for: open where the project's next step is.
+            target_view = "studio"
+            if self._wave_active():
+                self.query_one("#studio-switcher", ContentSwitcher).current = "studio-run"
+            elif self._in_review_count and not self._startable_count:
+                target_view = "review"
+        self._load_idea_draft()
         self.action_switch_view(target_view)
+
+    def _idea_draft_path(self) -> Path:
+        """The unsent idea is kept beside the projects list, since a new folder has nowhere to put it."""
+        key = hashlib.sha256(str(self.repo).encode()).hexdigest()[:16]
+        return default_projects_path().parent / "idea-drafts" / f"{key}.txt"
+
+    def _load_idea_draft(self) -> None:
+        try:
+            text = self._idea_draft_path().read_text(encoding="utf-8")
+        except OSError:
+            text = ""
+        self.query_one("#ta-idea", TextArea).load_text(text)
+
+    @on(TextArea.Changed, "#ta-idea")
+    def _save_idea_draft(self, event: TextArea.Changed) -> None:
+        path = self._idea_draft_path()
+        try:
+            if event.text_area.text.strip():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(event.text_area.text, encoding="utf-8")
+            else:
+                path.unlink(missing_ok=True)
+        except OSError as exc:
+            self.log.warning(f"could not save the idea draft: {exc}")
+
+    def _typing_target(self):
+        """The text field a typed letter belongs to on the idea screen, or None."""
+        if len(self.screen_stack) > 1:
+            return None
+        if self.query_one("#main-switcher", ContentSwitcher).current != "studio":
+            return None
+        if self.query_one("#studio-switcher", ContentSwitcher).current != "studio-grill":
+            return None
+        if not self.query_one("#grill-chat-box").has_class("hidden"):
+            return self.query_one("#inp-grill-answer", Input)
+        return self.query_one("#ta-idea", TextArea)
+
+    def _focus_typing_target(self) -> None:
+        target = self._typing_target()
+        if target is not None and not isinstance(self.focused, (Input, TextArea)):
+            target.focus()
+
+    def notify(self, message, *, title="", severity="information", timeout=None, markup=False):
+        """Toasts carry card text, errors and key names like [L], so they are plain text."""
+        super().notify(str(message), title=title, severity=severity, timeout=timeout, markup=markup)
+
+    def _card_ids(self) -> list[str]:
+        """Every task ID the project has, upper case. Empty for a folder with no project."""
+        cfg = self._safe_cfg()
+        try:
+            store = store_or_none(self.repo, cfg)
+            return list(store.states()) if store is not None else []
+        except (AdapterError, OSError):
+            return []
 
     def _safe_cfg(self):
         cfg_p = self.config_path or (self.repo / CONFIG_PATH)
@@ -757,7 +864,7 @@ class OpenfarmApp(App):
             signed = False
         badge = "[bold #4ade80]✓ signed in[/]" if signed else "[bold #fbbf24]○ login required[/]"
         self.query_one("#prov-frontier-status", Static).update(
-            f"[bold #f8fafc]● {fr.title()} ACP (OAuth)[/]   {badge}"
+            f"[bold #f8fafc]● {esc(fr.title())} ACP (OAuth)[/]   {badge}"
         )
         if wk.get("endpoint"):
             self.query_one("#inp-endpoint", Input).value = wk["endpoint"]
@@ -777,7 +884,7 @@ class OpenfarmApp(App):
             except Exception:
                 branch = ""
         self.query_one("#repo-title", Static).update(
-            f"{self.repo.name}  ({branch})" if branch else self.repo.name
+            esc(f"{self.repo.name}  ({branch})" if branch else self.repo.name)
         )
 
         # Load cards & findings
@@ -799,6 +906,8 @@ class OpenfarmApp(App):
         in_review = [c for c in non_findings if str(c.state).lower().replace("-", "_") == "in_review"]
         ready_cards = [c for c in non_findings if str(c.state).lower() == "ready"]
         blocked_cards = [c for c in non_findings if str(c.state).lower() == "blocked"]
+        startable = [c for c in ready_cards if c.id not in waiting_on(non_findings)]
+        self._in_review_count, self._startable_count = len(in_review), len(startable)
 
         # Update daemon pill when not actively drafting/running in-process
         if not self._running_wave and not self._drafting_plan:
@@ -825,7 +934,7 @@ class OpenfarmApp(App):
         self._set_step("#st-plan", "Plan", "done" if plan_ok else ("current" if prov_ok else "pending"))
         self._set_step(
             "#st-run",
-            f"Run ({len(ready_cards)})" if ready_cards else "Run",
+            f"Run ({len(startable)})" if startable else "Run",
             "current" if self._running_wave else ("done" if in_review else ("current" if plan_ok else "pending")),
         )
         self._set_step(
@@ -839,7 +948,7 @@ class OpenfarmApp(App):
         if w_cnt > 0:
             new_cnt = self._findings_counts["new_since_last_run"]
             sample_titles = "  ·  ".join(
-                f"{item['id']}: {rich_escape(item['title'][:40])}" for item in self._findings_items[:3]
+                f"{item['id']}: {esc(item['title'][:40])}" for item in self._findings_items[:3]
             )
             banner.remove_class("hidden")
             banner.update(
@@ -869,31 +978,48 @@ class OpenfarmApp(App):
         cht.clear()
         for ch in self._chunks_items:
             st_code = {"active": "act", "done": "✓", "pending": "pnd"}.get(ch["status"], ch["status"][:3])
-            cht.add_row(ch["id"], st_code, ch["title"][:28], key=ch["id"])
+            cht.add_row(Text(ch["id"]), st_code, Text(ch["title"][:28]), key=ch["id"])
         if self._chunks_items:
             if self._selected_chunk_id not in {c["id"] for c in self._chunks_items}:
                 act = next((c for c in self._chunks_items if c["status"] == "active"), self._chunks_items[0])
                 self._selected_chunk_id = act["id"]
             sel_ch = next(c for c in self._chunks_items if c["id"] == self._selected_chunk_id)
             self.query_one("#chunk-goal-detail", Static).update(
-                f"[bold #38bdf8]{rich_escape(sel_ch['id'])}[/] ({rich_escape(sel_ch['status'])})\n"
-                f"{rich_escape(sel_ch['title'])}\n[#cbd5e1]{rich_escape(sel_ch.get('goal') or '')}[/]"
+                f"[bold #38bdf8]{esc(sel_ch['id'])}[/] ({esc(sel_ch['status'])})\n"
+                f"{esc(sel_ch['title'])}\n[#cbd5e1]{esc(sel_ch.get('goal') or '')}[/]"
             )
         else:
             self._selected_chunk_id = ""
-            self.query_one("#chunk-goal-detail", Static).update("No chunks yet — click Flesh Out Spec & Chunks from Studio.")
+            self.query_one("#chunk-goal-detail", Static).update("No chunks yet. Back to Grill / Iterate below opens the idea screen, where Flesh Out Spec & Chunks writes them.")
         spec_ed = self.query_one("#ta-spec-editor", TextArea)
         if self.focused is not spec_ed:
-            sp = self.repo / ".openfarm" / "PROJECT_SPEC.md"
-            spec_ed.text = sp.read_text(encoding="utf-8", errors="replace") if sp.is_file() else ""
+            spec_ed.text = read_doc(self.repo, self._safe_cfg(), "spec")
 
         # Populate Plan table
         pt = self.query_one("#plan-table", DataTable)
         pt.clear()
         self._plan_cards = []
+        # A ready card behind an unfinished one is waiting, and one that fails the
+        # eligibility check can't be built: the plan shows both instead of "ready".
+        waiting = waiting_on(non_findings)
+        states = {str(c.id): str(c.state).lower() for c in non_findings}
         for c in ready_cards + blocked_cards:
             tri = triage_card_heuristic(c)
-            st_short = "rdy" if str(c.state).lower() == "ready" else "blk"
+            failures: list[str] = []
+            if str(c.state).lower() == "blocked":
+                st_short = "blocked"
+            elif c.id in waiting:
+                st_short = "waits"
+            else:
+                st_short = "ready"
+                if cfg is not None:
+                    try:
+                        failures = [str(f.get("detail") or f.get("rule"))
+                                    for f in check_eligibility(c, cfg, worktree=self.repo).failures]
+                    except Exception as exc:  # noqa: BLE001 - one odd card must not blank the plan
+                        failures = [f"could not be checked: {exc}"]
+                if failures:
+                    st_short = "fix"
             entry = {
                 "id": c.id,
                 "title": c.title,
@@ -904,10 +1030,15 @@ class OpenfarmApp(App):
                 "tests": [t.as_dict() for t in c.tests],
                 "done_text": c.done_text,
                 "profile": str(tri.get("recommended_profile") or "balanced"),
-                "eligible": True,
+                "eligible": not failures,
+                "failures": failures,
+                "plan_state": st_short,
+                "waits_for": waiting.get(c.id, []),
+                "depends_states": [(d, states.get(d, "missing")) for d in c.deps],
             }
             self._plan_cards.append(entry)
-            pt.add_row(c.id, c.title[:18], st_short, entry["profile"][:4], key=c.id)
+            pt.add_row(Text(c.id), Text(c.title[:18]), st_short, Text(", ".join(c.deps) or "-"),
+                       Text(entry["profile"][:4]), key=c.id)
         if self._plan_cards:
             if self._selected_plan_id not in {e["id"] for e in self._plan_cards}:
                 self._selected_plan_id = self._plan_cards[0]["id"]
@@ -918,18 +1049,28 @@ class OpenfarmApp(App):
         matrix = compute_touches_conflict_matrix(ready_cards)
         if matrix["conflict_count"]:
             c_pairs = ", ".join(f"{c['a']}↔{c['b']}" for c in matrix["conflicts"][:3])
-            conflict_line = f"\n[bold #fbbf24]![/] {matrix['conflict_count']} conflict(s) ({rich_escape(c_pairs)}) · {matrix['max_parallelism']} parallel lane(s)"
+            conflict_line = f"\n[bold #fbbf24]![/] {matrix['conflict_count']} conflict(s) ({esc(c_pairs)}) · {matrix['max_parallelism']} parallel lane(s)"
         else:
             conflict_line = f"\n[bold #4ade80]✓[/] 0 touches conflicts · {matrix['max_parallelism']} parallel lane(s)"
         base_line = ""
         if self._last_baseline_ok is True:
             base_line = "\n[bold #4ade80]✓[/] Baseline tests passed"
         elif self._last_baseline_ok is False:
-            base_line = f"\n[bold #fb7185]✗ Baseline failed:[/] {rich_escape(self._last_baseline_error[:120])}"
+            base_line = f"\n[bold #fb7185]✗ Baseline failed:[/] {esc(self._last_baseline_error[:120])}"
+        counts = {k: sum(1 for e in self._plan_cards if e["plan_state"] == k)
+                  for k in ("ready", "waits", "blocked", "fix")}
+        tally = f"{counts['ready']} can start now"
+        if counts["waits"]:
+            tally += f"  ·  {counts['waits']} waiting"
+        if counts["blocked"]:
+            tally += f"  ·  {counts['blocked']} blocked"
+        if counts["fix"]:
+            tally += f"  ·  {counts['fix']} can't be built yet"
+        waits_line = f"\n[bold #fbbf24]⏳[/] {esc(waiting_text(waiting))}" if waiting else ""
         self.query_one("#plan-preflight", Static).update(
-            f"[bold #4ade80]✓[/] {len(ready_cards)} ready card(s)  ·  "
-            f"{self._findings_counts['picked']} picked finding(s)\n"
-            f"[bold #38bdf8]✓[/] Worker: {rich_escape(gp['worker'].get('model') or '(repo config)')}"
+            f"[bold {'#4ade80' if counts['ready'] else '#fbbf24'}]{'✓' if counts['ready'] else '○'}[/] {tally}  ·  "
+            f"{self._findings_counts['picked']} picked finding(s){waits_line}\n"
+            f"[bold #38bdf8]✓[/] Worker: {esc(gp['worker'].get('model') or '(repo config)')}"
             f"{conflict_line}{base_line}"
         )
 
@@ -939,7 +1080,7 @@ class OpenfarmApp(App):
         self._review_cards = in_review + blocked_cards + ready_cards
         for c in self._review_cards:
             st = str(c.state).lower().replace("_", "-")
-            rt.add_row(c.id, st, c.title[:28], key=c.id)
+            rt.add_row(Text(c.id), st, Text(c.title[:28]), key=c.id)
         if self._review_cards:
             if self._selected_review_id not in {c.id for c in self._review_cards}:
                 self._selected_review_id = self._review_cards[0].id
@@ -958,6 +1099,7 @@ class OpenfarmApp(App):
         # Populate Engine diagnostics
         self._refresh_engine_widgets(cfg, gp)
         self._update_token_widgets(ws.get("economics") if isinstance(ws, dict) else None)
+        self._refresh_run_controls()
 
     def _set_step(self, selector: str, label: str, state: str) -> None:
         w = self.query_one(selector, Static)
@@ -988,10 +1130,10 @@ class OpenfarmApp(App):
         c_pct = int(round((ca / (fr + ca)) * 100)) if (fr + ca) > 0 else 0
         if tot > 0:
             self.query_one("#token-summary", Static).update(
-                f"Tokens: {tot:,}  ·  W {w_pct}% / F {f_pct}%  ·  {c_pct}% cached"
+                f"Token share: worker {w_pct}% · frontier {f_pct}%  ({tot:,} tokens, {c_pct}% cached)"
             )
         else:
-            self.query_one("#token-summary", Static).update("W —% · F —% (idle)")
+            self.query_one("#token-summary", Static).update("Token share: worker —% · frontier —% (no run yet)")
         pb = self.query_one("#worker-bar", ProgressBar)
         pb.update(total=100, progress=w_pct)
         self.query_one("#econ-stats", Static).update(
@@ -1003,41 +1145,63 @@ class OpenfarmApp(App):
     def _render_plan_detail(self, entry: dict) -> None:
         touches = ", ".join(entry.get("touches") or []) or "(none)"
         tests_lines = "\n".join(
-            f"  [bold #4ade80]• {rich_escape(t.get('name', ''))}[/] ({rich_escape(t.get('file', ''))})\n"
-            f"    [#94a3b8]{rich_escape(t.get('asserts', ''))}[/]"
+            f"  [bold #4ade80]• {esc(t.get('name', ''))}[/] ({esc(t.get('file', ''))})\n"
+            f"    [#94a3b8]{esc(t.get('asserts', ''))}[/]"
             for t in (entry.get("tests") or [])
         ) or "  (none)"
+        plan_state = entry.get("plan_state", "ready")
+        if plan_state == "waits":
+            waits = ", ".join(f"{d} ({st.replace('_', ' ')})" for d, st in entry.get("waits_for") or [])
+            status = f"[bold #fbbf24 on #3a2c0a] ⏳ waits for {esc(waits)} [/]"
+        elif plan_state == "blocked":
+            status = "[bold #fb7185 on #3b1219] ✗ blocked: edit it, then Release Blocked to retry [/]"
+        elif plan_state == "fix":
+            status = "[bold #fb7185 on #3b1219] ✗ can't be built yet [/]\n" + "\n".join(
+                f"  [#fb7185]• {esc(why)}[/]" for why in entry.get("failures") or [])
+        else:
+            status = "[bold #4ade80 on #103623] ✓ can be built [/]"
+        dep_states = entry.get("depends_states") or []
+        depends = ("Depends on: " + esc(", ".join(f"{d} ({st.replace('_', ' ')})" for d, st in dep_states)) + "\n"
+                   if dep_states else "Depends on: nothing\n")
         self.query_one("#plan-detail", Static).update(
-            f"[bold #f8fafc]{rich_escape(entry['id'])}  ·  {rich_escape(entry['title'])}[/]\n"
-            f"[bold #c084fc on #2f1b47] {rich_escape(entry['category'])} [/]  "
-            f"[bold #4ade80 on #103623] profile: {rich_escape(entry['profile'])} [/]  "
-            f"[bold #4ade80 on #103623] ✓ eligible [/]\n\n"
-            f"[bold #38bdf8]SCOPE[/]\nTouches: {rich_escape(touches)}\n\n"
-            f"[bold #38bdf8]DONE SPEC[/]\n{rich_escape(entry.get('done_text', '')[:500])}\n\n"
+            f"[bold #f8fafc]{esc(entry['id'])}  ·  {esc(entry['title'])}[/]\n"
+            f"[bold #c084fc on #2f1b47] {esc(entry['category'])} [/]  "
+            f"[bold #4ade80 on #103623] profile: {esc(entry['profile'])} [/]  "
+            f"{status}\n{depends}\n"
+            f"[bold #38bdf8]SCOPE[/]\nTouches: {esc(touches)}\n\n"
+            f"[bold #38bdf8]DONE SPEC[/]\n{esc(entry.get('done_text', ''))}\n\n"
             f"[bold #38bdf8]TESTS[/]\n{tests_lines}"
         )
+
+    def _frontier_review_path(self, cfg, card_id: str) -> Path:
+        return Path(cfg.state_dir) / "cards" / card_id / "frontier-review.txt"
 
     def _render_review_card(self, card, cfg) -> None:
         self._selected_review_id = card.id
         st = str(card.state).lower().replace("_", "-")
+        self.query_one("#btn-accept-blocked", Button).set_class(st != "blocked", "hidden")
+        saved = self._frontier_review_path(cfg, card.id) if cfg is not None else None
+        self.query_one("#review-frontier-out", Static).update(
+            esc(saved.read_text(encoding="utf-8", errors="replace")) if saved is not None and saved.is_file()
+            else esc(f"No Frontier Review of {card.id} yet. Press [m] to run one."))
         self.query_one("#review-gates", Static).update(
-            f"[bold #f8fafc]{rich_escape(card.id)} · {rich_escape(card.title)}[/]   "
-            f"[bold #38bdf8 on #12384d] {st} [/]   "
-            f"[bold #c084fc on #2f1b47] {rich_escape(card.category)} [/]"
+            f"[bold #f8fafc]{esc(card.id)} · {esc(card.title)}[/]   "
+            f"[bold #38bdf8 on #12384d] {esc(st)} [/]   "
+            f"[bold #c084fc on #2f1b47] {esc(card.category)} [/]"
         )
         # Findings filed by this card (id, title, start of body)
         card_findings = findings_for_card(self.repo, cfg, card.id) if cfg is not None else []
         if card_findings:
-            flines = [f"[bold #fbbf24]Findings filed by {rich_escape(card.id)} ({len(card_findings)}):[/]"]
+            flines = [f"[bold #fbbf24]Findings filed by {esc(card.id)} ({len(card_findings)}):[/]"]
             for f in card_findings[:5]:
                 flines.append(
-                    f"  [bold #38bdf8]{rich_escape(f['id'])}[/]  [bold #f8fafc]{rich_escape(f['title'])}[/]  "
-                    f"[#94a3b8]{rich_escape(f['body_preview'][:90])}[/]"
+                    f"  [bold #38bdf8]{esc(f['id'])}[/]  [bold #f8fafc]{esc(f['title'])}[/]  "
+                    f"[#94a3b8]{esc(f['body_preview'][:90])}[/]"
                 )
             self.query_one("#review-card-findings", Static).update("\n".join(flines))
         else:
             self.query_one("#review-card-findings", Static).update(
-                f"[#94a3b8]No findings filed by {rich_escape(card.id)}.[/]"
+                f"[#94a3b8]No findings filed by {esc(card.id)}.[/]"
             )
 
         # Diff preview from card branch if present
@@ -1055,14 +1219,14 @@ class OpenfarmApp(App):
             )
         else:
             self.query_one("#review-diff", Static).update(
-                f"[#94a3b8](No branch diff yet for {rich_escape(card.id)}; touches: {', '.join(card.touches)})[/]"
+                f"[#94a3b8](No branch diff yet for {esc(card.id)}; touches: {esc(', '.join(card.touches))})[/]"
             )
 
         tests_txt = "\n".join(
             f"• {t.name} ({t.file}) — {t.asserts}" for t in card.tests
         ) or "(no named tests)"
         self.query_one("#review-tests", Static).update(
-            f"Touches: {', '.join(card.touches)}\n\nTests:\n{tests_txt}\n\n{card.done_text}"
+            esc(f"Touches: {', '.join(card.touches)}\n\nTests:\n{tests_txt}\n\n{card.done_text}")
         )
 
     def _refresh_findings_widgets(self) -> None:
@@ -1078,7 +1242,9 @@ class OpenfarmApp(App):
         for item in self._findings_items:
             tag = " [new]" if item["is_new"] else ""
             dup = f" (×{item['duplicate_count']})" if int(item.get("duplicate_count") or 1) > 1 else ""
-            ft.add_row(item["id"], item["from_card"], f"{item['title'][:32]}{dup}{tag}", key=item["id"])
+            held = "blocks " + item["holds_up"][0] if item.get("holds_up") else "-"
+            ft.add_row(Text(item["id"]), Text(item["from_card"]), Text(held),
+                       Text(f"{item['title'][:32]}{dup}{tag}"), key=item["id"])
         if self._findings_items:
             if self._selected_finding_id not in {f["id"] for f in self._findings_items}:
                 self._selected_finding_id = self._findings_items[0]["id"]
@@ -1091,22 +1257,36 @@ class OpenfarmApp(App):
     def _render_finding_detail(self, item: dict) -> None:
         self._selected_finding_id = item["id"]
         new_badge = "  [bold #fbbf24 on #423310] NEW [/]" if item["is_new"] else ""
+        held = item.get("holds_up") or []
+        if held:
+            waiting = f", and {', '.join(held[1:])} wait{'s' if len(held) == 2 else ''} for it" if held[1:] else ""
+            blocks = f"[bold #fb7185]Holds up:[/] {esc(held[0])} (blocked){esc(waiting)}\n"
+        else:
+            state = str(item.get("from_card_state") or "").replace("_", " ")
+            why = f" ({item['from_card']} is {state})" if state else ""
+            blocks = f"[bold #4ade80]Doesn't block anything[/]{esc(why)}\n"
+        ids = item.get("duplicate_ids") or []
+        repeats = ""
+        if len(ids) > 1:
+            repeats = (f"[#94a3b8]Filed {len(ids)} times by retries of {esc(item['from_card'])} "
+                       f"({esc(', '.join(ids))}); a decision here covers all of them.[/]\n")
         self.query_one("#finding-detail", Static).update(
-            f"[bold #f8fafc]{rich_escape(item['id'])}  ·  {rich_escape(item['title'])}[/]{new_badge}\n"
-            f"[#94a3b8]From card:[/] [bold #38bdf8]{rich_escape(item['from_card'])}[/] "
-            f"({rich_escape(item['from_card_title'])})\n"
-            f"[#94a3b8]Created:[/]   {rich_escape(item.get('created_at') or '—')}   "
-            f"[#94a3b8]Decision:[/] {rich_escape(item.get('decision') or 'waiting')}\n\n"
-            f"{rich_escape(item.get('body') or '(no additional detail)')}"
+            f"[bold #f8fafc]{esc(item['id'])}  ·  {esc(item['title'])}[/]{new_badge}\n"
+            f"[#94a3b8]From card:[/] [bold #38bdf8]{esc(item['from_card'])}[/] "
+            f"({esc(item['from_card_title'])})\n"
+            f"[#94a3b8]Created:[/]   {esc(item.get('created_at') or '—')}   "
+            f"[#94a3b8]Decision:[/] {esc(item.get('decision') or 'waiting')}\n"
+            f"{blocks}{repeats}\n"
+            f"{esc(item.get('body') or '(no additional detail)')}"
         )
 
     def _refresh_engine_widgets(self, cfg, gp: dict) -> None:
         wk = gp["worker"]
         self.query_one("#engine-providers", Static).update(
-            f"[bold #38bdf8]Global Profile[/] ({rich_escape(gp['path'])})\n"
-            f"  Frontier: {rich_escape(gp['frontier']['provider'])}\n"
-            f"  Worker:   preset={rich_escape(wk['preset'])} · endpoint={rich_escape(wk['endpoint'] or '(unset)')} · model={rich_escape(wk['model'] or '(unset)')}\n"
-            f"  Key file: {rich_escape(wk['key_file'])} ({'ready' if wk['key_present'] else 'missing'}) · zdr={wk['zdr']}"
+            f"[bold #38bdf8]Global Profile[/] ({esc(gp['path'])})\n"
+            f"  Frontier: {esc(gp['frontier']['provider'])}\n"
+            f"  Worker:   preset={esc(wk['preset'])} · endpoint={esc(wk['endpoint'] or '(unset)')} · model={esc(wk['model'] or '(unset)')}\n"
+            f"  Key file: {esc(wk['key_file'])} ({'ready' if wk['key_present'] else 'missing'}) · zdr={wk['zdr']}"
         )
         bt = self.query_one("#board-table", DataTable)
         bt.clear()
@@ -1116,8 +1296,7 @@ class OpenfarmApp(App):
             self.query_one("#engine-spec", Static).update("(repository not initialized yet)")
             self.query_one("#engine-routing", Static).update("(repository not initialized yet)")
             return
-        spec_path = self.repo / ".openfarm" / "PROJECT_SPEC.md"
-        spec_txt = spec_path.read_text(encoding="utf-8", errors="replace").strip() if spec_path.is_file() else "(no PROJECT_SPEC.md yet)"
+        spec_txt = read_doc(self.repo, cfg, "spec").strip() or "(no spec yet)"
         nt_lines = "\n".join(f"  - {p}" for p in (getattr(cfg, "never_touch", ()) or ())) or "  (none)"
         inv_cfg = getattr(cfg, "invariants", None)
         inv_summary = (
@@ -1129,9 +1308,9 @@ class OpenfarmApp(App):
         )
         self.query_one("#engine-spec", Static).update(
             f"[bold #38bdf8]Living Project Spec[/] (.openfarm/PROJECT_SPEC.md)\n\n"
-            f"{rich_escape(spec_txt[:3500])}\n\n"
-            f"[bold #fbbf24]Locked [policy] never_touch[/]\n{rich_escape(nt_lines)}\n\n"
-            f"[bold #4ade80]Architectural Invariants[/]\n  {rich_escape(inv_summary)}"
+            f"{esc(spec_txt[:3500])}\n\n"
+            f"[bold #fbbf24]Locked [policy] never_touch[/]\n{esc(nt_lines)}\n\n"
+            f"[bold #4ade80]Architectural Invariants[/]\n  {esc(inv_summary)}"
         )
         try:
             rt = compute_routing_recommendations(self.repo)
@@ -1142,11 +1321,11 @@ class OpenfarmApp(App):
                 ]
                 for rec in recs:
                     r_lines.append(
-                        f"• [bold #f8fafc]{rich_escape(rec['language'])} / {rich_escape(rec['category'])}[/]  "
+                        f"• [bold #f8fafc]{esc(rec['language'])} / {esc(rec['category'])}[/]  "
                         f"pass={int(rec['pass_rate']*100)}% · first-try={int(rec['first_try_rate']*100)}% "
                         f"(n={rec['samples']}, {rec['confidence']})\n"
-                        f"  Recommended: [bold #4ade80]{rich_escape(rec['recommended_model'] or 'default')}[/] · "
-                        f"effort={rich_escape(rec['recommended_effort'])} · profile={rich_escape(rec['recommended_profile'])}"
+                        f"  Recommended: [bold #4ade80]{esc(rec['recommended_model'] or 'default')}[/] · "
+                        f"effort={esc(rec['recommended_effort'])} · profile={esc(rec['recommended_profile'])}"
                     )
                 self.query_one("#engine-routing", Static).update("\n".join(r_lines))
             else:
@@ -1154,16 +1333,18 @@ class OpenfarmApp(App):
                     "No completed card runs yet — empirical routing recommendations populate automatically after your first wave."
                 )
         except Exception as rt_exc:
-            self.query_one("#engine-routing", Static).update(f"Routing telemetry unavailable: {rich_escape(str(rt_exc))}")
+            self.query_one("#engine-routing", Static).update(f"Routing telemetry unavailable: {esc(str(rt_exc))}")
         state = StateDir(cfg.state_dir)
         self.query_one("#engine-swarm", Static).update(
-            f"Micromanager: {cfg.micromanager_adapter} ({getattr(cfg.micromanager, 'mode', 'off')})\n"
-            f"Worker: {cfg.model_adapter} ({cfg.endpoint})\n"
-            f"State dir: {cfg.state_dir}"
+            esc(
+                f"Micromanager: {cfg.micromanager_adapter} ({getattr(cfg.micromanager, 'mode', 'off')})\n"
+                f"Worker: {cfg.model_adapter} ({cfg.endpoint})\n"
+                f"State dir: {cfg.state_dir}"
+            )
         )
         h_enabled = bool(getattr(getattr(cfg, "harness", None), "enabled", False))
         self.query_one("#engine-harness", Static).update(
-            f"Harness enabled: {h_enabled}  ·  Dir: {state.harness()}"
+            esc(f"Harness enabled: {h_enabled}  ·  Dir: {state.harness()}")
         )
         # Load most recent board posts if present
         if state.runs.is_dir():
@@ -1179,11 +1360,11 @@ class OpenfarmApp(App):
                         except ValueError:
                             continue
                         bt.add_row(
-                            f"#{row.get('seq', '')}",
-                            str(row.get("from", "")),
-                            str(row.get("card", "")),
-                            str(row.get("kind", "")),
-                            str(row.get("body", ""))[:68],
+                            Text(f"#{row.get('seq', '')}"),
+                            Text(str(row.get("from", ""))),
+                            Text(str(row.get("card", ""))),
+                            Text(str(row.get("kind", ""))),
+                            Text(str(row.get("body", ""))[:68]),
                         )
                     break
 
@@ -1199,10 +1380,10 @@ class OpenfarmApp(App):
             status = "ready" if item["configured"] else ("dir" if item["repo_exists"] else "missing")
             prt.add_row(
                 mark,
-                item["name"][:22],
-                (item.get("language") or "—")[:10],
+                Text(item["name"][:22]),
+                Text((item.get("language") or "—")[:10]),
                 status,
-                str(item["repo"])[-30:],
+                Text(str(item["repo"])[-30:]),
                 key=item["id"],
             )
         if self._projects_items:
@@ -1217,7 +1398,7 @@ class OpenfarmApp(App):
         else:
             self._selected_project_id = ""
             self.query_one("#project-detail", Static).update(
-                "No projects registered yet.\n\nPress [bold #38bdf8][n][/] to add an existing folder or create a new project."
+                "No projects registered yet.\n\nPress [bold #38bdf8]\\[n][/] to add an existing folder or create a new project."
             )
 
     def _render_project_detail(self, item: dict) -> None:
@@ -1231,13 +1412,13 @@ class OpenfarmApp(App):
         )
         state_status = "present" if item.get("state_exists") else "none"
         self.query_one("#project-detail", Static).update(
-            f"[bold #f8fafc]{rich_escape(item['name'])}[/]  [#94a3b8]({rich_escape(item['id'])})[/]{badge}\n\n"
-            f"[#94a3b8]Directory:[/]   {rich_escape(item['repo'])}\n"
+            f"[bold #f8fafc]{esc(item['name'])}[/]  [#94a3b8]({esc(item['id'])})[/]{badge}\n\n"
+            f"[#94a3b8]Directory:[/]   {esc(item['repo'])}\n"
             f"[#94a3b8]Status:[/]      {status}\n"
-            f"[#94a3b8]Stack:[/]       {rich_escape(item.get('language') or 'auto')}\n"
-            f"[#94a3b8]Base branch:[/] {rich_escape(item.get('base_branch') or 'main')}\n"
-            f"[#94a3b8]State cache:[/] {rich_escape(item.get('state_dir') or '(none)')} ({state_status})\n"
-            f"[#94a3b8]Idea / Note:[/] {rich_escape(item.get('idea') or '(none)')}\n\n"
+            f"[#94a3b8]Stack:[/]       {esc(item.get('language') or 'auto')}\n"
+            f"[#94a3b8]Base branch:[/] {esc(item.get('base_branch') or 'main')}\n"
+            f"[#94a3b8]State cache:[/] {esc(item.get('state_dir') or '(none)')} ({state_status})\n"
+            f"[#94a3b8]Idea / Note:[/] {esc(item.get('idea') or '(none)')}\n\n"
             f"[#4ade80]Note:[/] Removing a project here only removes it from Openfarm — "
             f"your project files on disk are NEVER deleted or modified."
         )
@@ -1248,6 +1429,11 @@ class OpenfarmApp(App):
         sw = self.query_one("#main-switcher", ContentSwitcher)
         if view in ("projects", "providers", "studio", "review", "findings", "engine"):
             sw.current = view
+        if view == "studio" and not self._wave_active():
+            studio_sw = self.query_one("#studio-switcher", ContentSwitcher)
+            if studio_sw.current == "studio-run":
+                self._back_to_plan()
+        self.call_after_refresh(self._focus_typing_target)
         for vid, bid in (
             ("projects", "nav-projects"),
             ("studio", "nav-studio"),
@@ -1318,17 +1504,14 @@ class OpenfarmApp(App):
         cfg = self._safe_cfg()
         if cfg is None or not finding_id:
             return None
-        res = decide_finding(
-            self.repo,
-            cfg,
-            finding_id,
-            decision,
-            reason=reason,
-            target_card=target_card,
-        )
+        # A folded finding stands for every repeat of it, so the decision goes to all.
+        shown = next((f for f in self._findings_items if f["id"] == finding_id), None)
+        ids = (shown or {}).get("duplicate_ids") or [finding_id]
+        results = {fid: decide_finding(self.repo, cfg, fid, decision, reason=reason, target_card=target_card)
+                   for fid in ids}
         self.refresh_all_views()
-        self.notify(f"{finding_id}: {decision}")
-        return res
+        self.notify(f"{finding_id}: {decision}" + (f" (with its {len(ids) - 1} repeats)" if len(ids) > 1 else ""))
+        return results.get(finding_id)
 
     def switch_active_project(self, project_id: str) -> dict | None:
         proj = get_project(project_id)
@@ -1342,6 +1525,7 @@ class OpenfarmApp(App):
         self._grill_pending_question = ""
         self._grill_options = []
         self._render_grill_chat()
+        self._load_idea_draft()
         self._selected_review_id = ""
         self._selected_finding_id = ""
         self._approved_to_land.clear()
@@ -1442,6 +1626,19 @@ class OpenfarmApp(App):
                 self.refresh_all_views()
                 self.query_one("#findings-table", DataTable).focus()
             return
+        if len(self.screen_stack) > 1:
+            return  # a dialog is open: its keys are its own
+
+        target = self._typing_target()
+        if target is not None and event.character and event.character.isalpha():
+            target.focus()
+            if isinstance(target, TextArea):
+                target.insert(event.character)
+            else:
+                target.insert_text_at_cursor(event.character)
+            event.stop()
+            event.prevent_default()
+            return
 
         cur_view = self.query_one("#main-switcher", ContentSwitcher).current
         if cur_view == "projects":
@@ -1497,15 +1694,24 @@ class OpenfarmApp(App):
                 self._run_frontier_review_bg()
                 event.stop()
         elif cur_view == "studio":
-            if event.key == "p":
-                self._run_cli_quick(["pause"])
-                event.stop()
-            elif event.key == "s":
-                self._run_cli_quick(["stop"])
-                event.stop()
-            elif event.key == "h":
-                self._open_hint_modal()
-                event.stop()
+            sub = self.query_one("#studio-switcher", ContentSwitcher).current
+            if sub == "studio-run" and self._wave_active():
+                if event.key == "p":
+                    self._pause_btn()
+                    event.stop()
+                elif event.key == "s":
+                    self._stop_btn()
+                    event.stop()
+                elif event.key == "h":
+                    self._open_hint_modal()
+                    event.stop()
+            elif sub == "studio-plan" and self._selected_plan_id:
+                if event.key == "e":
+                    self._open_card_editor_modal()
+                    event.stop()
+                elif event.key == "x":
+                    self._open_split_card_modal()
+                    event.stop()
 
     # ── Widget Event Handlers ────────────────────────────────────────────────
 
@@ -1547,7 +1753,7 @@ class OpenfarmApp(App):
         gp = load_global_providers()
         prov = gp["frontier"]["provider"]
         with self.suspend():
-            cli_main(["--repo", str(self.repo), "acp", "login", "--provider", prov])
+            subprocess.run(self._cli_argv("acp", "login", "--provider", prov), env=self._cli_env())
         self._load_providers_into_form()
 
     @on(RadioSet.Changed, "#worker-presets")
@@ -1578,7 +1784,7 @@ class OpenfarmApp(App):
             msg = f"[bold #4ade80]✓ Live Probe Passed[/]  {res['latency_ms']}ms · HTTP {res['status']} · zdr={res['zdr_sent']} · models={res['models_count']}"
         else:
             err_detail = str(res["error"] or f"HTTP {res['status']}")
-            msg = f"[bold #fb7185]✗ Probe Failed[/]  {rich_escape(err_detail)}"
+            msg = f"[bold #fb7185]✗ Probe Failed[/]  {esc(err_detail)}"
         self.call_from_thread(self.query_one("#probe-status", Static).update, msg)
 
     @on(Button.Pressed, "#btn-save-prov")
@@ -1628,14 +1834,19 @@ class OpenfarmApp(App):
             chat_box.add_class("hidden")
             return
         chat_box.remove_class("hidden")
-        lines: list[str] = ["[bold #38bdf8]Frontier Architect Grill[/]"]
-        for turn in self._grill_history:
-            lines.append(f"[bold #cbd5e1]Architect:[/] {rich_escape(str(turn.get('question') or ''))}")
-            lines.append(f"[bold #4ade80]You:[/]       {rich_escape(str(turn.get('answer') or ''))}")
-        if self._grill_pending_question:
-            lines.append(f"\n[bold #fbbf24]Architect:[/] {rich_escape(self._grill_pending_question)}")
+        if self._grill_from_template:
+            lines = ["[bold #f59e0b]Basic questions (the Architect was not asked)[/]"]
+            asker = "Question:"
         else:
-            lines.append("\n[bold #4ade80]✓ Architect has enough context — click Draft Plan Now (or ask another question).[/]")
+            lines = ["[bold #38bdf8]Questions from the Architect[/]"]
+            asker = "Architect:"
+        for turn in self._grill_history:
+            lines.append(f"[bold #cbd5e1]{asker}[/] {esc(str(turn.get('question') or ''))}")
+            lines.append(f"[bold #4ade80]You:[/]       {esc(str(turn.get('answer') or ''))}")
+        if self._grill_pending_question:
+            lines.append(f"\n[bold #fbbf24]{asker}[/] {esc(self._grill_pending_question)}")
+        else:
+            lines.append("\n[bold #4ade80]✓ That's enough to go on. Next: Flesh Out Spec & Chunks, or ask another question.[/]")
         self.query_one("#grill-transcript", Static).update("\n".join(lines))
         opt_row = self.query_one("#grill-options-row", Horizontal)
         if self._grill_options and self._grill_pending_question:
@@ -1643,7 +1854,7 @@ class OpenfarmApp(App):
             for idx in range(3):
                 btn = self.query_one(f"#btn-grill-opt-{idx}", Button)
                 if idx < len(self._grill_options):
-                    btn.label = self._grill_options[idx][:48]
+                    btn.label = esc(self._grill_options[idx][:48])
                     btn.remove_class("hidden")
                 else:
                     btn.add_class("hidden")
@@ -1700,9 +1911,12 @@ class OpenfarmApp(App):
             try:
                 b = self.query_one(bid, Button)
                 b.disabled = active
-                b.label = busy_lbl if active else idle_lbl
+                b.label = busy_lbl if (active and bid == self._busy_button) else idle_lbl
             except Exception:
                 pass
+        self._architect_failure = None
+        for bid in ("#btn-arch-retry", "#btn-arch-template"):
+            self.query_one(bid, Button).add_class("hidden")
         try:
             cancel_btn = self.query_one("#btn-arch-cancel", Button)
             if active:
@@ -1744,13 +1958,14 @@ class OpenfarmApp(App):
                     .replace("[bold #fb7185]", "")
                     .replace("[bold #f59e0b]", "")
                     .replace("[/]", "")
+                    .replace("\\[", "[")
                 )
                 log_color = "#fb7185" if "✗" in plain else ("#f59e0b" if "■" in plain else "#4ade80")
                 self._log_architect(plain, style=log_color)
             else:
                 status_box.add_class("hidden")
                 if was_active:
-                    banner.update("[bold #4ade80]✓ Architect step finished[/]  [#94a3b8](click Hide Log to close)[/]")
+                    banner.update("[bold #4ade80]✓ Step finished[/]  [#94a3b8](Hide closes this)[/]")
 
     def _render_draft_status(self) -> None:
         if not self._drafting_plan:
@@ -1759,18 +1974,20 @@ class OpenfarmApp(App):
         mins, secs = divmod(elapsed, 60)
         head = (
             f"[bold #38bdf8]⏳ [{mins:02d}:{secs:02d}][/]  "
-            f"[bold #f8fafc]{rich_escape(self._draft_phase_msg or 'Working...')}[/]"
+            f"[bold #f8fafc]{esc(self._draft_phase_msg or 'Working...')}[/]"
         )
         self.query_one("#architect-banner", Static).update(head)
         self.query_one("#grill-status", Static).update(
             f"{head}\n"
-            f"[#94a3b8]Frontier ACP typically takes 15–120s to grill, synthesize spec/chunks, or split cards "
-            f"(live log above; turn off Frontier Architect switch for instant local templates).[/]"
+            + ("[#94a3b8]The Architect usually answers in 15 seconds to a few minutes. "
+               "The log above shows what it is writing. Cancel stops it.[/]"
+               if self._draft_asked else
+               "[#94a3b8]Using a basic template. The Architect is not asked.[/]")
         )
-        if elapsed >= 15 and elapsed - self._draft_last_heartbeat >= 15:
+        if self._draft_asked and elapsed >= 15 and elapsed - self._draft_last_heartbeat >= 15:
             self._draft_last_heartbeat = elapsed
             self._log_architect(
-                f"Still waiting on Frontier ACP response ({mins:02d}:{secs:02d} elapsed)...",
+                f"Still waiting for the Architect's answer ({mins:02d}:{secs:02d} so far)...",
                 style="#94a3b8",
             )
 
@@ -1778,18 +1995,70 @@ class OpenfarmApp(App):
         if self._drafting_plan:
             self._render_draft_status()
 
-    @on(Button.Pressed, "#btn-grill-ask")
-    def _grill_ask_clicked(self) -> None:
+    def _architect_on(self) -> bool:
+        return bool(self.query_one("#sw-use-architect", Switch).value)
+
+    @on(Switch.Changed, "#sw-use-architect")
+    def _architect_switch_changed(self, event: Switch.Changed) -> None:
+        self.query_one("#sw-architect-words", Static).update(
+            ARCHITECT_ON_WORDS if event.value else ARCHITECT_OFF_WORDS)
+        if not event.value:
+            self.notify(
+                "Architect off. The plan will come from a basic template, not from the Architect.",
+                severity="warning")
+
+    def _start_architect_step(self, step: str, *, chunk_id: str | None = None, template: bool = False) -> None:
+        """Start a grill, spec, split or plan step. `template` skips the Architect on purpose."""
         if self._drafting_plan:
-            self.notify("Architect is busy right now...")
+            self.notify("Another step is still running.")
             return
         idea = self.query_one("#ta-idea", TextArea).text.strip()
-        if not idea:
+        if step in ("grill", "spec") and not idea:
             self.notify("Describe what you want to build first.", severity="warning")
             self.query_one("#ta-idea", TextArea).focus()
             return
-        self._set_drafting_state(True, "Asking Frontier Architect to clarify your idea...")
-        self._grill_ask_bg(idea)
+        asked = self._architect_on() and not template
+        self._busy_button = STEP_BUTTONS[step]
+        self._draft_asked = asked
+        self._draft_doing = {
+            "grill": "asking about your idea",
+            "spec": "writing the spec and its chunks",
+            "split": f"splitting chunk {chunk_id or 'C1'} into cards",
+            "plan": "drafting cards",
+        }[step]
+        # Nothing says the Architect is being asked until it has really been opened.
+        self._set_drafting_state(
+            True,
+            "Connecting to the Architect..." if asked
+            else f"Basic template (the Architect is not asked): {self._draft_doing}...")
+        if step == "grill":
+            self._grill_ask_bg(idea, template)
+        elif step == "spec":
+            self._draft_spec_bg(idea, template)
+        else:
+            self._draft_plan_bg(chunk_id, template, step)
+
+    def _architect_failed(self, step: str, reason: str, chunk_id: str | None = None) -> None:
+        """The Architect could not be asked or did not answer: say why, offer Retry. Nothing is drafted."""
+        self._set_drafting_state(False, f"[bold #fb7185]✗ The Architect didn't answer:[/] {esc(reason)}")
+        self._architect_failure = {"step": step, "chunk_id": chunk_id}
+        for bid in ("#btn-arch-retry", "#btn-arch-template"):
+            self.query_one(bid, Button).remove_class("hidden")
+        self.notify(f"The Architect didn't answer: {reason}", severity="error")
+
+    @on(Button.Pressed, "#btn-arch-retry")
+    def _arch_retry_clicked(self) -> None:
+        if self._architect_failure:
+            self._start_architect_step(**self._architect_failure)
+
+    @on(Button.Pressed, "#btn-arch-template")
+    def _arch_template_clicked(self) -> None:
+        if self._architect_failure:
+            self._start_architect_step(**self._architect_failure, template=True)
+
+    @on(Button.Pressed, "#btn-grill-ask")
+    def _grill_ask_clicked(self) -> None:
+        self._start_architect_step("grill")
 
     @on(Button.Pressed, "#btn-grill-opt-0")
     @on(Button.Pressed, "#btn-grill-opt-1")
@@ -1821,8 +2090,7 @@ class OpenfarmApp(App):
         self._render_grill_chat()
         idea = self.query_one("#ta-idea", TextArea).text.strip()
         if idea and len(self._grill_history) < 3:
-            self._set_drafting_state(True, "Architect reviewing your answer...")
-            self._grill_ask_bg(idea)
+            self._start_architect_step("grill", template=self._grill_from_template)
 
     @on(Button.Pressed, "#btn-grill-reset")
     def _grill_reset_clicked(self) -> None:
@@ -1831,22 +2099,39 @@ class OpenfarmApp(App):
         self._grill_options = []
         self._render_grill_chat()
 
+    def _open_backend_for_step(self, step: str, template: bool, chunk_id: str | None = None):
+        """Open the Architect for a worker thread. Returns (backend, name, go_on).
+
+        `go_on` is False when the Architect was wanted but could not be opened: the
+        failure is on screen and the step must stop without drafting anything.
+        """
+        if template or not self._architect_on():
+            return None, "basic template", True
+        backend, reason = open_architect_backend(self.repo, self._safe_cfg())
+        if backend is None:
+            self.call_from_thread(self._architect_failed, step, reason, chunk_id)
+            return None, reason, False
+        self._active_architect_backend = backend
+        self.call_from_thread(self._set_drafting_state, True, f"{reason}: {self._draft_doing}...")
+        return backend, reason, True
+
+    def _close_backend(self, backend) -> None:
+        if self._active_architect_backend is backend:
+            self._active_architect_backend = None
+        if backend is not None and hasattr(backend, "close"):
+            try:
+                backend.close()
+            except Exception as close_exc:
+                self.log.warning(f"architect close error: {close_exc}")
+
     @work(thread=True)
-    def _grill_ask_bg(self, idea: str) -> None:
-        use_architect = bool(self.query_one("#sw-use-architect", Switch).value)
+    def _grill_ask_bg(self, idea: str, template: bool = False) -> None:
         self._architect_cancelled = False
         backend = None
         try:
-            cfg = self._safe_cfg()
-            if use_architect:
-                backend, reason = open_architect_backend(self.repo, cfg)
-                self._active_architect_backend = backend
-                if backend is not None:
-                    self.call_from_thread(
-                        self._set_drafting_state,
-                        True,
-                        f"Grilling with {reason}...",
-                    )
+            backend, _name, go_on = self._open_backend_for_step("grill", template)
+            if not go_on:
+                return
             turn = architect_grill_turn(
                 self.repo,
                 idea=idea,
@@ -1856,10 +2141,15 @@ class OpenfarmApp(App):
             )
             if self._architect_cancelled:
                 return
+            self._grill_from_template = backend is None
             if turn.get("ready_to_plan") or not str(turn.get("question") or "").strip():
                 self._grill_pending_question = ""
                 self._grill_options = []
-                msg = "[bold #4ade80]✓ Architect is ready — click Draft Plan Now.[/]"
+                msg = (
+                    "[bold #4ade80]✓ The Architect has what it needs. Next: Flesh Out Spec & Chunks.[/]"
+                    if backend is not None else
+                    "[bold #f59e0b]✓ Basic questions done (the Architect was not asked). Next: Flesh Out Spec & Chunks.[/]"
+                )
             else:
                 self._grill_pending_question = str(turn["question"]).strip()
                 self._grill_options = [str(o) for o in (turn.get("options") or [])[:3]]
@@ -1871,46 +2161,32 @@ class OpenfarmApp(App):
         except Exception as exc:
             if self._architect_cancelled:
                 return
-            self.call_from_thread(
-                self._set_drafting_state,
-                False,
-                f"[bold #fb7185]✗ Grill error:[/] {rich_escape(str(exc))}",
-            )
+            if backend is not None:
+                self.call_from_thread(self._architect_failed, "grill", str(exc))
+            else:
+                self.call_from_thread(
+                    self._set_drafting_state,
+                    False,
+                    f"[bold #fb7185]✗ Question error:[/] {esc(str(exc))}",
+                )
         finally:
-            if self._active_architect_backend is backend:
-                self._active_architect_backend = None
-            if backend is not None and hasattr(backend, "close"):
-                try:
-                    backend.close()
-                except Exception as close_exc:
-                    self.log.warning(f"grill backend close error: {close_exc}")
+            self._close_backend(backend)
 
     @on(Button.Pressed, "#btn-draft-spec")
     def _draft_spec_clicked(self) -> None:
-        if self._drafting_plan:
-            self.notify("Architect is busy right now...")
-            return
-        idea = self.query_one("#ta-idea", TextArea).text.strip()
-        if not idea:
-            self.notify("Describe what you want to build first.", severity="warning")
-            self.query_one("#ta-idea", TextArea).focus()
-            return
-        self._set_drafting_state(True, "Fleshing out living spec & splitting into chunks...")
-        self._draft_spec_bg(idea)
+        self._start_architect_step("spec")
 
     @work(thread=True)
-    def _draft_spec_bg(self, idea: str) -> None:
-        use_architect = bool(self.query_one("#sw-use-architect", Switch).value)
+    def _draft_spec_bg(self, idea: str, template: bool = False) -> None:
         self._architect_cancelled = False
         backend = None
         try:
+            # The Architect is opened before anything is set up, so a failure leaves the folder as it was.
+            backend, name, go_on = self._open_backend_for_step("spec", template)
+            if not go_on:
+                return
             self._ensure_workspace_initialized_for_studio(idea)
-            cfg = self._safe_cfg()
-            if use_architect:
-                backend, reason = open_architect_backend(self.repo, cfg)
-                self._active_architect_backend = backend
-                if backend is not None:
-                    self.call_from_thread(self._set_drafting_state, True, f"Fleshing out spec & chunks with {reason}...")
+
             def _on_spec_prog(msg: str) -> None:
                 if not self._architect_cancelled:
                     self.call_from_thread(self._set_drafting_state, True, msg)
@@ -1925,10 +2201,11 @@ class OpenfarmApp(App):
             )
             if self._architect_cancelled:
                 return
+            made_by = "" if backend is not None else " (basic template, the Architect was not asked)"
             self.call_from_thread(
                 self._set_drafting_state,
                 False,
-                f"[bold #4ade80]✓ Spec & {len(res['chunks'])} chunk(s) ready — review or split into cards[/]",
+                f"[bold #4ade80]✓ Spec & {len(res['chunks'])} chunk(s) ready{made_by}. Review it, or split a chunk into cards.[/]",
             )
             self.call_from_thread(self.refresh_all_views)
             self.call_from_thread(
@@ -1939,25 +2216,22 @@ class OpenfarmApp(App):
             )
             self.call_from_thread(
                 self.notify,
-                f"Spec ready with {len(res['chunks'])} chunk(s) — review or split into cards.",
+                f"Spec ready{made_by}: {len(res['chunks'])} chunk(s). Review it, or split a chunk into cards.",
             )
         except Exception as exc:
             if self._architect_cancelled:
                 return
-            self.call_from_thread(
-                self._set_drafting_state,
-                False,
-                f"[bold #fb7185]✗ Spec error:[/] {rich_escape(str(exc))}",
-            )
-            self.call_from_thread(self.notify, f"Spec error: {exc}", severity="error")
+            if backend is not None:
+                self.call_from_thread(self._architect_failed, "spec", str(exc))
+            else:
+                self.call_from_thread(
+                    self._set_drafting_state,
+                    False,
+                    f"[bold #fb7185]✗ Spec error:[/] {esc(str(exc))}",
+                )
+                self.call_from_thread(self.notify, f"Spec error: {exc}", severity="error")
         finally:
-            if self._active_architect_backend is backend:
-                self._active_architect_backend = None
-            if backend is not None and hasattr(backend, "close"):
-                try:
-                    backend.close()
-                except Exception as close_exc:
-                    self.log.warning(f"spec backend close error: {close_exc}")
+            self._close_backend(backend)
 
     @on(DataTable.RowHighlighted, "#chunks-table")
     def _chunk_row_changed(self, event: DataTable.RowHighlighted) -> None:
@@ -1967,17 +2241,16 @@ class OpenfarmApp(App):
             if match:
                 self._selected_chunk_id = cid
                 self.query_one("#chunk-goal-detail", Static).update(
-                    f"[bold #38bdf8]{rich_escape(match['id'])}[/] ({rich_escape(match['status'])})\n"
-                    f"{rich_escape(match['title'])}\n[#cbd5e1]{rich_escape(match.get('goal') or '')}[/]"
+                    f"[bold #38bdf8]{esc(match['id'])}[/] ({esc(match['status'])})\n"
+                    f"{esc(match['title'])}\n[#cbd5e1]{esc(match.get('goal') or '')}[/]"
                 )
 
     @on(Button.Pressed, "#btn-spec-save")
     def _spec_save_clicked(self) -> None:
-        sp = self.repo / ".openfarm" / "PROJECT_SPEC.md"
-        sp.parent.mkdir(parents=True, exist_ok=True)
-        sp.write_text(self.query_one("#ta-spec-editor", TextArea).text.rstrip() + "\n", encoding="utf-8")
-        self.query_one("#spec-status", Static).update("[bold #4ade80]✓ Saved .openfarm/PROJECT_SPEC.md[/]")
-        self.notify("Saved PROJECT_SPEC.md")
+        write_doc(self.repo, self._safe_cfg(), "spec",
+                  self.query_one("#ta-spec-editor", TextArea).text.rstrip() + "\n", why="edited by hand")
+        self.query_one("#spec-status", Static).update("[bold #4ade80]✓ Spec saved[/]")
+        self.notify("Spec saved")
 
     @on(Button.Pressed, "#btn-chunk-done")
     def _chunk_done_clicked(self) -> None:
@@ -1996,14 +2269,10 @@ class OpenfarmApp(App):
             self.notify("Architect is already drafting cards...")
             return
         # Save any user edits to the spec before splitting chunk into cards
-        sp = self.repo / ".openfarm" / "PROJECT_SPEC.md"
         spec_txt = self.query_one("#ta-spec-editor", TextArea).text.strip()
-        if spec_txt:
-            sp.parent.mkdir(parents=True, exist_ok=True)
-            sp.write_text(spec_txt + "\n", encoding="utf-8")
-        cid = self._selected_chunk_id or None
-        self._set_drafting_state(True, f"Splitting chunk {cid or 'C1'} into scoped Wave cards...")
-        self._draft_plan_bg(chunk_id=cid)
+        if spec_txt and spec_txt != read_doc(self.repo, self._safe_cfg(), "spec").strip():
+            write_doc(self.repo, self._safe_cfg(), "spec", spec_txt + "\n", why="edited by hand")
+        self._start_architect_step("split", chunk_id=self._selected_chunk_id or None)
 
     @on(Button.Pressed, "#btn-spec-back")
     def _spec_back_clicked(self) -> None:
@@ -2021,11 +2290,7 @@ class OpenfarmApp(App):
 
     @on(Button.Pressed, "#btn-draft-plan")
     def _draft_plan_clicked(self) -> None:
-        if self._drafting_plan:
-            self.notify("Architect is already drafting your plan...")
-            return
-        self._set_drafting_state(True, "Preparing workspace & connecting to Frontier Architect...")
-        self._draft_plan_bg()
+        self._start_architect_step("plan")
 
     def _ensure_workspace_initialized_for_studio(self, idea: str) -> None:
         existing_cfg = self._safe_cfg()
@@ -2039,7 +2304,7 @@ class OpenfarmApp(App):
             and self._selected_stack != "auto"
             and existing_lang != ""
             and existing_lang != self._selected_stack
-            and not any((self.repo / "cards").glob("W*.md"))
+            and not any(cid.startswith("W") for cid in self._card_ids())
         )
         needs_init = (
             (not (self.repo / CONFIG_PATH).is_file())
@@ -2060,11 +2325,6 @@ class OpenfarmApp(App):
                 force=True,
                 commit=True,
             )
-            cards_dir = self.repo / "cards"
-            if cards_dir.is_dir():
-                for old_md in cards_dir.glob("*.md"):
-                    if not old_md.stem.upper().startswith("FIND-"):
-                        old_md.unlink(missing_ok=True)
             fresh_cfg = self._safe_cfg()
             if fresh_cfg is not None:
                 for flag_name in ("paused", "stop"):
@@ -2095,38 +2355,19 @@ class OpenfarmApp(App):
         return False
 
     @work(thread=True)
-    def _draft_plan_bg(self, chunk_id: str | None = None) -> None:
+    def _draft_plan_bg(self, chunk_id: str | None = None, template: bool = False, step: str = "plan") -> None:
         idea = self.query_one("#ta-idea", TextArea).text.strip() or DEFAULT_GRILL_QUESTIONS[0]["default"]
-        use_architect = bool(self.query_one("#sw-use-architect", Switch).value)
         self._architect_cancelled = False
         backend = None
         try:
+            backend, name, go_on = self._open_backend_for_step(step, template, chunk_id)
+            if not go_on:
+                return
             self._ensure_workspace_initialized_for_studio(idea)
-            cfg = self._safe_cfg()
-            arch_note = "local template"
-            if use_architect:
-                backend, reason = open_architect_backend(self.repo, cfg)
-                self._active_architect_backend = backend
-                if backend is not None:
-                    arch_note = reason
-                    self.call_from_thread(
-                        self._set_drafting_state,
-                        True,
-                        f"Designing runnable app & Wave cards with {reason}...",
-                    )
-                else:
-                    arch_note = f"local fallback ({reason})"
-                    self.call_from_thread(
-                        self._set_drafting_state,
-                        True,
-                        f"Drafting local Wave plan ({reason})...",
-                    )
-            else:
-                self.call_from_thread(self._set_drafting_state, True, "Drafting instant local Wave plan...")
 
             def _on_prog(msg: str) -> None:
                 if not self._architect_cancelled:
-                    self.call_from_thread(self._set_drafting_state, True, f"{msg} ({arch_note})")
+                    self.call_from_thread(self._set_drafting_state, True, f"{msg} ({name})")
 
             try:
                 plan = draft_wave_plan(
@@ -2144,22 +2385,9 @@ class OpenfarmApp(App):
                     return
                 if backend is None:
                     raise
-                arch_note = f"local fallback (architect error: {arch_exc})"
-                self.call_from_thread(
-                    self._set_drafting_state,
-                    True,
-                    f"Architect failed ({arch_exc}) — generating local fallback plan...",
-                )
-                plan = draft_wave_plan(
-                    self.repo,
-                    idea=idea,
-                    grill_history=list(self._grill_history),
-                    chunk_id=chunk_id,
-                    backend=None,
-                    include_picked_findings=True,
-                    verify_baseline=True,
-                    on_progress=_on_prog,
-                )
+                # A failed Architect turn is a failure. It never turns into a template by itself.
+                self.call_from_thread(self._architect_failed, step, str(arch_exc), chunk_id)
+                return
             if self._architect_cancelled:
                 return
             self._last_baseline_ok = bool(plan.get("baseline_ok", True))
@@ -2172,11 +2400,17 @@ class OpenfarmApp(App):
                 "current",
                 "studio-plan",
             )
-            base_tag = " · baseline ✓" if self._last_baseline_ok else f" · baseline ✗ ({self._last_baseline_error[:60]})"
+            cards = plan["cards"]
+            can_build = sum(1 for c in cards if c.get("eligible"))
+            parts = [f"Plan ready ({name}): {len(cards)} card(s), {can_build} can be built"]
+            if plan.get("retired_cards"):
+                parts.append(f"replaced unbuilt {', '.join(plan['retired_cards'])}")
+            parts.append("baseline tests pass" if self._last_baseline_ok
+                         else f"baseline tests fail ({self._last_baseline_error[:60]})")
             self.call_from_thread(
                 self.notify,
-                f"Wave plan ready ({arch_note}): {len(plan['cards'])} eligible card(s){base_tag}",
-                severity=("warning" if not self._last_baseline_ok else "information"),
+                " · ".join(parts),
+                severity=("warning" if not self._last_baseline_ok or can_build < len(cards) else "information"),
             )
         except Exception as exc:
             if self._architect_cancelled:
@@ -2184,17 +2418,11 @@ class OpenfarmApp(App):
             self.call_from_thread(
                 self._set_drafting_state,
                 False,
-                f"[bold #fb7185]✗ Plan error:[/] {rich_escape(str(exc))}",
+                f"[bold #fb7185]✗ Plan error:[/] {esc(str(exc))}",
             )
             self.call_from_thread(self.notify, f"Plan error: {exc}", severity="error")
         finally:
-            if self._active_architect_backend is backend:
-                self._active_architect_backend = None
-            if backend is not None and hasattr(backend, "close"):
-                try:
-                    backend.close()
-                except Exception as close_exc:
-                    self.log.warning(f"architect close error: {close_exc}")
+            self._close_backend(backend)
 
     @on(DataTable.RowHighlighted, "#projects-table")
     def _project_row_changed(self, event: DataTable.RowHighlighted) -> None:
@@ -2324,11 +2552,14 @@ class OpenfarmApp(App):
                 )
                 self.refresh_all_views()
                 if res["eligible"]:
-                    self.notify(f"Saved {entry['id']} — ✓ eligible")
+                    self.notify(f"Saved {entry['id']}. It can be built.")
                 else:
-                    self.notify(f"Saved {entry['id']} — ineligible: {'; '.join(res['failures'][:2])}", severity="warning")
-            except (OSError, Refused, ConfigError) as exc:
-                self.notify(f"Card edit error: {exc}", severity="error")
+                    why = "; ".join(str(f.get("detail") or f.get("rule")) for f in res["failures"][:2])
+                    self.notify(f"Saved {entry['id']}, but it can't be built yet: {why}", severity="warning")
+            except Refused as exc:
+                self.notify(f"Not saved: {exc.message}", severity="warning")
+            except (OSError, ConfigError) as exc:
+                self.notify(f"Not saved: {exc}", severity="error")
 
         self.push_screen(CardEditorModal(entry), _done)
 
@@ -2416,15 +2647,15 @@ class OpenfarmApp(App):
     def _render_doctor_report(self, *, fix: bool = False) -> None:
         rep = run_doctor(self.repo, config_path=self.config_path, fix=fix)
         icons = {"ok": "[bold #4ade80]✓[/]", "warn": "[bold #fbbf24]![/]", "fail": "[bold #fb7185]✗[/]"}
-        lines = [f"[bold #38bdf8]Openfarm Doctor[/]  ({rich_escape(rep['repo'])})\n"]
+        lines = [f"[bold #38bdf8]Openfarm Doctor[/]  ({esc(rep['repo'])})\n"]
         for chk in rep["checks"]:
             ic = icons.get(chk["status"], "·")
             fx = " [#fbbf24](fixable)[/]" if chk.get("fixable") else ""
-            lines.append(f"  {ic} [bold]{rich_escape(chk['label']):<24}[/] {rich_escape(chk['detail'])}{fx}")
+            lines.append(f"  {ic} [bold]{esc(chk['label']):<24}[/] {esc(chk['detail'])}{fx}")
         if rep["fixes_applied"]:
             lines.append("\n[bold #4ade80]Safe Fixes Applied:[/]")
             for item in rep["fixes_applied"]:
-                lines.append(f"  + {rich_escape(item)}")
+                lines.append(f"  + {esc(item)}")
         self.query_one("#engine-doctor", Static).update("\n".join(lines))
         if fix:
             self.refresh_all_views()
@@ -2490,79 +2721,204 @@ class OpenfarmApp(App):
         except Refused as exc:
             self.notify(str(exc), severity="warning")
 
+    # -- openfarm commands run in their own process ----------------------------------
+    # The CLI is never called inside this process with stdout swapped out: two actions
+    # at once swap each other's streams back in the wrong order, and a stray print then
+    # lands in the terminal Textual is drawing on.
+
+    def _cli_argv(self, *argv: str) -> list[str]:
+        base = [sys.executable, "-m", "openfarm_core.cli", "--repo", str(self.repo)]
+        if self.config_path is not None:
+            base += ["--config", str(self.config_path)]
+        return [*base, *argv]
+
+    @staticmethod
+    def _cli_env() -> dict:
+        # The child must import this same openfarm, wherever the TUI was started from.
+        src = str(Path(openfarm_core.__file__).resolve().parent.parent)
+        env = dict(os.environ)
+        env["PYTHONPATH"] = src + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+        return env
+
+    def _cli(self, *argv: str) -> tuple[int, str]:
+        """Run one openfarm command; return its exit code and everything it printed."""
+        proc = subprocess.run(self._cli_argv(*argv), capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL, env=self._cli_env())
+        return proc.returncode, "\n".join(t for t in (proc.stdout.strip(), proc.stderr.strip()) if t)
+
+    @staticmethod
+    def _last_line(out: str, fallback: str) -> str:
+        return out.strip().splitlines()[-1] if out.strip() else fallback
+
+    def _wave_active(self) -> bool:
+        """A wave is running here, or the detached daemon is running one."""
+        if self._running_wave:
+            return True
+        try:
+            return bool(daemon_status(self.repo, config_path=self.config_path).get("running"))
+        except Exception:
+            return False
+
+    def _run_refusal(self) -> str:
+        """Why a wave can't start right now ('' when it can): the checks `openfarm run` makes first."""
+        cfg = self._safe_cfg()
+        if cfg is None:
+            return "this folder isn't set up for openfarm yet"
+        state = StateDir(cfg.state_dir)
+        if state.kill_requested(cfg.kill_switch):
+            return "the kill switch exists (Stop was pressed)"
+        if state.is_paused():
+            return "the queue is paused"
+        if state.read_breaker().get("tripped"):
+            return "the circuit breaker is tripped"
+        return ""
+
+    def _refresh_run_controls(self) -> None:
+        """Show only the run buttons that can do something right now."""
+        cfg = self._safe_cfg()
+        daemon_up = False
+        if cfg is not None:
+            try:
+                daemon_up = bool(daemon_status(self.repo, config_path=self.config_path).get("running"))
+            except Exception:
+                daemon_up = False
+        running = self._running_wave or daemon_up
+        held = cfg is not None and bool(self._run_refusal())
+        for bid, shown in (
+            ("#btn-pause", running), ("#btn-stop", running), ("#btn-hint", running),
+            ("#btn-resume", held),
+            ("#btn-daemon-start", cfg is not None and not running),
+            ("#btn-daemon-stop", daemon_up),
+        ):
+            self.query_one(bid, Button).set_class(not shown, "hidden")
+
+    def _back_to_plan(self) -> None:
+        has_cards = bool(self._plan_cards or self._review_cards)
+        self.query_one("#studio-switcher", ContentSwitcher).current = "studio-plan" if has_cards else "studio-grill"
+
+    @on(Button.Pressed, "#btn-run-back")
+    def _run_back_clicked(self) -> None:
+        self._back_to_plan()
+
+    def _show_run_refusal(self, reason: str) -> None:
+        self._append_activity(f"[bold #fb7185]✗ The wave didn't start:[/] {rich_escape(reason)}")
+        low = reason.lower()
+        if "paused" in low or "kill switch" in low or "breaker" in low:
+            self._append_activity("[#fbbf24]Press Resume below to clear it, then launch the wave from the plan.[/]")
+        elif "key" in low or "endpoint" in low or "api.example.invalid" in low:
+            self._append_activity("[#fbbf24]Open Providers (Ctrl+K, then Providers) to set the worker's endpoint and API key.[/]")
+        self.notify(f"The wave didn't start: {reason[:100]}", severity="error")
+        self._refresh_run_controls()
+
     @on(Button.Pressed, "#btn-launch-wave")
-    @on(Button.Pressed, "#btn-run-start")
     def start_nonblocking_wave(self) -> None:
+        self.query_one("#studio-switcher", ContentSwitcher).current = "studio-run"
         if self._running_wave:
             self.notify("A wave is already running")
             return
-        self.query_one("#studio-switcher", ContentSwitcher).current = "studio-run"
+        if not self._drafting_plan:
+            self.query_one("#architect-panel", Vertical).add_class("hidden")
+        refusal = self._run_refusal()
+        if refusal:
+            self._show_run_refusal(refusal)
+            return
+        self._card_phases.clear()
+        self._cards_finished.clear()
+        self._run_start_note = ""
+        self.query_one("#run-queue-view", Static).update("Starting...")
+        self._running_wave = True
         self._run_wave_bg()
 
+    def _forward_run_events(self, events_path: Path, seen: int) -> int:
+        """Hand the run's new events to the screen; returns how far the file has been read."""
+        try:
+            with events_path.open("rb") as handle:
+                handle.seek(seen)
+                data = handle.read()
+        except OSError:
+            return seen
+        whole = data[: data.rfind(b"\n") + 1]
+        for line in whole.splitlines():
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(event, dict):
+                self.call_from_thread(self._handle_run_event, event)
+        return seen + len(whole)
+
     @work(thread=True)
-    def _run_wave_bg(self) -> None:
+    def _run_wave_bg(self, attach_run_id: str = "") -> None:
+        """Start a build in the background service and follow it, or follow one that is already running.
+
+        The build belongs to the service, not to this window: closing or crashing
+        the app leaves it running, and opening the app again picks it up here.
+        """
         self._running_wave = True
         self.call_from_thread(self._set_running_badge, True)
-        self.call_from_thread(self._append_activity, "[#94a3b8]Preparing baseline and launching wave...[/]")
         try:
-            ensure_baseline_committed(self.repo)
-            ctx = Context(self.repo, self.config_path, json_output=True)
-            args = SimpleNamespace(
-                cards=3, spend=None, for_duration=None, until=None, dry_run=False, card=None,
-                run_id=None, profile=None, learn_from=None, script=None, mm_script=None, json=True,
-            )
-
-            def _on_ev(ev: dict) -> None:
-                self.call_from_thread(self._handle_run_event, ev)
-
-            buf = io.StringIO()
-            with redirect_stdout(buf), redirect_stderr(buf):
-                rc = cmd_run(ctx, args, on_event=_on_ev)
-            raw_out = buf.getvalue().strip()
-            parsed: dict = {}
-            if raw_out:
-                try:
-                    obj = json.loads(raw_out)
-                    if isinstance(obj, dict):
-                        parsed = obj
-                except ValueError:
-                    parsed = {}
-            if rc != 0 or parsed.get("refused") or parsed.get("error"):
-                reason = str(parsed.get("reason") or parsed.get("error") or raw_out.splitlines()[-1] if raw_out else f"run exited {rc}")
+            cfg = self._safe_cfg()
+            run_id = attach_run_id
+            if run_id:
+                self.call_from_thread(self._append_activity, "[#94a3b8]A build is already running; showing its progress...[/]")
+            else:
+                self.call_from_thread(self._append_activity, "[#94a3b8]Committing the baseline and starting the build...[/]")
+                ensure_baseline_committed(self.repo)
+                run_id = "run-" + time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+                start_daemon(self.repo, cards=24, run_id=run_id, follow=True, config_path=self.config_path)
+            events_path = StateDir(cfg.state_dir).run_dir(run_id) / "events.jsonl"
+            seen = 0
+            worker = get_current_worker()
+            while True:
+                if worker.is_cancelled:
+                    return  # the app is closing; the build carries on in the service
+                running = bool(daemon_status(self.repo, config_path=self.config_path).get("running"))
+                seen = self._forward_run_events(events_path, seen)
+                if not running:
+                    break
+                time.sleep(0.25)
+            ended: list[str] = []
+            try:
+                for line in events_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                    event = json.loads(line)
+                    if event.get("kind") == "card_done":
+                        ended.append(f"{event.get('card_id')}: {event.get('final_state')}")
+                started = True
+            except (OSError, ValueError):
+                started = False
+            if not started:
+                log = read_daemon_logs(self.repo, tail=12, config_path=self.config_path)
+                lines = [ln for ln in (log.get("lines") or []) if ln.strip() and not ln.startswith("===")]
+                self.call_from_thread(self._show_run_refusal, lines[-1] if lines else "the build ended before it began")
+            elif not ended:
+                why = f" {self._run_start_note}" if self._run_start_note else ""
                 self.call_from_thread(
                     self._append_activity,
-                    f"[bold #fb7185]✗ Wave refused/stopped (exit {rc}):[/] {rich_escape(reason)}",
+                    f"[#fbbf24]○ The build ended without starting a task.{rich_escape(why)}[/]",
                 )
-                if "paused" in reason.lower():
-                    self.call_from_thread(
-                        self._append_activity,
-                        "[#fbbf24]Tip: click [Resume] below (or run `openfarm resume`) to clear the stale pause, then click Launch Wave.[/]",
-                    )
-                elif "key" in reason.lower() or "endpoint" in reason.lower() or "api.example.invalid" in reason.lower():
-                    self.call_from_thread(
-                        self._append_activity,
-                        "[#fbbf24]Tip: press Ctrl+K → Providers to configure your Worker endpoint & API key.[/]",
-                    )
-                self.call_from_thread(self.notify, f"Wave stopped: {reason[:100]}", severity="error")
             else:
-                outcomes = parsed.get("outcomes") if isinstance(parsed.get("outcomes"), list) else []
-                if not outcomes:
-                    self.call_from_thread(
-                        self._append_activity,
-                        "[#fbbf24]○ Wave finished with 0 cards claimed (check card states in Plan / Review).[/]",
-                    )
-                else:
-                    self.call_from_thread(
-                        self._append_activity,
-                        f"[bold #4ade80]✓ Wave finished:[/] {len(outcomes)} card(s) processed.",
-                    )
+                self.call_from_thread(
+                    self._append_activity,
+                    f"[bold #4ade80]✓ Build finished:[/] {len(ended)} task(s) ({rich_escape(', '.join(ended))}).",
+                )
         except Exception as exc:
             self.call_from_thread(self._append_activity, f"[bold #fb7185]✗ Run error:[/] {rich_escape(str(exc))}")
             self.call_from_thread(self.notify, f"Run error: {str(exc)[:100]}", severity="error")
         finally:
             self._running_wave = False
-            self.call_from_thread(self._set_running_badge, False)
-            self.call_from_thread(self.refresh_all_views)
+            if not get_current_worker().is_cancelled:
+                self.call_from_thread(self._set_running_badge, False)
+                self.call_from_thread(self.refresh_all_views)
+
+    def _attach_running_build(self) -> None:
+        """On opening: a build the service is already running shows up as running here."""
+        try:
+            status = daemon_status(self.repo, config_path=self.config_path)
+        except Exception:
+            return
+        if status.get("running") and status.get("run_id") and not self._running_wave:
+            self._running_wave = True
+            self._run_wave_bg(str(status["run_id"]))
 
     def _set_running_badge(self, active: bool) -> None:
         pill = self.query_one("#status-badge", Static)
@@ -2573,6 +2929,7 @@ class OpenfarmApp(App):
         else:
             pill.add_class("status-ready")
             pill.update("○ READY")
+        self._refresh_run_controls()
 
     def _append_activity(self, markup_line: str) -> None:
         self.query_one("#activity-log", RichLog).write(markup_line)
@@ -2583,7 +2940,6 @@ class OpenfarmApp(App):
         phase = str(ev.get("phase") or "")
         msg = str(ev.get("message") or "")
         ts = str(ev.get("ts") or "")[11:19]
-
         if ev.get("worker_tokens") or ev.get("supervisor_tokens"):
             self._worker_tokens = max(self._worker_tokens, int(ev.get("worker_tokens") or 0))
             self._supervisor_tokens = max(self._supervisor_tokens, int(ev.get("supervisor_tokens") or 0))
@@ -2591,24 +2947,34 @@ class OpenfarmApp(App):
             self._tokens_cached = max(self._tokens_cached, int(ev.get("tokens_in_cached") or 0))
             self._spark_points.append(float(self._worker_tokens + self._supervisor_tokens))
             self._update_token_widgets()
-
-        if cid and phase:
+        same_phase = bool(cid) and self._card_phases.get(cid) == phase
+        if kind == "card_done" and cid:
+            self._cards_finished.add(cid)
+            self._card_phases[cid] = str(ev.get("final_state") or "finished")
+        elif cid and phase and cid not in self._cards_finished:
             self._card_phases[cid] = phase
+        if cid:
             q_lines = [
-                f"[bold #38bdf8]▶ {rich_escape(k)}[/]  [#cbd5e1]{rich_escape(v)}[/]"
+                (f"[bold #4ade80]●[/] {esc(k)} [#cbd5e1]finished: {esc(v)}[/]" if k in self._cards_finished
+                 else f"[bold #38bdf8]▶ {esc(k)}[/] [#cbd5e1]{esc(v)}[/]")
                 for k, v in self._card_phases.items()
             ]
             self.query_one("#run-queue-view", Static).update("\n".join(q_lines))
-
         if kind == "phase":
-            self._append_activity(f"[#94a3b8]{ts}[/]  [bold #38bdf8]▶[/]  {rich_escape(cid)} → [bold]{rich_escape(phase)}[/]")
+            if not same_phase:  # the same phase is announced more than once by the run
+                self._append_activity(f"[#94a3b8]{ts}[/] [bold #38bdf8]▶[/] {rich_escape(cid)} → [bold]{rich_escape(phase)}[/]")
         elif kind == "card_done":
             st = str(ev.get("final_state") or "")
             col = "#4ade80" if st == "in-review" else "#fb7185"
-            self._append_activity(f"[#94a3b8]{ts}[/]  [bold {col}]●[/]  {rich_escape(cid)} finished: {rich_escape(st)} {rich_escape(msg)}")
+            self._append_activity(f"[#94a3b8]{ts}[/] [bold {col}]●[/] {rich_escape(cid)} finished: {rich_escape(st)} {rich_escape(msg)}")
             self.refresh_all_views()
         elif msg:
-            self._append_activity(f"[#94a3b8]{ts}[/]  {rich_escape(msg)}")
+            if kind == "run_start":
+                self._run_start_note = msg.partition("; ")[2]
+                if not self._card_phases:
+                    self.query_one("#run-queue-view", Static).update(
+                        esc("No card running." + (f" {self._run_start_note}" if self._run_start_note else "")))
+            self._append_activity(f"[#94a3b8]{ts}[/] {rich_escape(msg)}")
 
     # ── Review & Findings Buttons + Modals ───────────────────────────────────
 
@@ -2656,25 +3022,53 @@ class OpenfarmApp(App):
         cid = self._selected_review_id
         if not cid:
             return
-        buf = io.StringIO()
-        with redirect_stdout(buf), redirect_stderr(buf):
-            rc = cli_main(["--repo", str(self.repo), "verdict", cid, "clean", "--review-tokens", "0"])
+        rc, out = self._cli("verdict", cid, "clean")
         if rc != 0:
-            err = buf.getvalue().strip().splitlines()[-1] if buf.getvalue().strip() else f"verdict exited {rc}"
-            self.notify(f"Approve failed: {err[:100]}", severity="error")
+            self.notify(f"Approve failed: {self._last_line(out, f'verdict exited {rc}')[:100]}", severity="error")
             return
         if cid not in self._approved_to_land:
             self._approved_to_land.append(cid)
         self.query_one("#approved-queue-label", Static).update(
-            f"Approved to land: {', '.join(self._approved_to_land)}"
+            esc(f"Approved to land: {', '.join(self._approved_to_land)}")
         )
-        self.notify(f"Approved {cid} — press [L] to Land Locally")
+        self.notify(f"Approved {cid}. Press [L] or Land Locally to merge it.")
+        self.refresh_all_views()
+
+    # -- slow review actions: say it's running, run it off the UI thread, show how it ended --
+
+    def _start_review_action(self, button_id: str, doing: str, argv: list[str], on_done=None) -> None:
+        if button_id in self._busy_labels:
+            self.notify(f"{doing} is still running")
+            return
+        btn = self.query_one(button_id, Button)
+        self._busy_labels[button_id] = str(btn.label)
+        btn.loading = True
+        self.query_one("#review-status", Static).update(f"[bold #38bdf8]⏳ {esc(doing)}...[/]")
+        self._review_action_bg(button_id, doing, argv, on_done)
+
+    @work(thread=True)
+    def _review_action_bg(self, button_id: str, doing: str, argv: list[str], on_done) -> None:
+        try:
+            rc, out = self._cli(*argv)
+        except Exception as exc:  # noqa: BLE001 - the button must come back whatever happened
+            rc, out = 1, str(exc)
+        self.call_from_thread(self._finish_review_action, button_id, doing, rc, out, on_done)
+
+    def _finish_review_action(self, button_id: str, doing: str, rc: int, out: str, on_done) -> None:
+        self._busy_labels.pop(button_id, None)
+        self.query_one(button_id, Button).loading = False
+        last = self._last_line(out, f"exit code {rc}")
+        colour = "#4ade80" if rc == 0 else "#fb7185"
+        self.query_one("#review-status", Static).update(
+            f"[bold {colour}]{'✓' if rc == 0 else '✗'} {esc(doing)}:[/] {esc(last[:200])}")
+        self.notify(f"{doing}: {last[:120]}", severity=("error" if rc != 0 else "information"))
+        if on_done is not None:
+            on_done(rc, out)
         self.refresh_all_views()
 
     @on(Button.Pressed, "#btn-promote-int")
     def _promote_integration_btn(self) -> None:
-        self._run_cli_quick(["land", "--promote-integration"])
-        self.refresh_all_views()
+        self._start_review_action("#btn-promote-int", "Merging the integration branch", ["land", "--promote-integration"])
 
     @on(Button.Pressed, "#btn-land")
     def _land_approved_queue(self) -> None:
@@ -2682,10 +3076,35 @@ class OpenfarmApp(App):
         if not targets:
             self.notify("No cards queued to land")
             return
-        self._run_cli_quick(["land", *targets])
-        self._approved_to_land.clear()
-        self.query_one("#approved-queue-label", Static).update("Approved queue: (none)")
-        self.refresh_all_views()
+
+        def _landed(rc: int, _out: str) -> None:
+            if rc == 0:
+                self._approved_to_land.clear()
+                self.query_one("#approved-queue-label", Static).update("Approved queue: (none)")
+
+        self._start_review_action("#btn-land", f"Landing {', '.join(targets)}", ["land", *targets], _landed)
+
+    @on(Button.Pressed, "#btn-accept-blocked")
+    def _open_accept_blocked_modal(self) -> None:
+        card = next((c for c in self._review_cards if c.id == self._selected_review_id), None)
+        if card is None or str(card.state).lower() != "blocked":
+            return
+
+        def _done(note: str | None) -> None:
+            if note is None:
+                return
+            if not note.strip():
+                self.notify("A note saying what you checked is required.", severity="warning")
+                return
+            self._start_review_action(
+                "#btn-accept-blocked", f"Accepting {card.id}",
+                ["land", card.id, "--accept-blocked", "--note", note.strip()])
+
+        self.push_screen(BounceNoteModal(
+            card.id, card.title,
+            heading=f"I've checked {card.id}, accept it",
+            sub="The farm blocked this card. Say what you checked; your name and this note are recorded, then it merges like Land.",
+            ok_label="Accept and Land"), _done)
 
     @on(Button.Pressed, "#btn-bounce")
     def _open_bounce_modal(self) -> None:
@@ -2695,37 +3114,50 @@ class OpenfarmApp(App):
 
         def _done(note: str | None) -> None:
             if note is not None:
-                self._run_cli_quick(["verdict", card.id, "bounced", "--review-tokens", "0"])
+                self._run_cli_quick(["verdict", card.id, "bounced", *(["--note", note] if note else [])])
                 self.refresh_all_views()
 
         self.push_screen(BounceNoteModal(card.id, card.title), _done)
 
     @on(Button.Pressed, "#btn-freview")
     def _run_frontier_review_bg(self) -> None:
-        self._frontier_review_worker()
-
-    @work(thread=True)
-    def _frontier_review_worker(self) -> None:
         cid = self._selected_review_id
-        buf = io.StringIO()
-        argv = ["--repo", str(self.repo), "frontier-review", "--scope", "card", cid] if cid else ["--repo", str(self.repo), "frontier-review", "--scope", "diff"]
-        with redirect_stdout(buf), redirect_stderr(buf):
-            cli_main(argv)
-        out = buf.getvalue().strip() or "(no frontier-review output)"
-        self.call_from_thread(self.query_one("#review-frontier-out", Static).update, out)
+        if not cid:
+            # One card at a time: without a choice nothing is reviewed, least of all the whole diff.
+            self.notify("Which card? Select one in the list, then press Frontier Review.", severity="warning")
+            self.query_one("#review-table", DataTable).focus()
+            return
+        cfg = self._safe_cfg()
+
+        def _reviewed(rc: int, out: str) -> None:
+            text = out or "(the review printed nothing)"
+            if rc == 0 and cfg is not None:
+                path = self._frontier_review_path(cfg, cid)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text + "\n", encoding="utf-8")
+            if self._selected_review_id == cid:
+                self.query_one("#review-frontier-out", Static).update(esc(text))
+            self.query_one("#review-tabs", TabbedContent).active = "rev-tab-frontier"
+
+        self._start_review_action(
+            "#btn-freview", f"Reviewing {cid} with Claude and Codex",
+            ["frontier-review", "--scope", "card", cid], _reviewed)
 
     @on(Button.Pressed, "#btn-pause")
     def _pause_btn(self) -> None:
         self._run_cli_quick(["pause"])
+        self._refresh_run_controls()
 
     @on(Button.Pressed, "#btn-resume")
     def _resume_btn(self) -> None:
-        self._run_cli_quick(["resume", "--clear-breaker", "--clear-kill"])
-        self._append_activity("[bold #4ade80]✓ Queue resumed (pause/breaker/kill cleared).[/]")
+        if self._run_cli_quick(["resume", "--clear-breaker", "--clear-kill"]) == 0:
+            self._append_activity("[bold #4ade80]✓ Resumed: pause, breaker and kill switch are cleared.[/]")
+        self._refresh_run_controls()
 
     @on(Button.Pressed, "#btn-stop")
     def _stop_btn(self) -> None:
         self._run_cli_quick(["stop"])
+        self._refresh_run_controls()
 
     @on(Button.Pressed, "#btn-hint")
     def _open_hint_modal(self) -> None:
@@ -2738,9 +3170,8 @@ class OpenfarmApp(App):
         self.push_screen(HintModal(active_cid), _done)
 
     def _run_cli_quick(self, argv: list[str]) -> int:
-        buf = io.StringIO()
-        with redirect_stdout(buf), redirect_stderr(buf):
-            rc = cli_main(["--repo", str(self.repo), *argv])
-        msg = buf.getvalue().strip().splitlines()[-1] if buf.getvalue().strip() else f"{argv[0]} exited {rc}"
-        self.notify(msg[:120], severity=("error" if rc != 0 else "information"))
+        """A quick openfarm command (pause, release, verdict...): run it and toast its last line."""
+        rc, out = self._cli(*argv)
+        self.notify(self._last_line(out, f"{argv[0]} exited {rc}")[:120],
+                    severity=("error" if rc != 0 else "information"))
         return rc

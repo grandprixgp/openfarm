@@ -70,6 +70,7 @@ OPTIONAL_CARD_FIELDS = (
     "replan_if",
     "complexity",
     "profile",
+    "network",
     "wave",
     "from_card",
     "created_at",
@@ -187,6 +188,11 @@ class Card:
         return math.isfinite(num)
 
     @property
+    def network(self) -> bool:
+        """The plan says this task itself must use the network (a server, a client of a remote API)."""
+        return self.fields.get("network") is True
+
+    @property
     def new_symbols(self) -> bool:
         return bool(self.fields.get("new_symbols", False))
 
@@ -264,3 +270,28 @@ class Card:
 
     def __repr__(self) -> str:
         return f"Card({self.id!r}, {self.category!r})"
+
+
+def waiting_on(cards) -> dict[str, list[tuple[str, str]]]:
+    """Ready cards that can't start yet: for each, the cards it waits for and their state.
+
+    A card is claimed only once every card it depends on is done, so a ready card
+    behind a blocked or unfinished one is waiting, whatever its own state says.
+    """
+    by_id = {card.id: card for card in cards}
+    out: dict[str, list[tuple[str, str]]] = {}
+    for card in cards:
+        if card.state != "ready":
+            continue
+        unmet = [(dep, by_id[dep].state if dep in by_id else "missing")
+                 for dep in card.deps if dep not in by_id or by_id[dep].state != "done"]
+        if unmet:
+            out[card.id] = unmet
+    return out
+
+
+def waiting_text(waiting: dict[str, list[tuple[str, str]]]) -> str:
+    """`W1-03 waits for W1-01 (blocked); W1-04 waits for W1-03 (ready)`."""
+    return "; ".join(
+        f"{cid} waits for " + ", ".join(f"{dep} ({state.replace('_', ' ')})" for dep, state in unmet)
+        for cid, unmet in waiting.items())

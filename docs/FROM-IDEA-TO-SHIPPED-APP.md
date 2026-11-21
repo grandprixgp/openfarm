@@ -1,8 +1,31 @@
-# From Empty Folder to Shipped App (Openfarm v0.14.0 Starter Guide)
+# From Empty Folder to Shipped App (Openfarm v0.15.0 Starter Guide)
 
 This guide shows **both human owners and prospective frontier AI agents** how to go from an **empty folder** and a **plain-English idea** to a gate-verified, human-reviewed application using **Openfarm v0.14.0**.
 
-> **Interactive Studio shortcut (v0.13.0–v0.14.0):** You can also just run bare `openfarm` inside any empty folder (TypeScript/Web, Python, Rust, or Go) to walk through **Idea → Conversational Frontier Architect Grill → Living Spec & Ordered Chunks (`.openfarm/CHUNKS.json`) → Split Chunk into Cards (with Live Architect Log) → Farm Run / `openfarm daemon` → Review & Local Land / `openfarm web --tailscale` → Iterate**. The walkthrough below documents the CLI & slash-command flow using a Rust example (`calorie-log`).
+## The seven steps, whichever door you use
+
+Run bare `openfarm` in an empty folder and one screen walks you through the steps below. The agent skills
+(`/openfarm-initialize`, Part 2) and the CLI go through the same steps and use the same words. The example
+here is the web app this version was tried on: a page built around Wikimedia's image of the day.
+
+| Step | On the screen | With the CLI or a skill |
+|---|---|---|
+| **Idea** | Type it: "User visits app, presented with image of the day, design is built around the image…" and press **Continue**. | `/openfarm-initialize iotd "<idea>"`, or `openfarm init iotd --idea "<idea>"` |
+| **Questions** | The Architect asks a few questions, one at a time, with suggested answers ("Where does the image come from?"). **Answer**. | `/openfarm-grill-me` |
+| **Spec** | Read the spec and its goals (1 Living Image, 2 Recursive Threads, 3 Realtime and polish). **Plan goal 1**. | the spec and goals are written by the skill; read them with `openfarm status` |
+| **Plan** | Goal 1 as four tasks (fetch the feed, derive the theme, route and proxy, show the page), each checked before you see it. A repair is shown with its reason. **Build 4 tasks**. | `openfarm plan`, `openfarm card show W1-01`, `openfarm check W1-01` |
+| **Build** | Each task's state in a sentence. A task that stopped says what kind of stop it is and offers the fitting action. **Accept W1-02** merges it locally. | `openfarm run --follow`, then `openfarm dossier`, `openfarm verdict W1-02 clean`, `openfarm land` |
+| **Try it** | The app is started and screenshotted; the checks say whether the title, story and credit can be seen. **Fix this** if not. | `openfarm try` |
+| **Accept** | The goal's summary. **Accept goal 1** moves on to goal 2's plan. | `openfarm land`, then plan the next goal |
+
+In that run the first build produced a page where the text was in the page but hidden under the photo. "Try it"
+is the step that catches this: its check fails with "can't be seen (it is covered by img#art)", and **Fix this**
+turns that sentence into fix tasks under goal 1. The four finished tasks stay as they are.
+
+Words: a **task** is a card, a **goal** is a chunk, a **plan** is a wave plan, and **accept** is what used to be
+approve, land and merge. Commands and file names keep the older words. Part 2 below is the agent-skill route in
+detail; its worked example is a calorie log, written before the steps above were named, so it says "card" and
+"wave" where this section says "task" and "plan".
 >
 > **For related docs:** See [README.md](../README.md) for the v0.14.0 overview, [docs/USAGE-AND-FIRST-DEPLOYMENT.md](USAGE-AND-FIRST-DEPLOYMENT.md) for detailed configuration & operator runbooks on existing repositories (`tallybox`), and [docs/openfarm-internals.md](openfarm-internals.md) for module internals.
 

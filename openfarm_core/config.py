@@ -26,7 +26,7 @@ KNOWN_TABLES = {
     "project", "adapters", "model", "policy", "eligibility", "brief",
     "runner", "budget", "gates", "cards", "micromanager", "state", "harness",
     "swarm", "tiers", "units", "factory", "invariants", "acceptance",
-    "notifications",
+    "notifications", "try",
 }
 
 _UNIT_LANGUAGES = ("rust", "python", "typescript", "go")
@@ -638,6 +638,16 @@ class Config:
                     f"[brief] test_conventions {conventions!r} must stay within the repository"
                 )
             self.test_conventions_path = Path(conventions)
+
+        # How "Try it" starts and looks at the app; empty means the language pack decides.
+        try_it = self._table("try")
+        _check_keys(try_it, {"start", "port", "path", "sample"}, "[try]")
+        for key in ("start", "path", "sample"):
+            if not isinstance(try_it.get(key, ""), str):
+                raise ConfigError(f"[try] {key} must be a string")
+        if not isinstance(try_it.get("port", 0), int) or isinstance(try_it.get("port", 0), bool):
+            raise ConfigError("[try] port must be a whole number")
+        self.try_it = dict(try_it)
 
         runner = self._table("runner")
         self.cargo_flags = _as_str_list(runner.get("cargo_flags", []),

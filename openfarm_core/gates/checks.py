@@ -101,7 +101,7 @@ def banned_patterns(added_lines: list[dict], cfg,
                     production_paths: set[str],
                     base_counts: dict[str, dict[str, int]] | None = None,
                     head_counts: dict[str, dict[str, int]] | None = None,
-                    pack=None) -> GateResult:
+                    pack=None, allowed: frozenset[str] = frozenset()) -> GateResult:
     """Added lines, scanned by the card's language pack (Rust when none is given).
 
     The decision is a **count comparison per file**, not a search for new-looking
@@ -116,6 +116,10 @@ def banned_patterns(added_lines: list[dict], cfg,
     and is banned. Comparing *added lines* against a base allowance instead would let
     a file with three swallow a fourth for free.
 
+    `allowed` holds the labels this card may introduce because its plan says so and the
+    owner saw that before building (today only `network-call`, from `network = true`).
+    An allowed hit is flagged for the reviewer, never dropped.
+
     When `head_counts` is absent the gate falls back to added lines alone, and every
     hit is banned: fewer allowances is the safe direction.
     """
@@ -123,6 +127,10 @@ def banned_patterns(added_lines: list[dict], cfg,
         from ..packs.rust import RustPack
         pack = RustPack()
     found = pack.patterns(added_lines, cfg.flagged_patterns, production_paths)
+    if allowed:
+        found = dict(found, banned=[e for e in found.get("banned", []) if e.get("pattern") not in allowed],
+                     flagged=[*found.get("flagged", []),
+                              *(e for e in found.get("banned", []) if e.get("pattern") in allowed)])
     evidence_counts = {"base": base_counts or {}, "head": head_counts or {}}
 
     if head_counts is None:
@@ -147,7 +155,9 @@ def banned_patterns(added_lines: list[dict], cfg,
     for path, labels in (head_counts or {}).items():
         for label, count in labels.items():
             base = (base_counts or {}).get(path, {}).get(label, 0)
-            if count > base:
+            if count > base and label in allowed:
+                pre_existing.append({"file": path, "pattern": label, "count": count, "allowed_by_plan": True})
+            elif count > base:
                 introduced.append({"file": path, "pattern": label,
                                    "base": base, "head": count,
                                    "added": count - base})

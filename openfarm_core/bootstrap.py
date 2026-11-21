@@ -17,7 +17,7 @@ from pathlib import Path
 from .adapters.acp import acp_adapter_for_provider, normalize_acp_provider
 from .config_template import render_config
 from .config import load_config
-from .errors import ConfigError, Invalid, Refused, UsageError
+from .errors import AdapterError, ConfigError, Invalid, Refused, UsageError
 from .git import Git
 
 INSTALL_TARGETS = ("claude", "antigravity", "codex", "agents", "workspace", "all")
@@ -432,7 +432,6 @@ def initialize_project(
     target_dir.mkdir(parents=True, exist_ok=True)
     for folder in (
         target_dir / ".openfarm",
-        target_dir / "cards",
         target_dir / "src",
         target_dir / "tests",
         resolved_state,
@@ -696,25 +695,24 @@ def initialize_project(
             "- Never use `.unwrap()`, `.expect()`, `#[ignore]`, `#[allow(...)]`, or `dbg!()`.\n"
         )
 
+    starter_spec = (
+        f"# {project_slug} Specification\n\n"
+        f"- **Idea**: {idea_text}\n"
+        f"- **Language**: `{resolved_lang}`\n"
+        f"- **Openfarm Profile**: `{resolved_profile}` (`micromanager = {mm_adapter}`, `auth = {mm_auth}`, `mutation = {resolved_mutation}`)\n\n"
+        f"## Protected Seam Invariants (`never_touch = [{_toml_str(inv_rel)}]`)\n\n"
+        f"- Document domain constants, checked rules, and bounds locked in `{inv_rel}`.\n"
+        f"- Never reference `{inv_rel}` in card `touches`, `reference`, or `context_files`.\n\n"
+        "## Golden Reference Vertical Slice\n\n"
+        "- Architect pass adds one clean reference slice with passing baseline tests.\n\n"
+        "## Wave Plan (`W1-01`..)\n\n"
+        "- **Wave 1 (Contrast Seed)**: foundational `small-feature` / `pattern` cards.\n"
+        "- **Wave 2 (Core Features)**: `feature` / `integration` cards building on Wave 1.\n"
+        "- **Wave 3 (Polish)**: `refactor` / `test-backfill` cards.\n"
+    )
     files_to_write: dict[str, str] = {
         **stack_files,
-        "cards/.gitkeep": "",
         ".openfarm/test-conventions.md": test_conv,
-        ".openfarm/PROJECT_SPEC.md": (
-            f"# {project_slug} Specification\n\n"
-            f"- **Idea**: {idea_text}\n"
-            f"- **Language**: `{resolved_lang}`\n"
-            f"- **Openfarm Profile**: `{resolved_profile}` (`micromanager = {mm_adapter}`, `auth = {mm_auth}`, `mutation = {resolved_mutation}`)\n\n"
-            f"## Protected Seam Invariants (`never_touch = [{_toml_str(inv_rel)}]`)\n\n"
-            f"- Document domain constants, checked rules, and bounds locked in `{inv_rel}`.\n"
-            f"- Never reference `{inv_rel}` in card `touches`, `reference`, or `context_files`.\n\n"
-            "## Golden Reference Vertical Slice\n\n"
-            "- Architect pass adds one clean reference slice with passing baseline tests.\n\n"
-            "## Wave Plan (`cards/W1-01.md`..)\n\n"
-            "- **Wave 1 (Contrast Seed)**: foundational `small-feature` / `pattern` cards.\n"
-            "- **Wave 2 (Core Features)**: `feature` / `integration` cards building on Wave 1.\n"
-            "- **Wave 3 (Polish)**: `refactor` / `test-backfill` cards.\n"
-        ),
         "AGENTS.md": (
             f"# {project_slug} Frontier Agent Instructions\n\n"
             f"1. Keep domain invariants in `{inv_rel}` (`never_touch`) and never weaken `.openfarm/config.toml`.\n"
@@ -755,6 +753,15 @@ def initialize_project(
             git.init(branch=branch)
         if commit:
             git.commit_all(f"chore: initialize {project_slug} openfarm skeleton")
+
+    # The spec lives with the cards, not on the project's branch. A folder with no
+    # commit yet has no cards branch, so there the spec waits in `.openfarm/`.
+    from .store import DOCS, write_doc
+
+    try:
+        write_doc(target_dir, cfg, "spec", starter_spec, why="project started")
+    except (AdapterError, OSError):
+        (target_dir / DOCS["spec"][1]).write_text(starter_spec, encoding="utf-8")
 
     registered_project = True
     try:
@@ -810,8 +817,8 @@ def initialize_project(
         "next_steps": [
             f"Ensure Frontier {acp_label} OAuth is signed in ({acp_cmd_hint}).",
             f"Place your Worker ZDR model API key in {resolved_key} (chmod 600).",
-            f"Expand .openfarm/PROJECT_SPEC.md, {inv_rel}, a golden slice, and {baseline_test_by_lang.get(resolved_lang, 'tests/baseline_tests.rs')}.",
+            f"Expand the project spec, {inv_rel}, a golden slice, and {baseline_test_by_lang.get(resolved_lang, 'tests/baseline_tests.rs')}.",
             verify_cmd_by_lang.get(resolved_lang, verify_cmd_by_lang["rust"]),
-            f"Author cards/W1-01.md.. under cards/, commit on {branch}, then run `openfarm check <ID>` and `openfarm run --dry-run`.",
+            f"Add tasks with `openfarm card add`, then run `openfarm check <ID>` and `openfarm run --dry-run`.",
         ],
     }

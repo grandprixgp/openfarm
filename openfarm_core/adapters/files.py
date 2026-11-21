@@ -24,6 +24,8 @@ branch, so concurrent cards can't conflict and every lane sees the same claims.
 from __future__ import annotations
 
 import re
+import json
+import re
 import shutil
 import threading
 import tomllib
@@ -34,6 +36,8 @@ from ..cards import (CARD_FIELDS, OPTIONAL_CARD_FIELDS, Card,
 from ..errors import Infra, Invalid, Refused, Unsupported
 from ..git import Git
 from ..state import utc_after, utc_now
+
+STORE_FILE = "store.json"
 
 _SOURCE_LOCKS_GUARD = threading.Lock()
 _SOURCE_LOCKS: dict[tuple[Path, str], threading.RLock] = {}
@@ -215,39 +219,6 @@ class FileCardSource:
             self._seed_from_base()
             return self.worktree
 
-    def sync_ready_cards_from_base(self) -> int:
-        """Sync new or updated `ready`/`backlog` cards from base `cards/` onto `openfarm-cards`."""
-        self.prepare()
-        with self._lock:
-            if self.worktree is None:
-                return 0
-            source = self.repo / self.folder
-            if not source.is_dir():
-                return 0
-            updated = 0
-            for path in sorted(source.glob("*.md")):
-                if path.is_symlink():
-                    continue
-                target = self.worktree / self.folder / path.name
-                src_bytes = path.read_bytes()
-                if target.exists():
-                    if target.read_bytes() == src_bytes:
-                        continue
-                    try:
-                        hdr, _bd = parse_card_file(target.read_text(encoding="utf-8", errors="replace"))
-                        st = str(hdr.get("state") or "").strip().lower()
-                        cid = str(hdr.get("id") or path.stem).upper()
-                    except (OSError, ValueError):
-                        continue
-                    if cid.startswith("FIND-") or st not in ("ready", "backlog"):
-                        continue
-                shutil.copy2(path, target, follow_symlinks=False)
-                updated += 1
-            if updated:
-                Git(self.worktree).commit_all(
-                    f"openfarm: sync {updated} planned card(s) from base branch")
-            return updated
-
     def reset_non_finding_cards_from_base(self, *, clear_findings: bool = False) -> int:
         """Replace cards on `openfarm-cards` with the base branch's `cards/` (used after re-init).
 
@@ -265,9 +236,9 @@ class FileCardSource:
                     continue
                 existing.unlink(missing_ok=True)
                 removed += 1
-            src_dir = self.repo / self.folder
+            src_dir = self.legacy_base_cards()
             copied = 0
-            if src_dir.is_dir():
+            if src_dir is not None:
                 for path in sorted(src_dir.glob("*.md")):
                     if path.is_symlink() or path.stem.upper().startswith("FIND-"):
                         continue
@@ -282,8 +253,8 @@ class FileCardSource:
         """Copy card files the base branch already holds onto the cards branch."""
         if self.worktree is None:
             return
-        source = self.repo / self.folder
-        if not source.is_dir():
+        source = self.legacy_base_cards()
+        if source is None:
             return
         copied = 0
         for path in sorted(source.glob("*.md")):
@@ -297,6 +268,84 @@ class FileCardSource:
         if copied:
             Git(self.worktree).commit_all(
                 f"openfarm: seed {copied} card(s) from the base branch")
+
+    # -- the store's own record ------------------------------------------------
+
+    def _meta_path(self) -> Path:
+        if self.worktree is None:
+            raise Invalid("no-worktree", "the file card source needs a worktree path")
+        return self.worktree / STORE_FILE
+
+    def meta(self) -> dict:
+        """`store.json` on the cards branch: whether the base branch's cards were taken over, and the ID counters."""
+        try:
+            data = json.loads(self._meta_path().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = {}
+        return data if isinstance(data, dict) else {}
+
+    def save_meta(self, data: dict, message: str = "") -> None:
+        """Write `store.json`. With no message it rides along with the next card commit."""
+        with self._lock:
+            self._meta_path().write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            if message:
+                Git(self.worktree).commit_all(message)
+
+    @property
+    def migrated(self) -> bool:
+        return bool(self.meta().get("migrated"))
+
+    def legacy_base_cards(self) -> Path | None:
+        """The base branch's `cards/` folder, for a project that still keeps cards there.
+
+        This is the one place the base copy is found. After migration the cards branch
+        is the only home of a card and this returns None.
+        """
+        if self.worktree is not None and self.worktree.is_dir() and self.migrated:
+            return None
+        source = self.repo / self.folder
+        return source if source.is_dir() else None
+
+    def next_id(self, prefix: str, width: int = 0) -> str:
+        """The next ID with this prefix, from a counter that never goes back.
+
+        `next_id("FIND-")` gives FIND-7, `next_id("W1-", 2)` gives W1-07. A deleted
+        card's number is not handed out again.
+        """
+        with self._lock:
+            data = self.meta()
+            ids = data.get("ids") if isinstance(data.get("ids"), dict) else {}
+            pattern = re.compile(re.escape(prefix) + r"(\d+)", re.IGNORECASE)
+            seen = [int(m.group(1)) for card in self.all_cards() if (m := pattern.fullmatch(card.id))]
+            number = max([int(ids.get(prefix.upper(), 0) or 0), *seen]) + 1
+            ids[prefix.upper()] = number
+            data["ids"] = ids
+            self.save_meta(data)
+            return f"{prefix}{number:0{width}d}"
+
+    def reserve_id(self, card_id: str) -> str:
+        """Take `card_id` for a new card if it was never used, else hand back the next free one.
+
+        `W1-05` is taken as asked only when no card has it and the counter for `W1-`
+        is still below 5; otherwise the counter decides, so a number is never reused.
+        An ID with no number is taken as asked unless a card already has it.
+        """
+        with self._lock:
+            match = re.fullmatch(r"(.*?)(\d+)", str(card_id))
+            existing = {card.id.upper() for card in self.all_cards()}
+            if match is None:
+                if str(card_id).upper() in existing:
+                    raise Refused("card-exists", f"{card_id} already exists")
+                return str(card_id)
+            prefix, number = match.group(1), int(match.group(2))
+            data = self.meta()
+            ids = data.get("ids") if isinstance(data.get("ids"), dict) else {}
+            if str(card_id).upper() in existing or number <= int(ids.get(prefix.upper(), 0) or 0):
+                return self.next_id(prefix, len(match.group(2)) if match.group(2).startswith("0") else 0)
+            ids[prefix.upper()] = number
+            data["ids"] = ids
+            self.save_meta(data)
+            return str(card_id)
 
     @property
     def cards_dir(self) -> Path:
@@ -513,6 +562,23 @@ class FileCardSource:
             self._write(card_id, header, body, f"{card_id}: done")
             return {"state": "done"}
 
+    def accept_blocked(self, card_id: str, by: str, note: str) -> dict:
+        """A person has checked a blocked card's work and takes it as it is.
+
+        The card goes to review with who accepted it and why written on it, so
+        `mark_done` can follow the merge like for any reviewed card.
+        """
+        with self._lock:
+            header, body, _ = self._read_raw(card_id)
+            if header.get("state") != "blocked":
+                raise Refused("not-blocked", f"{card_id} is {header.get('state')}, not blocked")
+            header["state"] = "in_review"
+            header["accepted_by"] = by
+            header["accepted_note"] = note
+            header["accepted_at"] = utc_now()
+            self._write(card_id, header, body, f"{card_id}: accepted while blocked by {by}")
+            return {"state": "in_review"}
+
     def release(self, card_id: str, lease_id: str = "", reason: str = "",
                 stop_code: str = "") -> dict:
         with self._lock:
@@ -547,11 +613,7 @@ class FileCardSource:
 
     def finding(self, from_card: str, title: str, body_md: str = "") -> dict:
         with self._lock:
-            existing = {card.id for card in self.all_cards()}
-            index = 1
-            while f"FIND-{index}" in existing:
-                index += 1
-            card_id = f"FIND-{index}"
+            card_id = self.next_id("FIND-")
             header = {
                 "id": card_id,
                 "title": title,

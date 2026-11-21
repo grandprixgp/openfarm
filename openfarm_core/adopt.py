@@ -162,8 +162,8 @@ def adopt_project(
     Raises `openfarm_core.errors.Refused` with code "not-a-git-repo" when
     `root/.git` does not exist, "dirty-worktree" when the worktree is not clean,
     or "already-adopted" when `root/.openfarm/config.toml` exists, in that order.
-    Writes `.openfarm/config.toml`, `.openfarm/PROJECT_SPEC.md` and
-    `cards/.gitkeep`, creates `state_dir` with mode 0o700, never commits, and
+    Writes `.openfarm/config.toml` (the spec and cards live on the cards branch),
+    creates `state_dir` with mode 0o700, never commits to the project's branch, and
     returns {"ok": True, "language": ..., "written": [...]}.
     """
     root = Path(root).expanduser().resolve()
@@ -178,9 +178,8 @@ def adopt_project(
     # already-adopted check has to come first to be the one it reports.
     config_path = root / ".openfarm" / "config.toml"
     spec_path = root / ".openfarm" / "PROJECT_SPEC.md"
-    gitkeep_path = root / "cards" / ".gitkeep"
     # Checked before anything is written, so a refusal never leaves half an adoption.
-    for path in (config_path, spec_path, gitkeep_path):
+    for path in (config_path, spec_path):
         if path.exists():
             raise Refused(
                 "already-adopted",
@@ -244,13 +243,8 @@ def adopt_project(
     with config_path.open("x", encoding="utf-8") as handle:
         handle.write(config_text)
 
-    spec_path.parent.mkdir(parents=True, exist_ok=True)
-    with spec_path.open("x", encoding="utf-8") as handle:
-        handle.write(f"# {name}\n")
-
-    gitkeep_path.parent.mkdir(parents=True, exist_ok=True)
-    with gitkeep_path.open("x", encoding="utf-8") as handle:
-        handle.write("")
+    # The spec and the cards live on the cards branch, so the project's own
+    # branch gets the config and nothing else.
 
     registered_project = True
     try:
@@ -272,8 +266,6 @@ def adopt_project(
         "language": resolved_language,
         "written": [
             ".openfarm/config.toml",
-            ".openfarm/PROJECT_SPEC.md",
-            "cards/.gitkeep",
         ],
     }
     if typescript_tools is not None:

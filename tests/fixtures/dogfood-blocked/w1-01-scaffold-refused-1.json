@@ -1,0 +1,23 @@
+{
+  "run_id": "run-20261120T125355Z",
+  "card_id": "W1-01",
+  "claimed_at": "2026-11-20T12:53:55Z",
+  "ended_at": "2026-11-20T12:56:29Z",
+  "final_state": "blocked",
+  "stop_code": "refused",
+  "attempts": 2,
+  "counter_tests": {
+    "written": 0,
+    "dropped_uncompiled": 0,
+    "passed": 0,
+    "failed": 0,
+    "not_run": 0
+  },
+  "detail": "the test writer left the allowed paths: src/feed.ts",
+  "named_tests": [
+    "feedUrl builds the dated endpoint",
+    "normaliseFeed maps the fixture",
+    "normaliseFeed rejects feeds without an image",
+    "fetchDay returns null on failure"
+  ]
+}

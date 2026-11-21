@@ -358,15 +358,16 @@ def _recent_event_lines(repo: Path, *, config_path: Path | None = None, limit: i
     if state.runs.is_dir():
         run_dirs = sorted([p for p in state.runs.iterdir() if p.is_dir()], key=lambda p: p.name)
         for rdir in reversed(run_dirs):
-            ev_path = rdir / "telemetry" / "events.jsonl"
-            if ev_path.is_file():
+            # The run's own event stream first: it is what the TUI shows for the same build.
+            ev_path = next((p for p in (rdir / "events.jsonl", rdir / "telemetry" / "events.jsonl") if p.is_file()), None)
+            if ev_path is not None:
                 out: list[str] = []
                 for raw in ev_path.read_text(encoding="utf-8", errors="replace").splitlines()[-limit:]:
                     try:
                         ev = json.loads(raw)
                         kind = ev.get("kind") or ev.get("event") or "event"
                         card = ev.get("card_id") or ev.get("card") or ""
-                        detail = ev.get("detail") or ev.get("result") or ""
+                        detail = ev.get("message") or ev.get("detail") or ev.get("result") or ""
                         out.append(f"{kind} {card} {detail}".strip())
                     except ValueError:
                         out.append(raw[:160])

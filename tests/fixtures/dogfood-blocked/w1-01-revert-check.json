@@ -1,0 +1,23 @@
+{
+  "run_id": "run-20261120T132433Z",
+  "card_id": "W1-01",
+  "claimed_at": "2026-11-20T13:24:33Z",
+  "ended_at": "2026-11-20T13:25:53Z",
+  "final_state": "blocked",
+  "stop_code": "tests-unprovable",
+  "attempts": 2,
+  "counter_tests": {
+    "written": 0,
+    "dropped_uncompiled": 0,
+    "passed": 0,
+    "failed": 0,
+    "not_run": 0
+  },
+  "detail": "tests did not fail when implementation was reverted: feedUrl builds the dated endpoint, normaliseFeed maps the fixture, normaliseFeed rejects feeds without an image, fetchDay returns null on failure",
+  "named_tests": [
+    "feedUrl builds the dated endpoint",
+    "normaliseFeed maps the fixture",
+    "normaliseFeed rejects feeds without an image",
+    "fetchDay returns null on failure"
+  ]
+}

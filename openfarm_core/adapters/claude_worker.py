@@ -67,6 +67,8 @@ class ClaudeAcpWorkerBackend:
         self.forbidden_files = list(forbidden_files or ())
         self.effort = effort
         self.timeout_s = float(timeout_s)
+        # Set to a callable to receive the answer's text as it arrives.
+        self.on_chunk = None
         self.isolate_home = isolate_home
         self.auth_file = auth_file
         self.auth_mode = auth_mode
@@ -135,7 +137,8 @@ class ClaudeAcpWorkerBackend:
             effort=effort or self.effort, tool_policy="none",
             timeout_s=min(30.0, self.timeout_s))
         text = "\n\n".join(str(m.get("content", "")) for m in messages)
-        result = adapter.prompt(session_id, text, timeout_s=self.timeout_s)
+        stream = {"on_chunk": self.on_chunk} if self.on_chunk is not None else {}
+        result = adapter.prompt(session_id, text, timeout_s=self.timeout_s, **stream)
         if result.vendor_cost_usd > 0:
             cost = float(result.vendor_cost_usd)
         else:

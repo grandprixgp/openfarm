@@ -86,6 +86,15 @@ class Pack:
         """
         return ""
 
+    def try_it(self, worktree: Path) -> dict:
+        """How to start the finished app so a person can look at it.
+
+        `{"kind": "web", "start": [argv], "port_env": "PORT"}` for something that
+        serves pages, `{"kind": "cli", "sample": [argv]}` for a command-line tool,
+        and empty (the default) when the pack can't tell. `[try]` in the config wins.
+        """
+        return {}
+
     def gate_evidence(self, gate: str) -> dict:
         """What a gate's record should say about how this pack ran it.
 
