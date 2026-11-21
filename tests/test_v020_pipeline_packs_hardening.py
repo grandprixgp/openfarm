@@ -442,10 +442,13 @@ class MicromanagerHardeningTests(unittest.TestCase):
         self.assertFalse(valid_go_scaffold('func Add(a, b int) int { if false { panic("x") }; return 0 }\n'))
         # Valid panic-only stub accepted
         self.assertTrue(valid_go_scaffold('func Add(a, b int) int { panic("todo") }\n', require_panic_func=True))
-        # Pure type/interface Go contract accepted by scaffold, rejected by append_stub
+        # Pure type/interface/struct Go contracts (including func-type fields/aliases) accepted
         pure_iface = "package store\n\ntype Store interface {\n\tGet(id string) (string, error)\n}\n"
         self.assertTrue(valid_go_scaffold(pure_iface))
         self.assertFalse(valid_go_scaffold(pure_iface, require_panic_func=True))
+        self.assertTrue(valid_go_scaffold("package foo\ntype Fn func(int) error\n"))
+        self.assertTrue(valid_go_scaffold("package foo\ntype Opts struct {\n\tOnDone func(int) error\n\tNext func(int) func(string) error\n}\n"))
+        self.assertFalse(valid_go_scaffold("package foo\nvar F = func() int { return 1 }\n"))
 
         # GoPack.append_stub rejects comment bypass
         pack = GoPack()

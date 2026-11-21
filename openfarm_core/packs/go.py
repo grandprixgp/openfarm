@@ -554,7 +554,7 @@ def valid_go_scaffold(body: str, *, require_panic_func: bool = False) -> bool:
         idx = m.end()
         while idx < n and cleaned[idx] in " \t":
             idx += 1
-        # Optional method receiver: `func (r *T) Name(...)`
+        # Optional method receiver: `func (r *T) Name(...)` (only when Name is followed by `(`)
         if idx < n and cleaned[idx] == "(":
             close_r = _match_delim(cleaned, idx, "(", ")")
             if close_r < 0:
@@ -562,9 +562,19 @@ def valid_go_scaffold(body: str, *, require_panic_func: bool = False) -> bool:
             look = close_r + 1
             while look < n and cleaned[look] in " \t":
                 look += 1
-            # A receiver is followed by the method name; otherwise `(` was the parameter list itself.
-            if look < n and _GO_IDENT_RE.match(cleaned, look):
-                idx = look
+            recv_name = _GO_IDENT_RE.match(cleaned, look)
+            if recv_name and recv_name.group(0) != "func":
+                after = recv_name.end()
+                while after < n and cleaned[after] in " \t":
+                    after += 1
+                if after < n and cleaned[after] == "[":
+                    close_rt = _match_delim(cleaned, after, "[", "]")
+                    if close_rt >= 0:
+                        after = close_rt + 1
+                        while after < n and cleaned[after] in " \t":
+                            after += 1
+                if after < n and cleaned[after] == "(":
+                    idx = look
         # Optional function/method name and generic type params `[T any]`
         name_m = _GO_IDENT_RE.match(cleaned, idx)
         if name_m:
