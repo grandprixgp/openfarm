@@ -92,6 +92,7 @@ _LOOK = r"""
     const own = [...el.childNodes].filter((n) => n.nodeType === 3).map((n) => n.textContent.trim()).join('').length;
     if (own) ink.set(hex(rgb(s.color)), (ink.get(hex(rgb(s.color))) || 0) + own);
   }
+  if (!paper.size) paper.set('#ffffff', 1);  // nothing painted: the browser's own white page
   const most = (m, n) => [...m.entries()].sort((a, b) => b[1] - a[1]).slice(0, n).map((e) => e[0]);
   const colours = [...most(paper, 4).map((c) => ({ hex: c, use: 'background' })), ...most(ink, 3).map((c) => ({ hex: c, use: 'text' }))];
   return JSON.stringify({ named, readable, pictures, colours, title: document.title, text: document.body ? document.body.innerText.length : 0 });

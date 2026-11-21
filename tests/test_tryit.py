@@ -143,6 +143,9 @@ class TryItTests(_Project):
         self.assertIn(("#ffffff", "text"), colours)
         saved = json.loads((Path(self.cfg.state_dir) / "tryit" / "C1" / "result.json").read_text())
         self.assertEqual(saved["colours"], result["colours"])
+        self._serve("<!doctype html><title>t</title><h1 id='title'>Plain</h1><p id='story'>s</p><small id='credit'>c</small>")
+        plain = try_it(self.root, self.cfg, GOAL)["colours"]  # a page that paints nothing sits on the browser's white
+        self.assertEqual(plain, [{"hex": "#ffffff", "use": "background"}, {"hex": "#000000", "use": "text"}])
 
     @unittest.skipUnless(find_browser(), "no headless browser on this machine")
     def test_a_page_error_is_reported(self) -> None:
