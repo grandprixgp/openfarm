@@ -25,7 +25,6 @@ import dataclasses
 import os
 import pwd
 import shutil
-import stat
 import subprocess
 import threading
 from pathlib import Path
@@ -862,13 +861,6 @@ def _dedupe_links(links: list[tuple[str, str]]) -> list[tuple[str, str]]:
         seen.add(path)
         out.append((target, path))
     return out
-
-
-def is_regular_file(path: Path) -> bool:
-    try:
-        return stat.S_ISREG(os.lstat(path).st_mode)
-    except OSError:
-        return False
 
 
 # -- the bridges' side ------------------------------------------------------------

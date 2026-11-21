@@ -9,13 +9,9 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import shutil
-import signal
-import subprocess
 import sys
-import threading
 import uuid
 from pathlib import Path
 
@@ -24,16 +20,18 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from openfarm_core import confine as confine_lib
-from openfarm_core.spawn import popen_with_retry
+from openfarm_core.adapters.native_acp_base import (
+    PROTOCOL_VERSION,
+    BaseNativeAcpServer,
+    extract_prompt_text as _extract_prompt_text,
+)
 
-PROTOCOL_VERSION = 1
 _AUTH_HINT_RE = re.compile(
     r"not logged in|please run.*login|codex login|authentication_failed|"
     r"authentication required|not authenticated|invalid api key|incorrect api key|"
     r"invalid bearer token|unauthorized|\b401\b|missing.*auth",
     re.IGNORECASE,
 )
-
 
 #: The instructions a lean session gets when openfarm sends no system prompt.
 LEAN_INSTRUCTIONS = (
@@ -68,19 +66,6 @@ def lean_codex_args(system_prompt: str) -> list[str]:
 
 def _is_auth_failure(text: str) -> bool:
     return bool(_AUTH_HINT_RE.search(str(text or "")))
-
-
-def _extract_prompt_text(prompt_items: object) -> str:
-    parts: list[str] = []
-    if isinstance(prompt_items, list):
-        for item in prompt_items:
-            if isinstance(item, dict) and "text" in item:
-                parts.append(str(item.get("text") or ""))
-            elif isinstance(item, str):
-                parts.append(item)
-    elif isinstance(prompt_items, str):
-        parts.append(prompt_items)
-    return "\n".join(parts)
 
 
 def _extract_agent_message_text(item: dict) -> str:
@@ -162,88 +147,31 @@ def _parse_codex_ndjson(stdout_text: str) -> tuple[str, int, int, float, str, bo
     return ("\n".join(messages), tokens_in, tokens_out, cost_usd, "; ".join(error_msgs), saw_event)
 
 
-class NativeCodexAcpServer:
+class NativeCodexAcpServer(BaseNativeAcpServer):
     """Minimal single-client NDJSON-RPC 2.0 ACP v1 bridge backed by ``codex exec``."""
 
+    CAPABILITY_KEY = "nativeCodexCli"
+    CLI_NAME = "codex"
+    AUTH_HINT_RE = _AUTH_HINT_RE
+    ACCEPTED_AUTH_METHODS = ("oauth", "chatgpt", "api-key", "api_key")
+    AUTH_METHODS = (
+        {
+            "id": "oauth",
+            "name": "Codex OAuth",
+            "type": "oauth",
+            "description": "Use local `codex login` credentials",
+        },
+        {
+            "id": "api-key",
+            "name": "OpenAI API Key",
+            "type": "api_key",
+            "description": "Use OPENAI_API_KEY env",
+        },
+    )
+
     def __init__(self, codex_bin: str = "codex") -> None:
-        self.codex_bin = str(codex_bin or "codex")
-        self._write_lock = threading.Lock()
-        self._proc_lock = threading.Lock()
-        self._active_procs: dict[str, subprocess.Popen[bytes]] = {}
-        self._cancelled_sessions: set[str] = set()
-        self._sessions: dict[str, dict] = {}
-        self._initialized = False
-
-    def send(self, payload: dict) -> None:
-        line = json.dumps(payload, separators=(",", ":"), ensure_ascii=False) + "\n"
-        with self._write_lock:
-            sys.stdout.write(line)
-            sys.stdout.flush()
-
-    def _send_result(self, req_id: object, result: dict) -> None:
-        if req_id is not None:
-            self.send({"jsonrpc": "2.0", "id": req_id, "result": result})
-
-    def _send_error(
-        self, req_id: object, code: int, message: str, *, data: dict | None = None
-    ) -> None:
-        if req_id is None:
-            return
-        err: dict = {"code": code, "message": str(message)}
-        if data is not None:
-            err["data"] = data
-        self.send({"jsonrpc": "2.0", "id": req_id, "error": err})
-
-    def _terminate_session_proc(self, session_id: str) -> None:
-        with self._proc_lock:
-            self._cancelled_sessions.add(session_id)
-            proc = self._active_procs.get(session_id)
-        # The child leads its own process group: end the whole group, so the
-        # commands it started do not outlive a cancelled or timed-out turn.
-        confine_lib.end_process_group(proc)
-
-    def end_all(self) -> None:
-        """End every running child's process group (on close or SIGTERM)."""
-        with self._proc_lock:
-            procs = list(self._active_procs.items())
-        for sid, _proc in procs:
-            self._terminate_session_proc(sid)
-
-    def _handle_initialize(self, req_id: object) -> None:
-        self._initialized = True
-        self._send_result(
-            req_id,
-            {
-                "protocolVersion": PROTOCOL_VERSION,
-                "agentCapabilities": {
-                    "loadSession": False,
-                    "nativeCodexCli": True,
-                },
-                "authMethods": [
-                    {
-                        "id": "oauth",
-                        "name": "Codex OAuth",
-                        "type": "oauth",
-                        "description": "Use local `codex login` credentials",
-                    },
-                    {
-                        "id": "api-key",
-                        "name": "OpenAI API Key",
-                        "type": "api_key",
-                        "description": "Use OPENAI_API_KEY env",
-                    },
-                ],
-            },
-        )
-
-    def _handle_authenticate(self, req_id: object, params: dict) -> None:
-        method_id = str(
-            params.get("methodId") or params.get("method") or "oauth"
-        ).strip().lower()
-        if method_id not in ("oauth", "chatgpt", "api-key", "api_key"):
-            self._send_error(req_id, -32602, f"Unsupported auth method: {method_id!r}")
-            return
-        self._send_result(req_id, {"authenticated": True, "methodId": method_id})
+        super().__init__(cli_bin=codex_bin or "codex")
+        self.codex_bin = self._cli_bin
 
     def _handle_new_session(self, req_id: object, params: dict) -> None:
         cwd = str(params.get("cwd") or Path.cwd())
@@ -273,7 +201,9 @@ class NativeCodexAcpServer:
         hold = confine_lib.bridge_plan("codex", tool_policy, confine_meta)
         if hold.refused:
             self._send_error(
-                req_id, -32001, hold.refused,
+                req_id,
+                -32001,
+                hold.refused,
                 data={"kind": "refused", "code": "acp-confine-unavailable"},
             )
             return
@@ -326,219 +256,55 @@ class NativeCodexAcpServer:
         if hold is None:
             return argv
         return confine_lib.bridge_child_argv(
-            argv, hold, session.get("confine_meta"), session_dir=session["cwd"])
+            argv, hold, session.get("confine_meta"), session_dir=session["cwd"]
+        )
 
-    def _run_prompt(self, req_id: object, params: dict) -> None:
-        sid = str(params.get("sessionId") or "")
-        session = self._sessions.get(sid)
-        if session is None:
-            self._send_error(req_id, -32602, f"Unknown sessionId: {sid!r}")
-            return
-
-        prompt_text = _extract_prompt_text(params.get("prompt") or [])
+    def _prepare_prompt(
+        self, req_id: object, session: dict, prompt_text: str
+    ) -> tuple[list[str], bytes]:
         # A lean session carries the system prompt as Codex's own instructions.
         sys_prompt = "" if session.get("lean_prompt") else session["system_prompt"]
         if sys_prompt and prompt_text:
             full_prompt = f"{sys_prompt}\n\n{prompt_text}"
         else:
             full_prompt = sys_prompt or prompt_text
+        return self._child_argv(session), full_prompt.encode("utf-8")
 
-        with self._proc_lock:
-            self._cancelled_sessions.discard(sid)
-
-        try:
-            argv = self._child_argv(session)
-        except confine_lib.ConfineError as exc:
-            self._send_error(
-                req_id, -32001, exc.message,
-                data={"kind": "refused", "code": "acp-confine-unavailable"},
-            )
-            return
-        try:
-            # A CLI mid-update is missing for a moment: try again (v0.8.5).
-            proc = popen_with_retry(
-                argv,
-                cwd=session["cwd"],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                start_new_session=True,
-            )
-        except OSError as exc:
-            self._send_error(req_id, -32603, f"Failed to spawn {self.codex_bin}: {exc}")
-            return
-
-        with self._proc_lock:
-            self._active_procs[sid] = proc
-            already_cancelled = sid in self._cancelled_sessions
-        if already_cancelled:
-            self._terminate_session_proc(sid)
-
-        try:
-            stdout_b, stderr_b = proc.communicate(input=full_prompt.encode("utf-8"))
-        finally:
-            with self._proc_lock:
-                self._active_procs.pop(sid, None)
-
-        with self._proc_lock:
-            was_cancelled = sid in self._cancelled_sessions
-            self._cancelled_sessions.discard(sid)
-        if was_cancelled:
-            self._send_result(req_id, {"stopReason": "cancelled"})
-            return
-
-        stdout_text = stdout_b.decode("utf-8", errors="replace").strip()
-        stderr_text = stderr_b.decode("utf-8", errors="replace").strip()
+    def _process_prompt_output(
+        self,
+        req_id: object,
+        sid: str,
+        session: dict,
+        returncode: int | None,
+        stdout_text: str,
+        stderr_text: str,
+    ) -> None:
         result_text, tokens_in, tokens_out, turn_cost, evt_err, saw_event = _parse_codex_ndjson(
             stdout_text
         )
 
-        if evt_err or proc.returncode != 0 or (not saw_event and not result_text):
+        if evt_err or returncode != 0 or (not saw_event and not result_text):
             err_msg = (
                 evt_err
                 or stderr_text
                 or stdout_text
-                or f"codex exited with code {proc.returncode}"
+                or f"codex exited with code {returncode}"
             )
-            if _is_auth_failure(err_msg + "\n" + stderr_text):
-                self._send_error(
-                    req_id,
-                    -32001,
-                    err_msg,
-                    data={
-                        "kind": "refused",
-                        "code": "acp-auth-required",
-                        "errorKind": "authentication_failed",
-                    },
-                )
+            if self._is_auth_failure(err_msg + "\n" + stderr_text):
+                self._send_auth_error(req_id, err_msg)
             else:
                 self._send_error(req_id, -32603, err_msg)
             return
 
-        session["used_tokens"] += tokens_in + tokens_out
-        session["cum_cost"] += turn_cost
-
-        self.send(
-            {
-                "jsonrpc": "2.0",
-                "method": "session/update",
-                "params": {
-                    "sessionId": sid,
-                    "update": {
-                        "sessionUpdate": "agent_message_chunk",
-                        "content": {"type": "text", "text": result_text},
-                    },
-                },
-            }
-        )
-        self.send(
-            {
-                "jsonrpc": "2.0",
-                "method": "session/update",
-                "params": {
-                    "sessionId": sid,
-                    "update": {
-                        "sessionUpdate": "usage_update",
-                        "inputTokens": tokens_in,
-                        "outputTokens": tokens_out,
-                        "used": session["used_tokens"],
-                        "size": 200_000,
-                        "cost": {"amount": session["cum_cost"], "currency": "USD"},
-                    },
-                },
-            }
-        )
-        self._send_result(
+        self._emit_prompt_success(
             req_id,
-            {
-                "stopReason": "end_turn",
-                "usage": {
-                    "inputTokens": tokens_in,
-                    "outputTokens": tokens_out,
-                },
-            },
+            sid,
+            session,
+            result_text,
+            tokens_in,
+            tokens_out,
+            turn_cost,
         )
-
-    def serve(self) -> int:
-        prompt_threads: list[threading.Thread] = []
-        _end_children_on_sigterm(self)
-        try:
-            while True:
-                raw = sys.stdin.readline()
-                if not raw:
-                    break
-                line = raw.strip()
-                if not line:
-                    continue
-                try:
-                    msg = json.loads(line)
-                except ValueError:
-                    continue
-                if not isinstance(msg, dict):
-                    continue
-                method = msg.get("method")
-                req_id = msg.get("id")
-                params = msg.get("params")
-                if not isinstance(params, dict):
-                    params = {}
-
-                if method == "initialize":
-                    self._handle_initialize(req_id)
-                elif method == "authenticate":
-                    self._handle_authenticate(req_id, params)
-                elif method == "session/new":
-                    self._handle_new_session(req_id, params)
-                elif method == "session/prompt":
-                    th = threading.Thread(
-                        target=self._run_prompt,
-                        args=(req_id, params),
-                        daemon=True,
-                    )
-                    th.start()
-                    prompt_threads.append(th)
-                elif method == "session/cancel":
-                    sid = str(params.get("sessionId") or "")
-                    if sid:
-                        self._terminate_session_proc(sid)
-                elif method == "session/close":
-                    sid = str(params.get("sessionId") or "")
-                    if sid:
-                        self._terminate_session_proc(sid)
-                        self._sessions.pop(sid, None)
-                    else:
-                        for active_sid in list(self._sessions):
-                            self._terminate_session_proc(active_sid)
-                        self._sessions.clear()
-                    self._send_result(req_id, {})
-                    break
-                else:
-                    self._send_error(req_id, -32601, f"Method not found: {method}")
-        finally:
-            self.end_all()
-            for th in prompt_threads:
-                if th.is_alive():
-                    th.join(timeout=1.0)
-        return 0
-
-
-def _end_children_on_sigterm(server) -> None:
-    """On SIGTERM (the adapter ending this bridge's group), end the CLI children too.
-
-    Each child leads its own process group, so killing the bridge's group alone
-    would leave them, and what they started, running.
-    """
-    if threading.current_thread() is not threading.main_thread():
-        return
-
-    def _handler(signum, _frame):
-        server.end_all()
-        os._exit(128 + signum)
-
-    try:
-        signal.signal(signal.SIGTERM, _handler)
-        signal.signal(signal.SIGHUP, _handler)
-    except (ValueError, OSError):
-        pass
 
 
 def main(argv: list[str] | None = None) -> int:

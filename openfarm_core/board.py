@@ -15,14 +15,18 @@ import fcntl
 import json
 import os
 import re
-import tempfile
 import threading
 import time
 from pathlib import Path
 
 from .errors import Infra, Refused
 from .harness_memory import sanitize_lesson_text
-from .state import StateDir, utc_now
+from .state import (
+    StateDir,
+    atomic_write_text as _atomic_write_text,
+    utc_now,
+    write_json as _atomic_write_json,
+)
 
 VALID_MEMBER_KINDS: tuple[str, ...] = ("api", "acp", "code", "external", "scripted")
 VALID_ROLES: tuple[str, ...] = (
@@ -158,30 +162,6 @@ def board_dir_for(state_dir: StateDir | Path | str, run_id: str) -> Path:
     """Return ``<state_dir>/runs/<run_id>/board`` with safe run-id validation."""
     sd = state_dir if isinstance(state_dir, StateDir) else StateDir(Path(state_dir))
     return sd.run_dir(run_id) / "board"
-
-
-def _atomic_write_text(path: Path, text: str) -> Path:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
-    )
-    tmp_path = Path(tmp_name)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(text)
-            handle.flush()
-        os.replace(tmp_path, path)
-    except Exception:
-        tmp_path.unlink(missing_ok=True)
-        raise
-    return path
-
-
-def _atomic_write_json(path: Path, payload: object) -> Path:
-    return _atomic_write_text(
-        path, json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
-    )
 
 
 def _matches_type(value: object, expected: object) -> bool:
@@ -579,28 +559,6 @@ class Board:
         self._ensure_unlocked()
         _atomic_write_json(self.members_path, members)
         return {k: dict(v) for k, v in members.items()}
-
-    def save_members(self, members: dict[str, dict]) -> dict[str, dict]:
-        if not isinstance(members, dict):
-            raise Refused("bad-members", "members roster must be a mapping")
-        cleaned: dict[str, dict] = {}
-        for key, raw in members.items():
-            if not isinstance(raw, dict):
-                raise Refused("bad-members", f"member entry {key!r} must be a mapping")
-            name = _validate_member_name(key)
-            entry = dict(raw)
-            entry["name"] = name
-            _validate_member_fields(
-                kind=entry.get("kind"),
-                role=entry.get("role"),
-                state=entry.get("state", "active"),
-                owner_kind=entry.get("owner_kind", ""),
-            )
-            if "role" in entry:
-                entry["role"] = normalize_role(entry["role"])
-            cleaned[name] = entry
-        with self._locked():
-            return self._save_members_unlocked(cleaned)
 
     def upsert_member(
         self,

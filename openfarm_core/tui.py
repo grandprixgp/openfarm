@@ -39,6 +39,16 @@ from .state import StateDir, _safe_id, read_json
 from .swarm import cards_collide
 
 VIEWS = ("overview", "cards", "dossier", "board", "swarm", "harness", "ops")
+TEXTUAL_VIEWS = ("studio", "review", "projects", "findings", "engine", "providers")
+CLI_VIEWS = VIEWS + TEXTUAL_VIEWS
+_CURSES_VIEW_FALLBACK = {
+    "studio": "overview",
+    "projects": "overview",
+    "providers": "ops",
+    "review": "cards",
+    "findings": "harness",
+    "engine": "ops",
+}
 VIEW_LABELS = {
     "overview": "Overview",
     "cards": "Cards",
@@ -4911,13 +4921,14 @@ def run_tui(
     **kwargs,
 ) -> int:
     """Launch interactive TUI (Textual when installed, stdlib curses fallback), or render snapshot."""
-    if view not in VIEWS:
-        raise UsageError(f"unknown view {view!r}; choose from {', '.join(VIEWS)}")
+    if view not in CLI_VIEWS:
+        raise UsageError(f"unknown view {view!r}; choose from {', '.join(CLI_VIEWS)}")
+    curses_view = _CURSES_VIEW_FALLBACK.get(view, view)
     if once:
         rendered = render_snapshot(
             repo,
             config_path=config_path,
-            view=view,
+            view=curses_view,
             run_id=run_id,
             as_json=json_output,
             **kwargs,
@@ -4943,7 +4954,7 @@ def run_tui(
         repo,
         config_path=config_path,
         run_id=run_id,
-        view=view,
+        view=curses_view,
         refresh_s=refresh_s,
     )
     try:

@@ -68,11 +68,6 @@ def utc_after(seconds: float) -> str:
     return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def parse_time(text: str) -> _dt.datetime:
-    return _dt.datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(
-        tzinfo=_dt.timezone.utc)
-
-
 class StateDir:
     """The state folder, and the names of everything in it."""
 
@@ -440,10 +435,9 @@ def _safe(name: str) -> str:
     return cleaned.strip("-") or "unit"
 
 
-def write_json(path: Path, payload) -> Path:
+def atomic_write_text(path: Path, text: str) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    text = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
     fd, tmp_name = tempfile.mkstemp(
         prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
     )
@@ -458,6 +452,12 @@ def write_json(path: Path, payload) -> Path:
             tmp_path.unlink(missing_ok=True)
         raise
     return path
+
+
+def write_json(path: Path, payload) -> Path:
+    return atomic_write_text(
+        path, json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+    )
 
 
 def read_json(path: Path, default=None):

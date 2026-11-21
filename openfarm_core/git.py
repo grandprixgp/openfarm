@@ -289,11 +289,6 @@ class Git:
                 self._run(["diff", "--name-only", "--cached"]).stdout.splitlines()
                 if line.strip()]
 
-    def unstaged_changes(self) -> list[str]:
-        """Tracked files whose unstaged content differs from the index."""
-        return [line.strip() for line in self._run(["diff", "--name-only"]).stdout.splitlines()
-                if line.strip()]
-
     def has_staged_changes(self) -> bool:
         return self._run(["diff", "--cached", "--quiet"], check=False).returncode == 1
 
@@ -312,9 +307,6 @@ class Git:
             if not self.has_staged_changes():
                 return self.head()
             return self.commit(message)
-
-    def merge_base(self, other: str) -> str:
-        return self._run(["merge-base", "HEAD", other]).stdout.strip()
 
     def count_commits(self, spec: str, base: str = "HEAD") -> int:
         result = self._run(["rev-list", "--count", f"{base}..{spec}"], check=False)

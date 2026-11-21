@@ -476,13 +476,6 @@ def _stage_one(edit: Edit, target: Path, current: str | None,
     raise Invalid("bad-format", f"{edit.format!r} is not an edit format")
 
 
-def _apply_one(edit: Edit, target: Path) -> None:
-    current = target.read_text() if target.exists() else None
-    content = _stage_one(edit, target, current, None)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(content)
-
-
 def _is_additions_only(before: str, after: str) -> bool:
     """True when every line of `before` survives, in order, and nothing else changed."""
     before_lines = before.splitlines()

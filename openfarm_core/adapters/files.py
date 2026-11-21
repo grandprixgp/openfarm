@@ -828,13 +828,6 @@ class FileCardSource:
                 Git(self.worktree).commit_all(f"{card.id}: add")
             return path
 
-    def delete_card(self, card_id: str) -> None:
-        with self._lock:
-            path = self._path(card_id)
-            if path.exists():
-                path.unlink()
-                Git(self.worktree).commit_all(f"{card_id}: remove")
-
 
 def _holder(raw: dict) -> str:
     return str(raw.get("holder", "") or "")

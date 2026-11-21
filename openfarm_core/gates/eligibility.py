@@ -432,10 +432,6 @@ def _is_python_test_file(path: str) -> bool:
         and name.endswith(".py")
 
 
-def is_eligible(card: Card, cfg, **kwargs) -> bool:
-    return check_eligibility(card, cfg, **kwargs).ok
-
-
 def file_is_blocked(path: str, cfg) -> str | None:
     """Why a path may not be touched, or None. Shared by every attempt's check."""
     pattern = first_match(path, cfg.never_touch)
@@ -444,7 +440,3 @@ def file_is_blocked(path: str, cfg) -> str | None:
     if matches_any(path, cfg.forbidden_files):
         return "a forbidden path"
     return None
-
-
-def card_hash_matches(card: Card, source_hash: str) -> bool:
-    return card.hash() == source_hash

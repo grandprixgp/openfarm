@@ -8,7 +8,6 @@ continue smoothly after closing the TUI or SSH terminal, logging to
 from __future__ import annotations
 
 import contextlib
-import datetime as _dt
 import fcntl
 import json
 import os
@@ -20,11 +19,14 @@ from pathlib import Path
 
 from .config import CONFIG_PATH, load_config
 from .errors import ConfigError, Refused
-from .state import StateDir, holder_provably_gone, process_identity, write_json
-
-
-def _utc_now() -> str:
-    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+from .state import (
+    StateDir,
+    _pid_alive as _state_pid_alive,
+    holder_provably_gone,
+    process_identity,
+    utc_now as _utc_now,
+    write_json,
+)
 
 
 def _pid_alive(pid: int) -> bool:
@@ -35,24 +37,7 @@ def _pid_alive(pid: int) -> bool:
         reaped, _ = os.waitpid(pid, os.WNOHANG)
         if reaped == pid:
             return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    stat_path = Path(f"/proc/{pid}/stat")
-    if stat_path.is_file():
-        with contextlib.suppress(OSError):
-            raw = stat_path.read_text(encoding="utf-8", errors="replace")
-            rparen = raw.rfind(")")
-            if rparen != -1:
-                fields = raw[rparen + 2 :].split()
-                if fields and fields[0] == "Z":
-                    return False
-    return True
+    return _state_pid_alive(pid)
 
 
 def _daemon_is_running(meta: dict) -> bool:

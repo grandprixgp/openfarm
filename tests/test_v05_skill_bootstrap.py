@@ -591,6 +591,14 @@ class SkillBundleParityTests(unittest.TestCase):
             (assets_root / "plugin" / "plugin.json").read_text(encoding="utf-8")
         )
         self.assertEqual(plugin.get("name"), "openfarm")
+        version_tag = f"v{openfarm_core.__version__}"
+        self.assertIn(version_tag, plugin.get("description", ""))
+        self.assertIn(version_tag, (ROOT / "SKILL.md").read_text(encoding="utf-8"))
+        for skill_name in ("openfarm-grill-me", "openfarm-initialize", "openfarm"):
+            self.assertIn(
+                version_tag,
+                (assets_root / "skills" / skill_name / "SKILL.md").read_text(encoding="utf-8"),
+            )
         rules_text = (assets_root / "plugin" / "rules" / "AGENTS.md").read_text(
             encoding="utf-8"
         )

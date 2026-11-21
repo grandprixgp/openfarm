@@ -15,7 +15,6 @@ import json
 import math
 import os
 import re
-import tempfile
 import threading
 import unicodedata
 from pathlib import Path
@@ -25,7 +24,14 @@ from .errors import AdapterError, Invalid, Refused, Unsupported
 from .globs import escapes, matches_any, normalise
 from .harness_global import GlobalLibrary, should_promote, should_veto
 from .harness_scope import global_eligibility, scope_of
-from .state import _safe_id, append_jsonl, read_json, utc_now
+from .state import (
+    _safe_id,
+    append_jsonl,
+    atomic_write_text as _atomic_write_text,
+    read_json,
+    utc_now,
+    write_json as _atomic_write_json,
+)
 
 _HARNESS_LOCKS_GUARD = threading.Lock()
 _HARNESS_LOCKS: dict[Path, threading.RLock] = {}
@@ -297,29 +303,6 @@ def _strip_unicode_noise(text: str) -> str:
 def _normalize_for_scan(text: str) -> str:
     """Normalize text and fold Cyrillic/Greek homoglyphs before security scanning."""
     return _strip_unicode_noise(text).translate(_HOMOGLYPH_MAP)
-
-
-def _atomic_write_text(path: Path, text: str) -> Path:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
-    )
-    tmp_path = Path(tmp_name)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(text)
-        tmp_path.replace(path)
-    except Exception:
-        tmp_path.unlink(missing_ok=True)
-        raise
-    return path
-
-
-def _atomic_write_json(path: Path, payload: object) -> Path:
-    return _atomic_write_text(
-        path, json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
-    )
 
 
 def sanitize_lesson_text(text: str, *, max_len: int = 600) -> str:

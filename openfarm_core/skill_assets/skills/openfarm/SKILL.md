@@ -1,7 +1,7 @@
 ---
 name: openfarm
 description: >-
-  Operate an initialized Openfarm v0.9.2 project across card waves: manage
+  Operate an initialized Openfarm v0.20.0 project across card waves: manage
   multi-provider Frontier ACP OAuth setup (Claude, Antigravity agy, Codex via
   openfarm acp), run automated Driver mode (openfarm drive), clarify feature
   waves with openfarm-grill-me, prepare queues with openfarm supervise, execute
@@ -10,7 +10,7 @@ description: >-
   <state_dir>/harness/ recursive memory.
 ---
 
-# Openfarm Wave Operations Skill (`v0.9.2`)
+# Openfarm Wave Operations Skill (`v0.20.0`)
 
 ## Steps and words (the same in the TUI, the CLI and here)
 
