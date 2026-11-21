@@ -36,7 +36,8 @@ CHECKS = ("scaffold", "touches", "depends", "seams", "network", "guards", "froze
 _CODE = re.compile(r"`([^`\n]+)`")
 _TS_FUNCTION = re.compile(r"^(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)\s*[(<]")
 _PY_FUNCTION = re.compile(r"^(?:async\s+)?def\s+([A-Za-z_]\w*)\s*\(")
-_PATH = re.compile(r"^(?:[\w.@-]+/)+[\w.@-]+\.[A-Za-z0-9]{1,5}$")
+# a file name ends in an extension with a letter in it: `onthisday/0.1` is a user-agent, not a file
+_PATH = re.compile(r"^(?:[\w.@-]+/)+[\w.@-]+\.(?![0-9]+$)[A-Za-z0-9]{1,5}$")
 _ID_SELECTOR = re.compile(r"(?<![&/])#([A-Za-z][\w-]*)")
 _HEX_COLOUR = re.compile(r"(?:[0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})")
 _CLASS_SELECTOR = re.compile(r"(?:^|[\s,>+~])\.([A-Za-z][\w-]*)")

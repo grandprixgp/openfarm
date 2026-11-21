@@ -58,6 +58,15 @@ class DogfoodCardsTests(unittest.TestCase):
         again = check_card(card_from(header, body), _cfg(), self.root, list(self.cards.values()))
         self.assertEqual(next(c for c in again if c["check"] == "scaffold")["status"], "pass")
 
+    def test_a_version_string_is_not_a_file(self) -> None:
+        # the v0.20 live run: a user-agent `onthisday/0.1` was added to the files a task may write
+        from types import SimpleNamespace
+
+        from openfarm_core.preflight import named_files
+
+        card = SimpleNamespace(done_text="Send `onthisday/0.1` as the User-Agent from `src/wiki.ts`, see `docs/v2/notes.md`.")
+        self.assertEqual(named_files(card), ["src/wiki.ts", "docs/v2/notes.md"])
+
     def test_the_files_the_text_names_must_be_in_touches(self) -> None:
         touches = self._checks("W1-04")["touches"]
         self.assertEqual(touches["status"], "fail")
