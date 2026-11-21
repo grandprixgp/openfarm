@@ -79,6 +79,9 @@ CHECKS = [  # the plan checks, in the words the Plan screen uses
     ("touches", "Every file a task names is one it may touch"),
     ("depends", "The order works: nothing waits on a task that comes later"),
     ("seams", "Shared pieces agree: files that must match name the same things"),
+    ("network", "A task that needs the network says so"),
+    ("guards", "Every test a task lists is new, so it can fail before the code is written"),
+    ("frozen", "No task changes what an existing test checks without leave to change that test"),
     ("rules", "Every task is small and exact enough to build"),
 ]
 STOPPED = {"task": "the task is wrong, not the code", "builder": "the builder fell short, the task is sound",

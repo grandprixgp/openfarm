@@ -1,6 +1,6 @@
 """Plan preflight: check a card with the rules that will judge it, before anyone builds it.
 
-Four cheap, deterministic checks, each run when a plan is drafted and again on
+Cheap, deterministic checks, each run when a plan is drafted and again on
 every card change:
 
 - `scaffold`: every function signature the card's text names can be written as a
@@ -10,6 +10,13 @@ every card change:
 - `depends`: the cards it waits for exist, can finish, and don't wait for it.
 - `seams`: where one card serves a page and another styles it, the stylesheet
   card quotes the page's element ids exactly.
+- `network`: a card whose text asks for network code says so with `network = true`,
+  because the build refuses network code from any other card.
+- `guards`: no test the card lists to be written is in the project already. Such a
+  test passes before any code is written, and the build wants each listed test to
+  fail first.
+- `frozen`: a card that renames, moves or removes something an existing test checks
+  lists that test file in `test_edits`, because the builder may not change it otherwise.
 
 `rules` is the existing eligibility check, so one list holds every reason a card
 can't be built. A check that can be put right without changing what the card
@@ -24,7 +31,7 @@ from pathlib import Path
 from .cards import Card
 from .globs import matches_any
 
-CHECKS = ("scaffold", "touches", "depends", "seams", "rules")
+CHECKS = ("scaffold", "touches", "depends", "seams", "network", "guards", "frozen", "rules")
 
 _CODE = re.compile(r"`([^`\n]+)`")
 _TS_FUNCTION = re.compile(r"^(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)\s*[(<]")
@@ -283,6 +290,129 @@ def _check_seams(card: Card, by_id: dict[str, Card]) -> dict:
     return _result("seams", problems)
 
 
+# -- network -------------------------------------------------------------------
+
+#: What a card's text says when the code it asks for reaches the network: the calls the build's rule refuses, and
+#: the plain words for them.
+_NETWORK = re.compile(
+    r"\bfetch(?:es|ed|ing)?\b|node:(?:https?|http2|net|dgram|tls|dns)\b|\bcreateServer\b|\bXMLHttpRequest\b|\bWebSocket\b"
+    r"|\bEventSource\b|\bundici\b|\burllib\b|\brequests\.(?:get|post|put|request)\b|\bhttpx\b|\baiohttp\b"
+    r"|\bhttp\.(?:server|client)\b|\bsocket\b|\bnet/http\b|\bListenAndServe\b|\breqwest\b|\bTcp(?:Stream|Listener)\b"
+    r"|\bstd::net\b|\bHTTP server\b|\bweb server\b|\blistens? on (?:a |the )?port\b|\bprox(?:y|ies) (?:the|a|to|for)\b",
+    re.IGNORECASE)
+
+
+def _check_network(card: Card) -> dict:
+    if card.network:
+        return _result("network", [])
+    said = []
+    for found in _NETWORK.finditer(f"{card.title}\n{card.done_text or ''}"):
+        word = found.group(0)
+        if word.lower() not in [w.lower() for w in said]:
+            said.append(word)
+    if not said:
+        return _result("network", [])
+    words = ", ".join(f"`{w}`" for w in said[:3])
+    return _result("network", [f"the text asks for network code ({words}) and the task is not marked `network = true`"],
+                   {"header": {"network": True},
+                    "notes": [f"marked as allowed to use the network, because its text asks for {words}"]})
+
+
+# -- guards --------------------------------------------------------------------
+
+
+def _test_exists(root: Path, file: str, name: str) -> bool:
+    path = root / file
+    if not name or not path.is_file() or not _really_exists(path):
+        return False
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return any(quote + name + quote in text for quote in "'\"`") or bool(
+        re.search(rf"\b(?:def|fn|func)\s+{re.escape(name)}\b", text))
+
+
+def _check_guards(card: Card, root: Path) -> dict:
+    entries = [e for e in card.fields.get("tests", []) or [] if isinstance(e, dict)]
+    there = [e for e in entries if str(e.get("file") or "") not in card.test_edits
+             and _test_exists(root, str(e.get("file") or ""), str(e.get("name") or ""))]
+    if not there:
+        return _result("guards", [])
+    names = ", ".join(f"`{e.get('name')}`" for e in there)
+    left = [e for e in entries if e not in there]
+    problems = [f"it lists {names} as a test to write, but that test is in the project already and passes, "
+                "so it can never fail first"]
+    fix = {"header": {"tests": left},
+           "notes": [f"took {names} off the tests to write: already in the project, and it still has to keep passing"]}
+    return _result("guards", problems, fix if left else None)
+
+
+# -- frozen ----------------------------------------------------------------------
+
+_CHANGES = re.compile(r"\b(renam\w+|mov(?:e|es|ed|ing)|remov\w+|delet\w+|drop(?:s|ped|ping)?|no longer)\b", re.IGNORECASE)
+_SKIP_DIRS = {"node_modules", "target", "dist", "build", "vendor", "__pycache__"}
+
+
+def _existing_tests(root: Path, limit: int = 400) -> list[str]:
+    out: list[str] = []
+    stack = [root]
+    while stack and len(out) < limit:
+        folder = stack.pop()
+        try:
+            children = sorted(folder.iterdir())
+        except OSError:
+            continue
+        for child in children:
+            if child.name.startswith(".") or child.name in _SKIP_DIRS or child.is_symlink():
+                continue
+            if child.is_dir():
+                stack.append(child)
+            elif _is_test_path(child.relative_to(root).as_posix()) and child.stat().st_size < 400_000:
+                out.append(child.relative_to(root).as_posix())
+    return sorted(out)
+
+
+def _spellings(span: str) -> list[str]:
+    """The ways a test would write the thing a card names: `#hero` is also `id="hero"`."""
+    span = span.strip()
+    found = re.fullmatch(r"""#([A-Za-z][\w-]*)|id=["']([A-Za-z][\w-]*)["']""", span)
+    if found:
+        name = found.group(1) or found.group(2)
+        return [f'id="{name}"', f"id='{name}'", f'id=\\"{name}\\"', f"#{name}"]
+    return [span] if len(span) >= 4 and not _PATH.match(span) else []
+
+
+def _check_frozen(card: Card, root: Path) -> dict:
+    changed: list[str] = []
+    for line in (card.done_text or "").splitlines():
+        if _CHANGES.search(line):
+            changed += [span for span in _CODE.findall(line) if span not in changed and _spellings(span)]
+    if not changed:
+        return _result("frozen", [])
+    listed = {str(e.get("file") or "") for e in card.fields.get("tests", []) or [] if isinstance(e, dict)}
+    hits: dict[str, str] = {}
+    for rel in _existing_tests(root):
+        if rel in card.test_edits or (rel in listed and not _really_exists(root / rel)):
+            continue
+        try:
+            text = (root / rel).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        span = next((s for s in changed if any(way in text for way in _spellings(s))), None)
+        if span:
+            hits[rel] = span
+    if not hits:
+        return _result("frozen", [])
+    problems = [f"the text renames, moves or removes `{span}`, which the existing test `{rel}` checks, and the builder "
+                "may not change that test" for rel, span in hits.items()]
+    fix = {"header": {"test_edits": [*card.test_edits, *hits],
+                      "touches": [*card.touches, *[rel for rel in hits if not matches_any(rel, list(card.touches))]]},
+           "notes": [f"may change the existing test `{rel}`, because the task changes `{span}`, which that test checks"
+                     for rel, span in hits.items()]}
+    return _result("frozen", problems, fix)
+
+
 # -- the whole card --------------------------------------------------------------
 
 
@@ -303,6 +433,9 @@ def check_card(card: Card, cfg, root: Path, cards: list[Card] | None = None) -> 
         _check_touches(card, cfg, root, by_id),
         _check_depends(card, by_id),
         _check_seams(card, by_id),
+        _check_network(card),
+        _check_guards(card, root),
+        _check_frozen(card, root),
     ]
     try:
         broken = check_eligibility(card, cfg, worktree=root).failures
@@ -339,5 +472,7 @@ def apply_fixes(header: dict, body: str, checks: list[dict]) -> tuple[dict, str,
             body = fix["done_text"]
         if "touches" in fix:
             header = dict(header, touches=list(fix["touches"]))
+        if "header" in fix:
+            header = dict(header, **fix["header"])
         notes.extend(fix.get("notes") or [])
     return header, body, notes
