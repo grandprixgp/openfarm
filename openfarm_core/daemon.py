@@ -15,6 +15,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 from .config import CONFIG_PATH, load_config
@@ -244,6 +245,19 @@ def start_daemon(
             )
         finally:
             log_handle.close()
+
+        # Reap the detached child if this parent stays alive (TUI, web, tests)
+        # so neither a zombie nor a Popen.__del__ ResourceWarning is left.
+        def _reap(child: subprocess.Popen) -> None:
+            with contextlib.suppress(ChildProcessError, OSError):
+                child.wait()
+
+        threading.Thread(
+            target=_reap,
+            args=(proc,),
+            name=f"openfarm-daemon-reap-{proc.pid}",
+            daemon=True,
+        ).start()
 
         meta = {
             **process_identity(int(proc.pid)),

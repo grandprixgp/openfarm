@@ -110,6 +110,10 @@ class DaemonHardeningTests(unittest.TestCase):
             self.assertTrue(ks.exists(), "start_daemon must not unlink STOP while a live run.lock exists")
         finally:
             stop_daemon(self.repo)
+            for _ in range(30):
+                if not daemon_status(self.repo)["running"]:
+                    break
+                time.sleep(0.05)
             st.release_run_lock("live-run")
 
     def test_read_daemon_logs_tails_from_eof(self) -> None:
