@@ -71,10 +71,13 @@ def save_session(repo: Path, session: dict) -> None:
 
 
 def _task(card, cards_by_id: dict, state_dir: Path, header: dict) -> dict:
-    from openfarm_core.blocked import records, triage_card
+    from openfarm_core.blocked import given_back, records, triage_card
 
     state = str(card.state).lower().replace("-", "_")
     runs = records(state_dir, card.id)
+    if state == "ready" and runs and given_back(runs[-1]) and str(runs[-1].get("ended_at") or "") >= str(
+            header.get("edited_at") or ""):
+        state = "blocked"  # handed back unbuilt and not changed since: building it again would end the same way
     waits = [d for d in card.deps if str(getattr(cards_by_id.get(d), "state", "")).lower() != "done"]
     return {
         "id": card.id, "title": card.title, "state": state, "files": list(card.touches), "deps": list(card.deps),

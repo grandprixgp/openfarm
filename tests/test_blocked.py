@@ -146,6 +146,36 @@ class FixTests(_Project):
         self.assertIn("breaks a test that was already there", got["why"])
         self.assertIn("page has hero structure", got["why"])
 
+    def test_a_task_the_builder_gave_back_is_stopped_until_it_changes_and_the_fix_sees_the_code(self) -> None:
+        # from the acceptance run: a rewrite made without the code was handed back, and "Build 1 task" was all the screen offered
+        from pathlib import Path
+
+        from openfarm_core.adapters.files import render_card_file
+        from openfarm_core.blocked import triage_card
+        from openfarm_core.store import card_from
+        from openfarm_tui.journey_state import _task
+
+        self.store.change_card("W1-01", "create", header=_header("W1-01"), body=BODY)
+        run = Path(self.cfg.state_dir) / "cards" / "W1-01" / "run-1"
+        run.mkdir(parents=True)
+        (run / "card-record.json").write_text(json.dumps({
+            "run_id": "run-1", "card_id": "W1-01", "claimed_at": "1", "ended_at": "2026-01-01T00:00:00Z",
+            "final_state": "released", "stop_code": "ineligible", "detail": "the hero is an img, it can't hold a plate"}))
+
+        def shown() -> dict:
+            header, body = self.store.read("W1-01")
+            return _task(card_from(header, body), {}, Path(self.cfg.state_dir), header)
+
+        self.assertEqual(shown()["state"], "blocked")
+        self.assertIn("gave it back", shown()["triage"]["why"])
+        self.assertEqual(triage_card(Path(self.cfg.state_dir), "W1-01")["main_label"], "Apply fix and retry")
+        asked = []
+        fix = propose_fix(self.root, self.cfg, self.store, "W1-01", why="x", backend=lambda prompt: asked.append(prompt) or json.dumps(
+            {"card": render_card_file(_header("W1-01", title="Count, with the code in view"), BODY), "change": "fits the code"}))
+        self.assertIn("### tally/core.py (as it is now)", asked[0])
+        self.assertEqual(apply_fix_and_retry(self.store, "W1-01", fix)["state"], "ready")  # no retry needed: it was never blocked
+        self.assertEqual(shown()["state"], "ready")
+
     def test_no_fix_is_said_plainly(self) -> None:
         self.store.change_card("W1-01", "create", header=_header("W1-01"), body=BODY)
         self.assertIsNone(propose_fix(self.root, self.cfg, self.store, "W1-01"))

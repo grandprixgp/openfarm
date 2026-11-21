@@ -227,6 +227,8 @@ class Store:
                     changed = {k: [before.get(k), after.get(k)] for k in sorted(set(before) | set(after))
                                if before.get(k) != after.get(k)}
                     self._note(card_id, kind, by, why, changed)
+                    if changed:
+                        header["edited_at"] = utc_now()  # lets a reader tell "changed since its last run" from "the same task"
                     self.src._write(card_id, header, body, f"{card_id}: edited by {by}")
                     return self._outcome(card_id, header, checks)
                 elif kind in ("skip", "drop", "split"):

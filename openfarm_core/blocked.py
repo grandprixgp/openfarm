@@ -178,6 +178,9 @@ def triage_card(state_dir: Path, card_id: str) -> dict | None:
     if not runs:
         return None
     got = triage(runs[-1], runs[:-1])
+    if given_back(runs[-1]):
+        got["why"] = "The builder read the task and gave it back: it can't be built as written. " + str(
+            runs[-1].get("detail") or "").strip()
     guards = guard_tests(state_dir, runs[-1])
     if guards:  # the task names a test that can't fail first: only changing the task ends this
         got = dict(triage(dict(runs[-1], stop_code="ineligible")), guards=guards, repeated=got["repeated"],
@@ -202,6 +205,22 @@ def triage_card(state_dir: Path, card_id: str) -> dict | None:
                        "test. " + "; ".join(broke_old) + ". The task has to keep that test passing, or say how.")
     got["checks"] = checks
     return got
+
+
+def given_back(record: dict | None) -> bool:
+    """The builder read the task and handed it back as impossible to build as written, before writing anything."""
+    return bool(record) and record.get("final_state") == "released" and record.get("stop_code") == "ineligible"
+
+
+def _files_now(root: Path, header: dict, cap: int = 6000) -> str:
+    """The files the task touches or reads, as they are now, so a rewrite fits the code that exists."""
+    parts = []
+    for rel in [*(header.get("touches") or []), *(header.get("reference") or [])]:
+        path = Path(root) / str(rel)
+        if path.is_file():
+            text = path.read_text(encoding="utf-8", errors="replace")
+            parts.append(f"### {rel} (as it is now)\n{text[:cap]}" + ("\n… (cut)" if len(text) > cap else ""))
+    return ("\n\nThe code the task must fit:\n\n" + "\n\n".join(parts)) if parts else ""
 
 
 def propose_fix(root: Path, cfg, store, card_id: str, why: str = "", backend=None) -> dict | None:
@@ -234,7 +253,7 @@ def propose_fix(root: Path, cfg, store, card_id: str, why: str = "", backend=Non
             f"{BUILD_RULES}\n"
             f"Files no task may write (never put them in `touches`): {', '.join(getattr(cfg, 'forbidden_files', []) or []) or 'none'}\n"
             'Return ONLY JSON: {"card": "<the whole card file, +++ TOML header and body>", "change": "<one sentence>"}\n\n'
-            + before
+            + before + _files_now(root, header)
         )
         try:
             parsed = _extract_json_dict(str(backend.ask(prompt) if hasattr(backend, "ask") else backend(prompt))) or {}
@@ -262,6 +281,8 @@ def apply_fix_and_retry(store, card_id: str, fix: dict, by: str = "") -> dict:
     header = dict(fix["header"], repairs=[*(store.read(card_id)[0].get("repairs") or []), *fix["notes"]])
     store.change_card(card_id, "edit", by=by, why="; ".join(fix["notes"]),
                       apply=lambda h, _b: (dict(header, state=h.get("state", "ready")), fix["body"]))
+    if str(store.read(card_id)[0].get("state")) != "blocked":  # given back or parked: the edit already queued it
+        return {"state": str(store.read(card_id)[0].get("state"))}
     return store.change_card(card_id, "retry", by=by, why="retry with the fix")
 
 
