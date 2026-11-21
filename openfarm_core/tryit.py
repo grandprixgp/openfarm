@@ -12,11 +12,13 @@ nothing has to be installed beyond the browser itself.
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import os
 import re
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import tempfile
@@ -136,16 +138,27 @@ class _Browser:
 
     def __init__(self, binary: Path) -> None:
         self._dir = tempfile.TemporaryDirectory(prefix="openfarm-browser-")
-        to_child_r, self._w = os.pipe()
-        self._r, from_child_w = os.pipe()
-        # The browser expects its pipe on descriptors 3 and 4; the shell puts it there.
-        # `--password-store=basic`: otherwise the first request waits on a desktop keyring a server lacks.
-        self._proc = subprocess.Popen(
-            ["bash", "-c", 'exec "$0" "$@" 3<&$OF_IN 4>&$OF_OUT', str(binary), "--headless", "--no-sandbox",
-             "--disable-gpu", "--hide-scrollbars", "--password-store=basic", "--remote-debugging-pipe", f"--user-data-dir={self._dir.name}",
-             "about:blank"],
-            pass_fds=(to_child_r, from_child_w), env={**os.environ, "OF_IN": str(to_child_r), "OF_OUT": str(from_child_w)},
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        to_child_r = self._w = self._r = from_child_w = -1
+        try:
+            to_child_r, self._w = os.pipe()
+            self._r, from_child_w = os.pipe()
+            # The browser expects its pipe on descriptors 3 and 4; the shell puts it there.
+            # `--password-store=basic`: otherwise the first request waits on a desktop keyring a server lacks.
+            self._proc = subprocess.Popen(
+                ["bash", "-c", 'exec "$0" "$@" 3<&$OF_IN 4>&$OF_OUT', str(binary), "--headless", "--no-sandbox",
+                 "--disable-gpu", "--hide-scrollbars", "--password-store=basic", "--remote-debugging-pipe",
+                 f"--user-data-dir={self._dir.name}", "about:blank"],
+                pass_fds=(to_child_r, from_child_w), env={**os.environ, "OF_IN": str(to_child_r), "OF_OUT": str(from_child_w)},
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        except BaseException:
+            for fd in (to_child_r, self._w, self._r, from_child_w):
+                if fd >= 0:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+            self._dir.cleanup()
+            raise
         os.close(to_child_r)
         os.close(from_child_w)
         os.set_blocking(self._r, False)
@@ -205,11 +218,22 @@ class _Browser:
                 os.close(fd)
             except OSError:
                 pass
-        self._proc.terminate()
-        try:
-            self._proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            self._proc.kill()
+        if self._proc.poll() is None:
+            try:
+                os.killpg(self._proc.pid, signal.SIGTERM)
+            except OSError:
+                with contextlib.suppress(OSError):
+                    self._proc.terminate()
+            try:
+                self._proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(self._proc.pid, signal.SIGKILL)
+                except OSError:
+                    with contextlib.suppress(OSError):
+                        self._proc.kill()
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    self._proc.wait(timeout=5)
         self._dir.cleanup()
 
 
@@ -341,13 +365,35 @@ def how_to_start(root: Path, cfg) -> dict:
         plan = dict(pack.try_it(root) or {})
     except Exception:  # noqa: BLE001 - a pack that can't answer is the same as no answer
         plan = {}
+    pack_env = dict(plan.get("env") or {})
     if own.get("start"):
         plan = {"kind": "web", "start": shlex.split(own["start"]), "port_env": "PORT"}
+        if pack_env:
+            plan["env"] = pack_env
     elif own.get("sample"):
         plan = {"kind": "cli", "sample": shlex.split(own["sample"])}
+        if pack_env:
+            plan["env"] = pack_env
     if plan:
-        plan.update(port=int(own.get("port") or 0), path=str(own.get("path") or "/"))
+        port = int(own.get("port") or plan.get("port") or 0)
+        raw_path = str(own.get("path") or plan.get("path") or "/").strip() or "/"
+        path = raw_path if raw_path.startswith("/") else "/" + raw_path
+        plan.update(port=port, path=path)
     return plan
+
+
+def _plan_env(plan: dict, extra: dict[str, str] | None = None) -> dict[str, str]:
+    """Merge `plan["env"]` and `extra` onto `os.environ`, prepending `PYTHONPATH`."""
+    env = dict(os.environ)
+    for key, val in (plan.get("env") or {}).items():
+        key_s, val_s = str(key), str(val)
+        if key_s == "PYTHONPATH" and env.get("PYTHONPATH"):
+            env[key_s] = f"{val_s}{os.pathsep}{env['PYTHONPATH']}"
+        else:
+            env[key_s] = val_s
+    if extra:
+        env.update({str(k): str(v) for k, v in extra.items()})
+    return env
 
 
 def _free_port() -> int:
@@ -389,7 +435,8 @@ def try_it(root: Path, cfg, goal: dict | None = None, *, out_dir: Path | None = 
     elif plan["kind"] == "cli":
         result["command"] = shlex.join(plan["sample"])
         try:
-            done = subprocess.run(plan["sample"], cwd=root, capture_output=True, text=True, timeout=120, check=False)
+            done = subprocess.run(plan["sample"], cwd=root, env=_plan_env(plan),
+                                  capture_output=True, text=True, timeout=120, check=False)
             result["output"] = (done.stdout + done.stderr).strip()[-6000:]
             result["checks"] = [{"name": "runs", "ok": done.returncode == 0,
                                  "detail": f"the sample command finished with code {done.returncode}"}]
@@ -404,7 +451,7 @@ def try_it(root: Path, cfg, goal: dict | None = None, *, out_dir: Path | None = 
         with log.open("w", encoding="utf-8") as sink:
             try:
                 server = subprocess.Popen(plan["start"], cwd=root, stdout=sink, stderr=subprocess.STDOUT,
-                                          env={**os.environ, plan.get("port_env") or "PORT": str(port)},
+                                          env=_plan_env(plan, {plan.get("port_env") or "PORT": str(port)}),
                                           start_new_session=True)
             except OSError as exc:
                 server = None
@@ -420,13 +467,18 @@ def try_it(root: Path, cfg, goal: dict | None = None, *, out_dir: Path | None = 
                                              "detail": f"the app did not start listening on port {port}"}]
                 finally:
                     try:
-                        os.killpg(server.pid, 15)
+                        os.killpg(server.pid, signal.SIGTERM)
                     except OSError:
                         pass
                     try:
                         server.wait(timeout=5)
                     except subprocess.TimeoutExpired:
-                        os.killpg(server.pid, 9)
+                        try:
+                            os.killpg(server.pid, signal.SIGKILL)
+                        except OSError:
+                            pass
+                        with contextlib.suppress(subprocess.TimeoutExpired):
+                            server.wait(timeout=5)
         result["output"] = log.read_text(encoding="utf-8", errors="replace").strip()[-3000:]
     oks = [c["ok"] for c in result["checks"]]
     result["ok"] = False if False in oks else (True if oks and None not in oks else None)

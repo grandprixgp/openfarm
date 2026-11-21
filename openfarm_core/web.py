@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import contextlib
 import http.server
+import ipaddress
 import json
 import secrets
 import shutil
+import socket
 import subprocess
 import time
 import urllib.parse
@@ -22,14 +24,56 @@ from .automode import load_project_chunks
 from .config import CONFIG_PATH, load_config
 from .dag import build_card_dag
 from .daemon import daemon_status, stop_daemon
-from .errors import ConfigError, Refused
+from .errors import ConfigError, Invalid, Refused
 from .findings import decide_finding, is_finding_id_or_header, list_findings
 from .projects import list_projects
 from .routing import compute_routing_recommendations
-from .state import StateDir
+from .state import StateDir, _safe_id
 from .tui import _load_tui_context, _read_cards_readonly
 
 _WILDCARD_BINDS = {"0.0.0.0", "::", ""}
+_PROXY_HEADERS = ("X-Forwarded-For", "X-Forwarded-Host", "Forwarded", "X-Real-IP")
+
+
+def _is_wildcard_bind(host: str) -> bool:
+    h = host.strip().strip("[]")
+    if not h or h == "*":
+        return True
+    bare = h.split("%", 1)[0]
+    try:
+        addr = ipaddress.ip_address(bare)
+        if addr.is_unspecified:
+            return True
+        mapped = getattr(addr, "ipv4_mapped", None)
+        return bool(mapped is not None and mapped.is_unspecified)
+    except ValueError:
+        pass
+    try:
+        return socket.inet_aton(bare) == b"\x00\x00\x00\x00"
+    except OSError:
+        return False
+
+
+def _is_loopback_host(host: str) -> bool:
+    h = host.strip().strip("[]").lower()
+    if h == "localhost":
+        return True
+    bare = h.split("%", 1)[0]
+    try:
+        addr = ipaddress.ip_address(bare)
+        if addr.is_loopback:
+            return True
+        mapped = getattr(addr, "ipv4_mapped", None)
+        return bool(mapped is not None and mapped.is_loopback)
+    except ValueError:
+        return False
+
+
+def _validate_web_id(name: str, what: str) -> str:
+    cid = _safe_id(name, what)
+    if cid.startswith("-"):
+        raise Invalid("bad-id", f"{what} {name!r} must not start with '-'")
+    return cid
 
 
 def build_web_state(repo: Path, *, config_path: Path | None = None) -> dict:
@@ -148,7 +192,7 @@ def _render_companion_html(token: str) -> str:
 <body>
 <header>
   <div><span class="brand">openfarm</span><strong id="proj-name">loading...</strong> <span id="proj-meta" style="color:var(--muted)"></span></div>
-  <div><span id="tok-split" style="color:var(--muted);margin-right:12px"></span><span id="daemon-pill" class="pill ok">IDLE</span> <button onclick="stopDaemon()">Stop Daemon</button></div>
+  <div><span id="tok-split" style="color:var(--muted);margin-right:12px"></span><span id="daemon-pill" class="pill ok">IDLE</span> <button data-action="stop-daemon">Stop Daemon</button></div>
 </header>
 <div class="grid">
   <section class="card"><h2>Spec Chunks</h2><div id="chunks-list"></div></section>
@@ -159,16 +203,37 @@ def _render_companion_html(token: str) -> str:
 <section class="card" style="margin-top:16px"><h2>Live Activity Stream (SSE)</h2><div id="log"></div></section>
 <script>
 const TOKEN = {json.dumps(token)};
-function esc(s) {{ const d = document.createElement('div'); d.textContent = String(s ?? ''); return d.innerHTML; }}
+function getToken() {{ return TOKEN || (window.sessionStorage && window.sessionStorage.getItem('openfarm_token')) || ''; }}
+function esc(s) {{
+  return String(s ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}}
 async function postApi(url, body) {{
-  const r = await fetch(url, {{ method:'POST', headers:{{'Content-Type':'application/json','X-Openfarm-Token':TOKEN}}, body:JSON.stringify(body||{{}}) }});
+  const r = await fetch(url, {{ method:'POST', headers:{{'Content-Type':'application/json','X-Openfarm-Token':getToken()}}, body:JSON.stringify(body||{{}}) }});
   const data = await r.json().catch(()=>({{}}));
   if (!r.ok) alert(data.error || ('HTTP ' + r.status));
   await refresh();
 }}
-async function stopDaemon() {{ await postApi('/api/daemon/stop', {{}}); }}
+document.addEventListener('click', (ev) => {{
+  const btn = ev.target && ev.target.closest ? ev.target.closest('button[data-action]') : null;
+  if (!btn) return;
+  const act = btn.dataset.action;
+  const id = btn.dataset.id || '';
+  if (act === 'stop-daemon') postApi('/api/daemon/stop', {{}});
+  else if (act === 'approve-card') postApi('/api/cards/' + encodeURIComponent(id) + '/approve', {{}});
+  else if (act === 'land-card') postApi('/api/cards/' + encodeURIComponent(id) + '/land', {{}});
+  else if (act === 'decide-finding') postApi('/api/findings/' + encodeURIComponent(id) + '/decide', {{decision: btn.dataset.decision || 'dismissed'}});
+}});
 async function refresh() {{
-  const s = await (await fetch('/api/state')).json();
+  const tok = getToken();
+  const hdrs = tok ? {{'X-Openfarm-Token': tok}} : {{}};
+  const r = await fetch('/api/state', {{headers: hdrs}});
+  if (!r.ok) return;
+  const s = await r.json();
   document.getElementById('proj-name').textContent = s.project;
   document.getElementById('proj-meta').textContent = '(' + (s.language || 'uninitialized') + ' · ' + s.base_branch + ')';
   document.getElementById('tok-split').textContent = 'Tokens: W ' + s.tokens.worker_pct + '% / F ' + s.tokens.frontier_pct + '%';
@@ -181,14 +246,14 @@ async function refresh() {{
   document.getElementById('cards-list').innerHTML = (s.cards.length ? s.cards.map(c => {{
     const st = String(c.state).toLowerCase().replace('-','_');
     const acts = st === 'in_review'
-      ? '<button class="approve" onclick="postApi(\\'/api/cards/' + encodeURIComponent(c.id) + '/approve\\')">Approve</button> <button class="primary" onclick="postApi(\\'/api/cards/' + encodeURIComponent(c.id) + '/land\\')">Land</button>'
+      ? '<button class="approve" data-action="approve-card" data-id="' + esc(c.id) + '">Approve</button> <button class="primary" data-action="land-card" data-id="' + esc(c.id) + '">Land</button>'
       : '<span class="pill ' + (st==='done'?'ok':(st==='blocked'?'err':'warn')) + '">' + esc(c.state) + '</span>';
     return '<div class="row"><span><strong>' + esc(c.id) + '</strong> ' + esc(c.title) + '</span><span>' + acts + '</span></div>';
   }}).join('') : '<div style="color:var(--muted)">No cards yet.</div>');
   document.getElementById('findings-list').innerHTML = (s.findings.length ? s.findings.map(f =>
     '<div class="row"><span><strong>' + esc(f.id) + '</strong> ' + esc(f.title) + '</span><span>' +
-    '<button class="primary" onclick="postApi(\\'/api/findings/' + encodeURIComponent(f.id) + '/decide\\',{{decision:\\'next-wave\\'}})">Pick</button> ' +
-    '<button onclick="postApi(\\'/api/findings/' + encodeURIComponent(f.id) + '/decide\\',{{decision:\\'dismiss\\'}})">Dismiss</button></span></div>'
+    '<button class="primary" data-action="decide-finding" data-id="' + esc(f.id) + '" data-decision="next-wave">Pick</button> ' +
+    '<button data-action="decide-finding" data-id="' + esc(f.id) + '" data-decision="dismissed">Dismiss</button></span></div>'
   ).join('') : '<div style="color:var(--muted)">Inbox clear.</div>');
   document.getElementById('routing-list').innerHTML = (s.routing.recommendations && s.routing.recommendations.length ? s.routing.recommendations.map(r =>
     '<div class="row"><span>' + esc(r.language) + '/' + esc(r.category) + ' (' + Math.round(r.pass_rate*100) + '% pass)</span><span>' + esc(r.recommended_model) + ' · ' + esc(r.recommended_effort) + '</span></div>'
@@ -220,14 +285,19 @@ class OpenfarmWebServer(http.server.ThreadingHTTPServer):
         *,
         config_path: Path | None = None,
         token: str | None = None,
+        tailscale: bool = False,
     ) -> None:
         self.repo = Path(repo).expanduser().resolve()
         self.config_path = Path(config_path).expanduser().resolve() if config_path else None
         self.auth_token = token or secrets.token_urlsafe(24)
+        self.bind_host = str(server_address[0] or "").strip()
+        self.is_loopback = _is_loopback_host(self.bind_host) and not tailscale
         super().__init__(server_address, _OpenfarmWebHandler)
 
 
 class _OpenfarmWebHandler(http.server.BaseHTTPRequestHandler):
+    timeout = 10.0
+
     def log_message(self, _fmt: str, *_args) -> None:
         return None
 
@@ -254,20 +324,91 @@ class _OpenfarmWebHandler(http.server.BaseHTTPRequestHandler):
         except ValueError:
             return {}
 
-    def _check_token(self) -> bool:
+    def _is_local_unproxied(self) -> bool:
+        srv: OpenfarmWebServer = self.server  # type: ignore[assignment]
+        if not srv.is_loopback:
+            return False
+        client_ip = str((self.client_address or ("", 0))[0] or "")
+        if not _is_loopback_host(client_ip):
+            return False
+        return not any(self.headers.get(hdr) for hdr in _PROXY_HEADERS)
+
+    def _check_host_and_origin(self) -> bool:
+        srv: OpenfarmWebServer = self.server  # type: ignore[assignment]
+        host_hdr = str(self.headers.get("Host") or "").strip()
+        if not host_hdr or any(ch in host_hdr for ch in "\r\n \t/\\@"):
+            self._send_json(403, {"ok": False, "error": "missing or invalid Host header"})
+            return False
+        try:
+            parsed_host = urllib.parse.urlsplit(f"http://{host_hdr}")
+            req_host = (parsed_host.hostname or "").lower()
+            _ = parsed_host.port
+        except ValueError:
+            self._send_json(403, {"ok": False, "error": "invalid Host header"})
+            return False
+        if not req_host or parsed_host.path or parsed_host.query or parsed_host.fragment:
+            self._send_json(403, {"ok": False, "error": "invalid Host header"})
+            return False
+
+        if srv.is_loopback:
+            if not _is_loopback_host(req_host):
+                self._send_json(403, {"ok": False, "error": "untrusted Host header"})
+                return False
+        elif not _is_wildcard_bind(srv.bind_host):
+            bind_norm = srv.bind_host.strip("[]").lower()
+            if req_host != bind_norm and not _is_loopback_host(req_host):
+                self._send_json(403, {"ok": False, "error": "untrusted Host header"})
+                return False
+
+        origin_hdr = self.headers.get("Origin")
+        if origin_hdr is not None:
+            origin_text = str(origin_hdr).strip()
+            try:
+                op = urllib.parse.urlsplit(origin_text)
+                origin_host = (op.hostname or "").lower()
+                _ = op.port
+            except ValueError:
+                self._send_json(403, {"ok": False, "error": "untrusted Origin header"})
+                return False
+            if (
+                op.scheme.lower() not in ("http", "https")
+                or not origin_host
+                or op.path
+                or op.query
+                or op.fragment
+                or op.netloc.lower() != host_hdr.lower()
+            ):
+                self._send_json(403, {"ok": False, "error": "untrusted Origin header"})
+                return False
+            if srv.is_loopback and not _is_loopback_host(origin_host):
+                self._send_json(403, {"ok": False, "error": "untrusted Origin header"})
+                return False
+        return True
+
+    def _has_valid_token(self) -> bool:
         srv: OpenfarmWebServer = self.server  # type: ignore[assignment]
         got = str(self.headers.get("X-Openfarm-Token") or "").strip()
-        if not secrets.compare_digest(got, srv.auth_token):
+        if not got:
+            auth = str(self.headers.get("Authorization") or "").strip()
+            if auth.lower().startswith("bearer "):
+                got = auth[7:].strip()
+        return bool(got) and secrets.compare_digest(got, srv.auth_token)
+
+    def _check_token(self) -> bool:
+        if not self._has_valid_token():
             self._send_json(403, {"ok": False, "error": "missing or invalid X-Openfarm-Token"})
             return False
         return True
 
     def do_GET(self) -> None:
         srv: OpenfarmWebServer = self.server  # type: ignore[assignment]
+        if not self._check_host_and_origin():
+            return
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         if path == "/" or path == "/index.html":
-            html = _render_companion_html(srv.auth_token).encode("utf-8")
+            exposed_token = srv.auth_token if (self._is_local_unproxied() or self._has_valid_token()) else ""
+            html = _render_companion_html(exposed_token).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(html)))
@@ -276,9 +417,13 @@ class _OpenfarmWebHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(html)
             return
         if path == "/api/state":
+            if not self._is_local_unproxied() and not self._check_token():
+                return
             self._send_json(200, build_web_state(srv.repo, config_path=srv.config_path))
             return
         if path == "/api/events":
+            if not self._is_local_unproxied() and not self._check_token():
+                return
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
             self.send_header("Cache-Control", "no-cache")
@@ -287,7 +432,8 @@ class _OpenfarmWebHandler(http.server.BaseHTTPRequestHandler):
             lines = _recent_event_lines(srv.repo, config_path=srv.config_path, limit=25)
             try:
                 for line in lines:
-                    self.wfile.write(f"data: {line}\n\n".encode("utf-8"))
+                    safe_line = str(line).replace("\r", " ").replace("\n", " ")
+                    self.wfile.write(f"data: {safe_line}\n\n".encode("utf-8"))
                 self.wfile.flush()
                 if once:
                     return
@@ -302,6 +448,8 @@ class _OpenfarmWebHandler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         srv: OpenfarmWebServer = self.server  # type: ignore[assignment]
+        if not self._check_host_and_origin():
+            return
         if not self._check_token():
             return
         path = urllib.parse.urlparse(self.path).path
@@ -313,12 +461,13 @@ class _OpenfarmWebHandler(http.server.BaseHTTPRequestHandler):
                 return
             parts = [urllib.parse.unquote(p) for p in path.strip("/").split("/")]
             if len(parts) == 4 and parts[0] == "api" and parts[1] == "findings" and parts[3] == "decide":
+                finding_id = _validate_web_id(parts[2], "finding_id")
                 cfg = load_config(srv.repo, cfg_p)
                 res = decide_finding(
                     srv.repo,
                     cfg,
-                    parts[2],
-                    str(body.get("decision") or "dismiss"),
+                    finding_id,
+                    str(body.get("decision") or "dismissed"),
                     reason=str(body.get("reason") or ""),
                     target_card=str(body.get("target_card") or ""),
                 )
@@ -327,21 +476,41 @@ class _OpenfarmWebHandler(http.server.BaseHTTPRequestHandler):
             if len(parts) == 4 and parts[0] == "api" and parts[1] == "cards" and parts[3] == "approve":
                 from .cli import main as cli_main
 
-                rc = cli_main([
-                    "--repo", str(srv.repo), "verdict", parts[2], "clean",
-                    "--review-tokens", str(int(body.get("review_tokens") or 1000)),
-                    "--note", str(body.get("note") or "approved via web companion"),
+                card_id = _validate_web_id(parts[2], "card_id")
+                raw_tokens = body.get("review_tokens")
+                if isinstance(raw_tokens, bool):
+                    raise ValueError("review_tokens must be an integer")
+                review_tokens = int(1000 if raw_tokens is None or raw_tokens == "" else raw_tokens)
+                if review_tokens < 0:
+                    raise ValueError("review_tokens must be non-negative")
+                note = str(body.get("note") or "approved via web companion")
+                cli_args = ["--repo", str(srv.repo)]
+                if srv.config_path is not None:
+                    cli_args.extend(["--config", str(srv.config_path)])
+                cli_args.extend([
+                    "verdict",
+                    f"--review-tokens={review_tokens}",
+                    f"--note={note}",
+                    "--",
+                    card_id,
+                    "clean",
                 ])
-                self._send_json(200 if rc == 0 else 400, {"ok": rc == 0, "card": parts[2]})
+                rc = cli_main(cli_args)
+                self._send_json(200 if rc == 0 else 400, {"ok": rc == 0, "card": card_id})
                 return
             if len(parts) == 4 and parts[0] == "api" and parts[1] == "cards" and parts[3] == "land":
                 from .cli import main as cli_main
 
-                rc = cli_main(["--repo", str(srv.repo), "land", parts[2]])
-                self._send_json(200 if rc == 0 else 400, {"ok": rc == 0, "card": parts[2]})
+                card_id = _validate_web_id(parts[2], "card_id")
+                cli_args = ["--repo", str(srv.repo)]
+                if srv.config_path is not None:
+                    cli_args.extend(["--config", str(srv.config_path)])
+                cli_args.extend(["land", "--", card_id])
+                rc = cli_main(cli_args)
+                self._send_json(200 if rc == 0 else 400, {"ok": rc == 0, "card": card_id})
                 return
             self._send_json(404, {"ok": False, "error": "unknown endpoint"})
-        except (Refused, ConfigError, OSError) as exc:
+        except (Refused, Invalid, ConfigError, OSError, ValueError) as exc:
             self._send_json(400, {"ok": False, "error": str(exc)})
 
 
@@ -382,14 +551,17 @@ def resolve_tailscale_ipv4(*, runner=None) -> str:
     if not binary:
         raise Refused("tailscale-missing", "tailscale CLI is not installed on PATH")
     run_fn = runner or subprocess.run
-    proc = run_fn(
-        [binary, "ip", "-4"],
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-        timeout=5.0,
-        check=False,
-    )
+    try:
+        proc = run_fn(
+            [binary, "ip", "-4"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise Refused("tailscale-unavailable", f"tailscale ip -4 failed: {exc}") from exc
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip()
         raise Refused("tailscale-unavailable", f"tailscale ip -4 failed: {detail or proc.returncode}")
@@ -431,14 +603,17 @@ def expose_via_tailscale_serve(port: int, *, runner=None) -> dict:
         raise Refused("tailscale-missing", "tailscale CLI is not installed on PATH")
     run_fn = runner or subprocess.run
     p = int(port)
-    proc = run_fn(
-        [binary, "serve", "--bg", f"--https={p}", f"http://127.0.0.1:{p}"],
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-        timeout=10.0,
-        check=False,
-    )
+    try:
+        proc = run_fn(
+            [binary, "serve", "--bg", f"--https={p}", f"http://127.0.0.1:{p}"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise Refused("tailscale-serve-failed", f"tailscale serve failed: {exc}") from exc
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip()
         raise Refused("tailscale-serve-failed", f"tailscale serve failed: {detail or proc.returncode}")
@@ -466,15 +641,18 @@ def create_web_server(
 
     Passing `bind="tailscale"` resolves this host's Tailscale IPv4 via `tailscale ip -4`.
     """
-    host = str(bind or "127.0.0.1").strip()
-    if host.lower() == "tailscale":
+    host = "127.0.0.1" if bind is None else str(bind).strip()
+    via_tailscale = host.lower() == "tailscale"
+    if via_tailscale:
         host = resolve_tailscale_ipv4(runner=tailscale_runner)
-    if host in _WILDCARD_BINDS and not allow_all_interfaces:
+    if _is_wildcard_bind(host) and not allow_all_interfaces:
         raise Refused(
             "wildcard-bind-refused",
             "refusing to bind to all interfaces without --allow-all-interfaces (default: 127.0.0.1)",
         )
-    return OpenfarmWebServer((host, int(port)), repo, config_path=config_path)
+    return OpenfarmWebServer(
+        (host, int(port)), repo, config_path=config_path, tailscale=via_tailscale
+    )
 
 
 __all__ = [

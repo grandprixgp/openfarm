@@ -1194,8 +1194,3 @@ def _has_balanced_braces(text: str) -> bool:
                 if depth < 0:
                     return False
     return depth == 0
-
-
-def _terminates(line: str) -> bool:
-    stripped = _strip_line_comment(line).rstrip()
-    return stripped.endswith("{") or stripped.endswith(";") or stripped.endswith("}")

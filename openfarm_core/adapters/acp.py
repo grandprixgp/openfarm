@@ -32,6 +32,7 @@ import select
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -74,6 +75,7 @@ _DISALLOWED_READ_ONLY = (
     "NotebookEdit",
     "WebFetch",
     "WebSearch",
+    "LS",
     "Task",
     "TodoWrite",
     "NotebookRead",
@@ -157,6 +159,7 @@ ACP_ADAPTER_NAMES: tuple[str, ...] = (
     "codex-acp",
 )
 _DEFAULT_FORBIDDEN_FILES: tuple[str, ...] = (
+    ".git/**",
     ".openfarm/**",
     ".claude/**",
     ".gemini/**",
@@ -371,6 +374,8 @@ _PATH_INPUT_KEYS = (
     "root",
     "paths",
     "files",
+    "include",
+    "glob",
 )
 
 
@@ -478,13 +483,26 @@ def resolve_acp_command(
 
 
 def _read_api_key_file(auth_file: Path | str) -> str:
-    auth_path = Path(auth_file).expanduser().resolve()
+    raw_path = Path(auth_file).expanduser()
+    if raw_path.is_symlink():
+        raise Refused("acp-auth-file-symlink", f"refusing to read symlink auth_file {raw_path}")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
-        key = auth_path.read_text(encoding="utf-8").strip()
+        fd = os.open(str(raw_path), flags)
     except OSError as exc:
-        raise Infra("acp-auth-file-unreadable", f"cannot read auth_file {auth_path}: {exc}") from exc
+        if exc.errno == errno.ELOOP:
+            raise Refused("acp-auth-file-symlink", f"refusing to read symlink auth_file {raw_path}") from exc
+        raise Infra("acp-auth-file-unreadable", f"cannot read auth_file {raw_path}: {exc}") from exc
+    try:
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            st = os.fstat(handle.fileno())
+            if not stat.S_ISREG(st.st_mode):
+                raise Refused("acp-auth-file-not-regular", f"auth_file {raw_path} is not a regular file")
+            key = handle.read().strip()
+    except OSError as exc:
+        raise Infra("acp-auth-file-unreadable", f"cannot read auth_file {raw_path}: {exc}") from exc
     if not key:
-        raise Infra("acp-auth-file-empty", f"auth_file {auth_path} is empty")
+        raise Infra("acp-auth-file-empty", f"auth_file {raw_path} is empty")
     return key
 
 
@@ -587,7 +605,7 @@ def _sanitised_env(
                 deny_rules = [
                     f"{tool}({pat})"
                     for pat in deny_patterns
-                    for tool in ("Read", "Edit", "Write", "Grep", "Glob")
+                    for tool in ("Read", "Edit", "Write", "Grep", "Glob", "LS")
                 ]
 
                 settings: dict[str, object] = {
@@ -784,11 +802,41 @@ def _extract_chunk_text(content: object) -> str:
 def _extract_paths_from_tool_call(tool_call: dict) -> list[str]:
     paths: list[str] = []
 
+    def _looks_like_path(val: str) -> bool:
+        return (
+            "\x00" in val
+            or val.startswith("/")
+            or val.startswith("~")
+            or ".." in val.replace("\\", "/").split("/")
+        )
+
     def _add(val: object) -> None:
         if isinstance(val, str) and val.strip():
             paths.append(val.strip())
         elif isinstance(val, list):
             for item in val:
+                _add(item)
+        elif isinstance(val, dict):
+            _walk_dict(val, force=True)
+
+    def _walk_dict(obj: dict, *, force: bool = False) -> None:
+        for key, val in obj.items():
+            if force or key in _PATH_INPUT_KEYS:
+                _add(val)
+            elif isinstance(val, dict):
+                _walk_dict(val, force=False)
+            elif isinstance(val, list):
+                _walk_list(val)
+            elif isinstance(val, str) and _looks_like_path(val):
+                _add(val)
+
+    def _walk_list(items: list) -> None:
+        for item in items:
+            if isinstance(item, dict):
+                _walk_dict(item, force=False)
+            elif isinstance(item, list):
+                _walk_list(item)
+            elif isinstance(item, str) and _looks_like_path(item):
                 _add(item)
 
     for loc in tool_call.get("locations") or []:
@@ -801,25 +849,12 @@ def _extract_paths_from_tool_call(tool_call: dict) -> list[str]:
 
     raw_input = tool_call.get("rawInput")
     if isinstance(raw_input, dict):
-        for key in _PATH_INPUT_KEYS:
-            if key in raw_input:
-                _add(raw_input[key])
-        # Catch any sneaky path-looking strings under non-standard keys.
-        for key, val in raw_input.items():
-            if key in _PATH_INPUT_KEYS:
-                continue
-            if isinstance(val, str) and (
-                "\x00" in val
-                or val.startswith("/")
-                or val.startswith("~")
-                or ".." in val.replace("\\", "/").split("/")
-            ):
-                _add(val)
+        _walk_dict(raw_input, force=False)
+    elif isinstance(raw_input, list):
+        _walk_list(raw_input)
     elif isinstance(raw_input, str) and raw_input.strip():
         if (
-            "\x00" in raw_input
-            or raw_input.startswith("/")
-            or raw_input.startswith("~")
+            _looks_like_path(raw_input)
             or "/" in raw_input
             or "\\" in raw_input
             or ".." in raw_input
@@ -1158,31 +1193,7 @@ class ClaudeAcpAdapter:
                 offset += written
 
     def _terminate_process_group(self) -> None:
-        proc = self._proc
-        if proc is None:
-            return
-        if proc.poll() is None:
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except (ProcessLookupError, PermissionError, OSError):
-                try:
-                    proc.terminate()
-                except OSError:
-                    pass
-            try:
-                proc.wait(timeout=1.5)
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError, OSError):
-                    try:
-                        proc.kill()
-                    except OSError:
-                        pass
-                try:
-                    proc.wait(timeout=1.5)
-                except subprocess.TimeoutExpired:
-                    pass
+        confine_lib.end_process_group(self._proc, grace_s=1.5)
 
     def _cleanup_process_and_threads(self) -> None:
         proc = self._proc
@@ -1193,13 +1204,7 @@ class ClaudeAcpAdapter:
                         stream.close()
                     except OSError:
                         pass
-            if proc.poll() is None:
-                self._terminate_process_group()
-            else:
-                try:
-                    proc.wait(timeout=0.5)
-                except subprocess.TimeoutExpired:
-                    pass
+            self._terminate_process_group()
         for th in (self._stdout_thread, self._stderr_thread):
             if th is not None and th.is_alive():
                 th.join(timeout=1.0)
@@ -1895,15 +1900,16 @@ class ClaudeAcpAdapter:
                         all_ok = False
                         reason = why
                         break
-                    if tool_kind == "search" and session_root is not None:
+                    search_root = session_root or self.allowed_root
+                    if tool_kind == "search" and search_root is not None:
                         try:
                             cand = Path(p)
                             if not cand.is_absolute():
-                                cand = (session_root / cand).resolve()
+                                cand = (search_root / cand).resolve()
                             else:
                                 cand = cand.resolve()
                             if cand.is_dir():
-                                rel = cand.relative_to(session_root.resolve()).as_posix()
+                                rel = cand.relative_to(search_root.resolve()).as_posix()
                                 tree_pat = "**" if rel in ("", ".") else f"{rel}/**"
                                 from ..globs import globs_overlap
                                 protected = (*_DEFAULT_FORBIDDEN_FILES, *self.forbidden_files, *self.never_touch)
@@ -2135,6 +2141,35 @@ class ClaudeAcpAdapter:
                         )
                         rejected_methods.append(
                             {"id": in_id, "method": method, "code": -32600, "reason": "replay"}
+                        )
+                        continue
+
+                    valid_id = (
+                        in_id is None
+                        or isinstance(in_id, str)
+                        or (isinstance(in_id, int) and not isinstance(in_id, bool))
+                        or (isinstance(in_id, float) and math.isfinite(in_id))
+                    )
+                    if not valid_id:
+                        self._send_json(
+                            {
+                                "jsonrpc": "2.0",
+                                "id": None,
+                                "error": {
+                                    "code": -32600,
+                                    "message": "Invalid request id",
+                                },
+                            },
+                            timeout_s=resp_timeout,
+                            cancel_check=cancel_check,
+                        )
+                        rejected_methods.append(
+                            {
+                                "id": in_id,
+                                "method": method,
+                                "code": -32600,
+                                "reason": "invalid-id",
+                            }
                         )
                         continue
 

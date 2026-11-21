@@ -97,6 +97,7 @@ _TABLE_KEYS = {
     "invariants": {"forbidden_imports", "max_file_bytes", "require_exports"},
     "acceptance": {"checks"},
     "notifications": {"webhook_url", "desktop", "events"},
+    "try": {"start", "port", "path", "sample"},
 }
 _ROLE_MODEL_KEYS = {"model", "temperature", "vary_seed", "effort", "retry_effort", "effort_ladder"}
 _HEADER_NAME = re.compile(r"^[A-Za-z0-9!#$%&'*+.^_`|~-]+$")
@@ -133,15 +134,22 @@ def parse_duration(value, what: str = "duration") -> float:
 
     A bare string of digits is seconds, so `--for 60` and `--for 60s` agree.
     """
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return float(value)
-    text = str(value).strip()
-    if text.replace(".", "", 1).isdigit():
-        return float(text)
-    match = _DURATION_RE.match(text)
-    if not match:
+    if isinstance(value, bool):
         raise ConfigError(f"{what}: cannot read {value!r} as a duration")
-    return float(match.group(1)) * _DURATION_UNITS[match.group(2)]
+    if isinstance(value, (int, float)):
+        seconds = float(value)
+    else:
+        text = str(value).strip()
+        if text.replace(".", "", 1).isdigit():
+            seconds = float(text)
+        else:
+            match = _DURATION_RE.match(text)
+            if not match:
+                raise ConfigError(f"{what}: cannot read {value!r} as a duration")
+            seconds = float(match.group(1)) * _DURATION_UNITS[match.group(2)]
+    if not math.isfinite(seconds) or seconds < 0:
+        raise ConfigError(f"{what}: duration must be a finite non-negative number, got {value!r}")
+    return seconds
 
 
 def _as_str_list(value, what: str) -> list[str]:
@@ -217,7 +225,7 @@ def _nonneg_int(value, what: str, default: int) -> int:
 
 def _nonneg_float(value, what: str, default: float) -> float:
     result = _as_float(value, what, default)
-    if result < 0.0:
+    if not math.isfinite(result) or result < 0.0:
         raise ConfigError(f"{what}: must be >= 0")
     return result
 
@@ -575,6 +583,7 @@ class Config:
                                     temperature=rm.temperature,
                                     vary_seed=rm.vary_seed,
                                     effort=rm.effort,
+                                    retry_effort=rm.retry_effort,
                                     effort_ladder=rm.effort_ladder,
                                 )
 
@@ -641,12 +650,12 @@ class Config:
 
         # How "Try it" starts and looks at the app; empty means the language pack decides.
         try_it = self._table("try")
-        _check_keys(try_it, {"start", "port", "path", "sample"}, "[try]")
         for key in ("start", "path", "sample"):
             if not isinstance(try_it.get(key, ""), str):
                 raise ConfigError(f"[try] {key} must be a string")
-        if not isinstance(try_it.get("port", 0), int) or isinstance(try_it.get("port", 0), bool):
-            raise ConfigError("[try] port must be a whole number")
+        try_port = try_it.get("port", 0)
+        if not isinstance(try_port, int) or isinstance(try_port, bool) or not (0 <= try_port <= 65535):
+            raise ConfigError("[try] port must be a whole number between 0 and 65535")
         self.try_it = dict(try_it)
 
         runner = self._table("runner")
@@ -659,8 +668,8 @@ class Config:
         self.runner_python = python.strip()
         # The TypeScript pack's runner and tools, recorded by adopt.
         self.runner_typescript = _as_choice(
-            runner.get("typescript"), "[runner] typescript", "node",
-            ("node", "vitest", "jest"))
+            runner.get("typescript"), "[runner] typescript", "auto",
+            ("auto", "node", "vitest", "jest"))
         self.typescript_typecheck = _as_choice(
             runner.get("typescript_typecheck"), "[runner] typescript_typecheck", "auto",
             ("auto", "tsc", "syntax"))
@@ -687,30 +696,34 @@ class Config:
             self.runner_env[str(unit)] = {str(k): str(v) for k, v in values.items()}
 
         budget = self._table("budget")
-        self.implementer_attempts = _as_int(
+        self.implementer_attempts = _nonneg_int(
             budget.get("implementer_attempts"), "[budget] implementer_attempts", 4)
-        self.test_writer_attempts = _as_int(
+        self.test_writer_attempts = _nonneg_int(
             budget.get("test_writer_attempts"), "[budget] test_writer_attempts", 2)
-        self.model_build_calls_per_card = _as_int(
+        self.model_build_calls_per_card = _nonneg_int(
             budget.get("model_build_calls_per_card"),
             "[budget] model_build_calls_per_card", 10)
-        self.mutation_build_calls_per_card = _as_int(
+        self.mutation_build_calls_per_card = _nonneg_int(
             budget.get("mutation_build_calls_per_card"),
             "[budget] mutation_build_calls_per_card", 40)
-        self.tokens_per_card = _as_int(
+        self.tokens_per_card = _nonneg_int(
             budget.get("tokens_per_card"), "[budget] tokens_per_card", 400_000)
         self.wall_clock_per_card = parse_duration(
             budget.get("wall_clock_per_card", "45m"),
             "[budget] wall_clock_per_card")
         self.frontier_cost_ratio = (
-            _as_float(budget.get("frontier_cost_ratio"),
-                      "[budget] frontier_cost_ratio", 0.0) or None)
-        self.spend_per_night = _as_float(
+            _nonneg_float(budget.get("frontier_cost_ratio"),
+                          "[budget] frontier_cost_ratio", 0.0) or None)
+        self.spend_per_night = _nonneg_float(
             budget.get("spend_per_night"), "[budget] spend_per_night", 20.0)
         self.concurrent_builds = _as_int(
             budget.get("concurrent_builds"), "[budget] concurrent_builds", 2)
+        if self.concurrent_builds < 1:
+            raise ConfigError("[budget] concurrent_builds: must be >= 1")
         self.concurrent_cards = _as_int(
             budget.get("concurrent_cards"), "[budget] concurrent_cards", 3)
+        if self.concurrent_cards < 1:
+            raise ConfigError("[budget] concurrent_cards: must be >= 1")
         self.lease_ttl_s = parse_duration(
             budget.get("lease_ttl", "20m"), "[budget] lease_ttl")
         kill = budget.get("kill_switch")
@@ -804,7 +817,7 @@ class Config:
                             f"one of {list(_ACP_EFFORTS)!r}"
                         )
                 else:
-                    tier = self.tier_for_model(role_model.model)
+                    tier = self.tier_for_model(role_model.model if role_model is not None else "")
                     if value not in tier.efforts:
                         raise ConfigError(
                             f"[model] {role_name}.{key} {value!r} is not "
@@ -1464,7 +1477,7 @@ class Config:
             return ("", "")
         if is_acp_adapter(self.model_adapter):
             return (effort, "effort")
-        tier = self.tier_for_model(role_model.model)
+        tier = self.tier_for_model(role_model.model if role_model is not None else "")
         if not tier.effort_param:
             return ("", "")
         return (effort, tier.effort_param)

@@ -46,20 +46,31 @@ def _run_cli_check(worktree: Path, check: dict) -> dict:
     expect_exit = int(check.get("expect_exit", 0))
     expect_out = str(check.get("expect_stdout_contains") or "")
     started = time.monotonic()
+    if not cmd:
+        return {
+            "name": name,
+            "kind": "cli",
+            "ok": False,
+            "exit_code": -1,
+            "latency_ms": 0,
+            "error": "empty acceptance command",
+        }
+    proc: subprocess.Popen | None = None
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
             cwd=str(worktree),
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout_s,
             start_new_session=True,
         )
-        ok = proc.returncode == expect_exit and (not expect_out or expect_out in (proc.stdout or ""))
+        stdout, stderr = proc.communicate(timeout=timeout_s)
+        ok = proc.returncode == expect_exit and (not expect_out or expect_out in (stdout or ""))
         err = ""
         if proc.returncode != expect_exit:
             err = f"expected exit {expect_exit}, got {proc.returncode}"
-        elif expect_out and expect_out not in (proc.stdout or ""):
+        elif expect_out and expect_out not in (stdout or ""):
             err = f"stdout missing {expect_out!r}"
         return {
             "name": name,
@@ -67,11 +78,15 @@ def _run_cli_check(worktree: Path, check: dict) -> dict:
             "ok": ok,
             "exit_code": proc.returncode,
             "latency_ms": int((time.monotonic() - started) * 1000),
-            "stdout_tail": (proc.stdout or "")[-400:],
-            "stderr_tail": (proc.stderr or "")[-400:],
+            "stdout_tail": (stdout or "")[-400:],
+            "stderr_tail": (stderr or "")[-400:],
             "error": err,
         }
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except subprocess.TimeoutExpired as exc:
+        if proc is not None:
+            _kill_proc_group(proc)
+            with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+                proc.communicate(timeout=1.0)
         return {
             "name": name,
             "kind": "cli",
@@ -80,6 +95,23 @@ def _run_cli_check(worktree: Path, check: dict) -> dict:
             "latency_ms": int((time.monotonic() - started) * 1000),
             "error": str(exc),
         }
+    except OSError as exc:
+        return {
+            "name": name,
+            "kind": "cli",
+            "ok": False,
+            "exit_code": -1,
+            "latency_ms": int((time.monotonic() - started) * 1000),
+            "error": str(exc),
+        }
+    finally:
+        if proc is not None:
+            if proc.poll() is None:
+                _kill_proc_group(proc)
+            for pipe in (proc.stdout, proc.stderr):
+                if pipe is not None:
+                    with contextlib.suppress(OSError):
+                        pipe.close()
 
 
 def _run_http_check(worktree: Path, check: dict) -> dict:
@@ -95,13 +127,25 @@ def _run_http_check(worktree: Path, check: dict) -> dict:
     proc: subprocess.Popen | None = None
     try:
         if start_cmd:
-            proc = subprocess.Popen(
-                start_cmd,
-                cwd=str(worktree),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
+            try:
+                proc = subprocess.Popen(
+                    start_cmd,
+                    cwd=str(worktree),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            except OSError as exc:
+                return {
+                    "name": name,
+                    "kind": "http",
+                    "ok": False,
+                    "url": url,
+                    "status": 0,
+                    "latency_ms": int((time.monotonic() - started) * 1000),
+                    "body_preview": "",
+                    "error": str(exc),
+                }
         deadline = time.monotonic() + startup_timeout
         last_err = ""
         status = 0

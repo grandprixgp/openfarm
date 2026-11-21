@@ -497,9 +497,11 @@ class _AcpArchitectBackend:
         self._spend(comp)
         return str(comp.content or "")
 
-    def stream_to(self, on_chunk) -> None:
-        """Send the answer's text to `on_chunk` as it arrives (None stops it)."""
+    def stream_to(self, on_chunk):
+        """Send the answer's text to `on_chunk` as it arrives (None stops it). Returns the previous callback."""
+        prev = getattr(self._worker, "on_chunk", None)
         self._worker.on_chunk = on_chunk
+        return prev
 
     def close(self) -> None:
         self._worker.close()
@@ -508,20 +510,27 @@ class _AcpArchitectBackend:
 _FILE_KEY = re.compile(r'"([^"\s\\]+\.[A-Za-z0-9]+)"\s*:')
 
 
-def _stream_file_progress(backend, on_progress) -> None:
+def _stream_file_progress(backend, on_progress):
     """Report each file the Architect starts writing, so a slow answer is visibly moving.
 
-    The answer is one JSON object keyed by file path; a new key means a new file.
-    The number of cards to come is not known until the answer ends, so there is no "of N".
+    Preserves any existing `on_chunk` callback on `backend` so UI streaming keeps receiving chunks.
+    Returns the previous callback so callers can restore it in a `finally:` block.
     """
     if not callable(on_progress) or not hasattr(backend, "stream_to"):
-        return
+        return None
+    worker = getattr(backend, "_worker", None)
+    prev = getattr(worker, "on_chunk", None) if worker is not None else getattr(backend, "on_chunk", None)
     text: list[str] = []
     seen: list[str] = []
     scanned = 0
 
     def _on_chunk(chunk: str) -> None:
         nonlocal scanned
+        if callable(prev):
+            try:
+                prev(chunk)
+            except Exception:  # noqa: BLE001 - UI streaming must never break planning
+                pass
         text.append(chunk)
         whole = "".join(text)
         for match in _FILE_KEY.finditer(whole, scanned):
@@ -537,7 +546,10 @@ def _stream_file_progress(backend, on_progress) -> None:
             except Exception:  # noqa: BLE001 - a progress line must never end the Architect's turn
                 pass
 
-    backend.stream_to(_on_chunk)
+    returned = backend.stream_to(_on_chunk)
+    if prev is None and callable(returned):
+        prev = returned
+    return prev
 
 
 def open_architect_backend(
@@ -588,7 +600,11 @@ def open_architect_backend(
         if timeout_s and timeout_s > 0:
             worker.timeout_s = min(float(getattr(worker, "timeout_s", timeout_s)), float(timeout_s))
         mm_model = str(getattr(getattr(cfg, "micromanager", None), "model", "") or "")
-        chosen = (getattr(cfg, "model_choices", None) or {}).get("architect") or {}
+        choices = getattr(cfg, "model_choices", None)
+        if not choices:
+            from .model_choices import resolve as resolve_model_choices
+            choices = resolve_model_choices({}, None)
+        chosen = (choices or {}).get("architect") or {}
         if chosen.get("model_from", "config") != "config":
             mm_model = chosen["model"]
         if chosen.get("effort_from", "config") != "config":
@@ -1221,12 +1237,12 @@ def run_grill_and_architect(
         )
         if callable(on_progress):
             on_progress(f"Sending {len(prompt):,} char prompt to Frontier Architect ({lang})...")
-        _stream_file_progress(backend, on_progress)
+        prev_stream = _stream_file_progress(backend, on_progress)
         try:
             raw = str(backend.ask(prompt) if hasattr(backend, "ask") else backend(prompt))
         finally:
-            if hasattr(backend, "stream_to"):
-                backend.stream_to(None)
+            if callable(on_progress) and hasattr(backend, "stream_to"):
+                backend.stream_to(prev_stream)
         if callable(on_progress):
             on_progress(f"Architect responded ({len(raw):,} chars) — extracting files...")
         from .frontier_review import _extract_json_dict
@@ -2098,8 +2114,14 @@ def something_wrong(repo: Path, text: str, *, chunk_id: str | None = None, backe
         raise Refused("nothing-said", "say what is wrong first")
     if backend is None:
         raise Refused("architect-needed", "fix tasks are drafted by the Architect, and none is set up")
-    return draft_wave_plan(repo, idea=text, chunk_id=chunk_id or _current_goal_id(repo), backend=backend,
-                           include_picked_findings=False, on_progress=on_progress, decision_kind="iteration")
+    target = chunk_id or _current_goal_id(repo)
+    result = draft_wave_plan(repo, idea=text, chunk_id=target, backend=backend,
+                             include_picked_findings=False, on_progress=on_progress, decision_kind="iteration")
+    if target:
+        chunks = load_project_chunks(repo)
+        if any(c["id"] == target and c["status"] == "done" for c in chunks):
+            set_chunk_status(repo, target, "active")
+    return result
 
 
 def _current_goal_id(repo: Path) -> str | None:

@@ -23,10 +23,12 @@ branch, so concurrent cards can't conflict and every lane sees the same claims.
 
 from __future__ import annotations
 
-import re
+import fcntl
 import json
+import os
 import re
 import shutil
+import tempfile
 import threading
 import tomllib
 from pathlib import Path
@@ -40,17 +42,108 @@ from ..state import utc_after, utc_now
 STORE_FILE = "store.json"
 
 _SOURCE_LOCKS_GUARD = threading.Lock()
-_SOURCE_LOCKS: dict[tuple[Path, str], threading.RLock] = {}
+_SOURCE_LOCKS: dict[object, threading.RLock] = {}
+_SOURCE_THREAD_STATE = threading.local()
 
 
-def _source_lock_for(repo: Path, branch: str) -> threading.RLock:
-    key = (Path(repo).resolve(), str(branch or ""))
+def _source_thread_lock(key: object) -> threading.RLock:
     with _SOURCE_LOCKS_GUARD:
         lock = _SOURCE_LOCKS.get(key)
         if lock is None:
             lock = threading.RLock()
             _SOURCE_LOCKS[key] = lock
         return lock
+
+
+def _source_depth_map() -> dict[Path, int]:
+    depths = getattr(_SOURCE_THREAD_STATE, "depths", None)
+    if depths is None:
+        depths = {}
+        _SOURCE_THREAD_STATE.depths = depths
+    return depths
+
+
+def _source_handle_map() -> dict[Path, object]:
+    handles = getattr(_SOURCE_THREAD_STATE, "handles", None)
+    if handles is None:
+        handles = {}
+        _SOURCE_THREAD_STATE.handles = handles
+    return handles
+
+
+def _source_stack() -> list[tuple[threading.RLock, Path | None]]:
+    stack = getattr(_SOURCE_THREAD_STATE, "stack", None)
+    if stack is None:
+        stack = []
+        _SOURCE_THREAD_STATE.stack = stack
+    return stack
+
+
+class _CardSourceLock:
+    """Reentrant per-thread lock layered over an advisory cross-process flock.
+
+    Reentrancy depth is tracked per resolved lockfile path in thread-local
+    storage (not per instance), so two `FileCardSource` instances pointing at
+    the same worktree on the same thread never self-deadlock on `flock`.
+    """
+
+    def __init__(self, source: "FileCardSource") -> None:
+        self._source = source
+
+    def _resolve_target(self) -> tuple[object, Path | None]:
+        wt = self._source.worktree
+        if wt is not None:
+            wt_resolved = Path(wt).resolve()
+            lock_path = wt_resolved.parent / f"{wt_resolved.name}.lock"
+            return lock_path, lock_path
+        return ("no-worktree", self._source.repo.resolve(), str(self._source.branch or "")), None
+
+    def __enter__(self) -> "_CardSourceLock":
+        key, lock_path = self._resolve_target()
+        tlock = _source_thread_lock(key)
+        tlock.acquire()
+        if lock_path is None:
+            _source_stack().append((tlock, None))
+            return self
+        depths = _source_depth_map()
+        depth = depths.get(lock_path, 0)
+        if depth > 0:
+            depths[lock_path] = depth + 1
+            _source_stack().append((tlock, lock_path))
+            return self
+        handle = None
+        try:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            handle = lock_path.open("a+", encoding="utf-8")
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            depths[lock_path] = 1
+            _source_handle_map()[lock_path] = handle
+            _source_stack().append((tlock, lock_path))
+        except BaseException:
+            if handle is not None:
+                handle.close()
+            tlock.release()
+            raise
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        tlock, lock_path = _source_stack().pop()
+        try:
+            if lock_path is not None:
+                depths = _source_depth_map()
+                depth = depths.get(lock_path, 0)
+                if depth > 1:
+                    depths[lock_path] = depth - 1
+                elif depth == 1:
+                    depths.pop(lock_path, None)
+                    handle = _source_handle_map().pop(lock_path, None)
+                    if handle is not None:
+                        try:
+                            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                        finally:
+                            handle.close()
+        finally:
+            tlock.release()
 
 #: The header is a TOML block between two `+++` lines. Delimiters must be alone on
 #: their line, so a note or a dossier's diff containing `+++ b/some/file.rs` is safe.
@@ -150,7 +243,7 @@ class FileCardSource:
         self.worktree = Path(worktree) if worktree else None
         self.fields_block = fields_block
         self.git = Git(self.repo)
-        self._lock = _source_lock_for(self.repo, self.branch)
+        self._lock = _CardSourceLock(self)
 
     # -- setup ---------------------------------------------------------------
 
@@ -224,8 +317,8 @@ class FileCardSource:
 
         Preserves `FIND-*.md` by default unless `clear_findings=True` (e.g. stack switch re-init).
         """
-        self.prepare()
         with self._lock:
+            self.prepare()
             if self.worktree is None:
                 return 0
             dst_dir = self.worktree / self.folder
@@ -285,9 +378,23 @@ class FileCardSource:
         return data if isinstance(data, dict) else {}
 
     def save_meta(self, data: dict, message: str = "") -> None:
-        """Write `store.json`. With no message it rides along with the next card commit."""
+        """Write `store.json` atomically. With no message it rides along with the next card commit."""
         with self._lock:
-            self._meta_path().write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            meta_path = self._meta_path()
+            meta_path.parent.mkdir(parents=True, exist_ok=True)
+            text = json.dumps(data, indent=2, sort_keys=True) + "\n"
+            fd, tmp_name = tempfile.mkstemp(
+                prefix=f".{meta_path.name}.", suffix=".tmp", dir=str(meta_path.parent)
+            )
+            tmp_path = Path(tmp_name)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(text)
+                    handle.flush()
+                os.replace(tmp_path, meta_path)
+            except BaseException:
+                tmp_path.unlink(missing_ok=True)
+                raise
             if message:
                 Git(self.worktree).commit_all(message)
 
@@ -405,8 +512,11 @@ class FileCardSource:
                  "state": str(merged.get("state", "backlog")),
                  "done_text": done_body,
                  "touches": touches,
-                 "deps": [str(d) for d in merged.get("depends", []) or []],
-                 "fields": fields},
+                 "deps": deps,
+                 "fields": fields,
+                 "holder": str(merged.get("holder", "") or ""),
+                 "lane": str(merged.get("lane", "") or ""),
+                 "lease_expires_at": str(merged.get("lease_expires_at", "") or "")},
         )
 
     def read(self, card_id: str) -> dict:
@@ -417,7 +527,7 @@ class FileCardSource:
     def hash(self, card_id: str) -> dict:
         with self._lock:
             header, body, path = self._read_raw(card_id)
-            return {"hash": self._card_from(header, body, path).hash()}
+            return {"hash": hash_value(self._card_from(header, body, path).as_dict())}
 
     def all_cards(self) -> list[Card]:
         with self._lock:
@@ -455,6 +565,8 @@ class FileCardSource:
             now = utc_now()
             out = []
             for card in self.all_cards():
+                if lane and _lane(card.raw) and _lane(card.raw) != lane:
+                    continue
                 holder = _holder(card.raw)
                 expires = _lease_expiry(card.raw)
                 if holder and expires and expires < now:
@@ -464,7 +576,8 @@ class FileCardSource:
 
     # -- writing -------------------------------------------------------------
 
-    def _write(self, card_id: str, header: dict, body: str, message: str) -> str:
+    def _write(self, card_id: str, header: dict, body: str, message: str,
+               *, commit: bool = True) -> str:
         with self._lock:
             path = self._path(card_id)
             text = render_card_file(header, body)
@@ -481,7 +594,8 @@ class FileCardSource:
                     f"was written") from exc
             path.write_text(text)
             git = Git(self.worktree)
-            git.commit_all(message)
+            if commit:
+                git.commit_all(message)
             return git.head()
 
     def claim(self, card_id: str, holder: str,
@@ -595,7 +709,7 @@ class FileCardSource:
                         "held",
                         f"{card_id} is held by {holder} on a lease until {expires}; "
                         f"release it once that has expired")
-            if header.get("state") in ("done", "dropped"):
+            if header.get("state") in ("done", "dropped", "split"):
                 raise Refused("not-held",
                               f"{card_id} is {header.get('state')}, not in progress")
             header["state"] = READY
@@ -713,13 +827,6 @@ class FileCardSource:
             if commit:
                 Git(self.worktree).commit_all(f"{card.id}: add")
             return path
-
-    def delete_card(self, card_id: str) -> None:
-        with self._lock:
-            path = self._path(card_id)
-            if path.exists():
-                path.unlink()
-                Git(self.worktree).commit_all(f"{card_id}: remove")
 
 
 def _holder(raw: dict) -> str:

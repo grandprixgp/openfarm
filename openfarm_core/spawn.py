@@ -9,6 +9,7 @@ few times, a little later each time; any other failure to start is not retried.
 from __future__ import annotations
 
 import errno
+import math
 import os
 import subprocess
 import time
@@ -31,7 +32,7 @@ def retry_delays() -> tuple[float, ...]:
             value = float(part)
         except ValueError:
             continue
-        if value >= 0:
+        if math.isfinite(value) and value >= 0:
             out.append(value)
     return tuple(out)
 
@@ -40,7 +41,12 @@ def popen_with_retry(argv, *, delays=None, popen=None, sleep=time.sleep,
                      on_retry=None, **kwargs):
     """`subprocess.Popen(argv, **kwargs)`, tried again while the program is missing."""
     start = popen or subprocess.Popen
-    waits = list(retry_delays() if delays is None else delays)
+    raw_waits = retry_delays() if delays is None else delays
+    waits = [
+        float(w) for w in raw_waits
+        if isinstance(w, (int, float)) and not isinstance(w, bool)
+        and math.isfinite(w) and w >= 0
+    ]
     while True:
         try:
             return start(argv, **kwargs)

@@ -11,13 +11,52 @@ Safety invariants:
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
+import os
+import re
 import shutil
-import time
+import threading
+import uuid
 from pathlib import Path
 
 from .errors import Refused, StopCode
 from .git import Git
 from .triage import triage_card_heuristic
+
+
+_AUTO_LAND_LOCKS_GUARD = threading.Lock()
+_AUTO_LAND_LOCKS: dict[Path, threading.Lock] = {}
+
+
+def _thread_lock_for(path: Path) -> threading.Lock:
+    resolved = path.resolve()
+    with _AUTO_LAND_LOCKS_GUARD:
+        lock = _AUTO_LAND_LOCKS.get(resolved)
+        if lock is None:
+            lock = threading.Lock()
+            _AUTO_LAND_LOCKS[resolved] = lock
+        return lock
+
+
+@contextlib.contextmanager
+def _auto_land_lock(state_dir: Path):
+    lock_path = Path(state_dir).expanduser().resolve() / "auto-land.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with _thread_lock_for(lock_path):
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+
+def _unique_wt_name(prefix: str) -> str:
+    return f"{prefix}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
 
 def trial_rebase_branch(
@@ -32,7 +71,7 @@ def trial_rebase_branch(
     if not git.branch_exists(branch):
         raise Refused("branch-not-found", f"branch {branch!r} does not exist")
     old_sha = git.branch_head(branch)
-    wt = Path(state_dir).expanduser().resolve() / "worktrees" / f"rebase-{int(time.time() * 1000)}"
+    wt = Path(state_dir).expanduser().resolve() / "worktrees" / _unique_wt_name("rebase")
     wt.parent.mkdir(parents=True, exist_ok=True)
     try:
         git.worktree_add(wt, old_sha)
@@ -95,8 +134,23 @@ def evaluate_auto_land(
     if not isinstance(gates, list) or not gates:
         reasons.append("missing deterministic gate record")
     else:
-        failed = [str(g.get("gate") or "?") for g in gates if isinstance(g, dict) and g.get("result") != "pass"]
-        if failed:
+        latest: dict[str, str] = {}
+        unnamed_failed = 0
+        for g in gates:
+            if not isinstance(g, dict):
+                continue
+            gname = str(g.get("gate") or g.get("name") or "").strip()
+            res = str(g.get("result") or "")
+            if gname:
+                latest[gname] = res
+            elif res != "pass":
+                unnamed_failed += 1
+        failed = [name for name, res in latest.items() if res != "pass"]
+        if unnamed_failed:
+            failed.extend(["?"] * unnamed_failed)
+        if not latest and not unnamed_failed:
+            reasons.append("missing deterministic gate record")
+        elif failed:
             reasons.append(f"non-passing gate(s): {', '.join(failed)}")
 
     if getattr(fcfg, "require_zero_findings", True) and findings:
@@ -138,36 +192,40 @@ def auto_land_card(
     root = Path(repo).expanduser().resolve()
     git = Git(root)
     int_branch = str(cfg.factory.integration_branch or "openfarm/integration")
-    if not git.branch_exists(int_branch):
-        git.create_branch(int_branch, cfg.base_branch)
+    safe_cid = re.sub(r"[^A-Za-z0-9._-]", "_", str(card.id))
+    wt_root = Path(cfg.state_dir).expanduser().resolve() / "worktrees"
+    wt_root.mkdir(parents=True, exist_ok=True)
 
-    wt = Path(cfg.state_dir).expanduser().resolve() / "worktrees" / f"autoland-{card.id}-{int(time.time() * 1000)}"
-    wt.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        git.worktree_add(wt, git.branch_head(int_branch))
-        wt_git = Git(wt)
-        ok, out = wt_git.merge_no_ff(branch, message=f"openfarm(auto-land): merge {branch} ({card.id})")
-        if not ok:
-            return {
-                "landed": False,
-                "stop_code": StopCode.REBASE_CONFLICT.value,
-                "reasons": [f"merge conflict onto {int_branch}: {out[:200]}"],
-            }
-        new_sha = wt_git.head()
-        git.create_branch(int_branch, new_sha)
-    finally:
-        git.worktree_remove(wt)
-        if wt.exists():
-            shutil.rmtree(wt, ignore_errors=True)
+    with _auto_land_lock(cfg.state_dir):
+        if not git.branch_exists(int_branch):
+            git.create_branch(int_branch, cfg.base_branch)
 
-    # Mark card done on openfarm-cards
-    try:
-        source.move(card.id, "", "done")
-    except (Refused, OSError) as exc:
-        move_err = str(exc)
-        _ = move_err
+        wt = wt_root / _unique_wt_name(f"autoland-{safe_cid}")
+        try:
+            git.worktree_add(wt, git.branch_head(int_branch))
+            wt_git = Git(wt)
+            ok, out = wt_git.merge_no_ff(branch, message=f"openfarm(auto-land): merge {branch} ({card.id})")
+            if not ok:
+                return {
+                    "landed": False,
+                    "stop_code": StopCode.REBASE_CONFLICT.value,
+                    "reasons": [f"merge conflict onto {int_branch}: {out[:200]}"],
+                }
+            new_sha = wt_git.head()
+            git.create_branch(int_branch, new_sha)
+        finally:
+            git.worktree_remove(wt)
+            if wt.exists():
+                shutil.rmtree(wt, ignore_errors=True)
+
+    # Mark card done on openfarm-cards; propagate Refused/OSError so callers never miss state drift.
+    source.mark_done(
+        card.id,
+        note=f"auto-landed onto {int_branch} ({new_sha[:12]})",
+    )
     return {
         "landed": True,
+        "marked_done": True,
         "card": card.id,
         "branch": branch,
         "integration_branch": int_branch,

@@ -59,7 +59,7 @@ from .bootstrap import (
     install_skill_bundle,
 )
 from .briefs import BriefBook
-from .budget import NightBudget, token_split
+from .budget import Budget, BudgetExceeded, NightBudget, token_split
 from .cards import Card
 from .store import record as record_change
 from .config import load_config, parse_duration
@@ -91,7 +91,14 @@ from .swarm import (
     swarm_status,
     swarm_tiers,
 )
-from .tui import VIEWS as TUI_VIEWS, run_tui
+from . import tui as _tui_mod
+from .tui import run_tui
+
+TUI_VIEWS = getattr(
+    _tui_mod,
+    "CLI_VIEWS",
+    _tui_mod.VIEWS + ("studio", "review", "projects", "findings", "engine", "providers"),
+)
 
 EXIT_OK = 0
 EXIT_REFUSED = 1
@@ -203,6 +210,99 @@ def _build_night_mm_budget(cfg) -> MicromanagerBudget:
         max_calls_per_card=max_calls,
         tokens_per_card=tokens_cap,
         spend_per_night=spend_cap,
+    )
+
+
+class _LiveNightBudget(NightBudget):
+    """NightBudget that also tracks live in-flight card spend so concurrent cards share one cap."""
+
+    def __init__(self, spend_cap: float, cards_cap: int | None = None, mm_budget=None) -> None:
+        super().__init__(spend_cap, cards_cap=cards_cap)
+        self._mm_budget = mm_budget
+        self._live: dict[str, float] = {}
+
+    def set_live(self, card_id: str, card_spend: float) -> None:
+        with self._lock:
+            self._live[card_id] = float(card_spend or 0.0)
+
+    def clear_live(self, card_id: str) -> None:
+        with self._lock:
+            self._live.pop(card_id, None)
+
+    def finish_card(self, card_id: str, spend: float, micromanager_spend: float) -> None:
+        with self._lock:
+            self._live.pop(card_id, None)
+            self.spend += float(spend or 0.0)
+            self.micromanager_spend += float(micromanager_spend or 0.0)
+
+    def live_total(self) -> float:
+        mm_live = 0.0
+        if self._mm_budget is not None:
+            with contextlib.suppress(TypeError, ValueError):
+                mm_live = float(getattr(self._mm_budget, "spend", 0.0) or 0.0)
+        with self._lock:
+            return (
+                self.spend
+                + sum(self._live.values())
+                + max(self.micromanager_spend, mm_live)
+                + self.coordinator_spend
+            )
+
+    def exhausted(self) -> str | None:
+        if self.spend_cap > 0:
+            used = self.live_total()
+            if used >= self.spend_cap:
+                return f"night spend {used:.4f} reached its cap of {self.spend_cap:.4f}"
+        return super().exhausted()
+
+
+class _NightCardBudget(Budget):
+    """Per-card Budget bound to the run's NightBudget cap (including CLI `--spend`)."""
+
+    def __init__(self, *args, night: NightBudget | None = None, card_id: str = "", **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._night = night
+        self._card_id = card_id
+
+    def note_tokens(self, tokens_in: int, tokens_out: int, spend: float = 0.0,
+                    tokens_in_cached: int = 0) -> None:
+        self.tokens_in += tokens_in
+        self.tokens_in_cached += max(0, int(tokens_in_cached or 0))
+        self.tokens_out += tokens_out
+        self.spend += spend
+        if self._night is not None and callable(getattr(self._night, "set_live", None)):
+            self._night.set_live(self._card_id, self.spend)
+        self._check_tokens()
+        self._check_spend()
+        if spend > 0 and self._night is not None and self._night.spend_cap > 0:
+            live_fn = getattr(self._night, "live_total", None)
+            used = (
+                float(live_fn())
+                if callable(live_fn)
+                else self._night.total_spend() + self.spend
+            )
+            if used > self._night.spend_cap:
+                raise BudgetExceeded(
+                    f"night spend reached {used:.4f}, over the cap of {self._night.spend_cap:.4f}"
+                )
+
+
+def _build_card_budget(cfg: Config, card: Card, night: NightBudget | None = None) -> Budget:
+    if night is None:
+        return Budget.from_config(cfg, card.frontier_estimate)
+    spend_cap = night.spend_cap if night.spend_cap > 0 else cfg.spend_per_night
+    return _NightCardBudget(
+        model_builds=cfg.model_build_calls_per_card,
+        mutation_builds=cfg.mutation_build_calls_per_card,
+        tokens=cfg.tokens_per_card,
+        wall_clock_s=cfg.wall_clock_per_card,
+        spend=spend_cap,
+        frontier_estimate=card.frontier_estimate,
+        frontier_ratio=cfg.frontier_cost_ratio,
+        implementer_attempts=cfg.implementer_attempts,
+        test_writer_attempts=cfg.test_writer_attempts,
+        night=night,
+        card_id=card.id,
     )
 
 
@@ -543,11 +643,13 @@ def _do_run(ctx: Context, args, run_id: str, *, on_event=None) -> int:
         cap = (min(args.spend, cfg.spend_per_night) if cfg.spend_per_night > 0
                else args.spend)
     night_mm_budget = _build_night_mm_budget(cfg)
+    if cap > 0 and (night_mm_budget.spend_per_night <= 0 or cap < night_mm_budget.spend_per_night):
+        night_mm_budget.spend_per_night = cap
     # `openfarm drive` runs this in its own process and hands in a night budget
     # its own turns are added to, so one total stops both (see driver.py).
     make_night = getattr(ctx, "make_night_budget", None)
     night = (make_night(cap, args.cards, night_mm_budget) if callable(make_night)
-             else NightBudget(cap, cards_cap=args.cards))
+             else _LiveNightBudget(cap, cards_cap=args.cards, mm_budget=night_mm_budget))
     deadline = _deadline(args)
     outcomes: list[dict] = []
     consecutive: list[tuple[str, str, str]] = []
@@ -718,25 +820,41 @@ def _do_run(ctx: Context, args, run_id: str, *, on_event=None) -> int:
         else None
     )
 
+    # Cards that ended `released` stay `ready`; skip them in `--follow` unless edited,
+    # while cards that ended `blocked` can be picked up again once retried.
+    skip_released: dict[str, str] = {}
+
+    def _already_released_unchanged(cid: str) -> bool:
+        if cid not in skip_released:
+            return False
+        old_hash = skip_released[cid]
+        if not old_hash:
+            return True
+        try:
+            cur_hash = Card.from_dict(source.read(cid)["card"]).hash()
+        except Exception:
+            return True
+        return cur_hash == old_hash
+
     def _queue():
         """The run's cards: those it started with, then (`--follow`) each one that can
-        start once the card it waits for is accepted, so one build covers every layer."""
+        start once the card it waits for is accepted or a blocked card is retried."""
         from .cards import waiting_on as _waiting_on
 
-        started: set[str] = set()
         batch = list(identifiers)
         while True:
             for cid in batch:
-                started.add(cid)
                 yield cid
             if not getattr(args, "follow", False) or args.card or args.dry_run:
                 return
             told = False
             while True:
-                if (ctx.state.kill_requested(cfg.kill_switch) or ctx.state.is_paused() or night.exhausted()
+                if (ctx.state.kill_requested(cfg.kill_switch) or ctx.state.is_paused()
+                        or ctx.state.read_breaker().get("tripped") or night.exhausted()
                         or (deadline is not None and _time.monotonic() >= deadline)):
                     return
-                batch = [c for c in source.next(cfg.lane, limit=args.cards)["cards"] if c not in started]
+                batch = [c for c in source.next(cfg.lane, limit=args.cards)["cards"]
+                         if not _already_released_unchanged(c)]
                 if batch:
                     event_bus.emit(kind="run_more", cards=list(batch),
                                    message=f"{', '.join(batch)} can start now")
@@ -770,6 +888,10 @@ def _do_run(ctx: Context, args, run_id: str, *, on_event=None) -> int:
                     outcomes.append({"card": card_id,
                                      "skipped": "the queue was paused"})
                     continue
+                if ctx.state.read_breaker().get("tripped"):
+                    outcomes.append({"card": card_id,
+                                     "skipped": "the circuit breaker is tripped"})
+                    continue
                 # `_deadline` answers in `time.monotonic()`, so it must be compared to the
                 # same clock. Comparing it to `time.time()` would skip every card at once.
                 if deadline is not None and _time.monotonic() >= deadline:
@@ -791,7 +913,7 @@ def _do_run(ctx: Context, args, run_id: str, *, on_event=None) -> int:
                                     run_dir, script_path, mm_script=mm_script_path,
                                     harness_library=harness_lib,
                                     mm_budget=night_mm_budget, board=board,
-                                    on_event=event_bus.emit)
+                                    on_event=event_bus.emit, night=night)
                 outcomes.append(outcome)
                 event_bus.emit(
                     kind="card_done",
@@ -805,6 +927,12 @@ def _do_run(ctx: Context, args, run_id: str, *, on_event=None) -> int:
                     message=str(outcome.get("detail") or outcome.get("final_state") or ""),
                 )
                 final_state = outcome.get("final_state")
+                _maybe_auto_land(ctx, source, card_id, run_id, outcome, event_bus)
+                _notify_card_outcome(cfg, card_id, outcome)
+                if final_state == "released":
+                    skip_released[card_id] = str(outcome.get("card_hash") or "")
+                else:
+                    skip_released.pop(card_id, None)
                 if final_state == "blocked":
                     code = outcome.get("stop_code", "")
                     consecutive.append((card_id, code, outcome.get("detail", "")))
@@ -812,16 +940,26 @@ def _do_run(ctx: Context, args, run_id: str, *, on_event=None) -> int:
                         ctx.state.pause(
                             f"infra error on {card_id}: {outcome.get('detail', '')}")
                         night.note_card()
-                        night.note_spend(outcome.get("spend", 0.0) or 0.0)
-                        night.note_micromanager(
-                            outcome.get("micromanager_spend", 0.0) or 0.0)
+                        finish = getattr(night, "finish_card", None)
+                        if callable(finish):
+                            finish(card_id, outcome.get("spend", 0.0) or 0.0,
+                                   outcome.get("micromanager_spend", 0.0) or 0.0)
+                        else:
+                            night.note_spend(outcome.get("spend", 0.0) or 0.0)
+                            night.note_micromanager(
+                                outcome.get("micromanager_spend", 0.0) or 0.0)
                         _update_breaker(ctx, consecutive)
                         break
                 elif final_state != "released":
                     consecutive = []
                 night.note_card()
-                night.note_spend(outcome.get("spend", 0.0) or 0.0)
-                night.note_micromanager(outcome.get("micromanager_spend", 0.0) or 0.0)
+                finish = getattr(night, "finish_card", None)
+                if callable(finish):
+                    finish(card_id, outcome.get("spend", 0.0) or 0.0,
+                           outcome.get("micromanager_spend", 0.0) or 0.0)
+                else:
+                    night.note_spend(outcome.get("spend", 0.0) or 0.0)
+                    night.note_micromanager(outcome.get("micromanager_spend", 0.0) or 0.0)
                 _update_breaker(ctx, consecutive)
         else:
             rec_lock = threading.Lock()
@@ -853,6 +991,7 @@ def _do_run(ctx: Context, args, run_id: str, *, on_event=None) -> int:
                         on_struggling=on_struggling,
                         mm_seat=mm_seat,
                         on_event=event_bus.emit,
+                        night=night,
                     )
                 finally:
                     if metered is not None and hasattr(metered, "close"):
@@ -861,6 +1000,7 @@ def _do_run(ctx: Context, args, run_id: str, *, on_event=None) -> int:
 
             def _record_swarm_outcome(cid: str, outcome: dict) -> bool:
                 nonlocal consecutive
+                _maybe_auto_land(ctx, source, cid, run_id, outcome, event_bus)
                 with rec_lock:
                     final_state = outcome.get("final_state")
                     infra_stop = False
@@ -883,8 +1023,9 @@ def _do_run(ctx: Context, args, run_id: str, *, on_event=None) -> int:
                         night.note_micromanager(
                             outcome.get("micromanager_spend", 0.0) or 0.0
                         )
-                    _update_breaker(ctx, consecutive)
-                    return infra_stop
+                    tripped = _update_breaker(ctx, consecutive)
+                _notify_card_outcome(cfg, cid, outcome)
+                return infra_stop or tripped
 
             swarm_runner = SwarmRunner(
                 cfg=cfg,
@@ -922,6 +1063,20 @@ def _do_run(ctx: Context, args, run_id: str, *, on_event=None) -> int:
             cards_count=len(outcomes),
             message=f"Finished run {run_id} ({len(outcomes)} outcome(s))",
         )
+        if not args.dry_run:
+            in_rev = sum(
+                1 for o in outcomes
+                if str(o.get("final_state") or "").lower().replace("-", "_") == "in_review"
+            )
+            blocked_n = sum(1 for o in outcomes if o.get("final_state") == "blocked")
+            landed_n = sum(
+                1 for o in outcomes
+                if isinstance(o.get("auto_land"), dict) and o["auto_land"].get("landed")
+            )
+            parts = [f"{len(outcomes)} outcome(s)", f"{in_rev} in review", f"{blocked_n} blocked"]
+            if landed_n:
+                parts.append(f"{landed_n} auto-landed")
+            _notify_run_event(cfg, "wave_finished", f"Run {run_id} finished", ", ".join(parts))
 
     notes: list[str] = []
     if not _backend_prices_spend(cfg, script_path):
@@ -1197,7 +1352,8 @@ def _run_card(ctx: Context, source: FileCardSource, card_id: str, run_id: str,
               on_handback=None,
               on_struggling=None,
               mm_seat: _SharedAcpSupervisor | None = None,
-              on_event=None) -> dict:
+              on_event=None,
+              night: NightBudget | None = None) -> dict:
     """Claim one card and drive it. `backend` overrides the configured one."""
     cfg = ctx.cfg
     holder = f"openfarm:{run_id}"
@@ -1207,73 +1363,97 @@ def _run_card(ctx: Context, source: FileCardSource, card_id: str, run_id: str,
         return {"card": card_id, "final_state": "released",
                 "stop_code": StopCode.REFUSED.value, "detail": exc.message}
 
-    card = Card.from_dict(source.read(card_id)["card"])
-    card_hash = card.hash()
-    worktree = ctx.state.worktrees / f"{card.id}-{run_id}"
-    if worktree.exists():
-        Git(ctx.repo).worktree_remove(worktree)
-
-    base_ref = (f"refs/heads/{cfg.base_branch}"
-                if Git(ctx.repo).ref_exists(f"refs/heads/{cfg.base_branch}") else "HEAD")
-    Git(ctx.repo).worktree_add(worktree, base_ref)
-
-    card_dir = ctx.state.create_card(card.id, run_id)
-    pack = _configured_pack(cfg, worktree, unit=card.unit)
+    worktree: Path | None = None
+    worktree_created = False
     owns_backend = backend is None
-    backend = backend if backend is not None else open_backend(cfg, script)
-    runner = ctx.runner(worktree, output_dir=card_dir / "gates" / "output")
-    if build_limiter is not None and hasattr(runner, "limiter") and runner.limiter is None:
-        runner.limiter = build_limiter
-    book = BriefBook(worktree, cfg.never_touch, cfg.forbidden_files)
-    book.pack = pack
-    conventions = _load_test_conventions(cfg, worktree)
-
-    if mm_seat is not None and micromanager is None and mm_backend is None:
-        # Its own session on the run's shared supervisor process, at its worktree.
-        mm_backend = mm_seat.for_card(worktree, card_dir)
-        owns_mm = True  # closing it ends the card's session, not the process
-    else:
-        owns_mm = micromanager is None and mm_backend is None
-    mm = (micromanager if micromanager is not None else open_micromanager(
-        cfg, card_dir, ctx.repo, script=mm_script,
-        worktree=worktree, card_dir=card_dir, budget=mm_budget,
-        board=board, worker_backend=backend, backend_override=mm_backend,
-    ))
-    if mm_budget is not None and hasattr(mm, "budget"):
-        mm.budget = mm_budget
-    resolved_harness = (
-        harness_library
-        if harness_library is not None
-        else _open_harness_library(ctx, require_enabled=True)
-    )
-    run = CardRun(
-        card=card, cfg=cfg, state=ctx.state, card_dir=card_dir,
-        worktree=worktree, runner=runner, pack=pack, backend=backend,
-        book=book, run_id=run_id, telemetry=telemetry,
-        deps_done=_deps_done(source, card), conventions=conventions,
-        log=lambda message: print(message, file=sys.stderr),
-        micromanager=mm, harness_library=resolved_harness,
-        board=board, swarm=getattr(cfg, "swarm", None),
-        on_handback=on_handback, on_struggling=on_struggling,
-        on_event=on_event)
-    run.card_source = source
+    opened_backend = None
+    owns_mm = False
+    mm = None
+    mm_session_backend = None
+    run_started = False
+    completed = False
     try:
-        record = run.run(claim=claim)
-    finally:
-        if owns_mm:
-            try:
-                mm.close()
-            except Exception:
-                pass
-        if owns_backend and hasattr(backend, "close"):
-            try:
-                backend.close()
-            except Exception:
-                pass
-        try:
+        card = Card.from_dict(source.read(card_id)["card"])
+        card_hash = card.hash()
+        worktree = ctx.state.worktrees / f"{card.id}-{run_id}"
+        if worktree.exists():
             Git(ctx.repo).worktree_remove(worktree)
-        except (Infra, OSError):
-            pass
+
+        base_ref = (f"refs/heads/{cfg.base_branch}"
+                    if Git(ctx.repo).ref_exists(f"refs/heads/{cfg.base_branch}") else "HEAD")
+        Git(ctx.repo).worktree_add(worktree, base_ref)
+        worktree_created = True
+
+        card_dir = ctx.state.create_card(card.id, run_id)
+        pack = _configured_pack(cfg, worktree, unit=card.unit)
+        if backend is None:
+            backend = open_backend(cfg, script)
+            opened_backend = backend
+        runner = ctx.runner(worktree, output_dir=card_dir / "gates" / "output")
+        if build_limiter is not None and hasattr(runner, "limiter") and runner.limiter is None:
+            runner.limiter = build_limiter
+        book = BriefBook(worktree, cfg.never_touch, cfg.forbidden_files)
+        book.pack = pack
+        conventions = _load_test_conventions(cfg, worktree)
+
+        if mm_seat is not None and micromanager is None and mm_backend is None:
+            # Its own session on the run's shared supervisor process, at its worktree.
+            mm_backend = mm_seat.for_card(worktree, card_dir)
+            mm_session_backend = mm_backend
+            owns_mm = True  # closing it ends the card's session, not the process
+        else:
+            owns_mm = micromanager is None and mm_backend is None
+        mm = (micromanager if micromanager is not None else open_micromanager(
+            cfg, card_dir, ctx.repo, script=mm_script,
+            worktree=worktree, card_dir=card_dir, budget=mm_budget,
+            board=board, worker_backend=backend, backend_override=mm_backend,
+        ))
+        if mm_budget is not None and hasattr(mm, "budget"):
+            mm.budget = mm_budget
+        resolved_harness = (
+            harness_library
+            if harness_library is not None
+            else _open_harness_library(ctx, require_enabled=True)
+        )
+        card_budget = _build_card_budget(cfg, card, night=night)
+        run = CardRun(
+            card=card, cfg=cfg, state=ctx.state, card_dir=card_dir,
+            worktree=worktree, runner=runner, pack=pack, backend=backend,
+            book=book, run_id=run_id, telemetry=telemetry,
+            budget=card_budget,
+            deps_done=_deps_done(source, card), conventions=conventions,
+            log=lambda message: print(message, file=sys.stderr),
+            micromanager=mm, harness_library=resolved_harness,
+            board=board, swarm=getattr(cfg, "swarm", None),
+            on_handback=on_handback, on_struggling=on_struggling,
+            on_event=on_event)
+        run.card_source = source
+        run_started = True
+        record = run.run(claim=claim)
+        completed = True
+    finally:
+        if not run_started:
+            with contextlib.suppress(Exception):
+                source.release(
+                    card_id,
+                    claim.get("lease_id", "") if isinstance(claim, dict) else "",
+                    reason="card setup failed before run started",
+                )
+        if not completed and night is not None and callable(getattr(night, "clear_live", None)):
+            night.clear_live(card_id)
+        if owns_mm:
+            if mm is not None:
+                with contextlib.suppress(Exception):
+                    mm.close()
+            elif mm_session_backend is not None and hasattr(mm_session_backend, "close"):
+                with contextlib.suppress(Exception):
+                    mm_session_backend.close()
+        if owns_backend and opened_backend is not None and hasattr(opened_backend, "close"):
+            with contextlib.suppress(Exception):
+                opened_backend.close()
+        if worktree_created and worktree is not None:
+            with contextlib.suppress(Infra, OSError):
+                Git(ctx.repo).worktree_remove(worktree)
     record["card_hash"] = card_hash
     record["detail"] = run.detail
     return record
@@ -1607,20 +1787,110 @@ def _member_token_breakdown(board: Board, split: dict) -> dict:
     return result
 
 
-def _update_breaker(ctx: Context, consecutive: list[tuple[str, str, str]]) -> None:
+def _notify_run_event(cfg, event: str, title: str, body: str) -> None:
+    """Best-effort lifecycle notification; never raises into the run loop."""
+    with contextlib.suppress(Exception):
+        from .notify import send_notification
+        send_notification(cfg, event, title, body)
+
+
+def _notify_card_outcome(cfg, card_id: str, outcome: dict) -> None:
+    final_state = str(outcome.get("final_state") or "").lower().replace("-", "_")
+    auto_land = outcome.get("auto_land")
+    auto_landed = isinstance(auto_land, dict) and bool(auto_land.get("landed"))
+    if final_state == "in_review" or (final_state == "done" and auto_landed):
+        if auto_landed:
+            body = f"{card_id} auto-landed onto {auto_land.get('integration_branch', '')}"
+        else:
+            body = str(outcome.get("detail") or f"{card_id} is ready for review")
+        _notify_run_event(cfg, "card_in_review", f"{card_id}: in review", body)
+    elif final_state == "blocked":
+        code = str(outcome.get("stop_code") or "").strip()
+        detail = str(outcome.get("detail") or "").strip()
+        body = f"{code}: {detail}" if (code and detail) else (detail or code or "blocked")
+        _notify_run_event(cfg, "card_blocked", f"{card_id}: blocked", body)
+
+
+def _maybe_auto_land(
+    ctx: Context,
+    source: FileCardSource,
+    card_id: str,
+    run_id: str,
+    outcome: dict,
+    event_bus,
+) -> None:
+    """Attempt opt-in `[factory] auto_land` when a card finishes `in_review`."""
+    fcfg = getattr(ctx.cfg, "factory", None)
+    if fcfg is None or not getattr(fcfg, "auto_land", False):
+        return
+    final_state = str(outcome.get("final_state") or "").lower().replace("-", "_")
+    if final_state != "in_review":
+        return
+    try:
+        from .factory import auto_land_card
+
+        card = Card.from_dict(source.read(card_id)["card"])
+        branch = str(outcome.get("branch") or f"openfarm/{card.id}-{card.slug()}")
+        if isinstance(outcome.get("gates"), list) and outcome["gates"]:
+            gate_record = outcome
+        else:
+            gate_record = read_json(
+                ctx.state.card_dir(card.id, run_id) / "gates" / "summary.json"
+            ) or {}
+        findings = outcome.get("findings")
+        if findings is None:
+            findings = outcome.get("findings_filed") or []
+        landed = auto_land_card(
+            ctx.repo,
+            ctx.cfg,
+            source,
+            card,
+            branch=branch,
+            record=gate_record,
+            findings=list(findings) if findings else [],
+            frontier_report=outcome.get("frontier_report"),
+        )
+        outcome["auto_land"] = landed
+        if landed.get("landed"):
+            outcome["final_state"] = "done"
+            outcome["auto_landed"] = True
+            event_bus.emit(
+                kind="card_auto_landed",
+                card_id=card.id,
+                branch=branch,
+                integration_branch=landed.get("integration_branch", ""),
+                commit=landed.get("commit", ""),
+                message=f"{card.id} auto-landed onto {landed.get('integration_branch', '')}",
+            )
+    except (Refused, AdapterError, Infra, OSError) as exc:
+        outcome["auto_land"] = {"landed": False, "error": str(exc)}
+
+
+def _update_breaker(ctx: Context, consecutive: list[tuple[str, str, str]]) -> bool:
     limit = ctx.cfg.circuit_breaker
     if not limit:
-        return
+        return False
+    # Never silently clear an already-tripped breaker; only an explicit resume clears it.
+    if ctx.state.read_breaker().get("tripped"):
+        return True
     if len(consecutive) < limit:
         ctx.state.write_breaker(False, [])
-        return
+        return False
     window = consecutive[-limit:]
     reasons = {code for _cid, code, _detail in window}
     if len(reasons) == 1:
         code = reasons.pop()
+        reason = f"{limit} cards blocked in a row for {code}"
         ctx.state.write_breaker(
-            True, [cid for cid, _c, _d in window],
-            f"{limit} cards blocked in a row for {code}")
+            True, [cid for cid, _c, _d in window], reason)
+        _notify_run_event(
+            ctx.cfg,
+            "breaker_tripped",
+            "Circuit breaker tripped",
+            reason,
+        )
+        return True
+    return False
 
 
 def cmd_status(ctx: Context, args) -> int:
@@ -1725,11 +1995,9 @@ def cmd_release(ctx: Context, args) -> int:
             if path.name == "partial":
                 continue
             target = partial / f"{stamp}-{path.name}"
-            try:
+            with contextlib.suppress(OSError):
                 path.rename(target)
                 archived.append(str(target))
-            except OSError:
-                pass
     _emit_ctx(ctx, {"released": True, "card": card_id, "archived": archived}, "release")
     return EXIT_OK
 
@@ -2009,9 +2277,10 @@ def cmd_land(ctx: Context, args) -> int:
             payload = {"landed": landed, "stopped_at": cid, "reason": f"no such card {cid}"}
             _emit_ctx(ctx, payload, "land")
             return EXIT_REFUSED
+        pending_accept: tuple[Path, str] | None = None
         if accept_blocked and card.state == "blocked" and not dry_run:
             # A person has checked this card's work and overrules the gate that blocked it.
-            # Who and why go on the card and in the run's verdict, then it lands like any card.
+            # Defer mutating card state and verdict.json until trial-merge, suite_green, and local merge succeed.
             runs = sorted(ctx.state.cards.glob(f"{cid}/*/card-record.json"))
             if not runs or not git.branch_exists(f"openfarm/{card.id}-{card.slug()}"):
                 payload = {"landed": landed, "stopped_at": cid,
@@ -2024,42 +2293,35 @@ def cmd_land(ctx: Context, args) -> int:
                 _emit_ctx(ctx, payload, "land")
                 return EXIT_REFUSED
             who = git._run(["config", "user.name"], check=False).stdout.strip() or getpass.getuser()
-            source.accept_blocked(cid, by=who, note=accept_note)
-            record_change(source, ctx.repo, cid, "accept", accept_note, {"state": ["blocked", "in_review"]},
-                          by=f"person/{who}")
-            write_json(runs[-1].parent / "verdict.json", {
-                "card": cid, "verdict": "clean", "review_tokens": 0, "minutes": None,
-                "note": accept_note, "at": utc_now(), "by": f"person/{who}",
-                "accepted_blocked": True,
-            })
-            card = next(c for c in source.all_cards() if c.id == cid)
-        if card.state != "in_review":
+            pending_accept = (runs[-1].parent / "verdict.json", who)
+        if pending_accept is None and card.state != "in_review":
             hint = (f". If you have checked its work yourself: openfarm land {cid} --accept-blocked "
                     f"--note \"what you checked\"") if card.state == "blocked" else ""
             payload = {"landed": landed, "stopped_at": cid,
                        "reason": f"{cid} is in state {card.state!r}, not 'in_review'{hint}"}
             _emit_ctx(ctx, payload, "land")
             return EXIT_REFUSED
-        # Require an approved verdict ('clean' or 'minor-fix') in the latest run's verdict.json.
-        candidates = sorted(ctx.state.cards.glob(f"{cid}/*/card-record.json"))
-        verdict_val = ""
-        if candidates:
-            vpath = candidates[-1].parent / "verdict.json"
-            if vpath.is_file():
-                try:
-                    verdict_val = str(json.loads(vpath.read_text()).get("verdict") or "")
-                except (OSError, ValueError):
-                    verdict_val = ""
-        if verdict_val not in ("clean", "minor-fix"):
-            payload = {
-                "landed": landed,
-                "stopped_at": cid,
-                "reason": (f"{cid} has verdict {verdict_val!r}; record an approved verdict "
-                           "('clean' or 'minor-fix') via `openfarm review` or `openfarm verdict` "
-                           "before landing"),
-            }
-            _emit_ctx(ctx, payload, "land")
-            return EXIT_REFUSED
+        if pending_accept is None:
+            # Require an approved verdict ('clean' or 'minor-fix') in the latest run's verdict.json.
+            candidates = sorted(ctx.state.cards.glob(f"{cid}/*/card-record.json"))
+            verdict_val = ""
+            if candidates:
+                vpath = candidates[-1].parent / "verdict.json"
+                if vpath.is_file():
+                    try:
+                        verdict_val = str(json.loads(vpath.read_text()).get("verdict") or "")
+                    except (OSError, ValueError):
+                        verdict_val = ""
+            if verdict_val not in ("clean", "minor-fix"):
+                payload = {
+                    "landed": landed,
+                    "stopped_at": cid,
+                    "reason": (f"{cid} has verdict {verdict_val!r}; record an approved verdict "
+                               "('clean' or 'minor-fix') via `openfarm review` or `openfarm verdict` "
+                               "before landing"),
+                }
+                _emit_ctx(ctx, payload, "land")
+                return EXIT_REFUSED
         branch = f"openfarm/{card.id}-{card.slug()}"
         if not git.branch_exists(branch):
             payload = {"landed": landed, "stopped_at": cid, "reason": f"no branch {branch}"}
@@ -2121,6 +2383,16 @@ def cmd_land(ctx: Context, args) -> int:
             git.worktree_remove(wt_path)
             shutil.rmtree(wt_path, ignore_errors=True)
         try:
+            if pending_accept is not None:
+                verdict_path, who = pending_accept
+                source.accept_blocked(cid, by=who, note=accept_note)
+                record_change(source, ctx.repo, cid, "accept", accept_note, {"state": ["blocked", "in_review"]},
+                              by=f"person/{who}")
+                write_json(verdict_path, {
+                    "card": cid, "verdict": "clean", "review_tokens": 0, "minutes": None,
+                    "note": accept_note, "at": utc_now(), "by": f"person/{who}",
+                    "accepted_blocked": True,
+                })
             source.mark_done(cid, note=f"landed {branch} onto {base}")
             record_change(source, ctx.repo, cid, "accept", f"merged {branch} into {base}", {"state": ["in_review", "done"]})
         except Refused as exc:
@@ -3360,6 +3632,8 @@ def build_parser() -> argparse.ArgumentParser:
     dmn_p.add_argument("--spend", type=float, default=None, help="optional spend cap for daemon start")
     dmn_p.add_argument("--profile", choices=("lean", "balanced", "strict"), default=None)
     dmn_p.add_argument("--card", action="append", default=[], help="specific card id(s) to run")
+    dmn_p.add_argument("--follow", action="store_true",
+                       help="keep running through dependent tasks as they unblock")
     dmn_p.add_argument("--tail", type=int, default=80, help="number of log lines for daemon logs")
 
     web_p = sub.add_parser(
@@ -3384,7 +3658,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="print detected workspace state, next action, and palette without starting curses")
     auto_p.add_argument("--run", dest="run_id", default=None)
     auto_p.add_argument("--refresh", type=float, default=1.0)
-    auto_p.add_argument("--view", default="overview")
+    auto_p.add_argument("--view", choices=TUI_VIEWS, default="overview")
     auto_p.add_argument("--curses", action="store_true", help="force stdlib curses TUI instead of Textual")
 
     tui_p = sub.add_parser(
@@ -4157,6 +4431,7 @@ def cmd_daemon(args) -> int:
             profile=getattr(args, "profile", None),
             card_ids=list(getattr(args, "card", None) or []),
             config_path=cfg_p,
+            follow=bool(getattr(args, "follow", False)),
         )
         if args.json:
             print(json.dumps(res, indent=2))
@@ -4332,12 +4607,12 @@ def cmd_card(ctx: Context, args) -> int:
                 print(json.dumps(outcome, indent=2))
             return EXIT_OK
         if action == "migrate":
-            take = dict(item.split("=", 1) for item in args.take if "=" in item)
+            take = {k.upper(): v for k, v in (item.split("=", 1) for item in args.take if "=" in item)}
             status = store.migration()
             if not status["needed"]:
                 _emit_ctx(ctx, {"migrated": False, "reason": "the cards branch is already the only home"}, "card")
                 return EXIT_OK
-            missing = [d for d in status["differences"] if take.get(d["id"]) not in ("main", "state")]
+            missing = [d for d in status["differences"] if take.get(d["id"].upper()) not in ("main", "state")]
             if missing:
                 if ctx.json:
                     print(json.dumps({"migrated": False, "differences": status["differences"]}, indent=2))

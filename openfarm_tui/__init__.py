@@ -1,4 +1,4 @@
-"""Optional Textual 3-View + Findings Inbox Workbench for Openfarm v0.10.0.
+"""Optional Textual workbench for Openfarm v0.20.0.
 
 `openfarm_core` remains 100% Python 3.11+ stdlib-only. This package is loaded
 lazily by `openfarm_core.tui.run_tui` when `textual` is installed; otherwise

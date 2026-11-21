@@ -25,7 +25,6 @@ import dataclasses
 import os
 import pwd
 import shutil
-import stat
 import subprocess
 import threading
 from pathlib import Path
@@ -544,12 +543,15 @@ def scan_masks(
     *,
     max_entries: int = MAX_SCAN_ENTRIES,
     hide_git: bool = False,
+    mounted_roots=(),
 ) -> tuple[list[Path], list[Path]]:
     """Files and folders inside `session_dir` matching `hide_globs`, to hide.
 
     A folder that matches is hidden whole and not walked; `.git` folders are never
-    walked. A symlink that matches hides the in-folder file it points at (one
-    pointing outside points at nothing visible).
+    walked. A symlink that matches hides the target it points at whenever that
+    target is `session_dir`, sits inside `session_dir`, or sits inside one of
+    `mounted_roots` (one pointing outside any mounted root points at nothing
+    visible).
 
     With `hide_git`, every `.git` entry (a repository's folder, or a worktree's
     or submodule's pointer file) is hidden too: the history holds every committed
@@ -557,6 +559,7 @@ def scan_masks(
     could read them back with `git show`.
     """
     root = Path(session_dir).resolve()
+    mounted = [Path(r).resolve() for r in (mounted_roots or ()) if str(r)]
     globs = [normalise(str(g)) for g in (hide_globs or ()) if normalise(str(g))]
     files: list[Path] = []
     dirs: list[Path] = []
@@ -590,11 +593,13 @@ def scan_masks(
             try:
                 if entry.is_symlink():
                     target = full.resolve()
-                    inside = _within(target, root) and target != root
+                    in_root = _within(target, root)
+                    in_mounted = any(_within(target, mr) for mr in mounted)
                     if hit:
-                        if inside:
+                        if target.exists() and (in_root or in_mounted):
                             (dirs if target.is_dir() else files).append(target)
-                    elif (inside and globs and target.is_dir()
+                    elif ((in_root or in_mounted) and target != root and globs
+                          and target.is_dir()
                           and target not in ancestors
                           and (target, rel) not in walked_links):
                         walked_links.add((target, rel))
@@ -671,7 +676,7 @@ def boundary_argv(
 
     args: list[str] = [exe, *_base_args(), "--tmpfs", "/tmp"]
     bound: list[Path] = []
-    for root in _dedupe(prog_roots + extra_roots):
+    for root in sorted(_dedupe(prog_roots + extra_roots), key=lambda p: (len(p.parts), str(p))):
         if _under_system(str(root)):
             continue
         args.extend(["--ro-bind", str(root), str(root)])
@@ -684,15 +689,19 @@ def boundary_argv(
     args.extend(["--ro-bind", str(session), str(session)])
     bound.append(session)
 
-    files, dirs = scan_masks(session, hide_globs, hide_git=True)
+    files, dirs = scan_masks(session, hide_globs, hide_git=True, mounted_roots=bound)
     for hp in hidden_abs:
         if not hp.exists() or not any(_within(hp, b) for b in bound):
             continue
         (dirs if hp.is_dir() else files).append(hp)
-    for d in _dedupe(dirs):
+    top_dirs: list[Path] = []
+    for d in sorted(_dedupe(dirs), key=lambda p: (len(p.parts), str(p))):
+        if any(_within(d, parent) for parent in top_dirs):
+            continue
+        top_dirs.append(d)
         args.extend(["--tmpfs", str(d), "--remount-ro", str(d)])
     for f in _dedupe(files):
-        if any(_within(f, d) for d in dirs):
+        if any(_within(f, d) for d in top_dirs):
             continue
         args.extend(["--ro-bind", "/dev/null", str(f)])
 
@@ -789,8 +798,7 @@ def runner_argv(
             raise ConfineError("confine-write-root-holds-home",
                                f"refusing to make {raw!r} writable: it holds your home folder")
         writable.append(resolved)
-    for path in _dedupe(writable):
-        args.extend(["--bind", str(path), str(path)])
+    writable_sorted = sorted(_dedupe(writable), key=lambda p: (len(p.parts), str(p)))
     hidden: list[Path] = [Path(p) for p in (hide_paths or ()) if str(p)]
     if real_home is not None:
         hidden += [real_home / name for name in RUNNER_HIDDEN_HOME]
@@ -799,16 +807,37 @@ def runner_argv(
         raw = str(source.get(name) or "").strip()
         if raw and os.path.isabs(os.path.expanduser(raw)):
             hidden.append(Path(os.path.expanduser(raw)))
+    hidden_dirs: list[Path] = []
+    hidden_files: list[Path] = []
     for path in _dedupe(hidden):
         if not os.path.lexists(path) or not path.exists():
             continue
         real = path.resolve()
-        if any(_within(real, w) for w in writable):
+        if any(_within(real, w) for w in writable_sorted):
             continue
         if real.is_dir():
-            args.extend(["--tmpfs", str(real), "--remount-ro", str(real)])
+            hidden_dirs.append(real)
         else:
-            args.extend(["--ro-bind", "/dev/null", str(real)])
+            hidden_files.append(real)
+    # Keep only topmost hidden dirs (parent-before-child) so nested hides like
+    # CLAUDE_CONFIG_DIR inside ~/.claude do not fail on a read-only parent tmpfs.
+    top_hidden_dirs: list[Path] = []
+    for d in sorted(_dedupe(hidden_dirs), key=lambda p: (len(p.parts), str(p))):
+        if any(_within(d, parent) for parent in top_hidden_dirs):
+            continue
+        top_hidden_dirs.append(d)
+    # Mount hidden dir tmpfs FIRST, then bind writable roots (which may live under a
+    # hidden parent such as state_dir/worktrees/card-1), then remount hidden dirs ro.
+    for d in top_hidden_dirs:
+        args.extend(["--tmpfs", str(d)])
+    for path in writable_sorted:
+        args.extend(["--bind", str(path), str(path)])
+    for d in top_hidden_dirs:
+        args.extend(["--remount-ro", str(d)])
+    for f in _dedupe(hidden_files):
+        if any(_within(f, d) for d in top_hidden_dirs):
+            continue
+        args.extend(["--ro-bind", "/dev/null", str(f)])
     for name in sorted({str(n) for n in unset_env or () if str(n)}):
         args.extend(["--unsetenv", name])
     args.extend(["--setenv", "TMPDIR", "/tmp", "--chdir", str(tree), "--", *argv])
@@ -832,13 +861,6 @@ def _dedupe_links(links: list[tuple[str, str]]) -> list[tuple[str, str]]:
         seen.add(path)
         out.append((target, path))
     return out
-
-
-def is_regular_file(path: Path) -> bool:
-    try:
-        return stat.S_ISREG(os.lstat(path).st_mode)
-    except OSError:
-        return False
 
 
 # -- the bridges' side ------------------------------------------------------------

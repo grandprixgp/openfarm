@@ -15,7 +15,6 @@ import json
 import math
 import os
 import re
-import tempfile
 import threading
 import unicodedata
 from pathlib import Path
@@ -25,10 +24,18 @@ from .errors import AdapterError, Invalid, Refused, Unsupported
 from .globs import escapes, matches_any, normalise
 from .harness_global import GlobalLibrary, should_promote, should_veto
 from .harness_scope import global_eligibility, scope_of
-from .state import _safe_id, append_jsonl, read_json, utc_now
+from .state import (
+    _safe_id,
+    append_jsonl,
+    atomic_write_text as _atomic_write_text,
+    read_json,
+    utc_now,
+    write_json as _atomic_write_json,
+)
 
 _HARNESS_LOCKS_GUARD = threading.Lock()
 _HARNESS_LOCKS: dict[Path, threading.RLock] = {}
+_HARNESS_THREAD_DEPTHS = threading.local()
 
 
 def _harness_thread_lock(root: Path) -> threading.RLock:
@@ -39,6 +46,14 @@ def _harness_thread_lock(root: Path) -> threading.RLock:
             lock = threading.RLock()
             _HARNESS_LOCKS[key] = lock
         return lock
+
+
+def _harness_depth_map() -> dict[Path, int]:
+    depths = getattr(_HARNESS_THREAD_DEPTHS, "depths", None)
+    if depths is None:
+        depths = {}
+        _HARNESS_THREAD_DEPTHS.depths = depths
+    return depths
 
 EDITABLE_SURFACES: tuple[str, ...] = (
     "test_writer_guidance",
@@ -64,7 +79,8 @@ IMMUTABLE_GATE_KEYS = frozenset({
     "workspace_lint", "baseline_cache", "catch_up", "findings_per_card",
     "circuit_breaker", "extra", "extra_gates", "eligibility", "max_files",
     "max_units", "require_reference", "refuse_touches_prefixes",
-    "rust_tests_in_separate_files", "allow_type_changes", "budget",
+    "rust_tests_in_separate_files", "python_tests_in_test_files",
+    "allow_type_changes", "budget",
     "implementer_attempts", "test_writer_attempts",
     "model_build_calls_per_card", "mutation_build_calls_per_card",
     "tokens_per_card", "wall_clock_per_card", "frontier_cost_ratio",
@@ -73,6 +89,8 @@ IMMUTABLE_GATE_KEYS = frozenset({
     "known_failing", "flagged_patterns", "touches", "test_edits",
     "cargo_test", "clippy", "mutants", "diff_check", "scope", "thresholds",
     "runner", "cargo_flags", "min_free_mb", "protocol",
+    "checker_mode", "planner", "invariants", "acceptance",
+    "factory", "auto_land", "confine", "confine_network",
 })
 
 _ALLOWED_PATCH_SUBKEYS = frozenset(EDITABLE_SURFACES) | frozenset({
@@ -285,29 +303,6 @@ def _strip_unicode_noise(text: str) -> str:
 def _normalize_for_scan(text: str) -> str:
     """Normalize text and fold Cyrillic/Greek homoglyphs before security scanning."""
     return _strip_unicode_noise(text).translate(_HOMOGLYPH_MAP)
-
-
-def _atomic_write_text(path: Path, text: str) -> Path:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
-    )
-    tmp_path = Path(tmp_name)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(text)
-        tmp_path.replace(path)
-    except Exception:
-        tmp_path.unlink(missing_ok=True)
-        raise
-    return path
-
-
-def _atomic_write_json(path: Path, payload: object) -> Path:
-    return _atomic_write_text(
-        path, json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
-    )
 
 
 def sanitize_lesson_text(text: str, *, max_len: int = 600) -> str:
@@ -1149,7 +1144,6 @@ class HarnessLibrary:
         self.revisions_dir = self.harness_dir / "revisions"
         self.entries_dir = self.harness_dir / "entries"
         self._lock_path = self.harness_dir / ".lock"
-        self._local = threading.local()
         self.ledger = HarnessLedger(
             self.harness_dir,
             window_size=max(3, int(self.harness_cfg.probe_window) * 2),
@@ -1158,25 +1152,27 @@ class HarnessLibrary:
 
     @contextlib.contextmanager
     def _locked(self):
-        """Acquire a per-root thread RLock outside advisory flock (reentrant)."""
-        tlock = _harness_thread_lock(self.harness_dir)
+        """Acquire a per-root thread RLock outside advisory flock (reentrant across instances)."""
+        key = self.harness_dir.resolve()
+        tlock = _harness_thread_lock(key)
         with tlock:
-            depth = int(getattr(self._local, "depth", 0) or 0)
+            depths = _harness_depth_map()
+            depth = depths.get(key, 0)
             if depth > 0:
-                self._local.depth = depth + 1
+                depths[key] = depth + 1
                 try:
                     yield
                 finally:
-                    self._local.depth = depth
+                    depths[key] = depth
                 return
             self.harness_dir.mkdir(parents=True, exist_ok=True)
             with self._lock_path.open("a+", encoding="utf-8") as lock_handle:
                 fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
-                self._local.depth = 1
+                depths[key] = 1
                 try:
                     yield
                 finally:
-                    self._local.depth = 0
+                    depths.pop(key, None)
                     fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
 
     @staticmethod
@@ -1865,6 +1861,12 @@ class HarnessLibrary:
                 eid for eid in ((parent_snap or {}).get("active_entry_ids") or ())
                 if eid not in demoted_ids
             ]
+            for eid in restored_ids:
+                entry = self._load_entry(eid)
+                if entry and entry.get("status") == "demoted" and entry.get("demote_reason") == "evicted_by_cap":
+                    entry["status"] = "active"
+                    entry.pop("demote_reason", None)
+                    self._save_entry(entry)
             overlay["revision"] = parent_rev
             overlay["parent_revision"] = int((parent_snap or {}).get("parent_revision", 0))
             overlay["state"] = "confirmed"
@@ -2025,59 +2027,65 @@ class HarnessLibrary:
         scope_markers: set[str] | None = None,
     ) -> dict:
         """Record a card run outcome, update probe state, capture adaptations, and refresh metrics."""
-        with self._locked():
-            contrast = extract_contrast(card_meta, attempt_records, failure=failure)
-            overlay = self._load_overlay()
-            cues_list = list(cues_applied or ())
+        contrast = extract_contrast(card_meta, attempt_records, failure=failure)
+        cues_list = list(cues_applied or ())
+        candidates: list[dict] = []
+        rejected_proposals: list[dict] = []
+        will_capture = (
+            self.harness_cfg.enabled
+            and contrast["outcome_kind"] in self.harness_cfg.capture_on
+        )
+        reflect_on = getattr(self.harness_cfg, "reflect_on", None)
+        if reflect_on is None:
+            reflect_on = self.harness_cfg.capture_on
+        reflect_kind = contrast["outcome_kind"]
+        if reflect_kind == "pass" and int(card_meta.get("handbacks", 0) or 0) > 0:
+            # A worker that handed back and passed after a hint was stuck: not a
+            # clean first-try pass, so it is reflected on as a recovery would be.
+            reflect_kind = "retry_recovery"
+        should_reflect = (
+            will_capture
+            and reflect
+            and reflect_kind in reflect_on
+            and self.harness_cfg.allow_micromanager_reflection
+            and micromanager is not None
+            and getattr(micromanager, "enabled", False)
+        )
+        if should_reflect:
+            with self._locked():
+                overlay_snap = self._load_overlay()
+                index_snap = self.format_index()
+                metrics_snap = self.ledger.compute_metrics()
+            # Perform the potentially slow LLM reflection call OUTSIDE the lock so
+            # concurrent workers/readers do not stall on the harness flock/RLock.
+            try:
+                refl = micromanager.reflect_harness(
+                    card_meta,
+                    contrast,
+                    overlay_snap,
+                    index_snap,
+                    metrics_snap,
+                    cfg=self._cfg,
+                )
+            except (AdapterError, ValueError) as exc:
+                refl = {}
+                rejected_proposals.append({
+                    "reason": f"reflect_harness error ({type(exc).__name__}): {exc}",
+                    "raw": {},
+                })
+            if isinstance(refl, dict):
+                for item in refl.get("lessons") or ():
+                    if isinstance(item, dict):
+                        candidates.append({**item, "source": item.get("source") or "micromanager"})
+                for rej in refl.get("rejected") or ():
+                    if isinstance(rej, dict):
+                        rejected_proposals.append(rej)
 
+        with self._locked():
+            overlay = self._load_overlay()
             # Snapshot pre-card metrics before appending this card's outcome so
             # probe_baseline captures true pre-card performance.
             metrics_before_capture = self.ledger.compute_metrics()
-
-            candidates: list[dict] = []
-            rejected_proposals: list[dict] = []
-            will_capture = (
-                self.harness_cfg.enabled
-                and contrast["outcome_kind"] in self.harness_cfg.capture_on
-            )
-            reflect_on = getattr(self.harness_cfg, "reflect_on", None)
-            if reflect_on is None:
-                reflect_on = self.harness_cfg.capture_on
-            reflect_kind = contrast["outcome_kind"]
-            if reflect_kind == "pass" and int(card_meta.get("handbacks", 0) or 0) > 0:
-                # A worker that handed back and passed after a hint was stuck: not a
-                # clean first-try pass, so it is reflected on as a recovery would be.
-                reflect_kind = "retry_recovery"
-            if (
-                will_capture
-                and reflect
-                and reflect_kind in reflect_on
-                and self.harness_cfg.allow_micromanager_reflection
-                and micromanager is not None
-                and getattr(micromanager, "enabled", False)
-            ):
-                try:
-                    refl = micromanager.reflect_harness(
-                        card_meta,
-                        contrast,
-                        overlay,
-                        self.format_index(),
-                        metrics_before_capture,
-                        cfg=self._cfg,
-                    )
-                except (AdapterError, ValueError) as exc:
-                    refl = {}
-                    rejected_proposals.append({
-                        "reason": f"reflect_harness error ({type(exc).__name__}): {exc}",
-                        "raw": {},
-                    })
-                if isinstance(refl, dict):
-                    for item in refl.get("lessons") or ():
-                        if isinstance(item, dict):
-                            candidates.append({**item, "source": item.get("source") or "micromanager"})
-                    for rej in refl.get("rejected") or ():
-                        if isinstance(rej, dict):
-                            rejected_proposals.append(rej)
 
             surfaces_applied = self._update_applied_stats(cues_list, contrast)
             self.ledger.record_card_outcome(
@@ -2257,26 +2265,32 @@ class HarnessLibrary:
                             reason="evicted_by_cap",
                         )
 
-                    overlay["parent_revision"] = prev_rev
-                    overlay["revision"] = next_rev
-                    overlay["state"] = "probing"
-                    overlay["probe_remaining"] = int(self.harness_cfg.probe_window)
-                    overlay["probe_baseline"] = {
-                        "cards_total": int(metrics_before_capture.get("cards_total", 0)),
-                        "pass_rate": float(metrics_before_capture.get("pass_rate", 0.0)),
-                        "harness_efficiency": float(metrics_before_capture.get("harness_efficiency", 0.0)),
-                    }
-                    overlay["probe_outcomes"] = []
-                    overlay["active_entry_ids"] = kept_ids
-                    overlay["surfaces"] = self._rebuild_surfaces(kept_ids)
-                    self._save_overlay(overlay)
-                    _atomic_write_json(self.revisions_dir / f"rev-{next_rev:04d}.json", overlay)
-                    self.ledger.record_revision_promoted(
-                        revision=next_rev,
-                        parent_revision=prev_rev,
-                        entry_ids=new_entry_ids,
-                        reason=contrast["outcome_kind"],
-                    )
+                    surviving = [eid for eid in new_entry_ids if eid in kept_ids]
+                    if surviving:
+                        overlay["parent_revision"] = prev_rev
+                        overlay["revision"] = next_rev
+                        overlay["state"] = "probing"
+                        overlay["probe_remaining"] = int(self.harness_cfg.probe_window)
+                        overlay["probe_baseline"] = {
+                            "cards_total": int(metrics_before_capture.get("cards_total", 0)),
+                            "pass_rate": float(metrics_before_capture.get("pass_rate", 0.0)),
+                            "harness_efficiency": float(metrics_before_capture.get("harness_efficiency", 0.0)),
+                        }
+                        overlay["probe_outcomes"] = []
+                        overlay["active_entry_ids"] = kept_ids
+                        overlay["surfaces"] = self._rebuild_surfaces(kept_ids)
+                        self._save_overlay(overlay)
+                        _atomic_write_json(self.revisions_dir / f"rev-{next_rev:04d}.json", overlay)
+                        self.ledger.record_revision_promoted(
+                            revision=next_rev,
+                            parent_revision=prev_rev,
+                            entry_ids=surviving,
+                            reason=contrast["outcome_kind"],
+                        )
+                    else:
+                        overlay["active_entry_ids"] = kept_ids
+                        overlay["surfaces"] = self._rebuild_surfaces(kept_ids)
+                        self._save_overlay(overlay)
 
             metrics = self.ledger.refresh_metrics()
             self._rebuild_index()

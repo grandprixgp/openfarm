@@ -147,18 +147,15 @@ class FactoryAutopilotV011Tests(unittest.TestCase):
             self.assertTrue(ev_ok["eligible"])
 
             # Land onto local openfarm/integration (main stays untouched!)
-            (repo / "cards").mkdir()  # a project from before the cards branch became the only home
-            (repo / "cards" / "W1-01.md").write_text(
-                '+++\nid = "W1-01"\ntitle = "Small helper"\nstate = "in_review"\ncategory = "mechanical"\ntouches = ["src/helper.ts"]\n+++\n## Done\n- helper\n',
-                encoding="utf-8",
-            )
-            git.commit_all("add W1-01 card")
             src = FileCardSource(repo, "cards", worktree=state_dir / "cards-source", base_branch="main")
             src.prepare()
+            src.add_card(lean_card)
             main_before = git.branch_head("main")
 
             landed = auto_land_card(repo, cfg, src, lean_card, branch="openfarm/W1-01-lean", record=clean_record, findings=[])
             self.assertTrue(landed["landed"])
+            self.assertTrue(landed.get("marked_done"))
+            self.assertEqual(src.read("W1-01")["card"]["state"], "done")
             self.assertEqual(git.branch_head("main"), main_before)  # main untouched!
             self.assertTrue(git.branch_exists("openfarm/integration"))
 

@@ -114,18 +114,28 @@ _FORBIDDEN_CONFIG_PREFIXES = (
     "core.sshcommand",
     "core.fsmonitor",
     "core.pager",
+    "core.editor",
+    "core.askpass",
+    "credential.",
+    "diff.external",
+    "filter.",
+    "include.",
+    "includeif.",
 )
 
 
 def _check_config_args(args: list[str]) -> None:
-    """Reject global/system/executable-hook git config invocations."""
+    """Reject global/system/file/executable-hook git config invocations."""
     after_double_dash = False
     for token in args:
         if token == "--" and not after_double_dash:
             after_double_dash = True
             continue
-        if not after_double_dash and token in {"--global", "--system"}:
-            raise GitRefused(f"git config flag {token!r} is refused")
+        if not after_double_dash:
+            if (token in {"--global", "--system", "-f", "--file"}
+                    or token.startswith("--file=")
+                    or (token.startswith("-f") and len(token) > 2)):
+                raise GitRefused(f"git config flag {token!r} is refused")
         if after_double_dash or not token.startswith("-"):
             low = token.lower()
             for prefix in _FORBIDDEN_CONFIG_PREFIXES:
@@ -196,21 +206,29 @@ class Git:
         self.extra_env = dict(env or {})
 
     def _run(self, args: list[str], check: bool = True,
-             timeout: float = 300.0) -> subprocess.CompletedProcess:
+             timeout: float = 300.0, text: bool = True) -> subprocess.CompletedProcess:
         _check_subcommand(list(args))
         env = dict(os.environ)
         env.update(_ENV)
         env.update(self.extra_env)
         try:
             result = subprocess.run(
-                ["git", "-c", "core.hooksPath=/dev/null", *args],
-                cwd=self.cwd, capture_output=True, text=True,
+                [
+                    "git",
+                    "-c", "core.hooksPath=/dev/null",
+                    "-c", "core.quotepath=false",
+                    "-c", "core.fsmonitor=false",
+                    *args,
+                ],
+                cwd=self.cwd, capture_output=True, text=text,
                 env=env, timeout=timeout)
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise Infra("git-failed", f"git {args[0]} could not run: {exc}") from exc
         if check and result.returncode != 0:
+            err = (result.stderr.decode("utf-8", errors="replace")
+                   if isinstance(result.stderr, bytes) else result.stderr)
             raise Infra("git-failed",
-                        f"git {' '.join(args)} failed: {result.stderr.strip()[:500]}")
+                        f"git {' '.join(args)} failed: {err.strip()[:500]}")
         return result
 
     # -- queries --------------------------------------------------------------
@@ -273,11 +291,6 @@ class Git:
                 self._run(["diff", "--name-only", "--cached"]).stdout.splitlines()
                 if line.strip()]
 
-    def unstaged_changes(self) -> list[str]:
-        """Tracked files whose unstaged content differs from the index."""
-        return [line.strip() for line in self._run(["diff", "--name-only"]).stdout.splitlines()
-                if line.strip()]
-
     def has_staged_changes(self) -> bool:
         return self._run(["diff", "--cached", "--quiet"], check=False).returncode == 1
 
@@ -296,9 +309,6 @@ class Git:
             if not self.has_staged_changes():
                 return self.head()
             return self.commit(message)
-
-    def merge_base(self, other: str) -> str:
-        return self._run(["merge-base", "HEAD", other]).stdout.strip()
 
     def count_commits(self, spec: str, base: str = "HEAD") -> int:
         result = self._run(["rev-list", "--count", f"{base}..{spec}"], check=False)
@@ -335,6 +345,11 @@ class Git:
             if holder is not None:
                 self.worktree_remove(holder)
                 self._run(["branch", "--force", name, commit])
+                return
+            raise Infra(
+                "git-failed",
+                f"git branch --force {name} {commit} failed: {result.stderr.strip()[:500]}",
+            )
 
     def worktree_add(self, path: Path, ref: str) -> None:
         path = Path(path)
@@ -345,6 +360,10 @@ class Git:
     def worktree_remove(self, path: Path) -> None:
         with _git_lock_for(self.cwd):
             self._run(["worktree", "remove", "--force", str(path)], check=False)
+            self._run(["worktree", "prune"], check=False)
+
+    def worktree_prune(self) -> None:
+        with _git_lock_for(self.cwd):
             self._run(["worktree", "prune"], check=False)
 
     def worktree_list(self) -> list[str]:
@@ -421,6 +440,11 @@ class Git:
     def show_blob(self, spec: str) -> str | None:
         """A file's content at a commit, or None when it did not exist."""
         result = self._run(["show", spec], check=False)
+        return result.stdout if result.returncode == 0 else None
+
+    def show_blob_bytes(self, spec: str) -> bytes | None:
+        """A file's raw bytes at a commit, or None when it did not exist."""
+        result = self._run(["show", spec], check=False, text=False)
         return result.stdout if result.returncode == 0 else None
 
     def untracked_files(self, paths: list[str] | None = None) -> list[str]:

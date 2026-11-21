@@ -8,49 +8,92 @@ continue smoothly after closing the TUI or SSH terminal, logging to
 from __future__ import annotations
 
 import contextlib
-import datetime as _dt
+import fcntl
 import json
 import os
 import signal
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 from .config import CONFIG_PATH, load_config
 from .errors import ConfigError, Refused
-from .state import StateDir
-
-
-def _utc_now() -> str:
-    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+from .state import (
+    StateDir,
+    _pid_alive as _state_pid_alive,
+    holder_provably_gone,
+    process_identity,
+    utc_now as _utc_now,
+    write_json,
+)
 
 
 def _pid_alive(pid: int) -> bool:
-    if pid <= 0:
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
         return False
     # Reap if this process is the parent and the child already exited (avoids zombies)
     with contextlib.suppress(ChildProcessError, OSError):
         reaped, _ = os.waitpid(pid, os.WNOHANG)
         if reaped == pid:
             return False
+    return _state_pid_alive(pid)
+
+
+def _daemon_is_running(meta: dict) -> bool:
+    """True only when `meta` names a live local process whose identity still matches."""
+    if not isinstance(meta, dict):
+        return False
+    pid = meta.get("pid")
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return False
+    with contextlib.suppress(ChildProcessError, OSError):
+        reaped, _ = os.waitpid(pid, os.WNOHANG)
+        if reaped == pid:
+            return False
+    if holder_provably_gone(meta):
+        return False
+    if "host" in meta:
+        here = process_identity()
+        if meta.get("host") != here.get("host"):
+            return False
+        for key in ("machine_id", "boot_id", "pidns"):
+            recorded = meta.get(key)
+            if recorded is not None and recorded != here.get(key):
+                return False
+    return _pid_alive(pid)
+
+
+@contextlib.contextmanager
+def _daemon_guard(state_dir: Path):
+    guard_path = Path(state_dir) / "daemon.lock"
+    guard_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(guard_path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    stat_path = Path(f"/proc/{pid}/stat")
-    if stat_path.is_file():
-        with contextlib.suppress(OSError):
-            raw = stat_path.read_text(encoding="utf-8", errors="replace")
-            rparen = raw.rfind(")")
-            if rparen != -1:
-                fields = raw[rparen + 2 :].split()
-                if fields and fields[0] == "Z":
-                    return False
-    return True
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _tail_lines(path: Path, n: int, *, chunk_size: int = 8192) -> list[str]:
+    """Read only the last `n` lines of `path` by seeking backwards from EOF."""
+    with path.open("rb") as fh:
+        fh.seek(0, os.SEEK_END)
+        pos = fh.tell()
+        if pos == 0:
+            return []
+        buf = b""
+        newlines = 0
+        while pos > 0 and newlines <= n:
+            read_size = min(chunk_size, pos)
+            pos -= read_size
+            fh.seek(pos)
+            chunk = fh.read(read_size)
+            buf = chunk + buf
+            newlines += chunk.count(b"\n")
+    return buf.decode("utf-8", errors="replace").splitlines()[-n:]
 
 
 def _meta_path(state_dir: Path) -> Path:
@@ -98,8 +141,11 @@ def daemon_status(repo: Path, *, config_path: Path | None = None) -> dict:
         meta = json.loads(mp.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         meta = {}
-    pid = int(meta.get("pid") or 0)
-    alive = _pid_alive(pid)
+    if not isinstance(meta, dict):
+        meta = {}
+    raw_pid = meta.get("pid")
+    pid = int(raw_pid) if isinstance(raw_pid, int) and not isinstance(raw_pid, bool) else 0
+    alive = _daemon_is_running(meta)
     return {
         "running": alive,
         "pid": pid if pid > 0 else None,
@@ -131,67 +177,83 @@ def start_daemon(
     can find its events; `follow` keeps the run going through dependent tasks.
     """
     root, cfg = _load_cfg(repo, config_path)
-    cur = daemon_status(root, config_path=config_path)
-    if cur["running"]:
-        raise Refused("daemon-already-running", f"daemon already running (pid {cur['pid']})")
-
     state = StateDir(cfg.state_dir)
-    # Clear an earlier STOP kill-switch file before starting a fresh detached daemon.
-    with contextlib.suppress(OSError):
-        state.kill_switch(cfg.kill_switch).unlink(missing_ok=True)
+    with _daemon_guard(cfg.state_dir):
+        cur = daemon_status(root, config_path=config_path)
+        if cur["running"]:
+            raise Refused("daemon-already-running", f"daemon already running (pid {cur['pid']})")
 
-    lp = _log_path(cfg.state_dir)
-    lp.parent.mkdir(parents=True, exist_ok=True)
+        # Clear an earlier STOP kill-switch file only when no live run holds run.lock.
+        has_live_run_lock = state.run_lock.exists() and state.stale_lock_holder() is None
+        if not has_live_run_lock:
+            with contextlib.suppress(OSError):
+                state.kill_switch(cfg.kill_switch).unlink(missing_ok=True)
 
-    if command_override is not None:
-        cmd = [str(a) for a in command_override]
-    else:
-        cmd = [sys.executable, "-m", "openfarm_core.cli", "--repo", str(root)]
-        if config_path is not None:
-            cmd += ["--config", str(Path(config_path).expanduser().resolve())]
-        cmd += ["run", "--cards", str(max(1, int(cards)))]
-        if spend is not None:
-            cmd += ["--spend", str(float(spend))]
-        if profile:
-            cmd += ["--profile", str(profile)]
-        for cid in (card_ids or ()):
-            if str(cid).strip():
-                cmd += ["--card", str(cid).strip()]
-        if run_id:
-            cmd += ["--run-id", run_id]
-        if follow:
-            cmd += ["--follow"]
+        lp = _log_path(cfg.state_dir)
+        lp.parent.mkdir(parents=True, exist_ok=True)
 
-    log_handle = lp.open("a", encoding="utf-8")
-    try:
-        log_handle.write(f"\n=== openfarm daemon started at {_utc_now()} ===\n")
-        log_handle.flush()
-        # The child must import this same openfarm, wherever the caller was started from.
-        env = dict(os.environ)
-        src = str(Path(__file__).resolve().parent.parent)
-        env["PYTHONPATH"] = src + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
-        proc = subprocess.Popen(
-            cmd,
-            cwd=str(root),
-            env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=log_handle,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-    finally:
-        log_handle.close()
+        if command_override is not None:
+            cmd = [str(a) for a in command_override]
+        else:
+            cmd = [sys.executable, "-m", "openfarm_core.cli", "--repo", str(root)]
+            if config_path is not None:
+                cmd += ["--config", str(Path(config_path).expanduser().resolve())]
+            cmd += ["run", "--cards", str(max(1, int(cards)))]
+            if spend is not None:
+                cmd += ["--spend", str(float(spend))]
+            if profile:
+                cmd += ["--profile", str(profile)]
+            for cid in (card_ids or ()):
+                if str(cid).strip():
+                    cmd += ["--card", str(cid).strip()]
+            if run_id:
+                cmd += ["--run-id", run_id]
+            if follow:
+                cmd += ["--follow"]
 
-    meta = {
-        "pid": int(proc.pid),
-        "repo": str(root),
-        "started_at": _utc_now(),
-        "log_path": str(lp),
-        "cmd": cmd,
-        "run_id": run_id,
-    }
-    _meta_path(cfg.state_dir).write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
-    return {"ok": True, "running": True, **meta}
+        log_handle = lp.open("a", encoding="utf-8")
+        try:
+            log_handle.write(f"\n=== openfarm daemon started at {_utc_now()} ===\n")
+            log_handle.flush()
+            # The child must import this same openfarm, wherever the caller was started from.
+            env = dict(os.environ)
+            src = str(Path(__file__).resolve().parent.parent)
+            env["PYTHONPATH"] = src + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+            proc = subprocess.Popen(
+                cmd,
+                cwd=str(root),
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        finally:
+            log_handle.close()
+
+        # Reap the detached child if this parent stays alive (TUI, web, tests)
+        # so neither a zombie nor a Popen.__del__ ResourceWarning is left.
+        def _reap(child: subprocess.Popen) -> None:
+            with contextlib.suppress(ChildProcessError, OSError):
+                child.wait()
+
+        threading.Thread(
+            target=_reap,
+            args=(proc,),
+            name=f"openfarm-daemon-reap-{proc.pid}",
+            daemon=True,
+        ).start()
+
+        meta = {
+            **process_identity(int(proc.pid)),
+            "repo": str(root),
+            "started_at": _utc_now(),
+            "log_path": str(lp),
+            "cmd": cmd,
+            "run_id": run_id,
+        }
+        write_json(_meta_path(cfg.state_dir), meta)
+        return {"ok": True, "running": True, **meta}
 
 
 def stop_daemon(repo: Path, *, config_path: Path | None = None) -> dict:
@@ -202,17 +264,18 @@ def stop_daemon(repo: Path, *, config_path: Path | None = None) -> dict:
     ks.parent.mkdir(parents=True, exist_ok=True)
     ks.write_text(f"stopped by daemon stop at {_utc_now()}\n", encoding="utf-8")
 
-    st = daemon_status(root, config_path=config_path)
-    pid = st.get("pid")
-    signaled = False
-    if st["running"] and isinstance(pid, int) and pid > 0:
-        try:
-            os.killpg(pid, signal.SIGTERM)
-            signaled = True
-        except OSError:
-            with contextlib.suppress(OSError):
-                os.kill(pid, signal.SIGTERM)
+    with _daemon_guard(cfg.state_dir):
+        st = daemon_status(root, config_path=config_path)
+        pid = st.get("pid")
+        signaled = False
+        if st["running"] and isinstance(pid, int) and pid > 0:
+            try:
+                os.killpg(pid, signal.SIGTERM)
                 signaled = True
+            except OSError:
+                with contextlib.suppress(OSError):
+                    os.kill(pid, signal.SIGTERM)
+                    signaled = True
     return {
         "ok": True,
         "was_running": bool(st["running"]),
@@ -228,9 +291,8 @@ def read_daemon_logs(repo: Path, *, tail: int = 80, config_path: Path | None = N
     lp = _log_path(cfg.state_dir)
     if not lp.is_file():
         return {"log_path": str(lp), "lines": [], "exists": False}
-    raw_lines = lp.read_text(encoding="utf-8", errors="replace").splitlines()
     n = max(1, int(tail))
-    return {"log_path": str(lp), "lines": raw_lines[-n:], "exists": True}
+    return {"log_path": str(lp), "lines": _tail_lines(lp, n), "exists": True}
 
 
 __all__ = ["daemon_status", "read_daemon_logs", "start_daemon", "stop_daemon"]

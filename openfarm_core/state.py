@@ -68,11 +68,6 @@ def utc_after(seconds: float) -> str:
     return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def parse_time(text: str) -> _dt.datetime:
-    return _dt.datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(
-        tzinfo=_dt.timezone.utc)
-
-
 class StateDir:
     """The state folder, and the names of everything in it."""
 
@@ -218,15 +213,40 @@ class StateDir:
         return dict(holder)
 
     def release_run_lock(self, run_id: str) -> None:
+        guard_path = self.root / "run.lock.guard"
+        guard_fd = os.open(guard_path, os.O_CREAT | os.O_RDWR, 0o600)
         try:
-            data = json.loads(self.run_lock.read_text())
-        except (OSError, ValueError):
-            data = {}
-        if not data or data.get("run_id") == run_id:
+            fcntl.flock(guard_fd, fcntl.LOCK_EX)
+            try:
+                data = json.loads(self.run_lock.read_text())
+            except (OSError, ValueError):
+                return
+            if isinstance(data, dict) and data.get("run_id") == run_id:
+                try:
+                    self.run_lock.unlink()
+                except OSError:
+                    pass
+        finally:
+            fcntl.flock(guard_fd, fcntl.LOCK_UN)
+            os.close(guard_fd)
+
+    def remove_stale_run_lock(self) -> dict | None:
+        """Unlink `run.lock` under the guard only if its holder is still provably gone."""
+        guard_path = self.root / "run.lock.guard"
+        guard_fd = os.open(guard_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(guard_fd, fcntl.LOCK_EX)
+            stale = self.stale_lock_holder()
+            if stale is None:
+                return None
             try:
                 self.run_lock.unlink()
-            except OSError:
+            except FileNotFoundError:
                 pass
+            return stale
+        finally:
+            fcntl.flock(guard_fd, fcntl.LOCK_UN)
+            os.close(guard_fd)
 
     def lock_holder(self) -> dict | None:
         try:
@@ -330,17 +350,18 @@ def _start_time(pid: int) -> str:
     return fields[19] if len(fields) > 19 else ""
 
 
-def process_identity() -> dict:
+def process_identity(pid: int | None = None) -> dict:
     """Who holds a lock or a seat, beyond pid and hostname (v0.8.5).
 
     Two containers share a hostname but not a pid namespace; two machines can
     share a hostname but not a machine id or a boot. Fields this system cannot
     read are left out, and a record that lacks one is judged as before.
     """
-    out = {"pid": os.getpid(), "host": _this_host()}
+    target = os.getpid() if pid is None else int(pid)
+    out = {"pid": target, "host": _this_host()}
     for key, value in (("machine_id", _read_first("/etc/machine-id")),
                        ("boot_id", _read_first("/proc/sys/kernel/random/boot_id")),
-                       ("start", _start_time(os.getpid()))):
+                       ("start", _start_time(target))):
         if value:
             out[key] = value
     try:
@@ -383,6 +404,8 @@ def holder_provably_gone(rec: dict) -> bool:
 
 def _pid_alive(pid: int) -> bool:
     """True unless no process with `pid` exists on this host."""
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return False
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -390,6 +413,11 @@ def _pid_alive(pid: int) -> bool:
     except OSError:
         # EPERM and the like: something is there, just not ours to signal.
         return True
+    raw = _read_first(f"/proc/{pid}/stat")
+    if raw and ")" in raw:
+        fields = raw.rsplit(")", 1)[1].split()
+        if fields and fields[0] == "Z":
+            return False
     return True
 
 
@@ -407,10 +435,9 @@ def _safe(name: str) -> str:
     return cleaned.strip("-") or "unit"
 
 
-def write_json(path: Path, payload) -> Path:
+def atomic_write_text(path: Path, text: str) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    text = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
     fd, tmp_name = tempfile.mkstemp(
         prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
     )
@@ -427,6 +454,12 @@ def write_json(path: Path, payload) -> Path:
     return path
 
 
+def write_json(path: Path, payload) -> Path:
+    return atomic_write_text(
+        path, json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+    )
+
+
 def read_json(path: Path, default=None):
     try:
         return json.loads(Path(path).read_text())
@@ -440,5 +473,9 @@ def append_jsonl(path: Path, record: dict) -> None:
     with _append_lock_for(path):
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as handle:
-            handle.write(line)
-            handle.flush()
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                handle.write(line)
+                handle.flush()
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)

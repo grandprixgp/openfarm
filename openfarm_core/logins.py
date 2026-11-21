@@ -15,12 +15,14 @@ logs a credential's content.
 
 from __future__ import annotations
 
-import dataclasses
 import contextlib
+import dataclasses
 import errno
 import fcntl
 import json
+import math
 import os
+import secrets
 import stat
 import tempfile
 from pathlib import Path
@@ -222,14 +224,19 @@ def check_shape(provider: str, raw: bytes, original: bytes | None) -> str:
             return "the Claude credentials have no access token"
         if "refreshToken" in oauth and not _nonempty_str(oauth.get("refreshToken")):
             return "the Claude credentials have an empty refresh token"
+        new_exp = oauth.get("expiresAt")
+        if new_exp is not None:
+            if isinstance(new_exp, bool) or not isinstance(new_exp, (int, float)) or not math.isfinite(new_exp):
+                return "the Claude credentials have an invalid expiresAt"
         old = _json_object(original) if original else None
         old_oauth = old.get("claudeAiOauth") if old is not None else None
         if isinstance(old_oauth, dict):
             if _nonempty_str(old_oauth.get("refreshToken")) and not _nonempty_str(oauth.get("refreshToken")):
                 return "the refreshed Claude login lost its refresh token"
-            old_exp, new_exp = old_oauth.get("expiresAt"), oauth.get("expiresAt")
-            if (isinstance(old_exp, (int, float)) and isinstance(new_exp, (int, float))
-                    and not isinstance(old_exp, bool) and new_exp < old_exp):
+            old_exp = old_oauth.get("expiresAt")
+            if (isinstance(old_exp, (int, float)) and not isinstance(old_exp, bool)
+                    and math.isfinite(old_exp)
+                    and isinstance(new_exp, (int, float)) and new_exp < old_exp):
                 return "the refreshed Claude login expires before the one it replaces"
         return ""
     if provider == "codex":
@@ -414,6 +421,107 @@ def sync_back(
         return SyncResult("refused", f"write failed ({exc.strerror})", str(dest))
 
 
+def _write_isolated_atomic(
+    isolated_home: Path | str,
+    rel_parts: tuple[str, ...],
+    data: bytes,
+) -> str:
+    """Atomically write `data` under `isolated_home` using `dir_fd` + `O_NOFOLLOW`.
+
+    Returns `""` on success or a refusal reason string on failure.
+    """
+    if not rel_parts:
+        return "empty isolated credential path"
+    flags_dir = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        dir_fd = os.open(str(isolated_home), flags_dir)
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+            return "isolated home is not a plain folder (a link?)"
+        return f"isolated home cannot be opened ({errno.errorcode.get(exc.errno, exc.errno)})"
+    fds = [dir_fd]
+    tmp_name = ""
+    tmp_fd = -1
+    try:
+        for part in rel_parts[:-1]:
+            try:
+                next_fd = os.open(part, flags_dir, dir_fd=dir_fd)
+            except OSError as exc:
+                if exc.errno == errno.ENOENT:
+                    try:
+                        os.mkdir(part, 0o700, dir_fd=dir_fd)
+                    except FileExistsError:
+                        pass
+                    except OSError as mk_exc:
+                        return f"cannot create {part} ({errno.errorcode.get(mk_exc.errno, mk_exc.errno)})"
+                    try:
+                        next_fd = os.open(part, flags_dir, dir_fd=dir_fd)
+                    except OSError as open_exc:
+                        if open_exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                            return f"isolated path {part} is not a plain folder (a link?)"
+                        return f"cannot open {part} ({errno.errorcode.get(open_exc.errno, open_exc.errno)})"
+                elif exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                    return f"isolated path {part} is not a plain folder (a link?)"
+                else:
+                    return f"cannot open {part} ({errno.errorcode.get(exc.errno, exc.errno)})"
+            fds.append(next_fd)
+            dir_fd = next_fd
+
+        target_name = rel_parts[-1]
+        try:
+            st = os.lstat(target_name, dir_fd=dir_fd)
+            if stat.S_ISLNK(st.st_mode):
+                return "isolated credential path is a symlink"
+            if not stat.S_ISREG(st.st_mode):
+                return "isolated credential path is not a regular file"
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            return f"cannot stat isolated credential ({errno.errorcode.get(exc.errno, exc.errno)})"
+
+        tmp_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        for _ in range(16):
+            candidate = f".openfarm-refresh-{secrets.token_hex(8)}"
+            try:
+                tmp_fd = os.open(candidate, tmp_flags, 0o600, dir_fd=dir_fd)
+                tmp_name = candidate
+                break
+            except FileExistsError:
+                continue
+        else:
+            return "could not allocate temporary refresh file"
+
+        os.fchmod(tmp_fd, 0o600)
+        view = memoryview(data)
+        written = 0
+        while written < len(data):
+            written += os.write(tmp_fd, view[written:])
+        os.fsync(tmp_fd)
+        os.close(tmp_fd)
+        tmp_fd = -1
+        os.replace(tmp_name, target_name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        tmp_name = ""
+        return ""
+    except OSError as exc:
+        return f"write failed ({errno.errorcode.get(exc.errno, exc.errno)})"
+    finally:
+        if tmp_fd >= 0:
+            try:
+                os.close(tmp_fd)
+            except OSError:
+                pass
+        if tmp_name:
+            try:
+                os.unlink(tmp_name, dir_fd=dir_fd)
+            except OSError:
+                pass
+        for f in reversed(fds):
+            try:
+                os.close(f)
+            except OSError:
+                pass
+
+
 def refresh_isolated(
     provider: str,
     *,
@@ -452,17 +560,10 @@ def refresh_isolated(
     if problem:
         return SyncResult("refused", problem, str(src)), initial
     iso = isolated_place(provider, isolated_home)
-    # Refuse if any component under isolated_home is a symlink (prevents child-planted symlink overwrite).
-    iso_root = Path(isolated_home)
-    if iso_root.is_symlink():
-        return SyncResult("refused", "isolated home is a symlink", str(iso_root)), initial
-    cur = iso_root
-    for part in iso.credential.relative_to(iso_root).parts:
-        cur = cur / part
-        if os.path.islink(cur):
-            return SyncResult("refused", f"isolated path {cur} is a symlink", str(cur)), initial
-    iso.credential.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    _write_atomic(iso.credential.parent, iso.credential.name, raw, ".openfarm-refresh-")
+    rel = iso.credential.relative_to(Path(isolated_home)).parts
+    why = _write_isolated_atomic(isolated_home, rel, raw)
+    if why:
+        return SyncResult("refused", why, str(iso.credential)), initial
     return SyncResult("refreshed", "", str(iso.credential)), raw
 
 

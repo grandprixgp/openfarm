@@ -614,10 +614,12 @@ class CardRun:
         return True
 
     def _effective_unit(self) -> str:
-        if self.card.unit:
-            return self.card.unit
-        if not self.effective_unit:
-            self.effective_unit = derive_cargo_unit(self.card.touches, self.worktree)
+        unit = getattr(self.card, "unit", "") or ""
+        if unit:
+            return unit
+        if not getattr(self, "effective_unit", ""):
+            touches = getattr(self.card, "touches", None) or ()
+            self.effective_unit = derive_cargo_unit(touches, self.worktree) if touches else ""
         return self.effective_unit
 
     def _file_finding(self, entry: dict) -> str | None:
@@ -1600,7 +1602,9 @@ class CardRun:
         if not step:
             return
         wanted = step.get("tests") or []
-        if wanted and all(_status_of(parsed, name) == "ok" for name in wanted):
+        named_files = self._named_test_files()
+        row_file = self._row_file()
+        if wanted and all(_status_of(parsed, name, named_files.get(name, ""), row_file) == "ok" for name in wanted):
             self.step_index = min(self.step_index + 1, len(self.plan.steps))
             self.step_failures = 0
             self.log(f"{self.card.id}: planner step done, now on "
@@ -1788,6 +1792,7 @@ class CardRun:
                     checker_bounced = True
                 else:
                     pre_review_bounced = True
+                self.named_history.clear()
             self._step_catch_up()
             final_state = "in-review"
             self.stop_code = None
@@ -2587,7 +2592,10 @@ class CardRun:
         for path in self._test_paths():
             full = self.worktree / path
             if full.exists():
-                out[path] = full.read_text()
+                try:
+                    out[path] = full.read_text()
+                except UnicodeDecodeError:
+                    out[path] = "<binary file>"
         return out
 
     # -- step 6: named tests exist, and fail before the code ------------------
@@ -2811,11 +2819,13 @@ class CardRun:
         wrong = [name for name, status in failures.items()
                  if status != "FAILED"]
         if wrong:
+            passing_on_base = [name for name in wrong if failures.get(name) == "ok"]
             self._record_gate(GateResult(
                 "fail-before", FAIL,
                 "these named tests do not fail at runtime on base, so they assert "
                 "nothing: " + ", ".join(wrong[:10]),
-                {"passing_on_base": wrong,
+                {"passing_on_base": passing_on_base,
+                 "non_failing_on_base": wrong,
                  "rows": {name: named_rows[name] for name in wrong}}))
             raise GateFailure(
                 StopCode.TESTS_UNPROVABLE,
@@ -2945,6 +2955,17 @@ class CardRun:
             write_json(self.card_layout / "edits" / f"{attempt_no}.json",
                        report.as_dict())
 
+            if report.outside_touches:
+                outside_detail = (
+                    "the implementer edited outside touches: "
+                    + ", ".join(report.outside_touches)
+                )
+                self._record_contrast_attempt(
+                    attempt=attempt_no, phase="implementer", role="implementer",
+                    outcome="refused", error_signature="outside-touches",
+                    detail=outside_detail, stop_code=StopCode.REFUSED, call=call,
+                )
+                raise GateFailure(StopCode.REFUSED, outside_detail)
             if report.refused:
                 if all(e["code"] == "no-unique-match" for e in report.refused):
                     last_failure = _report_detail(report)
@@ -2977,17 +2998,6 @@ class CardRun:
                     detail=refused_detail, stop_code=StopCode.REFUSED, call=call,
                 )
                 raise GateFailure(StopCode.REFUSED, refused_detail)
-            if report.outside_touches:
-                outside_detail = (
-                    "the implementer edited outside touches: "
-                    + ", ".join(report.outside_touches)
-                )
-                self._record_contrast_attempt(
-                    attempt=attempt_no, phase="implementer", role="implementer",
-                    outcome="refused", error_signature="outside-touches",
-                    detail=outside_detail, stop_code=StopCode.REFUSED, call=call,
-                )
-                raise GateFailure(StopCode.REFUSED, outside_detail)
 
             outcome = self._judge_attempt(attempt_no, report)
             if outcome is None:
@@ -3047,7 +3057,10 @@ class CardRun:
         for path in self.frozen_tests:
             full = self.worktree / path
             if full.exists():
-                out[path] = full.read_text()
+                try:
+                    out[path] = full.read_text()
+                except UnicodeDecodeError:
+                    out[path] = "<binary file>"
         return out
 
     def _stash_diff(self) -> dict:
@@ -3176,9 +3189,24 @@ class CardRun:
         added = added_lines_from_diff(diff["diff"])
         production = {path for path in changed
                       if self.pack.classify_paths([path]).get(path) == "production"}
+        base_counts = self._banned_counts(changed, at_base=True)
+        # On intermediate steps of a multi-step scaffolded card, untouched stubs
+        # for later steps came from `scaffold_commit` and are cleared on later steps
+        # (the final step and end-gates still check strictly against `base_commit`).
+        if (self.plan is not None
+                and self.step_index + 1 < len(self.plan.steps)
+                and self.scaffold_commit
+                and self.scaffold_commit != self.base_commit):
+            scaffold_counts = self._banned_counts(changed, at_base=True,
+                                                  ref=self.scaffold_commit)
+            for path, labels in scaffold_counts.items():
+                stub_n = labels.get("leftover-stub", 0)
+                if stub_n:
+                    entry = base_counts.setdefault(path, {})
+                    entry["leftover-stub"] = max(entry.get("leftover-stub", 0), stub_n)
         banned = self._record_gate(banned_patterns(
             added, self.cfg, production,
-            base_counts=self._banned_counts(changed, at_base=True),
+            base_counts=base_counts,
             head_counts=self._banned_counts(changed, at_base=False),
             pack=self.pack, allowed=self._plan_allows()))
         if not banned.ok:
@@ -3213,8 +3241,12 @@ class CardRun:
         suite = self._record_gate(suite_green(
             parsed, self.cfg.known_failing,
             run_cls=test_result.cls, exit_code=test_result.exit_code))
-        passing = sum(1 for name in self.card.test_names
-                      if _status_of(parsed, name) == "ok")
+        named_files = self._named_test_files()
+        row_file = self._row_file()
+        passing = sum(
+            1 for name in self.card.test_names
+            if _status_of(parsed, name, named_files.get(name, ""), row_file) == "ok"
+        )
         self.named_passing = passing
         self.best_named_passing = max(self.best_named_passing, passing)
         # Only cards with named tests have a count that can rise. A mechanical card
@@ -3245,8 +3277,10 @@ class CardRun:
             None,
         )
 
-        all_named = all(_status_of(parsed, name) == "ok"
-                        for name in self.card.test_names)
+        all_named = all(
+            _status_of(parsed, name, named_files.get(name, ""), row_file) == "ok"
+            for name in self.card.test_names
+        )
         if suite.ok and lint_gate.ok and all_named:
             if self.plan is not None and self.plan.steps:
                 self.step_index = len(self.plan.steps)
@@ -3264,7 +3298,8 @@ class CardRun:
             step = self._current_step() or {}
             wanted = step.get("tests") or []
             step_tests_ok = bool(wanted) and all(
-                _status_of(parsed, name) == "ok" for name in wanted)
+                _status_of(parsed, name, named_files.get(name, ""), row_file) == "ok"
+                for name in wanted)
             later_step_tests = {
                 t
                 for s in self.plan.steps[self.step_index + 1:]
@@ -3308,7 +3343,7 @@ class CardRun:
         if suite.ok and lint_gate.ok:
             detail = ("named tests still failing: " + ", ".join(
                 name for name in self.card.test_names
-                if _status_of(parsed, name) != "ok"))
+                if _status_of(parsed, name, named_files.get(name, ""), row_file) != "ok"))
             # The suite can be green while a named test is still red, so the progress
             # signals have to be checked on this path too.
             self._check_progress_with_coach(diff, detail, attempt_no)
@@ -3411,7 +3446,7 @@ class CardRun:
         # actually ran. `named_history` holds one entry per judged attempt.
         if len(self.named_history) >= 2:
             previous, current = self.named_history[-2], self.named_history[-1]
-            if current <= previous:
+            if current <= previous and current < len(self.card.test_names):
                 raise GateFailure(
                     StopCode.NO_PROGRESS,
                     f"passing named tests did not rise: {previous} then {current}")
@@ -3420,7 +3455,7 @@ class CardRun:
         """What this card may introduce that the build otherwise refuses: its plan said so, and the owner saw it."""
         return frozenset({"network-call"}) if self.card.network else frozenset()
 
-    def _banned_counts(self, paths: list[str], at_base: bool
+    def _banned_counts(self, paths: list[str], at_base: bool, ref: str = ""
                        ) -> dict[str, dict[str, int]]:
         """How often each banned pattern appears in each file, at base or at head.
 
@@ -3430,12 +3465,23 @@ class CardRun:
         """
         pack = self.pack
         out: dict[str, dict[str, int]] = {}
+        commit = ref or self.base_commit
         for path in paths:
             if at_base:
-                content = self.git.show_blob(f"{self.base_commit}:{path}")
+                raw_blob = self.git.show_blob_bytes(f"{commit}:{path}")
+                if raw_blob is None:
+                    content = None
+                else:
+                    try:
+                        content = raw_blob.decode("utf-8")
+                    except UnicodeDecodeError:
+                        content = None
             else:
                 full = self.worktree / path
-                content = full.read_text() if full.exists() else None
+                try:
+                    content = full.read_text() if full.exists() else None
+                except UnicodeDecodeError:
+                    content = None
             if content is None:
                 continue
             production = ({path} if pack.classify_paths([path]).get(path)
@@ -3659,11 +3705,11 @@ class CardRun:
                     overlay = sorted(set(self.frozen_tests) | set(self.phase_a_stub_files)
                                      | {p.strip() for p in frozen_changed if p.strip()})
                     for rel in overlay:
-                        blob = self.git.show_blob(f"{self.frozen_commit}:{rel}")
+                        blob = self.git.show_blob_bytes(f"{self.frozen_commit}:{rel}")
                         if blob is not None:
                             dst = trial_wt / rel
                             dst.parent.mkdir(parents=True, exist_ok=True)
-                            dst.write_text(blob)
+                            dst.write_bytes(blob)
                     env = self.cfg.runner_env.get(unit, {})
                     rev_result = self.runner.exec(
                         kind=runner_kind("test"),
@@ -3948,7 +3994,8 @@ class CardRun:
                              "mutating the files whole")
         try:
             argv = self.pack.commands(
-                "mutation", files=production, tests=self.card.test_names)["argv"]
+                "mutation", unit=self._effective_unit(),
+                files=production, tests=self.card.test_names)["argv"]
             result = self._run(runner_kind("mutation"), argv, counted="mutation")
         except (Infra, Invalid) as exc:
             self._record_gate(GateResult(
@@ -4107,7 +4154,10 @@ class CardRun:
         for path in changed[:8]:
             full = self.worktree / path
             if full.exists():
-                modified[path] = full.read_text()[:8000]
+                try:
+                    modified[path] = full.read_text()[:8000]
+                except UnicodeDecodeError:
+                    modified[path] = "<binary file>"
         # The brief names the language, the runner and the files the counter-tests
         # are saved as, in the same form `parse_pass2` reads.
         language = str(getattr(self.pack, "name", "") or "")
@@ -4530,8 +4580,10 @@ class CardRun:
                     return "\n".join(lines[at:at + 12])
             return "\n".join(lines[:12])
 
-        def status_of(parsed: dict, name: str) -> str:
-            status = _status_of(parsed, name)
+        row_file = self._row_file()
+
+        def status_of(parsed: dict, name: str, file: str = "") -> str:
+            status = _status_of(parsed, name, file, row_file)
             if status != "not-run":
                 return status
             for entry in parsed.get("results", []):
@@ -4543,7 +4595,7 @@ class CardRun:
             # name, from a language whose test names have no spaces.
             first = name.split(" ", 1)[0]
             if first != name:
-                return status_of(parsed, first)
+                return status_of(parsed, first, file)
             return "not-run"
 
         for index, counter in enumerate(tests, start=1):
@@ -4601,7 +4653,7 @@ class CardRun:
                             why=("the run did not finish" if result.cls == INFRA
                                  else "it did not compile or could not be collected"))
                     else:
-                        status = status_of(parsed, name)
+                        status = status_of(parsed, name, path)
                         died = bool(parsed.get("missing_footers"))
                         if died:
                             # The run died partway: a row it printed is not a pass.
@@ -4611,7 +4663,7 @@ class CardRun:
                             # exists for.
                             status = ("FAILED" if any(
                                 row.get("status") == "FAILED" for row in rows_for_test(
-                                    parsed.get("results", []), name))
+                                    parsed.get("results", []), name, path, row_file))
                                 else "not-run")
                         entry["status"] = status
                         if status == "ok":
@@ -4661,8 +4713,10 @@ class CardRun:
             return
 
         trial = self.card_layout / "catch-up"
+        trial_target = self.card_layout / "catch-up-target"
         if trial.exists():
             shutil.rmtree(trial, ignore_errors=True)
+        shutil.rmtree(trial_target, ignore_errors=True)
         self.git.worktree_add(trial, self.branch)
         self._prepare_checkout(trial)
         trial_git = Git(trial)
@@ -4675,7 +4729,6 @@ class CardRun:
                     {"conflict": output[-2000:]}))
                 raise GateFailure(StopCode.STALE_CONFLICT, self.catch_up_result)
 
-            trial_target = self.card_layout / "catch-up-target"
             env = self.cfg.runner_env.get(unit, {})
             result = self.runner.exec(
                 kind="test",
@@ -4706,6 +4759,8 @@ class CardRun:
         finally:
             trial_git.abort_merge()
             self.git.worktree_remove(trial)
+            shutil.rmtree(trial, ignore_errors=True)
+            shutil.rmtree(trial_target, ignore_errors=True)
 
     # -- finishing ------------------------------------------------------------
 
@@ -5117,9 +5172,9 @@ def _revert_detail(failures: dict[str, str], compile_errors: list) -> str:
             + ", ".join(wrong[:10]))
 
 
-def _status_of(parsed: dict, name: str) -> str:
+def _status_of(parsed: dict, name: str, file: str = "", row_file=None) -> str:
     """A named test's status over all its rows, as `_named_failures` reads it."""
-    return combined_status(rows_for_test(parsed.get("results", []), name))
+    return combined_status(rows_for_test(parsed.get("results", []), name, file, row_file))
 
 
 def _report_detail(report) -> str:

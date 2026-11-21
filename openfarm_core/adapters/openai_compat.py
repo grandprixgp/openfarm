@@ -8,8 +8,12 @@ is never written into a message, a log or a response.
 
 from __future__ import annotations
 
+import errno
+import http.client
 import json
+import math
 import os
+import stat
 import threading
 import time
 import urllib.error
@@ -22,6 +26,7 @@ from ..errors import Infra, Invalid, Refused
 
 _RETRYABLE_HTTP_CODES = frozenset({429, 502, 503, 504})
 _MAX_RETRY_DELAY_S = 30.0
+_MAX_RESPONSE_BYTES = 32 * 1024 * 1024  # 32 MiB cap on completion responses
 _RESERVED_EFFORT_PARAMS = frozenset({
     "model", "messages", "max_tokens", "temperature", "seed", "response_format",
 })
@@ -100,7 +105,9 @@ def _retry_delay(attempt: int, headers=None) -> float:
         raw = headers.get("Retry-After")
         if raw is not None:
             try:
-                return min(_MAX_RETRY_DELAY_S, max(0.0, float(str(raw).strip())))
+                val = float(str(raw).strip())
+                if math.isfinite(val):
+                    return min(_MAX_RETRY_DELAY_S, max(0.0, val))
             except ValueError:
                 pass
     return min(_MAX_RETRY_DELAY_S, 0.5 * (2 ** attempt))
@@ -115,19 +122,63 @@ def _safe_int(value) -> int:
         return 0
 
 
+def _effective_port(parts: urllib.parse.SplitResult) -> int | None:
+    if parts.port is not None:
+        return parts.port
+    scheme = parts.scheme.lower()
+    if scheme == "https":
+        return 443
+    if scheme == "http":
+        return 80
+    return None
+
+
+def _same_origin(url_a: str, url_b: str) -> bool:
+    a = urllib.parse.urlsplit(url_a)
+    b = urllib.parse.urlsplit(url_b)
+    return (
+        a.scheme.lower() == b.scheme.lower()
+        and (a.hostname or "").lower() == (b.hostname or "").lower()
+        and _effective_port(a) == _effective_port(b)
+    )
+
+
+def _redact_secret(text: str, secret: str) -> str:
+    if not secret or not text:
+        return text
+    out = text.replace(secret, "[REDACTED]")
+    for line in secret.splitlines():
+        token = line.strip()
+        if token and token in out:
+            out = out.replace(token, "[REDACTED]")
+    return out
+
+
 class _AllowlistRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Refuse to follow a redirect off the allowlist."""
+    """Refuse to follow a redirect off the allowlist or downgrade HTTPS; strip auth cross-origin."""
 
     def __init__(self, allowed: list[str]) -> None:
         self.allowed = list(allowed)
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        if not _within(newurl, self.allowed):
+        target_url = urllib.parse.urljoin(req.full_url, newurl)
+        if not _within(target_url, self.allowed):
             raise Refused(
                 "redirect-off-allowlist",
-                f"the endpoint tried to redirect to {newurl}, which is not on the "
+                f"the endpoint tried to redirect to {target_url}, which is not on the "
                 f"allowlist; nothing was sent")
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+        orig = urllib.parse.urlsplit(req.full_url)
+        dest = urllib.parse.urlsplit(target_url)
+        if orig.scheme.lower() == "https" and dest.scheme.lower() != "https":
+            raise Refused(
+                "redirect-downgrade",
+                "refusing HTTPS-to-HTTP redirect; nothing was sent")
+        new_req = super().redirect_request(req, fp, code, msg, headers, target_url)
+        if new_req is not None and not _same_origin(req.full_url, target_url):
+            for hdr_dict in (new_req.headers, new_req.unredirected_hdrs):
+                for key in [k for k in hdr_dict if k.lower() in ("authorization", "proxy-authorization")]:
+                    del hdr_dict[key]
+        return new_req
 
 
 class OpenAICompatibleBackend:
@@ -179,11 +230,29 @@ class OpenAICompatibleBackend:
     def _key(self) -> str:
         if self.key_file is None:
             return ""
+        p = self.key_file
+        if p.is_symlink():
+            raise Refused("symlink-key", f"refusing to read symlink key file {p}")
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
         try:
-            return self.key_file.read_text().strip()
+            fd = os.open(str(p), flags)
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise Refused("symlink-key", f"refusing to read symlink key file {p}") from exc
+            raise Infra("key-unreadable",
+                        f"cannot read the key file {p}: {exc}") from exc
+        try:
+            with os.fdopen(fd, "r", encoding="utf-8") as handle:
+                st = os.fstat(handle.fileno())
+                if not stat.S_ISREG(st.st_mode):
+                    raise Refused("key-not-regular", f"refusing to read non-regular key file {p}")
+                key = handle.read().strip()
         except OSError as exc:
             raise Infra("key-unreadable",
-                        f"cannot read the key file {self.key_file}: {exc}") from exc
+                        f"cannot read the key file {p}: {exc}") from exc
+        if "\r" in key or "\n" in key:
+            raise Invalid("bad-key", f"key file {p} contains multiple lines or invalid CR/LF characters")
+        return key
 
     def complete(self, role: str, model: str, temperature: float,
                  messages: list[dict], seed: int | None = None,
@@ -209,6 +278,7 @@ class OpenAICompatibleBackend:
                               f"effort_param {effort_param!r} is invalid")
             payload[effort_param] = effort
 
+        secret = self._key()
         request = urllib.request.Request(
             url, data=json.dumps(payload).encode("utf-8"),
             # Python's default User-Agent is blocked outright by some providers'
@@ -216,7 +286,7 @@ class OpenAICompatibleBackend:
             headers={"User-Agent": f"openfarm/{__version__}",
                      **self.headers,
                      "Content-Type": "application/json",
-                     "Authorization": f"Bearer {self._key()}"},
+                     "Authorization": f"Bearer {secret}"},
             method="POST")
 
         started = time.monotonic()
@@ -224,7 +294,14 @@ class OpenAICompatibleBackend:
         for attempt in range(self.retries + 1):
             try:
                 with self._opener.open(request, timeout=self.timeout_s) as response:
-                    body = response.read().decode("utf-8", errors="replace")
+                    try:
+                        raw_bytes = response.read(_MAX_RESPONSE_BYTES + 1)
+                    except TypeError:
+                        raw_bytes = response.read()
+                    if len(raw_bytes) > _MAX_RESPONSE_BYTES:
+                        raise Infra("response-too-large",
+                                    "the endpoint response exceeded the maximum allowed size")
+                    body = raw_bytes.decode("utf-8", errors="replace")
                 break
             except urllib.error.HTTPError as exc:
                 if exc.code in _RETRYABLE_HTTP_CODES and attempt < self.retries:
@@ -235,12 +312,22 @@ class OpenAICompatibleBackend:
                 if attempt < self.retries:
                     self._sleep(_retry_delay(attempt))
                     continue
-                raise Infra("endpoint-unreachable", f"{exc.reason}") from exc
+                raise Infra("endpoint-unreachable",
+                            _redact_secret(str(exc.reason), secret)) from exc
             except TimeoutError as exc:
                 if attempt < self.retries:
                     self._sleep(_retry_delay(attempt))
                     continue
                 raise Infra("timeout", "the endpoint did not answer in time") from exc
+            except (http.client.HTTPException, OSError) as exc:
+                if attempt < self.retries:
+                    self._sleep(_retry_delay(attempt))
+                    continue
+                raise Infra("endpoint-unreachable",
+                            _redact_secret(str(exc), secret)) from exc
+            except ValueError as exc:
+                raise Infra("http-request-error",
+                            _redact_secret(str(exc), secret)) from exc
         latency = time.monotonic() - started
 
         try:

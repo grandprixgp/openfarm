@@ -49,6 +49,11 @@ _COORDINATOR_ACTIONS = frozenset({
     "wait",
 })
 
+
+def _breaker_tripped(state) -> bool:
+    reader = getattr(state, "read_breaker", None)
+    return bool(callable(reader) and (reader() or {}).get("tripped"))
+
 _COORDINATOR_SYSTEM_PROMPT = (
     "You are the swarm coordinator for an Openfarm run. Decide which ready, "
     "non-colliding cards to start and how to handle struggling or handed-back "
@@ -227,7 +232,11 @@ class CoordinatorRuntime:
         with self.lock:
             if self.stop_launching:
                 return 0
-            if self.state.kill_requested(self.cfg.kill_switch) or self.state.is_paused():
+            if (
+                self.state.kill_requested(self.cfg.kill_switch)
+                or self.state.is_paused()
+                or _breaker_tripped(self.state)
+            ):
                 return 0
             if self.deadline is not None and time.monotonic() >= self.deadline:
                 return 0
@@ -1694,11 +1703,12 @@ class SwarmRunner:
 
                     with rt.lock:
                         if rt.stop_launching or self.state.kill_requested(self.cfg.kill_switch):
-                            reason_skip = (
-                                "the kill switch was set"
-                                if self.state.kill_requested(self.cfg.kill_switch)
-                                else "run stopped"
-                            )
+                            if self.state.kill_requested(self.cfg.kill_switch):
+                                reason_skip = "the kill switch was set"
+                            elif _breaker_tripped(self.state):
+                                reason_skip = "the circuit breaker is tripped"
+                            else:
+                                reason_skip = "run stopped"
                             for cid in list(rt.pending):
                                 outcomes_by_card.setdefault(
                                     cid, {"card": cid, "skipped": reason_skip}
@@ -1708,6 +1718,12 @@ class SwarmRunner:
                             for cid in list(rt.pending):
                                 outcomes_by_card.setdefault(
                                     cid, {"card": cid, "skipped": "the queue was paused"}
+                                )
+                            rt.pending.clear()
+                        elif _breaker_tripped(self.state):
+                            for cid in list(rt.pending):
+                                outcomes_by_card.setdefault(
+                                    cid, {"card": cid, "skipped": "the circuit breaker is tripped"}
                                 )
                             rt.pending.clear()
                         elif self.deadline is not None and time.monotonic() >= self.deadline:
@@ -1758,6 +1774,7 @@ class SwarmRunner:
                             )
                         if not done_futs:
                             continue
+                        finished_batch: list[tuple[str, dict]] = []
                         for fut in done_futs:
                             with rt.lock:
                                 cid = rt.in_flight.pop(fut)
@@ -1786,6 +1803,8 @@ class SwarmRunner:
                             # Code retires the finished card's workers at once, whatever
                             # coordinator is seated, so the roster never fills with them.
                             retire_card_members(self.board, cid)
+                            finished_batch.append((cid, outcome))
+                        for cid, outcome in finished_batch:
                             if not rt.stop_launching:
                                 with rt.coord_busy():
                                     self.coordinator.on_finished(rt, cid, outcome)

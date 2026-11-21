@@ -7,7 +7,7 @@ description: >-
   setup, and concrete card Done assertions into .openfarm/GRILL_DECISIONS.md.
 ---
 
-# Openfarm Grill-Me Skill (`v0.9.2`)
+# Openfarm Grill-Me Skill (`v0.20.0`)
 
 ## Steps and words (the same in the TUI, the CLI and here)
 

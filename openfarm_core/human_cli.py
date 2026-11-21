@@ -749,6 +749,10 @@ def _format_run(payload: dict, style: Style) -> str:
     next_tips: list[str] = []
     in_review = [_outcome_card(o) for o in outcomes
                  if o.get("final_state") in ("in-review", "in_review")]
+    auto_landed = [
+        _outcome_card(o) for o in outcomes
+        if o.get("auto_landed") or (isinstance(o.get("auto_land"), dict) and o["auto_land"].get("landed"))
+    ]
     blocked = [_outcome_card(o) for o in outcomes if o.get("final_state") == "blocked"]
     if in_review:
         sample = in_review[0]
@@ -757,6 +761,8 @@ def _format_run(payload: dict, style: Style) -> str:
             f"openfarm verdict {sample} clean --review-tokens 1000",
             f"git merge --no-ff openfarm/{sample}-<slug> && openfarm done {sample}",
         ])
+    if auto_landed:
+        next_tips.append("openfarm land --promote-integration")
     if blocked:
         next_tips.append(f"openfarm dossier {blocked[0]}  (or: openfarm supervise --triage-blocked)")
     if dry:

@@ -49,6 +49,8 @@ class Edit:
             payload["replace"] = self.replace
         else:
             payload["content"] = self.content
+        if self.test_name:
+            payload["test_name"] = self.test_name
         return payload
 
     @classmethod
@@ -59,6 +61,7 @@ class Edit:
             search=str(data.get("search", "")),
             replace=str(data.get("replace", "")),
             content=data.get("content"),
+            test_name=str(data.get("test_name", "")),
         )
 
 
@@ -428,14 +431,17 @@ def apply_edits(worktree: Path, edits: list[Edit], allowed_paths: list[str],
         for target, content in pending.items():
             target.parent.mkdir(parents=True, exist_ok=True)
             prior = orig_disk[target]
-            target.write_text(content)
             written.append((target, prior))
+            target.write_text(content)
     except OSError as exc:
         for target, prior in reversed(written):
-            if prior is None:
-                target.unlink(missing_ok=True)
-            else:
-                target.write_text(prior)
+            try:
+                if prior is None:
+                    target.unlink(missing_ok=True)
+                else:
+                    target.write_text(prior)
+            except OSError:
+                pass
         raise Invalid("write-failed", f"cannot write edit batch: {exc}") from exc
 
     return report
@@ -468,13 +474,6 @@ def _stage_one(edit: Edit, target: Path, current: str | None,
         return base_text.replace(edit.search, edit.replace, 1)
 
     raise Invalid("bad-format", f"{edit.format!r} is not an edit format")
-
-
-def _apply_one(edit: Edit, target: Path) -> None:
-    current = target.read_text() if target.exists() else None
-    content = _stage_one(edit, target, current, None)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(content)
 
 
 def _is_additions_only(before: str, after: str) -> bool:
@@ -516,6 +515,10 @@ def diff_text(worktree: Path, paths: list[str], ref: str = "HEAD") -> str:
         try:
             content = (worktree / path).read_text()
         except OSError:
+            continue
+        except UnicodeDecodeError:
+            chunks.append(f"diff --git a/{path} b/{path}\nnew file mode 100644\n"
+                          f"Binary files /dev/null and b/{path} differ\n")
             continue
         lines = content.splitlines()
         chunks.append(f"diff --git a/{path} b/{path}\nnew file mode 100644\n"

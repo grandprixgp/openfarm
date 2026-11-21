@@ -8,12 +8,16 @@ they stay in atomic mode-0600 non-symlink `.key` files.
 
 from __future__ import annotations
 
+import errno
+import http.client
 import json
 import os
+import stat
 import tempfile
 import time
 import tomllib
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -95,6 +99,90 @@ def _toml_str(value: str) -> str:
     return json.dumps(str(value))
 
 
+def _protected_shared_dirs() -> set[Path]:
+    dirs: set[Path] = {Path("/"), Path("/tmp"), Path("/var/tmp")}
+    try:
+        dirs.add(Path(tempfile.gettempdir()).resolve())
+    except OSError:
+        pass
+    try:
+        home = Path.home().resolve()
+        dirs.add(home)
+        dirs.update(home.parents)
+        dirs.add((home / ".config").resolve())
+        dirs.add((home / ".local").resolve())
+        dirs.add((home / ".local" / "share").resolve())
+    except (RuntimeError, OSError):
+        pass
+    xdg = os.environ.get("XDG_CONFIG_HOME", "").strip()
+    if xdg:
+        try:
+            dirs.add(Path(xdg).expanduser().resolve())
+        except OSError:
+            pass
+    return dirs
+
+
+def _ensure_private_parent(parent: Path) -> Path:
+    parent.mkdir(parents=True, exist_ok=True)
+    resolved_parent = parent.resolve()
+    if resolved_parent not in _protected_shared_dirs():
+        os.chmod(resolved_parent, 0o700)
+    return resolved_parent
+
+
+def _redact_secret(text: str, secret: str) -> str:
+    if not secret or not text:
+        return text
+    out = text.replace(secret, "[REDACTED]")
+    for line in secret.splitlines():
+        token = line.strip()
+        if token and token in out:
+            out = out.replace(token, "[REDACTED]")
+    return out
+
+
+def _effective_port(parts: urllib.parse.SplitResult) -> int | None:
+    if parts.port is not None:
+        return parts.port
+    scheme = parts.scheme.lower()
+    if scheme == "https":
+        return 443
+    if scheme == "http":
+        return 80
+    return None
+
+
+def _same_origin(url_a: str, url_b: str) -> bool:
+    a = urllib.parse.urlsplit(url_a)
+    b = urllib.parse.urlsplit(url_b)
+    return (
+        a.scheme.lower() == b.scheme.lower()
+        and (a.hostname or "").lower() == (b.hostname or "").lower()
+        and _effective_port(a) == _effective_port(b)
+    )
+
+
+class _SafeProbeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse non-HTTP(S) and HTTPS->HTTP redirects; strip auth on cross-origin redirects."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        target_url = urllib.parse.urljoin(req.full_url, newurl)
+        orig = urllib.parse.urlsplit(req.full_url)
+        dest = urllib.parse.urlsplit(target_url)
+        dest_scheme = dest.scheme.lower()
+        if dest_scheme not in ("http", "https"):
+            raise urllib.error.URLError(f"refusing redirect to unsupported scheme {dest_scheme!r}")
+        if orig.scheme.lower() == "https" and dest_scheme != "https":
+            raise urllib.error.URLError("refusing HTTPS-to-HTTP redirect")
+        new_req = super().redirect_request(req, fp, code, msg, headers, target_url)
+        if new_req is not None and not _same_origin(req.full_url, target_url):
+            for hdr_dict in (new_req.headers, new_req.unredirected_hdrs):
+                for key in [k for k in hdr_dict if k.lower() in ("authorization", "proxy-authorization")]:
+                    del hdr_dict[key]
+        return new_req
+
+
 def _write_key_atomic_0600(key_file: Path, secret: str) -> Path:
     cleaned = str(secret or "").strip()
     if not cleaned:
@@ -102,11 +190,7 @@ def _write_key_atomic_0600(key_file: Path, secret: str) -> Path:
     target = Path(key_file).expanduser()
     if target.is_symlink():
         raise Refused("symlink-key", f"refusing to overwrite symlink key file {target}")
-    parent = target.parent
-    parent.mkdir(parents=True, exist_ok=True)
-    resolved_parent = parent.resolve()
-    if str(resolved_parent) not in ("/", "/tmp", "/var/tmp"):
-        os.chmod(resolved_parent, 0o700)
+    resolved_parent = _ensure_private_parent(target.parent)
 
     fd, tmp_name = tempfile.mkstemp(prefix=".openfarm-key-", dir=str(resolved_parent))
     try:
@@ -130,9 +214,26 @@ def _read_key_safe(key_file: Path | None) -> str:
     p = Path(key_file).expanduser()
     if p.is_symlink():
         raise Refused("symlink-key", f"refusing to read symlink key file {p}")
-    if not p.is_file():
-        return ""
-    return p.read_text(encoding="utf-8").strip()
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(str(p), flags)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise Refused("symlink-key", f"refusing to read symlink key file {p}") from exc
+        if exc.errno == errno.ENOENT:
+            return ""
+        raise Refused("key-unreadable", f"cannot read key file {p}: {exc.strerror or exc}") from exc
+    try:
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            st = os.fstat(handle.fileno())
+            if not stat.S_ISREG(st.st_mode):
+                raise Refused("key-not-regular", f"refusing to read non-regular key file {p}")
+            key = handle.read().strip()
+    except OSError as exc:
+        raise Refused("key-unreadable", f"cannot read key file {p}: {exc.strerror or exc}") from exc
+    if "\r" in key or "\n" in key:
+        raise Refused("invalid-key", f"key file {p} contains multiple lines or invalid CR/LF characters")
+    return key
 
 
 def load_global_providers(path: Path | None = None) -> dict:
@@ -246,11 +347,7 @@ def save_global_providers(
         f"zdr = {'true' if resolved_zdr else 'false'}\n"
     )
 
-    parent = target.parent
-    parent.mkdir(parents=True, exist_ok=True)
-    resolved_parent = parent.resolve()
-    if str(resolved_parent) not in ("/", "/tmp", "/var/tmp"):
-        os.chmod(resolved_parent, 0o700)
+    resolved_parent = _ensure_private_parent(target.parent)
     fd, tmp_name = tempfile.mkstemp(prefix=".openfarm-providers-", dir=str(resolved_parent))
     try:
         os.chmod(tmp_name, 0o600)
@@ -307,6 +404,18 @@ def probe_worker_endpoint(
                 "error": str(exc),
             }
 
+    if secret and ("\r" in secret or "\n" in secret):
+        return {
+            "ok": False,
+            "status": 0,
+            "latency_ms": 0,
+            "zdr_sent": bool(zdr),
+            "model": str(model or "").strip(),
+            "model_found": None,
+            "models_count": 0,
+            "error": "API key contains invalid newline characters",
+        }
+
     url = f"{ep}/models"
     headers = {
         "Accept": "application/json",
@@ -318,12 +427,13 @@ def probe_worker_endpoint(
         headers["Authorization"] = f"Bearer {secret}"
 
     req = urllib.request.Request(url, headers=headers, method="GET")
+    opener = urllib.request.build_opener(_SafeProbeRedirectHandler())
     started = time.monotonic()
     status = 0
     error = ""
     models: list[str] = []
     try:
-        with urllib.request.urlopen(req, timeout=max(0.5, float(timeout_s))) as resp:
+        with opener.open(req, timeout=max(0.5, float(timeout_s))) as resp:
             status = int(getattr(resp, "status", 200) or 200)
             raw = resp.read(16 * 1024 * 1024).decode("utf-8", errors="replace")
             try:
@@ -343,11 +453,10 @@ def probe_worker_endpoint(
     except urllib.error.HTTPError as exc:
         status = int(getattr(exc, "code", 0) or 0)
         error = f"HTTP {status}: {exc.reason}"
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+    except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError, ValueError) as exc:
         error = str(getattr(exc, "reason", exc) or exc)
 
-    if secret and secret in error:
-        error = error.replace(secret, "[REDACTED]")
+    error = _redact_secret(error, secret)
     elapsed_ms = int(round((time.monotonic() - started) * 1000))
     wanted = str(model or "").strip()
     model_found: bool | None = None

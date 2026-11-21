@@ -17,11 +17,41 @@ For greenfield empty-folder initialization (`"Read and install this skill <link>
   screen (`openfarm_tui/journey_more.py`).
 - **Models and setup (v0.20.0)**: `openfarm_core/model_choices.py` lays `.openfarm/models.toml` (project) and the
   global `models.toml` over the config data in `load_config`, before validation, so every existing reader sees the
-  chosen model and effort. The Architect's own choice is applied in `open_architect_backend`.
-  `openfarm_core/setup_helper.py` is `openfarm setup`; its questions are plain functions taking `ask` and `out`,
-  which is how the tests drive it.
+  chosen model and effort (including string/omitted role entries, `[tiers]`, and custom/empty tier efforts). The
+  Architect's own choice is applied in `open_architect_backend`. `openfarm_core/setup_helper.py` is `openfarm setup`;
+  its questions are plain functions taking `ask` and `out`, which is how the tests drive it.
+- **v0.20.0 hardening (Waves 1–3, `audit-v020-hardening`)**:
+  - **Security & boundaries**: fixed `bwrap` worktree overmount (`state_dir` hide ordering) + real-`bwrap` test;
+    hardened `openfarm web` (Findings Dismiss `"dismissed"`, XSS removal, CLI flag-injection guards, `Host`/`Origin`
+    DNS-rebinding protection, non-loopback token checks, wildcard IP parsing); hardened ACP read-only `.git/**` &
+    `search-overlaps-protected`, `dir_fd`/`O_NOFOLLOW` login refresh, and redirect `Authorization` stripping.
+  - **Concurrency & lifecycle**: cross-process `flock` on `cards-source` (`Store`/`FileCardSource`), atomic
+    `store.json` & migration ordering, `FileCardSource.stale()`/`next(lane=...)` fixes, `run.lock` & `daemon.json`
+    process-identity checks and child reaping, `Git.create_branch` + `quotepath`/`fsmonitor` hardening, byte-offset
+    `Board.wait()`, and `HarnessLibrary` lock release during LLM reflection + probe-rollback restore.
+  - **Pipeline, CLI, packs & Journey UX**: circuit breaker halts sequential/`--follow`/swarm runs mid-wave without
+    silent clearing; `_check_progress` respects 100% passing named tests; `land --accept-blocked` defers mutations
+    until after trial-merge & tests; Journey TUI fixes (`Plan` walk-back after all goals accepted, `"Something's
+    wrong…"` reopening finished goals, `"split"` card filtering, `given_back` retry, `self.fix` preservation on `d`
+    + `Esc`, per-step cancel isolation); `[runner] typescript = "auto"` default; Go subtest/crash handling; binary-safe
+    `revert-check` + `PYTHONDONTWRITEBYTECODE=1`; Python 3.14 `tests/` without `__init__.py` & `src/`-layout
+    `openfarm try`; `daemon start --follow`; `card skip` `ok: true`.
+  - **Wiring & cleanup**: wired `[notifications]` into run/card lifecycle and fixed+wired `[factory] auto_land`
+    (`source.mark_done` + locking + summary output); consolidated all three native ACP bridges onto
+    `BaseNativeAcpServer` (-721 lines, fixing SIGTERM deadlock, prompt-thread crashes, concurrent session overwrite,
+    `agy` temp-dir leaks, and `claude` fail-open default); synced skill/plugin versions to `0.20.0` and pruned dead
+    zero-caller helpers.
+- **Verified live on 21 Nov 2026 (dogfooding + offline suite)**:
+  - Offline suite: 2,064 tests passing on Python 3.14 and Linux.
+  - Real `bwrap` runner passing all 25 gates.
+  - Circuit breaker halting active runs mid-wave, concurrent `daemon` + CLI + `openfarm web`, `land --accept-blocked`,
+    `[factory] auto_land` + `--promote-integration`, and `[notifications]` webhooks.
+  - Live Claude ACP + worker greenfield build, real headless Chromium `openfarm try`, and Journey TUI pilot.
+  - `openfarm adopt`, `init`, and `try` on Python 3.14, plus `openfarm bench run --dry-run`.
+- **Untested**: a light terminal, the mouse in a real terminal, real `go`/`vitest`/`jest` binaries, unattended `agy`,
+  desktop `notify-send` on a real desktop, building whole projects on providers other than the configured live one
+  (Command Code), and a different model for Architect vs. reviewer in a real build.
 - Start reading at `openfarm_tui/journey_state.py` (`screen_for`), then `journey.py`.
-- Not seen live: a light terminal, the mouse, a different model for Architect and reviewer in a real build.
 
 ## Earlier State (v0.14.0, 20 Nov 2026)
 

@@ -37,7 +37,7 @@ def screen_for(facts: dict) -> dict:
         return {"screen": "questions" if facts.get("asking") else "idea", "flag": False}
     if facts.get("goal") is None:  # every goal is accepted
         return {"screen": "accept", "flag": False}
-    states = [t["state"] for t in facts.get("tasks") or [] if t["state"] != "dropped"]
+    states = [t["state"] for t in facts.get("tasks") or [] if t["state"] not in ("dropped", "split")]
     if not states:
         return {"screen": "spec", "flag": False}
     needs_you = any(s in ("blocked", "in_review") for s in states) or bool(facts.get("questions"))
@@ -70,7 +70,7 @@ def reached(facts: dict, goal_no: int = 0) -> dict[str, str]:
     if goal_no != current:
         wait = f"Goal {goal_no} starts once goal {current} is accepted."
         return {**out, "plan": wait, "build": wait, "try": wait, "accept": wait}
-    tasks = [t for t in facts.get("tasks") or [] if t["state"] != "dropped"]
+    tasks = [t for t in facts.get("tasks") or [] if t["state"] not in ("dropped", "split")]
     if not tasks:
         out["plan"] = NOT_YET["plan"]
     if now < 4 and all(t["state"] in UNBUILT for t in tasks):
@@ -87,6 +87,8 @@ def looking_at(facts: dict, goal_no: int) -> dict:
     from openfarm_core.tryit import last_result
 
     goals = facts.get("goals") or []
+    if not goal_no and facts.get("goal") is None and goals:
+        goal_no = len(goals)
     if not goal_no or goal_no == facts.get("goal_no") or not 0 < goal_no <= len(goals):
         return {**facts, "tried": facts.get("tried") or facts.get("tried_any")}
     goal = goals[goal_no - 1]
@@ -125,8 +127,8 @@ def _task(card, cards_by_id: dict, state_dir: Path, header: dict) -> dict:
 
     state = str(card.state).lower().replace("-", "_")
     runs = records(state_dir, card.id)
-    if state == "ready" and runs and given_back(runs[-1]) and str(runs[-1].get("ended_at") or "") >= str(
-            header.get("edited_at") or ""):
+    last_touched = max(str(header.get("edited_at") or ""), str(header.get("released_at") or ""))
+    if state == "ready" and runs and given_back(runs[-1]) and str(runs[-1].get("ended_at") or "") >= last_touched:
         state = "blocked"  # handed back unbuilt and not changed since: building it again would end the same way
     waits = [d for d in card.deps if str(getattr(cards_by_id.get(d), "state", "")).lower() != "done"]
     return {
@@ -172,11 +174,25 @@ def gather(repo: Path, config_path: Path | None = None) -> dict:
         (g for g in facts["goals"] if g["status"] != "done"), None)
     facts["goal"] = goal
     facts["goal_no"] = 1 + facts["goals"].index(goal) if goal else 0
-    store = store_or_none(repo, cfg)
-    cards = [c for c in (store.cards() if store else []) if not c.id.upper().startswith("FIND")]
+    try:
+        store = store_or_none(repo, cfg)
+        cards = [c for c in (store.cards() if store else []) if not c.id.upper().startswith("FIND")]
+    except Exception:  # noqa: BLE001 - unreadable card store must not crash the screen
+        store, cards = None, []
     by_id = {c.id: c for c in cards}
-    facts["all_tasks"] = [dict(_task(c, by_id, cfg.state_dir, store.read(c.id)[0]), goal_no=int(c.fields.get("wave") or 1))
-                          for c in sorted(cards, key=lambda c: c.id)]
+    all_tasks: list[dict] = []
+    for c in sorted(cards, key=lambda c: c.id):
+        try:
+            header = store.read(c.id)[0] if store else {}
+        except Exception:  # noqa: BLE001
+            header = {}
+        raw_wave = c.fields.get("wave") if isinstance(getattr(c, "fields", None), dict) else None
+        try:
+            goal_no = int(raw_wave) if raw_wave not in (None, "") else 1
+        except (TypeError, ValueError):
+            goal_no = 1
+        all_tasks.append(dict(_task(c, by_id, cfg.state_dir, header), goal_no=goal_no))
+    facts["all_tasks"] = all_tasks
     facts["tasks"] = [t for t in facts["all_tasks"] if t["goal_no"] == facts["goal_no"]]
     try:
         facts["running"] = bool(daemon_status(repo, config_path=config_path).get("running"))

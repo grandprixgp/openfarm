@@ -448,7 +448,11 @@ def implementer_brief(card: Card, book: BriefBook, frozen_tests: dict[str, str],
             target = _safe_existing_target(book, path)
             if target is not None:
                 shown.add(normalise(path))
-                parts.append(f"\n### {normalise(path)}\n{target.read_text()}")
+                try:
+                    content = target.read_text()
+                except UnicodeDecodeError:
+                    content = "<binary file>"
+                parts.append(f"\n### {normalise(path)}\n{content}")
         parts.append("\nThe frozen tests (you must not edit these):")
         for path, text in frozen_tests.items():
             parts.append(f"\n### {path}\n{text}")

@@ -27,6 +27,7 @@ from .state import append_jsonl, read_json, utc_now, write_json
 
 _GLOBAL_LOCKS_GUARD = threading.Lock()
 _GLOBAL_LOCKS: dict[Path, threading.RLock] = {}
+_GLOBAL_THREAD_DEPTHS = threading.local()
 
 
 def _global_thread_lock(root: Path) -> threading.RLock:
@@ -37,6 +38,14 @@ def _global_thread_lock(root: Path) -> threading.RLock:
             lock = threading.RLock()
             _GLOBAL_LOCKS[key] = lock
         return lock
+
+
+def _global_depth_map() -> dict[Path, int]:
+    depths = getattr(_GLOBAL_THREAD_DEPTHS, "depths", None)
+    if depths is None:
+        depths = {}
+        _GLOBAL_THREAD_DEPTHS.depths = depths
+    return depths
 
 # The fields of a project entry that travel to the global library. Evidence and
 # card IDs stay behind: they name the source project's cards.
@@ -117,28 +126,29 @@ class GlobalLibrary:
         self.entries_dir = self.root / "entries"
         self.ledger_path = self.root / "ledger.jsonl"
         self._lock_path = self.root / ".lock"
-        self._local = threading.local()
 
     @contextlib.contextmanager
     def _locked(self):
-        tlock = _global_thread_lock(self.root)
+        key = self.root.resolve()
+        tlock = _global_thread_lock(key)
         with tlock:
-            depth = int(getattr(self._local, "depth", 0) or 0)
+            depths = _global_depth_map()
+            depth = depths.get(key, 0)
             if depth > 0:
-                self._local.depth = depth + 1
+                depths[key] = depth + 1
                 try:
                     yield
                 finally:
-                    self._local.depth = depth
+                    depths[key] = depth
                 return
             self.root.mkdir(parents=True, exist_ok=True)
             with self._lock_path.open("a+", encoding="utf-8") as handle:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-                self._local.depth = 1
+                depths[key] = 1
                 try:
                     yield
                 finally:
-                    self._local.depth = 0
+                    depths.pop(key, None)
                     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     def _path(self, gid: str) -> Path:
