@@ -67,7 +67,9 @@ BUILD_RULES = (
     "before the build. No other task sets it. Every test a task lists must FAIL before the task's code is written; a "
     "test that would already pass (a guard against a regression) is never listed in `tests`. Tests that exist already "
     "must keep passing and the builder may not edit them: a task never renames or moves an element id, export or "
-    "route that an existing test checks; it adds beside it."
+    "route that an existing test checks; it adds beside it. The one exception: when an existing test asserts the very "
+    "behaviour the task corrects, the task lists that test file in `test_edits` (and in `touches`) and says in its "
+    "Done text which assertion changes and to what."
 )
 
 
