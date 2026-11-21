@@ -89,13 +89,22 @@ Ensure `~/.local/bin` is on your `PATH`, then verify:
 openfarm --help
 ```
 
-You should see all **22 subcommands**: `init`, `adopt`, `bench`, `install-skill`, `acp`, `tui`, `run`, `status`, `pause`, `resume`, `stop`, `release`, `done`, `dossier`, `check`, `verdict`, `escape`, `supervise`, `harness`, `board`, `swarm`, `drive`.
+You should see the commands (41 in all, listed in [commands.md](commands.md)), among them: `init`, `adopt`, `bench`, `install-skill`, `acp`, `tui`, `run`, `status`, `pause`, `resume`, `stop`, `release`, `done`, `dossier`, `check`, `verdict`, `escape`, `supervise`, `harness`, `board`, `swarm`, `drive`.
 
 Sign in once with your Claude OAuth subscription for the Architect (it needs no API key; the builders use an API key):
 
 ```bash
 openfarm acp status --json
 openfarm acp login          # optional if already signed into Claude Code
+```
+
+Or do all of the setup in one go. `openfarm setup` asks who plans, where the builders' requests go and with which
+key, which of the models on offer builds, and how much effort each job gets. With `--yes` it asks nothing and uses
+the flags, which is the form an agent should use ([models.md](models.md)):
+
+```bash
+openfarm setup --yes --frontier claude --preset openrouter --api-key "$KEY" --builder-model qwen/qwen3-coder
+openfarm models             # which model and effort each job uses, and where each choice comes from
 ```
 
 Codex and Antigravity can be the Architect instead (`--provider codex|antigravity`). Read [Architect providers](USAGE-AND-FIRST-DEPLOYMENT.md#5-frontier-providers-claude-codex-and-antigravity) first: Antigravity needs bubblewrap (and Codex wants it), Codex should use `binary = "codex-exec"`, and you must check that your Antigravity plan's terms allow openfarm to start `agy` without a person typing before you use it on OAuth.

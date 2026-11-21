@@ -1,8 +1,34 @@
-# Openfarm v0.14.0 Usage, Operations Guide & First-Deployment Runbook
+# Openfarm Usage, Operations Guide & First-Deployment Runbook (v0.20.0)
 
-> **Audience**: Human operators and autonomous frontier agents bringing up **Openfarm v0.14.0** on a Rust, Python, TypeScript, or Go (or polyglot) repository. Part 2 and Part 3 walk through a first deployment on a Rust example crate.  
+> **Audience**: Human operators and autonomous frontier agents bringing up **Openfarm** on a Rust, Python, TypeScript, or Go (or polyglot) repository. Part 2 and Part 3 walk through a first deployment on a Rust example crate.  
 > **Local-only guarantee**: Openfarm has **no `git push` code path**. Every passing card ends on a local branch (`openfarm/<card-id>-<slug>`) for review in the Textual TUI (`openfarm`), CLI (`openfarm review`), or Tailscale Web Companion (`openfarm web --tailscale`) and opt-in local landing (`openfarm land`).  
-> **Quick v0.10–v0.14 additions**: Bare `openfarm` launches the Textual Workbench (`0 Projects`, `1 Studio` with **Idea → Conversational Grill → Living Spec & Chunks (`.openfarm/CHUNKS.json`) → Split Chunk into Cards → Live Architect Log → Run**, `2 Review`, `3 Findings`, `4 Engine`). New CLI commands since v0.9 (`37` total): `providers`, `projects`, `doctor`, `plan`, `replay`, `routing`, `timeline`, `daemon`, `web [--tailscale|--bind tailscale]`, `findings`, `triage`, `frontier-review`, `review`, `land`, `auto`. New optional config tables (`20` total): `[units.*]`, `[factory]`, `[invariants]`, `[acceptance]`, `[notifications]`. See [README.md](../README.md) and [HANDOFF.md](HANDOFF.md) for the concise v0.14.0 overview.
+
+## Read this first (v0.20.0)
+
+The quickest way in is no longer this runbook. Run `openfarm setup` once, then `openfarm` in your project folder,
+and follow the one screen ([README](../README.md), [walkthrough](FROM-IDEA-TO-SHIPPED-APP.md)).
+
+What this guide is still for: the configuration reference (Part 1, section 2), how to write a task by hand
+(section 3), the providers and confinement (section 5), the checks and how to read a refusal (sections 8 and 9),
+and a first deployment done entirely from the command line (Parts 2 and 3).
+
+What has moved or changed since it was written:
+
+- **Setup**: `openfarm setup` asks for the planner's sign-in, the builders' address and key, the model and the
+  efforts in one go. Models and effort per job, for one project or all of them, are in [models.md](models.md).
+  Phase 0 and Phase 2 below do the same by hand.
+- **Commands**: there are 41, listed in [commands.md](commands.md). Section 4 below describes the 22 that existed
+  when it was written; all of them still exist.
+- **Words**: the screen and the help say task, goal, plan, build and accept. This guide, the file names and the
+  commands still say card, chunk, wave, run and land. They mean the same things.
+- **Where tasks live**: on the `openfarm-cards` branch, changed only through `openfarm card ...` (v0.15.0). The
+  `cards/` folder on `main` in Parts 2 and 3 is the older layout; `openfarm card migrate` moves a project over.
+- **Plan checks** run before a build and repair what they can: scaffolding, files named but not listed, a
+  forbidden file a task still asks for, order, shared names, network use, tests that already pass, and tests an
+  existing test contradicts. A task that still fails is held back with the reason.
+- **The older screens** (`0 Projects` to `4 Engine`) are reachable only with `openfarm tui --view studio|review`.
+
+Parts 2 and 3 were last run end to end on v0.8; the commands in them have not been re-run on v0.20.0.
 
 ---
 

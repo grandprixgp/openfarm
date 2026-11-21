@@ -3781,15 +3781,12 @@ def cmd_setup(args) -> int:
     def signed_in(provider: str) -> bool:
         try:
             status = inspect_acp_status(repo, provider=provider)
-        except Exception:  # noqa: BLE001 - an unreadable sign-in is one that is not ready
-            return False
+        except (OSError, ValueError, Refused):
+            return False  # a sign-in that can't be read is one that is not ready
         return bool(status.get("oauth_ready") or status.get("ok"))
 
     def sign_in(provider: str) -> None:
-        import subprocess
-
-        subprocess.run([sys.executable, "-m", "openfarm_core.cli", "--repo", str(repo), "acp", "login",
-                        "--provider", provider], check=False)
+        run_acp_login(provider=provider)
 
     try:
         result = run_setup(args, signed_in=signed_in, sign_in=sign_in)
