@@ -292,25 +292,44 @@ class OwnMutationMixin:
     mutation_output = None
     mutation_lines = None
     _mutation_dir = None
+    _mutation_temp = False
+    _mutation_finalizer = None
     _mutation_runs = 0
 
-    def _own_mutation_argv(self, files, tests) -> list[str]:
+    def _cleanup_mutation_temp(self) -> None:
+        import shutil
+
+        fin = getattr(self, "_mutation_finalizer", None)
+        if fin is not None:
+            fin()
+            self._mutation_finalizer = None
+        if self._mutation_temp and self._mutation_dir is not None:
+            shutil.rmtree(self._mutation_dir, ignore_errors=True)
+            self._mutation_dir = None
+            self._mutation_temp = False
+
+    def _own_mutation_argv(self, files, tests, unit: str = "") -> list[str]:
         import json
         import shutil
         import sys
         import tempfile
+        import weakref
 
         from .. import mutate
 
+        self._cleanup_mutation_temp()
         self._mutation_runs = int(self._mutation_runs or 0) + 1
         if self.mutation_output is not None:
             out = Path(self.mutation_output) / str(self._mutation_runs)
             shutil.rmtree(out, ignore_errors=True)
             out.mkdir(parents=True, exist_ok=True)
+            self._mutation_temp = False
         else:
             out = Path(tempfile.mkdtemp(prefix="openfarm-mutants-")).resolve()
+            self._mutation_temp = True
+            self._mutation_finalizer = weakref.finalize(self, shutil.rmtree, str(out), True)
         self._mutation_dir = out
-        test_argv = self.commands("test", tests=list(tests or []))["argv"]
+        test_argv = self.commands("test", unit=unit, tests=list(tests or []))["argv"]
         argv = [sys.executable, "-I", str(Path(mutate.__file__)), "--lang", self.mutation_language,
                 "--out", str(out), "--test-argv", json.dumps(test_argv)]
         if self.mutation_lines is not None:
@@ -321,7 +340,10 @@ class OwnMutationMixin:
     def read_mutation(self, stdout: str, stderr: str = "", exit_code=None) -> dict:
         from ..mutate import read_outcomes
 
-        return read_outcomes(self._mutation_dir, stdout, stderr, exit_code)
+        try:
+            return read_outcomes(self._mutation_dir, stdout, stderr, exit_code)
+        finally:
+            self._cleanup_mutation_temp()
 
     def parse_mutation(self, stdout: str) -> dict:
         return self.read_mutation(stdout, "", None)

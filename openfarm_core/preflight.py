@@ -44,13 +44,28 @@ _CLASS_SELECTOR = re.compile(r"(?:^|[\s,>+~])\.([A-Za-z][\w-]*)")
 _NOT_BUILDABLE = ("dropped", "split")
 
 
+_TS_JS_TEST_RE = re.compile(r"(?:\.(?:test|spec)|_test)\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs)$")
+_CLASS_ATTR_RE = re.compile(r"""\b(?:class|className)\s*=\s*["']([^"']+)["']""")
+
+
 def _is_test_path(rel: str) -> bool:
-    low, name = rel.lower(), Path(rel).name.lower()
-    return (low.startswith(("tests/", "test/")) or "/tests/" in low or ".test." in name or ".spec." in name
-            or name.startswith("test_") or name.endswith(("_test.go", "_test.py", "_tests.rs")))
+    low = rel.replace("\\", "/").lower()
+    parts = [p for p in low.split("/") if p]
+    if not parts:
+        return False
+    dirs, name = parts[:-1], parts[-1]
+    return (any(d in ("tests", "test", "__tests__") for d in dirs)
+            or bool(_TS_JS_TEST_RE.search(name))
+            or name.endswith(("_test.go", "_test.py", "_test.rs", "_tests.rs"))
+            or name == "conftest.py"
+            or (name.startswith("test_") and name.endswith(".py")))
 
 
-def _language(cfg) -> str:
+def _language(cfg, card: Card | None = None) -> str:
+    if card is not None and hasattr(cfg, "language_for_unit"):
+        unit_lang = cfg.language_for_unit(getattr(card, "unit", "") or "")
+        if unit_lang:
+            return str(unit_lang).lower()
     langs = list(getattr(cfg, "languages", None) or [])
     return str(langs[0]).lower() if langs else ""
 
@@ -94,7 +109,7 @@ def _top_level_default(param: str) -> int:
 
 
 def _without_ts_defaults(signature: str) -> tuple[str, list[tuple[str, str]]]:
-    """Turn `name: T = value` parameters into `name?: T`. Returns the new text and what was dropped."""
+    """Turn trailing `name: T = value` into `name?: T`, and non-trailing into `name: T | undefined` (no TS1016)."""
     open_at = signature.find("(")
     depth, close_at = 0, -1
     for i in range(open_at, len(signature)):
@@ -107,8 +122,21 @@ def _without_ts_defaults(signature: str) -> tuple[str, list[tuple[str, str]]]:
                 break
     if open_at < 0 or close_at < 0:
         return signature, []
+    raw_params = _split_params(signature[open_at + 1:close_at])
+    # Determine which parameter positions are followed by a required positional parameter
+    # (adding `?` before a required parameter produces TS1016).
+    required_after = [False] * len(raw_params)
+    seen_required = False
+    for idx in range(len(raw_params) - 1, -1, -1):
+        required_after[idx] = seen_required
+        p = raw_params[idx].strip()
+        if not p or p.startswith("...") or _top_level_default(p) >= 0:
+            continue
+        pname, _colon, _kind = p.partition(":")
+        if not pname.strip().endswith("?"):
+            seen_required = True
     dropped, params = [], []
-    for param in _split_params(signature[open_at + 1:close_at]):
+    for idx, param in enumerate(raw_params):
         at = _top_level_default(param)
         if at < 0:
             params.append(param)
@@ -117,18 +145,27 @@ def _without_ts_defaults(signature: str) -> tuple[str, list[tuple[str, str]]]:
         name, colon, kind = head.partition(":")
         lead = param[:len(param) - len(param.lstrip())]
         name = name.strip()
-        params.append(f"{lead}{name}{'' if name.endswith('?') else '?'}{colon}{kind}")
+        if required_after[idx]:
+            if colon:
+                clean_kind = kind.rstrip()
+                if not re.search(r"\bundefined\b", clean_kind):
+                    clean_kind = f"{clean_kind} | undefined"
+                params.append(f"{lead}{name.rstrip('?')}{colon}{clean_kind}")
+            else:
+                params.append(f"{lead}{name.rstrip('?')}")
+        else:
+            params.append(f"{lead}{name}{'' if name.endswith('?') else '?'}{colon}{kind}")
         dropped.append((name.rstrip("?"), default))
     return signature[:open_at + 1] + ",".join(params) + signature[close_at:], dropped
 
 
 def _check_scaffold(card: Card, cfg, root: Path) -> dict:
-    lang = _language(cfg)
+    lang = _language(cfg, card)
     body = card.done_text or ""
     problems: list[str] = []
     new_body = body
     notes: list[str] = []
-    if lang in ("typescript", "ts", "javascript"):
+    if lang in ("typescript", "ts", "javascript", "js"):
         from .packs.typescript import typescript_scaffold_problem
 
         def stub(sig: str) -> str:
@@ -281,6 +318,23 @@ def _stylesheet_section(card: Card) -> str:
     return "\n".join(out)
 
 
+def _classes(text: str) -> list[str]:
+    found: list[str] = []
+    for m in _CLASS_ATTR_RE.finditer(text):
+        for cls in m.group(1).split():
+            if cls and cls not in found:
+                found.append(cls)
+    for code in _CODE.findall(text):
+        for m in _CLASS_ATTR_RE.finditer(code):
+            for cls in m.group(1).split():
+                if cls and cls not in found:
+                    found.append(cls)
+        for name in _CLASS_SELECTOR.findall(code):
+            if name not in found:
+                found.append(name)
+    return found
+
+
 def _check_seams(card: Card, by_id: dict[str, Card]) -> dict:
     if not any(str(t).lower().endswith(".css") for t in [*card.touches, *named_files(card)]):
         return _result("seams", [])
@@ -292,10 +346,16 @@ def _check_seams(card: Card, by_id: dict[str, Card]) -> dict:
         if not _serves_markup(owner):
             continue
         owned = _ids(owner.done_text or "")
+        owned_classes = set(_classes(owner.done_text or ""))
         styled = _ids(section)
-        classes = [c for code in _CODE.findall(section) for c in _CLASS_SELECTOR.findall(code)]
+        classes = list(dict.fromkeys(
+            c for code in _CODE.findall(section) for c in _CLASS_SELECTOR.findall(code)
+        ))
         unstyled = [name for name in owned if name not in styled]
-        unknown = [f"#{name}" for name in styled if name not in owned] + [f".{c}" for c in classes]
+        unknown = (
+            [f"#{name}" for name in styled if name not in owned]
+            + [f".{c}" for c in classes if c not in owned_classes]
+        )
         if unstyled:
             problems.append(
                 f"{owner.id} serves the page with {', '.join(f'`#{n}`' for n in owned)}, but this task's stylesheet "
@@ -484,6 +544,10 @@ def as_rule_failures(checks: list[dict]) -> list[dict]:
     return out
 
 
+def _merge_unique(existing, incoming) -> list:
+    return list(dict.fromkeys([*(existing or []), *(incoming or [])]))
+
+
 def apply_fixes(header: dict, body: str, checks: list[dict]) -> tuple[dict, str, list[str]]:
     """Apply each failed check's own fix to a card. Returns the card and one sentence per repair."""
     notes: list[str] = []
@@ -494,8 +558,13 @@ def apply_fixes(header: dict, body: str, checks: list[dict]) -> tuple[dict, str,
         if "done_text" in fix:
             body = fix["done_text"]
         if "touches" in fix:
-            header = dict(header, touches=list(fix["touches"]))
+            header = dict(header, touches=_merge_unique(header.get("touches"), fix["touches"]))
         if "header" in fix:
-            header = dict(header, **fix["header"])
+            updates = dict(fix["header"])
+            if "touches" in updates:
+                updates["touches"] = _merge_unique(header.get("touches"), updates["touches"])
+            if "test_edits" in updates:
+                updates["test_edits"] = _merge_unique(header.get("test_edits"), updates["test_edits"])
+            header = dict(header, **updates)
         notes.extend(fix.get("notes") or [])
     return header, body, notes

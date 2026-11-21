@@ -145,11 +145,27 @@ _RULE_WORDS = {
 }
 
 
+def _gates_dir(state_dir: Path, record: dict) -> Path:
+    base = Path(state_dir) / "cards" / str(record.get("card_id"))
+    run_id = str(record.get("run_id"))
+    direct = base / run_id / "gates"
+    if direct.is_dir():
+        return direct
+    archived = base / "partial" / run_id / "gates"
+    return archived if archived.is_dir() else direct
+
+
+def _attempt_sort_key(path: Path) -> tuple[int, str]:
+    parent = path.parent.name
+    m = re.match(r"(\d+)", parent)
+    return (int(m.group(1)) if m else 0, parent)
+
+
 def failed_checks(state_dir: Path, record: dict) -> list[str]:
     """The checks that failed in a run, one plain line each, repeats folded (the stop reason often hides them)."""
-    folder = Path(state_dir) / "cards" / str(record.get("card_id")) / str(record.get("run_id")) / "gates"
+    folder = _gates_dir(state_dir, record)
     lines: list[str] = []
-    for path in sorted(folder.glob("*/*.json")):
+    for path in sorted(folder.glob("*/*.json"), key=lambda p: (_attempt_sort_key(p), p.name)):
         try:
             gate = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -170,8 +186,8 @@ def stub_refused(state_dir: Path, record: dict) -> str:
     Without the stub the new tests have nothing to import, so the run ends as "the tests do not compile" or "the
     test writer wrote outside its files", neither of which says what went wrong.
     """
-    folder = Path(state_dir) / "cards" / str(record.get("card_id")) / str(record.get("run_id")) / "gates"
-    for path in sorted(folder.glob("*/micromanager-scaffold.json")):
+    folder = _gates_dir(state_dir, record)
+    for path in sorted(folder.glob("*/micromanager-scaffold.json"), key=_attempt_sort_key):
         try:
             gate = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -189,14 +205,17 @@ def stub_refused(state_dir: Path, record: dict) -> str:
 
 def guard_tests(state_dir: Path, record: dict) -> list[str]:
     """Named tests that already passed before any code was written in this run: guards, which can never 'fail first'."""
-    folder = Path(state_dir) / "cards" / str(record.get("card_id")) / str(record.get("run_id")) / "gates"
+    folder = _gates_dir(state_dir, record)
     names: list[str] = []
-    for path in sorted(folder.glob("*/fail-before.json")):
+    for path in sorted(folder.glob("*/fail-before.json"), key=_attempt_sort_key):
         try:
             gate = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        names = [str(n) for n in (gate.get("evidence") or {}).get("passing_on_base") or []] if gate.get("result") == "fail" else names
+        if gate.get("result") == "fail":
+            names = [str(n) for n in (gate.get("evidence") or {}).get("passing_on_base") or []]
+        elif gate.get("result") == "pass":
+            names = []
     return names
 
 
@@ -274,12 +293,12 @@ def settle_question(root: Path, cfg, store, finding: dict, backend=None) -> dict
     title, body = str(finding.get("title") or ""), str(finding.get("body") or "")
     if _TOOLING.search(f"{title}\n{body}"):
         decide_finding(root, cfg, fid, "dismissed", reason="about the build's own tooling, not the product; kept as a note")
-        return {"for": "nobody", "answer": ""}
+        return {"for": "nobody", "answer": "", "retried": False, "stuck": False}
 
     def for_owner() -> dict:
         header, text = store.read(fid)
         store.src._write(fid, dict(header, audience="owner"), text, f"{fid}: only the owner can answer this")
-        return {"for": "owner", "answer": ""}
+        return {"for": "owner", "answer": "", "retried": False, "stuck": False}
 
     if backend is None or not target:
         return for_owner()
@@ -296,7 +315,7 @@ def settle_question(root: Path, cfg, store, finding: dict, backend=None) -> dict
             f"\n\n## The spec\n\n{_spec(root, cfg)[:6000]}"
             f"\n\n## The task {target}: {task_header.get('title') or ''}\n\n{task_body[:6000]}"
             f"\n\n## The builder's question\n\n{title}\n\n{body[:3000]}"
-            + _files_now(root, task_header)
+            + _files_now(root, task_header, cfg=cfg)
         )
         parsed = _extract_json_dict(str(backend.ask(prompt) if hasattr(backend, "ask") else backend(prompt))) or {}
     except Exception:  # noqa: BLE001 - an Architect that can't be reached leaves the question with the owner
@@ -308,7 +327,8 @@ def settle_question(root: Path, cfg, store, finding: dict, backend=None) -> dict
                       apply=lambda h, b: (h, b.rstrip() + f"\n\n## Answer from the Architect\n\n{title}\n\n{answer}\n"))
     decide_finding(root, cfg, fid, "folded", reason=answer, target_card=target)
     retried = stuck = False
-    if store.states().get(target) == "blocked":
+    states_upper = {str(k).upper(): v for k, v in store.states().items()}
+    if states_upper.get(target.upper()) == "blocked":
         runs = records(cfg.state_dir, target)
         stuck = len(runs) >= 3 or (len(runs) == 2 and all(
             (runs[-1].get(key) or "") == (runs[-2].get(key) or "") for key in ("stop_code", "detail")))
@@ -323,13 +343,37 @@ def given_back(record: dict | None) -> bool:
     return bool(record) and record.get("final_state") == "released" and record.get("stop_code") == "ineligible"
 
 
-def _files_now(root: Path, header: dict, cap: int = 6000) -> str:
+def _as_paths(value) -> list[str]:
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    if isinstance(value, (list, tuple)):
+        return [str(v) for v in value if isinstance(v, str) and v.strip()]
+    return []
+
+
+def _files_now(root: Path, header: dict, cap: int = 6000, cfg=None) -> str:
     """The files the task touches or reads, as they are now, so a rewrite fits the code that exists."""
+    from .globs import matches_any, normalise, resolves_within
+
+    root = Path(root)
+    denied = list(getattr(cfg, "never_touch", ()) or ()) + list(getattr(cfg, "forbidden_files", ()) or ())
     parts = []
-    for rel in [*(header.get("touches") or []), *(header.get("reference") or [])]:
-        path = Path(root) / str(rel)
+    seen: set[str] = set()
+    for rel in [*_as_paths(header.get("touches")), *_as_paths(header.get("reference"))]:
+        norm = normalise(rel)
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        if not resolves_within(root, rel):
+            continue
+        if denied and matches_any(norm, denied):
+            continue
+        path = root / rel
         if path.is_file():
-            text = path.read_text(encoding="utf-8", errors="replace")
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
             parts.append(f"### {rel} (as it is now)\n{text[:cap]}" + ("\n… (cut)" if len(text) > cap else ""))
     return ("\n\nThe code the task must fit:\n\n" + "\n\n".join(parts)) if parts else ""
 
@@ -351,7 +395,7 @@ def propose_fix(root: Path, cfg, store, card_id: str, why: str = "", backend=Non
     new_header, new_body, notes = apply_fixes(header, body, check_card(card_from(header, body), cfg, root, store.cards()))
     runs = records(Path(cfg.state_dir), card_id)
     guards = set(guard_tests(Path(cfg.state_dir), runs[-1])) if runs else set()
-    kept = [t for t in new_header.get("tests") or [] if str(t.get("name")) not in guards]
+    kept = [t for t in new_header.get("tests") or [] if str(t.get("name") if isinstance(t, dict) else t) not in guards]
     if guards and kept and len(kept) < len(new_header.get("tests") or []):
         new_header = dict(new_header, tests=kept)
         notes.append("took " + ", ".join(f"'{g}'" for g in sorted(guards)) + " off the task's list of tests: it already "
@@ -364,7 +408,7 @@ def propose_fix(root: Path, cfg, store, card_id: str, why: str = "", backend=Non
             f"{BUILD_RULES}\n"
             f"Files no task may write (never put them in `touches`): {', '.join(getattr(cfg, 'forbidden_files', []) or []) or 'none'}\n"
             'Return ONLY JSON: {"card": "<the whole card file, +++ TOML header and body>", "change": "<one sentence>"}\n\n'
-            + before + _files_now(root, header)
+            + before + _files_now(root, header, cfg=cfg)
         )
         try:
             parsed = _extract_json_dict(str(backend.ask(prompt) if hasattr(backend, "ask") else backend(prompt))) or {}
@@ -397,14 +441,21 @@ def apply_fix_and_retry(store, card_id: str, fix: dict, by: str = "") -> dict:
     return store.change_card(card_id, "retry", by=by, why="retry with the fix")
 
 
-def check_command(cfg, card, root: Path) -> list[str]:
-    """The exact command the test checks run for this task's named tests."""
+def _configured_pack(cfg, card, root: Path):
     from .packs.base import pack_for
 
     lang = cfg.language_for_unit(card.unit) if hasattr(cfg, "language_for_unit") else cfg.languages[0]
     pack = pack_for(lang, cfg.cargo_flags, spec=cfg.pack_adapter, cwd=root, python=cfg.runner_python)
     if getattr(pack, "apply_settings", None) is not None:
         pack.apply_settings(cfg)
+    if getattr(pack, "configure", None) is not None:
+        pack.configure(root)
+    return pack
+
+
+def check_command(cfg, card, root: Path) -> list[str]:
+    """The exact command the test checks run for this task's named tests."""
+    pack = _configured_pack(cfg, card, root)
     files = sorted({t.file for t in card.tests if t.file})
     return list(pack.commands("test", card.unit, tests=[t.name for t in card.tests], files=files or None)["argv"])
 
@@ -422,11 +473,16 @@ def run_check(root: Path, cfg, card, timeout_s: float = 300) -> dict:
     if not git.branch_exists(branch):
         return {"command": "", "exit": None, "output": f"The task's branch {branch} does not exist, so there is nothing to run.",
                 "where": branch}
-    argv = check_command(cfg, card, root)
+    files = sorted({t.file for t in card.tests if t.file})
+    argv: list[str] = []
     with tempfile.TemporaryDirectory(prefix="openfarm-check-") as tmp:
         work = Path(tmp) / "work"
         git.worktree_add(work, branch)
         try:
+            pack = _configured_pack(cfg, card, work)
+            if getattr(pack, "prepare_worktree", None) is not None:
+                pack.prepare_worktree(work)
+            argv = list(pack.commands("test", card.unit, tests=[t.name for t in card.tests], files=files or None)["argv"])
             done = subprocess.run(argv, cwd=work, capture_output=True, text=True, timeout=timeout_s, check=False)
             output, code = (done.stdout + done.stderr).strip(), done.returncode
         except subprocess.TimeoutExpired:
@@ -443,21 +499,20 @@ def set_project_setting(root: Path, table: str, key: str, value: str, why: str) 
 
     The line is replaced where it stands, or added under the table's heading, so the file's comments stay.
     """
-    import re
     import tomllib
 
     from .git import Git
 
     path = Path(root) / ".openfarm" / "config.toml"
     text = path.read_text(encoding="utf-8")
-    line = f'{key} = "{value}"'
-    head = re.search(rf"^\[{re.escape(table)}\][ \t]*$", text, flags=re.M)
+    line = f"{key} = {json.dumps(value)}"
+    head = re.search(rf"^\[{re.escape(table)}\][ \t]*(?:#[^\n]*)?$", text, flags=re.M)
     if head is None:
         new = text.rstrip("\n") + f"\n\n[{table}]\n{line}\n"
     else:
         end = re.search(r"^\[", text[head.end():], flags=re.M)
         stop = head.end() + end.start() if end else len(text)
-        body, n = re.subn(rf"^{re.escape(key)}[ \t]*=.*$", line, text[head.end():stop], count=1, flags=re.M)
+        body, n = re.subn(rf"^{re.escape(key)}[ \t]*=.*$", lambda _m: line, text[head.end():stop], count=1, flags=re.M)
         new = text[:head.end()] + (body if n else f"\n{line}" + text[head.end():stop]) + text[stop:]
     if tomllib.loads(new).get(table, {}).get(key) != value:
         raise ValueError(f"could not set [{table}] {key} in {path}")
