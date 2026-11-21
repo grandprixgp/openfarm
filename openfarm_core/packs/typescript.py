@@ -2944,6 +2944,18 @@ def typescript_without_param_defaults(text: str) -> str:
     return "".join(out)
 
 
+_VOID_NAME = re.compile(r"^[ \t]*void[ \t]+[A-Za-z_$][\w$]*[ \t]*;[ \t]*\r?\n", re.M)
+
+
+def typescript_stub_tidied(text: str) -> str:
+    """A stub with what a model adds out of habit taken out: parameter defaults, and `void name;` lines.
+
+    Neither changes what a caller sees. Anything else that is not a declaration or a throwing stub is left in,
+    for `typescript_scaffold_problem` to refuse.
+    """
+    return _VOID_NAME.sub("", typescript_without_param_defaults(text))
+
+
 def typescript_scaffold_problem(body: str, in_class: bool = False) -> str:
     """Why `body` is not a TypeScript scaffold, or "" when it is one.
 

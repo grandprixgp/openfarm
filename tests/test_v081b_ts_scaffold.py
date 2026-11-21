@@ -139,6 +139,16 @@ class ScaffoldGrammarTests(unittest.TestCase):
         self.assertEqual(edit.content, "export function f(a?) { throw new Error(); }\n")  # the code that ran is gone
         self.assertEqual(typescript_without_param_defaults("export const f = (a: number): void => { throw new Error('x'); };"),
                          "export const f = (a: number): void => { throw new Error('x'); };")
+        # the same run, next task: `void name;` lines before the throw, to quiet an unused-name warning
+        [edit] = _scaffold({"format": "whole_file", "content": (
+            'import { escapeHtml } from "./html.ts";\n'
+            'export function renderPage(input: Input): string {\n  void escapeHtml;\n  void input;\n'
+            '  throw new Error("not implemented");\n}\n')})
+        self.assertEqual(edit.content, 'import { escapeHtml } from "./html.ts";\n'
+                                       'export function renderPage(input: Input): string {\n'
+                                       '  throw new Error("not implemented");\n}\n')
+        with self.assertRaises(Refused):  # a call is not a `void name;`
+            _scaffold({"format": "whole_file", "content": "export function f() {\n  void evil();\n  throw new Error();\n}\n"})
         with self.assertRaises(Refused):  # anything else wrong with it is still refused
             _scaffold({"format": "whole_file", "content": "export function f(a = 1) { return a; }\n"})
 

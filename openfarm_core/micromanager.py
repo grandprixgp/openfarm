@@ -1818,12 +1818,14 @@ class Micromanager:
 
                 problem = typescript_scaffold_edit_problem(
                     edit.format, edit.search or "", edit.replace or "", edit.content)
-                if problem.startswith("a parameter default"):
-                    # The repair the plan check makes to a task's words, made to the stub: `n = 3` becomes `n?`.
-                    from .packs.typescript import typescript_without_param_defaults
+                if problem:
+                    # Two things a model adds to a stub that change nothing a caller sees are taken out, not
+                    # refused: a parameter default (`n = 3` becomes `n?`, as the plan check does to a task's
+                    # words) and `void name;` lines that only quiet an unused-name warning.
+                    from .packs.typescript import typescript_stub_tidied
 
-                    content = None if edit.content is None else typescript_without_param_defaults(edit.content)
-                    replace = typescript_without_param_defaults(edit.replace or "")
+                    content = None if edit.content is None else typescript_stub_tidied(edit.content)
+                    replace = typescript_stub_tidied(edit.replace or "")
                     if not typescript_scaffold_edit_problem(edit.format, edit.search or "", replace, content):
                         edit.content, edit.replace, problem = content, replace, ""
                 if problem:
