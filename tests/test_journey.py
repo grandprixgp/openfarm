@@ -1029,6 +1029,33 @@ class FlowTests(_Folder):
 
         self.drive("build", body)
 
+    def test_the_plan_step_offers_to_clear_the_safety_stop_too(self) -> None:
+        # a stop left on from an earlier build met the owner at Plan, where "Build" could only refuse
+        async def body(app, pilot) -> None:
+            from openfarm_core.state import StateDir
+
+            ready = sum(1 for t in app.facts["tasks"] if t["state"] == "ready")
+            state = StateDir(app.facts["cfg"].state_dir)
+            state.write_breaker(True, ["W1-01", "W1-02", "W1-03"], "3 cards blocked in a row for no-progress")
+            app.refresh_screen()
+            await pilot.pause(0.2)
+            self.assertEqual(self.label(app), f"▶ Clear the safety stop and build {ready} task{'s' if ready != 1 else ''}")
+            self.started.reset_mock()
+
+            def cleared(commands, done, then=None):
+                state.write_breaker(False, [])
+                app._set_busy("")
+                then()
+
+            with mock.patch.object(app, "_cli_bg", side_effect=cleared) as cli:
+                await pilot.press("enter")
+                await app.workers.wait_for_complete()
+                await pilot.pause(0.2)
+            self.assertEqual(cli.call_args.args[0], [["resume", "--clear-breaker", "--clear-kill"]])
+            self.started.assert_called_once()
+
+        self.drive("plan", body)
+
     def test_a_build_that_paused_itself_says_why_and_resume_carries_on(self) -> None:
         # v0.20 live run: the build paused itself on a reviewer answer it could not read; the main button was still
         # "Build 1 task", which only said "use Resume"

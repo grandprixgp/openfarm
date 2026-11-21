@@ -1146,7 +1146,10 @@ class Journey(MorePanes, App):
             return ("fix_parked", f"Repair {parked} task{'s' if parked != 1 else ''}"), others, "Enter repair · " + keys
         if parked:
             others.insert(0, ("fix_parked", f"Repair {parked} parked"))
-        return ("build", f"Build {ready} task{'s' if ready != 1 else ''}"), others, "Enter build · " + keys
+        count = f"build {ready} task{'s' if ready != 1 else ''}"
+        if self.facts.get("cfg") is not None and self._refusal():  # held: the press that lifts it also builds
+            return ("resume", f"{self._resume_word()} and {count}"), others, "Enter build · " + keys
+        return ("build", count[:1].upper() + count[1:]), others, "Enter build · " + keys
 
     def do_change_plan(self) -> None:
         self.push_screen(AskModal("What should change in the plan?", "The Architect redrafts this goal's tasks."),
