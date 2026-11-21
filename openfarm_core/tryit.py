@@ -410,13 +410,13 @@ def code_version(root: Path) -> str:
     return done.stdout.strip() if done.returncode == 0 else ""
 
 
-def last_result(root: Path, cfg, goal_id: str) -> dict | None:
-    """The saved result of trying this goal, if the code has not changed since."""
+def last_result(root: Path, cfg, goal_id: str, any_code: bool = False) -> dict | None:
+    """The saved result of trying this goal, if the code has not changed since (`any_code`: whatever the code is now)."""
     try:
         result = json.loads((Path(cfg.state_dir) / "tryit" / goal_id / "result.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    return result if result.get("head") == code_version(root) else None
+    return result if any_code or result.get("head") == code_version(root) else None
 
 
 def looks_right(cfg, goal_id: str, why: str = "") -> None:

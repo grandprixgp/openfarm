@@ -90,6 +90,14 @@ class ScreenForTests(unittest.TestCase):
         self.assertEqual(list(inspect.signature(screen_for).parameters), ["facts"])
 
 
+def rail(app, which: str) -> list[str]:
+    """The rows of the rail's steps or goals list, as written."""
+    from textual.widgets import OptionList
+
+    rows = app.query_one(f"#rail-{which}", OptionList)
+    return [str(rows.get_option_at_index(i).prompt) for i in range(rows.option_count)]
+
+
 def build_project(base: Path, stage: str) -> Path:
     """A project folder in the state a screen needs. Stages: idea, questions, spec, plan, build, blocked, try, accept."""
     from openfarm_core.adapters.files import parse_card_file
@@ -498,7 +506,7 @@ class FlowTests(_Folder):
             where = app.query_one("#where")
             self.assertLessEqual(len(str(where.render())) + 2, where.size.width)
             self.assertTrue(str(where.render()).endswith("…"))
-            self.assertTrue(str(app.query_one("#goals").render()).splitlines()[0].endswith("…"))
+            self.assertIn("…", rail(app, "goals")[0])
 
         root2 = build_project(self.base / "spec", "spec")
         self.app = lambda stage, theme="openfarm-dark": journey.Journey(repo=root2, theme=theme)
@@ -656,8 +664,8 @@ class FlowTests(_Folder):
             self.assertIn("W1-02", ready)
             self.assertIn("3 files · 4 tests pass · the old code fails them", ready)
             self.assertIn("Accept merges it into main on this machine. Nothing is pushed.", ready)
-            self.assertIn("!  Build · needs you", str(app.query_one("#step-4").render()))
-            self.assertTrue(app.query_one("#step-4").has_class("alert"))
+            self.assertIn("!  Build · needs you", rail(app, "steps")[4])
+            self.assertIn("$error", rail(app, "steps")[4])
             self.assertIn("1 needs you", str(app.query_one("#where").render()))
             with mock.patch.object(type(app), "_cli_bg") as cli:
                 await pilot.press("enter")
@@ -847,8 +855,115 @@ class FlowTests(_Folder):
             await pilot.pause(0.2)
             self.assertEqual(app.screen_name, "spec")
             self.assertEqual(self.label(app), "▶ Plan goal 2")
-            self.assertIn("✓  Living Image", str(app.query_one("#goals").render()))
+            self.assertIn("✓  Living Image", rail(app, "goals")[0])
             self.assertIn("Goal 2 of 3 · Recursive Threads", str(app.query_one("#where").render()))
+
+        self.drive("accept", body)
+
+    def test_every_earlier_step_can_be_looked_at_and_looking_changes_nothing(self) -> None:
+        async def body(app, pilot) -> None:
+            from textual.widgets import TextArea
+
+            def cards_head() -> str:
+                return subprocess.run(["git", "-C", str(app.repo), "rev-parse", "openfarm-cards", "HEAD"],
+                                      capture_output=True, text=True).stdout
+
+            before = cards_head()
+            self.assertEqual(app.screen_name, "accept")
+            seen = []
+            for _back in range(6):  # Try it, Build, Plan, Spec, Questions, Idea
+                await pilot.press("left_square_bracket")
+                await pilot.pause(0.1)
+                seen.append(app.screen_name)
+                self.assertEqual(self.label(app), "▶ Back to Accept")
+                self.assertEqual(self.others(app), [])
+                self.assertIn("nothing changes from here", str(app.query_one("#where").render()))
+            self.assertEqual(seen, ["try", "build", "plan", "spec", "questions", "idea"])
+            self.assertIn("◂", rail(app, "steps")[0])
+            self.assertTrue(app.query_one("#idea-text", TextArea).read_only)
+            await pilot.press("right_square_bracket", "right_square_bracket", "right_square_bracket")
+            await pilot.pause(0.1)
+            self.assertEqual(app.screen_name, "plan")
+            self.assertEqual(app.query_one("#plan-tasks").option_count, 4)
+            for name in ("build", "edit_task", "change_plan", "accept_goal", "something_wrong"):
+                app.action_act(name)  # every button and key ends here
+                await pilot.pause(0.05)
+                self.assertEqual(len(app.screen_stack), 1, name)
+                self.assertIn("nothing changes from here", str(app.query_one("#busy").render()))
+            await pilot.press("e", "enter")  # the edit key is refused; Enter is the way back
+            await pilot.pause(0.1)
+            self.assertEqual((app.screen_name, app.view), ("accept", None))
+            self.assertEqual(self.label(app), "▶ Accept goal 1")
+            await pilot.press("left_square_bracket", "n")
+            await pilot.pause(0.1)
+            self.assertEqual((app.screen_name, app.view), ("accept", None))
+            await pilot.press("left_square_bracket", "escape")
+            await pilot.pause(0.1)
+            self.assertEqual((app.screen_name, app.view), ("accept", None))
+            self.assertEqual(cards_head(), before)
+
+        self.drive("accept", body)
+
+    def test_the_rail_is_two_lists_that_keyboard_and_mouse_both_work(self) -> None:
+        async def body(app, pilot) -> None:
+            app.query_one("#rail-steps").focus()
+            await pilot.press("up", "up", "enter")  # from Accept up to Build
+            await pilot.pause(0.1)
+            self.assertEqual(app.screen_name, "build")
+            self.assertEqual(app.query_one("#build-tasks").option_count, 4)
+            await pilot.click("#rail-steps", offset=(4, 2))  # the third row: Spec
+            await pilot.pause(0.1)
+            self.assertEqual(app.screen_name, "spec")
+            await pilot.click("#rail-goals", offset=(4, 1))  # goal 2 has not started
+            await pilot.pause(0.1)
+            self.assertEqual(app.screen_name, "ahead")
+            self.assertIn("Goal 2 starts once goal 1 is accepted.", str(app.query_one("#ahead-text").render()))
+            self.assertIn("Recursive Threads", str(app.query_one("#ahead-text").render()))
+            await pilot.click("#rail-goals", offset=(4, 0))  # the goal the project is on: back to now
+            await pilot.pause(0.1)
+            self.assertEqual((app.screen_name, app.view), ("accept", None))
+
+        self.drive("accept", body)
+
+    def test_a_step_not_reached_says_what_has_to_happen_first(self) -> None:
+        async def body(app, pilot) -> None:
+            self.assertEqual(app.screen_name, "plan")
+            for step, words in (("build", "Building starts from the Plan step"),
+                                ("try", "once every task of this goal is built and accepted"),
+                                ("accept", "you have said it looks right")):
+                await pilot.press("right_square_bracket")
+                await pilot.pause(0.1)
+                self.assertEqual((app.screen_name, app.view["step"]), ("ahead", step))
+                self.assertIn(words, str(app.query_one("#ahead-text").render()))
+                self.assertEqual(self.label(app), "▶ Back to Plan")
+            await pilot.press("n")
+            await pilot.pause(0.1)
+            self.assertEqual(app.screen_name, "plan")
+
+        self.drive("plan", body)
+
+    def test_an_accepted_goal_can_still_be_looked_at(self) -> None:
+        async def body(app, pilot) -> None:
+            await pilot.press("enter")  # accept goal 1
+            await pilot.pause(0.2)
+            self.assertEqual(app.screen_name, "spec")
+            app.look(goal=1)
+            await pilot.pause(0.1)
+            self.assertEqual(app.screen_name, "accept")
+            self.assertIn("was accepted", str(app.query_one("#accept-title").render()))
+            self.assertIn("4 built and merged", str(app.query_one("#accept-text").render()))
+            self.assertIn("◂", rail(app, "goals")[0])
+            await pilot.press("left_square_bracket")
+            await pilot.pause(0.1)
+            self.assertEqual(app.screen_name, "try")
+            self.assertIn("Here it is running", str(app.query_one("#try-title").render()))
+            await pilot.press("left_square_bracket")
+            await pilot.pause(0.1)
+            self.assertEqual(app.query_one("#build-tasks").option_count, 4)
+            self.assertEqual(app.facts["goal_no"], 2)  # the project's own facts are untouched
+            await pilot.press("n")
+            await pilot.pause(0.1)
+            self.assertEqual((app.screen_name, self.label(app)), ("spec", "▶ Plan goal 2"))
 
         self.drive("accept", body)
 

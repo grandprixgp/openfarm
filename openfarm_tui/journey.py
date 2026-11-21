@@ -50,7 +50,18 @@ from openfarm_core.state import StateDir
 from openfarm_core.store import card_from, open_store, read_doc, write_doc
 from openfarm_core.tryit import fix_request, looks_right, try_it
 
-from .journey_state import STEP_OF, STEPS, gather, load_session, save_session, screen_for, session_path
+from .journey_state import (
+    PROJECT_STEPS,
+    STEP_OF,
+    STEPS,
+    gather,
+    load_session,
+    looking_at,
+    reached,
+    save_session,
+    screen_for,
+    session_path,
+)
 from .markup import esc
 
 THEMES = [
@@ -196,30 +207,55 @@ class Everything(Provider):
             yield Hit(1, label, action)
 
 
+STEP_NAMES = list(STEP_OF)  # the steps in order, by their pane's name
+LOOK_ONLY = {"now", "back", "details", "open_task", "shot_desktop", "shot_phone", "full_diff", "tries", "cancel"}
+
+
 class Rail(Vertical):
+    """The steps and the goals. Both are lists: Enter or a click looks at one."""
+
     def compose(self) -> ComposeResult:
         yield Static("JOURNEY", classes="rail-head")
-        for index, name in enumerate(STEPS):
-            yield Static(name, id=f"step-{index}", classes="step")
+        yield OptionList(id="rail-steps")
         yield Static("GOALS", classes="rail-head gap")
-        yield Static("", id="goals")
+        yield OptionList(id="rail-goals")
+        yield Static("none yet", id="goals-none")
+        self._drawn: dict[str, tuple] = {}
 
-    def show(self, step: int, flag: bool, goals: list[dict], current: int) -> None:
+    def _fill(self, list_id: str, rows: list[tuple[str, str]], at: int | None) -> None:
+        key = (tuple(rows), at)
+        if self._drawn.get(list_id) == key:
+            return
+        self._drawn[list_id] = key
+        widget = self.query_one(f"#{list_id}", OptionList)
+        widget.clear_options()
+        widget.add_options([Option(prompt, id=option_id) for option_id, prompt in rows])
+        widget.set_class(not rows, "hidden")
+        if rows and at is not None:
+            widget.highlighted = at
+
+    def show(self, step: int, flag: bool, goals: list[dict], current: int, open_steps: dict[str, str],
+             look_step: int | None = None, look_goal: int = 0) -> None:
+        rows = []
         for index, name in enumerate(STEPS):
-            row = self.query_one(f"#step-{index}", Static)
-            row.set_classes("step " + ("done" if index < step else "now" if index == step else "todo"))
-            glyph = "✓" if index < step else "●" if index == step else "○"
+            glyph, colour = ("✓", "$success") if index < step else ("●", "b $accent") if index == step else (
+                "○", "$foreground-muted")
+            if index > step and not open_steps.get(STEP_NAMES[index]):
+                glyph, colour = "◌", "$foreground"  # ahead of where the project is, but there is something to see
             if index == step and flag:
-                glyph, name = "!", f"{name} · needs you"
-                row.add_class("alert")
-            row.update(f"{glyph}  {name}")
-        lines = []
+                glyph, name, colour = "!", f"{name} · needs you", "b $error"
+            here = "  ◂" if index == look_step else ""
+            rows.append((f"step-{index}", f"[{colour}]{glyph}  {esc(name)}[/]{here}"))
+        self._fill("rail-steps", rows, step if look_step is None else look_step)
+        rows = []
         for number, goal in enumerate(goals, start=1):
             mark = "✓" if goal["status"] == "done" else str(number)
             text = f"{mark}  {goal['title']}"
-            text = esc(text if len(text) <= 22 else text[:21] + "…")
-            lines.append(f"[b $foreground]{text}[/]" if number == current else text)
-        self.query_one("#goals", Static).update("\n".join(lines) or "none yet")
+            text = esc(text if len(text) <= 19 else text[:18] + "…")
+            text = f"[b $foreground]{text}[/]" if number == current else f"[$foreground-muted]{text}[/]"
+            rows.append((f"goal-{number}", text + ("  ◂" if number == look_goal else "")))
+        self._fill("rail-goals", rows, (look_goal or current or 1) - 1 if goals else None)
+        self.query_one("#goals-none", Static).set_class(bool(goals), "hidden")
 
 
 class Journey(App):
@@ -235,12 +271,9 @@ class Journey(App):
     Rail { width: 26; padding: 1 1 0 2; background: $surface; border-right: tall $panel; }
     .rail-head { color: $foreground-muted; text-style: bold; margin-bottom: 1; }
     .rail-head.gap { margin-top: 2; }
-    .step { height: 1; }
-    #goals { color: $foreground-muted; }
-    .step.done { color: $success; }
-    .step.todo { color: $foreground-muted; }
-    .step.now { color: $accent; text-style: bold; background: $accent 12%; }
-    .step.now.alert { color: $error; background: $error 14%; }
+    Rail OptionList { border: none; background: transparent; margin-bottom: 0; padding: 0; max-height: 9; }
+    Rail OptionList:focus { border: none; background: $accent 10%; }
+    #goals-none { color: $foreground-muted; }
     #main { width: 1fr; }
     #panes { height: 1fr; padding: 1 3 0 3; }
     #panes > VerticalScroll { height: 1fr; scrollbar-size-vertical: 1; }
@@ -275,6 +308,9 @@ class Journey(App):
         Binding("ctrl+j,ctrl+enter", "go", "Do it", priority=True),
         Binding("enter", "go", "Do it"),
         Binding("escape", "back", "Back"),
+        Binding("n", "now", "Where the project is"),
+        Binding("left_square_bracket", "step(-1)", "Earlier step"),
+        Binding("right_square_bracket", "step(1)", "Later step"),
         Binding("b", "board", "Board"),
         Binding("l", "log", "Log"),
         Binding("space", "details", "Details"),
@@ -297,6 +333,9 @@ class Journey(App):
         self.facts: dict = {}
         self.screen_name = ""
         self.overlay = ""  # "", "blocked", "details", "board" or "log": a look aside, Esc returns
+        self.view: dict | None = None  # {"step", "goal", "why"}: a step the user went to look at; nothing changes from there
+        self.real: dict = {}  # the project's facts; `facts` is what the drawn step shows (another goal's, when looking)
+        self.now = "idea"  # the step the project is at
         self.task_id = ""
         self.busy = ""
         self.busy_since = 0.0
@@ -320,6 +359,7 @@ class Journey(App):
         self._build_started = 0.0  # when the build being shown began, for the top bar
         self._slots: dict[str, str] = {}  # button id -> the action it does now
         self._more: list[tuple] = []  # actions of this screen that had no room for a button
+        self.shown: dict = {}  # the facts the step on screen was drawn from
         self._auto_tried: set[str] = set()  # goals tried without being asked, so a try that can't be saved isn't repeated
 
     # -- layout ---------------------------------------------------------------
@@ -386,6 +426,9 @@ class Journey(App):
         with VerticalScroll(id="accept"):
             yield Static("", id="accept-title", classes="h1")
             yield Static("", id="accept-text")
+        with VerticalScroll(id="ahead"):
+            yield Static("", id="ahead-title", classes="h1")
+            yield Static("", id="ahead-text")
         with VerticalScroll(id="details"):
             yield Static("", id="details-text")
         with VerticalScroll(id="board"):
@@ -541,11 +584,18 @@ class Journey(App):
     # -- which screen, and drawing it --------------------------------------------
 
     def refresh_screen(self, focus: bool = False) -> None:
-        self.facts = gather(self.repo, self.config_path)
+        self.real = self.facts = gather(self.repo, self.config_path)
         picked = screen_for(self.facts)
+        self.now = picked["screen"]
         if self.overlay in ("blocked", "details") and self._find() is None:
             self.overlay = ""
-        name = self.overlay or picked["screen"]
+        view = self.view
+        if view:
+            view["why"] = reached(self.real, view["goal"])[view["step"]]
+            if view["step"] == self.now and (view["step"] in PROJECT_STEPS or view["goal"] == self.real["goal_no"]):
+                view = self.view = None  # the project is where the user was looking
+        self._lock(bool(view))
+        name = self.overlay or ((("ahead" if view["why"] else view["step"]) if view else picked["screen"]))
         changed = name != self.screen_name
         self.screen_name = name
         if changed:
@@ -553,13 +603,23 @@ class Journey(App):
         facts = self.facts
         self.query_one("#brand", Static).update(esc(f"openfarm · {facts['name']}"))
         self.query_one("#panes", ContentSwitcher).current = name
-        self.query_one(Rail).show(STEP_OF[picked["screen"]], picked["flag"], facts["goals"], facts["goal_no"])
-        getattr(self, f"_draw_{name}")()
-        primary, secondary, keys = self._actions()
+        self.query_one(Rail).show(STEP_OF[picked["screen"]], picked["flag"], facts["goals"], facts["goal_no"],
+                                  reached(facts), STEP_OF[view["step"]] if view else None,
+                                  view["goal"] if view and view["step"] not in PROJECT_STEPS else 0)
+        if view and view["step"] not in PROJECT_STEPS:
+            self.facts = looking_at(self.real, view["goal"])  # drawn from that goal's tasks; put back below
+        try:
+            getattr(self, f"_draw_{name}")()
+            primary, secondary, keys = self._actions()
+        finally:
+            self.shown, self.facts = self.facts, self.real
         where = self._where(picked)
         room = self.size.width - len(f"openfarm · {facts['name']}") - 34
         self.query_one("#where", Static).update(esc(where if len(where) <= room else where[: max(8, room - 1)] + "…"))
-        self.query_one("#keys", Static).update(esc(f"{keys} · Ctrl+K everything else"))
+        line = f"{keys} · Ctrl+K everything else"
+        if not view and not self.overlay and len(line) + 12 <= self.size.width - 2:  # said where there is room; Ctrl+K has it too
+            line = f"{keys} · [ ] steps · Ctrl+K everything else"
+        self.query_one("#keys", Static).update(esc(line))
         self._draw_health()
         self._draw_busy()
         self._show_actions(primary, secondary)
@@ -571,8 +631,64 @@ class Journey(App):
         if changed:
             self.call_after_refresh(lambda: self.query_one(f"#{name}").scroll_home(animate=False))
 
+    def _lock(self, looking: bool) -> None:
+        """Looking at an earlier step: its fields can be read, not typed in."""
+        self.query_one("#idea-text", TextArea).read_only = looking
+        self.query_one("#stack", Select).disabled = looking
+        self.query_one("#q-own", Input).disabled = looking
+
+    def look(self, step: str = "", goal: int = 0) -> None:
+        """Show a step of a goal as it stands. Looking changes nothing; `n` or Esc returns."""
+        if self.busy or self.failure or len(self.screen_stack) > 1:
+            return
+        current = int(self.real.get("goal_no") or 0)
+        was = self.view or {}
+        if not step:  # a goal was picked: where that goal is
+            done = 0 < goal <= len(self.real["goals"]) and self.real["goals"][goal - 1]["status"] == "done"
+            step = self.now if goal == current else "accept" if done else "plan"
+        goal = goal or was.get("goal") or current
+        self.view = {"step": step, "goal": goal, "why": ""}
+        self.overlay = ""
+        self.refresh_screen(focus=True)
+
+    def action_step(self, by: int) -> None:
+        at = STEP_OF[(self.view or {}).get("step") or self.now] + by
+        if 0 <= at < len(STEP_NAMES):
+            self.look(STEP_NAMES[at])
+
+    def action_now(self) -> None:
+        if self.view or self.overlay:
+            self.view, self.overlay = None, ""
+            self.refresh_screen(focus=True)
+
+    def do_now(self) -> None:
+        self.action_now()
+
+    @on(OptionList.OptionSelected, "#rail-steps")
+    def _rail_step(self, event: OptionList.OptionSelected) -> None:
+        self.look(STEP_NAMES[int(str(event.option.id).split("-")[1])])
+
+    @on(OptionList.OptionSelected, "#rail-goals")
+    def _rail_goal(self, event: OptionList.OptionSelected) -> None:
+        self.look(goal=int(str(event.option.id).split("-")[1]))
+
+    def _draw_ahead(self) -> None:
+        view = self.view or {}
+        name = STEPS[STEP_OF[view["step"]]]
+        goals, number = self.real["goals"], view["goal"]
+        ahead = view["step"] not in PROJECT_STEPS and number != self.real["goal_no"] and 0 < number <= len(goals)
+        self.query_one("#ahead-title", Static).update(esc(f"{name}: not yet" + (f" for goal {number}" if ahead else "")))
+        lines = [esc(view["why"])]
+        if ahead:
+            lines += ["", f"[b]{number}  {esc(goals[number - 1]['title'])}[/]", esc(goals[number - 1].get("goal") or "")]
+        self.query_one("#ahead-text", Static).update("\n".join(lines))
+
     def _where(self, picked: dict) -> str:
-        facts = self.facts
+        facts = self.real
+        if self.view and self.overlay != "board":
+            step = STEPS[STEP_OF[self.view["step"]]]
+            of_goal = "" if self.view["step"] in PROJECT_STEPS or not self.view["goal"] else f" of goal {self.view['goal']}"
+            return f"Looking at {step}{of_goal} · nothing changes from here"
         if self.overlay == "board":
             return "Board · all goals"
         if not facts["spec"]:
@@ -691,11 +807,19 @@ class Journey(App):
         if self.failure:
             others = [("template", "Go on without the Architect")] if self.failure["step"] in ("ask", "spec", "plan") else []
             return ("retry", "Retry"), [*others, ("dismiss_failure", "Back")], "Enter retry"
+        if self.view and self.overlay in ("details", "blocked"):
+            return ("back", "Back"), [], "Esc back · ↑↓ scroll"
+        if self.view and not self.overlay:
+            keys = {"plan": " · Space details", "build": " · Space details", "try": " · o desktop shot · p phone shot"}
+            return ("now", f"Back to {STEPS[STEP_OF[self.now]]}"), [], \
+                "n back to where the project is · [ ] other steps" + keys.get(self.screen_name, "")
         return getattr(self, f"_actions_{self.screen_name}")()
 
     # idea ----------------------------------------------------------------------
 
     def _draw_idea(self) -> None:
+        if self.view:
+            return self.query_one("#idea-next", Static).update("This is the idea the project started from.")
         self.query_one("#idea-next", Static).update(
             "Next the Architect asks a few questions, one at a time, then writes a spec you can read "
             "before anything is built.")
@@ -745,7 +869,8 @@ class Journey(App):
         self.query_one("#q-progress", Static).update(
             f"[$foreground-muted]Question {len(history) + 1} of {total}[/]   {dots}" if pending else dots)
         self.query_one("#q-title", Static).update(esc(pending.get("question") or (
-            "Asking the Architect about your idea..." if self.busy else "No question is open.")))
+            "Asking the Architect about your idea..." if self.busy else
+            ("The questions you answered" if history else "No questions were asked.") if self.view else "No question is open.")))
         self.query_one("#q-why", Static).update(esc(pending.get("why") or ""))
         suggested = str(pending.get("recommended") or "").strip().lower()
         self._set_list("q-options", [
@@ -753,7 +878,8 @@ class Journey(App):
                 option.lower().startswith(suggested[:24]) or suggested.startswith(option.lower()[:24])) else ""))
             for i, option in enumerate(pending.get("options") or [])])
         self._set_list("q-answered", [(f"ans-{i}", f"[$success]✓[/] {esc(turn['question'])}\n   {esc(turn['answer'])}"
-                                       "   [$foreground-muted](Enter: change)[/]") for i, turn in enumerate(history)])
+                                       + ("" if self.view else "   [$foreground-muted](Enter: change)[/]"))
+                                      for i, turn in enumerate(history)])
 
     def _actions_questions(self):
         if not self.facts["session"]["pending"]:
@@ -781,11 +907,13 @@ class Journey(App):
 
     @on(Input.Submitted, "#q-own")
     def _own_answer_sent(self) -> None:
-        self.do_answer()
+        self.action_act("answer")
 
     @on(OptionList.OptionSelected, "#q-answered")
     def _change_answer(self, event: OptionList.OptionSelected) -> None:
         """Reopen an earlier question: it and what followed are asked again."""
+        if self.view:
+            return
         session = self._session()
         index = int(str(event.option.id).split("-")[1])
         turn = session["history"][index]
@@ -1384,6 +1512,11 @@ class Journey(App):
     def _draw_try(self) -> None:
         facts, result = self.facts, self.facts["tried"]
         number = facts["goal_no"]
+        if result is None and self.view:
+            self.query_one("#try-title", Static).update(esc(f"Goal {number} was not tried here."))
+            for part in ("#try-sub", "#try-checks", "#try-shots"):
+                self.query_one(part, Static).update("")
+            return
         if result is None:
             self.query_one("#try-title", Static).update(esc(f"Goal {number} is built. Starting it to have a look."))
             self.query_one("#try-sub", Static).update("")
@@ -1471,7 +1604,7 @@ class Journey(App):
         self.refresh_screen(focus=True)
 
     def _shot(self, index: int) -> None:
-        shots = (self.facts.get("tried") or {}).get("screenshots") or []
+        shots = (self.shown.get("tried") or {}).get("screenshots") or []
         if self.screen_name == "try" and index < len(shots):
             webbrowser.open(Path(shots[index]).as_uri())
             self.note = f"Opened {shots[index]}"
@@ -1532,7 +1665,8 @@ class Journey(App):
             lines += [f"{'[$success]✓[/]' if c['ok'] else '[$error]✗[/]'} {esc(str(c['detail']).partition(' (')[0])}"
                       for c in result["checks"]]
         self.query_one("#accept-title", Static).update(
-            esc(f"Goal {facts['goal_no']} · {facts['goal']['title']} is ready to accept"))
+            esc(f"Goal {facts['goal_no']} · {facts['goal']['title']} "
+                + ("was accepted" if facts["goal"]["status"] == "done" else "is ready to accept")))
         self.query_one("#accept-text", Static).update("\n".join(lines))
 
     def _actions_accept(self):
@@ -1703,6 +1837,8 @@ class Journey(App):
             self.overlay = "blocked" if (self.overlay == "details" and (self._find() or {}).get("state") == "blocked"
                                          and self.fix is not None) else ""
             self.refresh_screen(focus=True)
+        elif self.view:
+            self.action_now()
 
     # -- running things -----------------------------------------------------------
 
@@ -1836,10 +1972,10 @@ class Journey(App):
 
     def check_action(self, action: str, parameters: tuple) -> bool | None:
         """Single keys never steal typing: in a text field only the Ctrl keys and Esc act."""
-        if len(self.screen_stack) > 1 and action in ("go", "back", "board", "log", "details", "act", "column"):
+        if len(self.screen_stack) > 1 and action in ("go", "back", "board", "log", "details", "act", "column", "now", "step"):
             return False  # a dialog is open: its own keys act
-        typing = isinstance(self.focused, (Input, TextArea))
-        if typing and action in ("board", "log", "details", "act", "column", "go") and not (
+        typing = isinstance(self.focused, (Input, TextArea)) and not self.view
+        if typing and action in ("board", "log", "details", "act", "column", "go", "now", "step") and not (
                 action == "go" and isinstance(self.focused, TextArea)):
             return False
         if action == "go" and isinstance(self.focused, (Button, OptionList)):
@@ -1854,6 +1990,9 @@ class Journey(App):
             self.action_act(self._slots["go"])
 
     def action_act(self, name: str) -> None:
+        if self.view and name not in LOOK_ONLY:  # every button and key comes through here
+            self.note = f"You are looking back: nothing changes from here. n returns to {STEPS[STEP_OF[self.now]]}."
+            return self._draw_busy()
         if len(self.screen_stack) == 1 and (not self.busy or name == "cancel"):
             getattr(self, f"do_{name}")()
 
@@ -1864,7 +2003,7 @@ class Journey(App):
     @on(OptionList.OptionSelected)
     def _row_chosen(self, event: OptionList.OptionSelected) -> None:
         list_id = event.option_list.id or ""
-        if list_id == "q-answered":
+        if list_id in ("q-answered", "rail-steps", "rail-goals"):
             return
         self.action_go()  # Enter always does the main action; Space looks at the row
 
@@ -1875,6 +2014,9 @@ class Journey(App):
         items = [(label.rstrip("…"), lambda name=name: self.action_act(name)) for name, label in self._more]
         items += [("Board: every task of every goal", self.action_board), ("Log: everything that happened", self.action_log),
                  ("Switch between the light and dark theme", self.action_toggle_theme)]
+        items += [(f"Look at the {name} step", lambda step=step: self.look(step)) for step, name in zip(STEP_NAMES, STEPS)]
+        if self.view:
+            return [("Back to where the project is", self.action_now), *items, ("Quit", self.exit)]
         if self.facts.get("spec"):
             items += [("Something's wrong: ask for fix tasks", self.do_something_wrong),
                       ("New feature: add a goal", self.do_new_feature)]

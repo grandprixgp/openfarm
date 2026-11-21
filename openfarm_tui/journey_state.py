@@ -13,6 +13,15 @@ from pathlib import Path
 STEPS = ["Idea", "Questions", "Spec", "Plan", "Build", "Try it", "Accept"]
 STEP_OF = {"idea": 0, "questions": 1, "spec": 2, "plan": 3, "build": 4, "try": 5, "accept": 6}
 UNBUILT = ("ready", "backlog")
+PROJECT_STEPS = ("idea", "questions", "spec")  # the same for every goal
+NOT_YET = {
+    "questions": "The questions come once you have said what you want to build.",
+    "spec": "The spec is written once the questions are answered.",
+    "plan": "This goal has no plan yet. It is planned from the Spec step.",
+    "build": "Nothing has been built yet. Building starts from the Plan step.",
+    "try": "Try it opens once every task of this goal is built and accepted.",
+    "accept": "Accept opens once the goal is built and you have said it looks right.",
+}
 
 
 def screen_for(facts: dict) -> dict:
@@ -45,6 +54,45 @@ def screen_for(facts: dict) -> dict:
     if all(s in UNBUILT for s in states):
         return {"screen": "plan", "flag": False}
     return {"screen": "build", "flag": False}  # some built, some still to build
+
+
+def reached(facts: dict, goal_no: int = 0) -> dict[str, str]:
+    """For each step of a goal: "" when there is something to look at, else what has to happen first."""
+    now = STEP_OF[screen_for(facts)["screen"]]
+    if not facts.get("spec"):
+        return {name: "" if index <= now else NOT_YET[name] for name, index in STEP_OF.items()}
+    out = dict.fromkeys(STEP_OF, "")
+    current = int(facts.get("goal_no") or 0)
+    goal_no = goal_no or current
+    goals = facts.get("goals") or []
+    if not current or (0 < goal_no <= len(goals) and goals[goal_no - 1]["status"] == "done"):
+        return out  # an accepted goal went through every step
+    if goal_no != current:
+        wait = f"Goal {goal_no} starts once goal {current} is accepted."
+        return {**out, "plan": wait, "build": wait, "try": wait, "accept": wait}
+    tasks = [t for t in facts.get("tasks") or [] if t["state"] != "dropped"]
+    if not tasks:
+        out["plan"] = NOT_YET["plan"]
+    if now < 4 and all(t["state"] in UNBUILT for t in tasks):
+        out["build"] = NOT_YET["build"]
+    if now < 5 and not facts.get("tried_any"):
+        out["try"] = NOT_YET["try"]
+    if now < 6:
+        out["accept"] = NOT_YET["accept"]
+    return out
+
+
+def looking_at(facts: dict, goal_no: int) -> dict:
+    """The facts as one goal's steps show them: that goal's tasks and its last try, whatever the code is now."""
+    from openfarm_core.tryit import last_result
+
+    goals = facts.get("goals") or []
+    if not goal_no or goal_no == facts.get("goal_no") or not 0 < goal_no <= len(goals):
+        return {**facts, "tried": facts.get("tried") or facts.get("tried_any")}
+    goal = goals[goal_no - 1]
+    return {**facts, "goal": goal, "goal_no": goal_no, "questions": [], "running": False,
+            "tasks": [t for t in facts.get("all_tasks") or [] if t["goal_no"] == goal_no],
+            "tried": last_result(facts["repo"], facts["cfg"], goal["id"], any_code=True) if facts.get("cfg") else None}
 
 
 def session_path(repo: Path) -> Path:
@@ -103,7 +151,7 @@ def gather(repo: Path, config_path: Path | None = None) -> dict:
     session = load_session(repo)
     facts = {"repo": repo, "name": repo.name, "cfg": None, "spec": False, "spec_text": "", "goals": [],
              "goal": None, "goal_no": 0, "tasks": [], "all_tasks": [], "running": False, "questions": [],
-             "try_needed": False, "try_plan": {}, "tried": None, "session": session,
+             "try_needed": False, "try_plan": {}, "tried": None, "tried_any": None, "session": session,
              "asking": bool(session["asking"] and (session["pending"] or session["history"]))}
     cfg_file = Path(config_path) if config_path else repo / CONFIG_PATH
     if not cfg_file.is_file():
@@ -141,4 +189,5 @@ def gather(repo: Path, config_path: Path | None = None) -> dict:
     facts["try_needed"] = facts["try_plan"].get("kind") == "web"
     if goal:
         facts["tried"] = last_result(repo, cfg, goal["id"])
+        facts["tried_any"] = facts["tried"] or last_result(repo, cfg, goal["id"], any_code=True)
     return facts
