@@ -43,6 +43,7 @@ _PLAIN = {
     "cannot-split": "The task is too big and could not be split",
     "card-changed": "The task's text changed while it was being built",
     "tests-unprovable": "The check that the tests really test the new code disagreed with the other checks",
+    "dirty-baseline": "The project itself fails a check before this task changes anything",
     "attempts": "The builder ran out of tries",
     "no-progress": "The builder stopped making progress",
     "checker-reject": "The reviewer turned the work down",
@@ -111,6 +112,7 @@ def triage(record: dict, earlier: list[dict] | None = None) -> dict:
     if repeated and kind == "task" and code not in _TASK_CODES:
         plain += ", the same way as last time"
     return {
+        "base_lint": code == "dirty-baseline" and detail.startswith("base lint:"),
         "kind": kind,
         "title": spec["title"],
         "why": f"{plain}. {detail}" if detail else f"{plain}.",
@@ -434,3 +436,32 @@ def run_check(root: Path, cfg, card, timeout_s: float = 300) -> dict:
         finally:
             git.worktree_remove(work)
     return {"command": " ".join(argv), "exit": code, "output": output, "where": branch}
+
+
+def set_project_setting(root: Path, table: str, key: str, value: str, why: str) -> None:
+    """Set one `[table] key = "value"` in the project's config.toml and commit that file alone.
+
+    The line is replaced where it stands, or added under the table's heading, so the file's comments stay.
+    """
+    import re
+    import tomllib
+
+    from .git import Git
+
+    path = Path(root) / ".openfarm" / "config.toml"
+    text = path.read_text(encoding="utf-8")
+    line = f'{key} = "{value}"'
+    head = re.search(rf"^\[{re.escape(table)}\][ \t]*$", text, flags=re.M)
+    if head is None:
+        new = text.rstrip("\n") + f"\n\n[{table}]\n{line}\n"
+    else:
+        end = re.search(r"^\[", text[head.end():], flags=re.M)
+        stop = head.end() + end.start() if end else len(text)
+        body, n = re.subn(rf"^{re.escape(key)}[ \t]*=.*$", line, text[head.end():stop], count=1, flags=re.M)
+        new = text[:head.end()] + (body if n else f"\n{line}" + text[head.end():stop]) + text[stop:]
+    if tomllib.loads(new).get(table, {}).get(key) != value:
+        raise ValueError(f"could not set [{table}] {key} in {path}")
+    path.write_text(new, encoding="utf-8")
+    git = Git(Path(root))
+    git._run(["add", "--", ".openfarm/config.toml"])
+    git._run(["commit", "-m", f"openfarm: [{table}] {key} = {value} ({why})", "--", ".openfarm/config.toml"], check=False)

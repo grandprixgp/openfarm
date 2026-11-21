@@ -1604,7 +1604,13 @@ class Journey(MorePanes, App):
             except Exception:  # noqa: BLE001 - no fix to show is a state the screen handles
                 self.fix = {}
         box = self.query_one("#blocked-fix", Static)
-        if self.check_output:
+        way_out = self._base_lint_fix(task)
+        if way_out and not self.check_output:
+            box.update(f"[b]The way out: {esc(way_out['label'].lower())}[/]\n[$foreground-muted]It sets "
+                       f"[{esc(way_out['table'])}] {esc(way_out['key'])} = \"{esc(way_out['value'])}\" in "
+                       f".openfarm/config.toml and commits that file: {esc(way_out['why'])}. The other way is to "
+                       "repair the project's own settings by hand, then Retry.[/]")
+        elif self.check_output:
             box.update(f"[b]{esc(self.check_output['command'])}[/]  [$foreground-muted]exit {self.check_output['exit']}[/]\n"
                        + esc(self.check_output["output"][-3000:]))
         elif self.fix:
@@ -1638,6 +1644,11 @@ class Journey(MorePanes, App):
         task = self._find()
         kind = (task["triage"] or {}).get("kind", "builder")
         keys = "d full diff · t tries · Esc back"
+        way_out = self._base_lint_fix(task)
+        if way_out:  # the project, not the task, is what fails: the main button is the way out
+            return ("base_lint_fix", f"{way_out['label']} and retry"), \
+                [("retry_task", "Retry"), ("edit_task", "Edit the task myself"), ("skip_task", "Skip this task")], \
+                "Enter use the fix and retry · " + keys
         if kind == "task":
             main = ("apply_fix", "Apply fix and retry") if self.fix else ("ask_fix", "Ask the Architect for a fix")
             return main, [("edit_task", "Edit the task myself"), ("skip_task", "Skip this task")], \
@@ -1654,6 +1665,32 @@ class Journey(MorePanes, App):
         if task["tries"] >= 2:
             return learn, [("retry_task", "Retry"), *rest], "Enter ask the Architect · " + keys
         return ("retry_task", "Retry"), [learn, *rest], "Enter retry · " + keys
+
+    def _base_lint_fix(self, task: dict) -> dict | None:
+        """The language pack's way out when the untouched project fails its own lint, if this stop is that."""
+        if not (task.get("triage") or {}).get("base_lint"):
+            return None
+        from openfarm_core.cli import _configured_pack
+
+        try:
+            fix = getattr(_configured_pack(self._cfg(), self.repo), "base_lint_fix", None)
+            return fix() if callable(fix) else None
+        except Exception:  # noqa: BLE001 - no way out to offer leaves the ordinary buttons
+            return None
+
+    def do_base_lint_fix(self) -> None:
+        from openfarm_core.blocked import set_project_setting
+
+        fix = self._base_lint_fix(self._find())
+        if not fix:
+            return
+        try:
+            set_project_setting(self.repo, fix["table"], fix["key"], fix["value"], fix["label"].lower())
+        except Exception as exc:  # noqa: BLE001 - said on screen; nothing was half-changed
+            self.note = f"The setting could not be changed: {exc}"
+            return self._draw_busy()
+        self.say(f"{fix['label']}: {fix['why']}")
+        self.do_retry_task()
 
     def do_apply_fix(self) -> None:
         cfg = self._cfg()

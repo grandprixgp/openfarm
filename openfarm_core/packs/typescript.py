@@ -994,6 +994,13 @@ class TypeScriptPack(OwnMutationMixin, Pack):
             return True
         return (self.worktree / "tsconfig.json").is_file()
 
+    def base_lint_fix(self) -> dict | None:
+        """The way out when the untouched project fails `tsc`: check syntax only. None when tsc is not in use."""
+        if not self.has_tsc:
+            return None
+        return {"label": "Check syntax only", "table": "runner", "key": "typescript_typecheck", "value": "syntax",
+                "why": "the full TypeScript check is switched off for this project; node still parses every file"}
+
     def commands(self, purpose: str, unit: str = "", tests: list[str] | None = None,
                  files: list[str] | None = None,
                  extra_flags: list[str] | None = None) -> dict:
