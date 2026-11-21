@@ -1,4 +1,6 @@
-# openfarm
+<p align="center">
+  <img src="docs/assets/openfarm-banner.svg" alt="openfarm: Frontier thinks. The farm grinds. Code decides." width="100%">
+</p>
 
 Your best model plans and reviews. Cheap models write the code. Plain code checks every step.
 
@@ -25,6 +27,14 @@ You accept each task and each goal. Accepting merges on your machine. openfarm h
 
 Version 0.20.0, pre-release. Python 3.11+, and the core has no dependencies outside the standard library.
 
+<p align="center">
+  <img src="docs/assets/openfarm-stats.svg" alt="1912 offline tests with 0 failures, 41 CLI subcommands, 6 adapter interfaces, 0 core runtime dependencies" width="100%">
+</p>
+
+<p align="center">
+  <img src="docs/assets/openfarm-lanes.svg" alt="Three lanes: the frontier model, the orchestrator in plain Python, and the farm of builders" width="100%">
+</p>
+
 ## The seven steps
 
 Run `openfarm` in a folder, empty or not. One screen shows the one thing that is yours to do next.
@@ -41,6 +51,13 @@ Run `openfarm` in a folder, empty or not. One screen shows the one thing that is
 
 You can go back to any step you have reached, or to any goal, with `[` and `]`, the mouse or `Ctrl+K`. Looking
 changes nothing, and `n` returns to the step that needs you. Closing the window does not stop a build.
+
+<p align="center">
+  <img src="docs/assets/openfarm-quickstart.svg" alt="The loop: idea, questions and spec, split into tasks, build, review and accept, then the next goal" width="100%">
+</p>
+
+*The pictures use the older names, which the commands and file names still use: a card is a task, a chunk
+is a goal, the grill is the questions, and to land is to accept.*
 
 Something wrong after a goal is accepted? "Something's wrong" turns what you say into fix tasks. "New feature"
 adds a goal. Nothing already built is thrown away.
@@ -113,6 +130,10 @@ every project, and both win over the project's `config.toml`. More in [docs/mode
 
 ## How a task is built
 
+<p align="center">
+  <img src="docs/assets/openfarm-pipeline.svg" alt="The steps every task goes through, each checked by code" width="100%">
+</p>
+
 1. The task is checked against the project's rules, and gets its own branch and working copy.
 2. Your test suite must be green before anything changes.
 3. A builder writes the task's tests. They have to fail on the old code, and are then frozen.
@@ -129,7 +150,13 @@ What stays true whatever a model says:
 - Keys live outside the repository in files only you can read, and are never logged.
 - Requests only go to the addresses you allowed.
 
-The internals are described in [docs/openfarm-internals.md](docs/openfarm-internals.md).
+<p align="center">
+  <img src="docs/assets/openfarm-adapters.svg" alt="The core and its six replaceable adapter interfaces" width="100%">
+</p>
+
+Every outside piece (where tasks come from, how commands run, the language, the models, the records) sits
+behind one of six interfaces and can be swapped. The internals are described in
+[docs/openfarm-internals.md](docs/openfarm-internals.md).
 
 ## Without the screen
 
