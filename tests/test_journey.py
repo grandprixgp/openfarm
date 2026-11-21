@@ -891,6 +891,55 @@ class FlowTests(_Folder):
         self.app = lambda stage, theme="openfarm-dark": journey.Journey(repo=self.base / "try" / "iotd", theme=theme)
         self.drive("try", body)
 
+    def test_the_token_share_counts_builders_reviewers_and_the_architect(self) -> None:
+        async def body(app, pilot) -> None:
+            from openfarm_core.automode import _AcpArchitectBackend, record_architect_use, token_share
+
+            state = Path(app.facts["cfg"].state_dir)
+            (state / "cards" / "W1-01" / "run-9").mkdir(parents=True)
+            (state / "cards" / "W1-01" / "run-9" / "card-record.json").write_text(json.dumps(
+                {"card_id": "W1-01", "tokens_in": 5000, "tokens_out": 1000, "micromanager_tokens_in": 1500,
+                 "micromanager_tokens_out": 500}))
+            before = token_share(state)
+            record_architect_use(state, 1800, 200)
+            worker = mock.Mock()
+            worker.complete.return_value = mock.Mock(content="{}", tokens_in=900, tokens_out=100)
+            backend = _AcpArchitectBackend(worker, root=app.repo, state_dir=state)
+            backend.ask("plan it")  # every call the Architect answers is counted, whoever made it
+            share = token_share(state)
+            self.assertEqual(share["builders"] - before["builders"], 0)
+            self.assertEqual(share["architect"] - before["architect"], 3000)
+            app.refresh_screen()
+            await pilot.pause(0.1)
+            self.assertEqual(app.real["tokens"], share)
+            total = share["total"]
+            self.assertIn(f"{total // 1000}k tokens", str(app.query_one("#health").render()))
+            for who in ("builders", "reviewers", "Architect"):
+                self.assertIn(f"{who} ", app.share)
+            self.assertIn(f"Architect {share['architect']:,} tokens ({100 * share['architect'] // total}%)", app.share)
+            await pilot.press("l")
+            await pilot.pause(0.1)
+            self.assertIn("Tokens so far: builders", str(app.query_one("#log-text").render()))
+
+        self.drive("build", body)
+
+    def test_architect_tokens_spent_before_there_is_a_project_are_not_lost(self) -> None:
+        async def body(app, pilot) -> None:
+            from openfarm_core.automode import _AcpArchitectBackend
+            from openfarm_tui.journey_state import load_session
+
+            worker = mock.Mock()
+            worker.complete.return_value = mock.Mock(content="{}", tokens_in=700, tokens_out=50)
+            backend = _AcpArchitectBackend(worker, root=app.repo)
+            backend.ask("first question")
+            app._settle_architect_use(backend)
+            self.assertEqual(load_session(app.repo)["spent"], [[700, 50]])  # kept with the idea
+            self.assertEqual(app._unrecorded, 750)
+            app._settle_architect_use(None)
+            self.assertEqual(load_session(app.repo)["spent"], [[700, 50]])  # and not counted twice
+
+        self.drive("questions", body)
+
     def test_try_it_shows_the_pages_colours_as_swatches(self) -> None:
         async def body(app, pilot) -> None:
             panel = app.query_one("#try-colours")

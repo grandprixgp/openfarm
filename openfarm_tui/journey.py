@@ -39,6 +39,7 @@ from openfarm_core.automode import (
     new_feature,
     next_goal,
     open_architect_backend,
+    record_architect_use,
     preflight_plan,
     something_wrong,
 )
@@ -364,6 +365,8 @@ class Journey(App):
         self._slots: dict[str, str] = {}  # button id -> the action it does now
         self._more: list[tuple] = []  # actions of this screen that had no room for a button
         self.shown: dict = {}  # the facts the step on screen was drawn from
+        self.share = ""  # who spent the tokens, in words; the top bar's tooltip and the log say it
+        self._unrecorded = 0  # Architect tokens spent before the folder was a project, so not in its ledger yet
         self._sorting: set[str] = set()  # builders' questions being sorted, or sorted, in this window
         self._auto_tried: set[str] = set()  # goals tried without being asked, so a try that can't be saved isn't repeated
 
@@ -462,6 +465,7 @@ class Journey(App):
         except OSError:
             pass
         self.query_one("#stack", Select).value = load_session(self.repo)["stack"]
+        self._unrecorded = sum(int(a) + int(b) for a, b in load_session(self.repo)["spent"])
         self._load_last_run()
         self.refresh_screen(focus=True)
         self.set_interval(1.0, self._tick)
@@ -539,7 +543,7 @@ class Journey(App):
             return
         self.query_one("#activity", Static).update("\n".join(esc(line) for line in self.activity[-3:]))
         if self.overlay == "log":
-            self.query_one("#log-text", Static).update("\n".join(esc(line) for line in self.activity) or "Nothing yet.")
+            self._draw_log()
 
     def _set_list(self, list_id: str, rows: list[tuple[str, str]]) -> None:
         """Fill an option list, keeping the highlighted row when the rows did not change."""
@@ -726,13 +730,19 @@ class Journey(App):
 
     def _draw_health(self) -> None:
         marks = {True: "[$success]●[/]", False: "[$error]✗[/]", None: "[$foreground-muted]○[/]"}
-        total = self.tokens["worker"] + self.tokens["frontier"]
+        spent = dict(self.real.get("tokens") or {})
+        # a running build's own count is ahead of the records, which are written as each task ends
+        spent["builders"] = max(int(spent.get("builders") or 0), self.tokens["worker"])
+        spent["reviewers"] = max(int(spent.get("reviewers") or 0), self.tokens["frontier"])
+        spent["architect"] = int(spent.get("architect") or 0) + self._unrecorded
+        total = spent["builders"] + spent["reviewers"] + spent["architect"]
         tokens = f"   {total // 1000}k tokens" if total >= 1000 else (f"   {total} tokens" if total else "")
         health = self.query_one("#health", Static)
         health.update("   ".join(f"{marks[ok]} {name}" for name, ok in self.health.items()) + tokens)
-        share = (f"builders {self.tokens['worker']:,} tokens ({100 * self.tokens['worker'] // total}%) · "
-                 f"Architect and reviewers {self.tokens['frontier']:,} ({100 * self.tokens['frontier'] // total}%)"
-                 if total else "no tokens spent in this build yet")
+        self.share = (" · ".join(f"{name} {spent[key]:,} tokens ({100 * spent[key] // total}%)" for key, name in (
+            ("builders", "builders"), ("reviewers", "reviewers"), ("architect", "Architect")))
+                      if total else "no tokens spent on this project yet")
+        share = self.share
         words = {True: "answered last time it was asked", False: "did not answer last time", None: "not asked yet"}
         health.tooltip = share + "\n" + "\n".join(f"{name}: {words[ok]}" for name, ok in self.health.items())
 
@@ -1873,7 +1883,8 @@ class Journey(App):
             self.call_after_refresh(lambda: self._show_actions(*self._actions()[:2]))
 
     def _draw_log(self) -> None:
-        self.query_one("#log-text", Static).update("\n".join(esc(line) for line in self.activity) or "Nothing yet.")
+        self.query_one("#log-text", Static).update(
+            f"[$foreground-muted]Tokens so far: {esc(self.share)}[/]\n\n" + ("\n".join(esc(line) for line in self.activity) or "Nothing yet."))
 
     def _actions_log(self):
         return ("back", "Back"), [], "Esc back · ↑↓ scroll"
@@ -1953,11 +1964,31 @@ class Journey(App):
                                       f"{getattr(exc, 'message', None) or exc}")
         finally:
             self._backend = None
+            self._settle_architect_use(backend)
             if backend is not None and hasattr(backend, "close"):
                 try:
                     backend.close()
                 except Exception:  # noqa: BLE001
                     pass
+
+    def _settle_architect_use(self, backend) -> None:
+        """Calls made before the folder was a project are kept with the idea, and put in its ledger once it is one."""
+        try:
+            session = self._session()
+            unwritten = getattr(backend, "_unwritten", None)
+            owed = [*session["spent"], *[list(pair) for pair in (unwritten if isinstance(unwritten, list) else [])]]
+            if isinstance(unwritten, list):
+                unwritten.clear()
+            cfg = self._cfg()
+            if cfg is not None:
+                for tokens_in, tokens_out in owed:
+                    record_architect_use(cfg.state_dir, tokens_in, tokens_out)
+                owed = []
+            if owed != session["spent"]:
+                save_session(self.repo, {**session, "spent": owed})
+            self._unrecorded = sum(int(a) + int(b) for a, b in owed)
+        except Exception as exc:  # noqa: BLE001 - counting never gets in the way of the work
+            self.log.warning(f"could not note the Architect's tokens: {exc}")
 
     def _progress(self, message: str) -> None:
         if self.busy and message.strip():

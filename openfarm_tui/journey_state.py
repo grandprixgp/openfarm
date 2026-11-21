@@ -109,7 +109,9 @@ def load_session(repo: Path) -> dict:
     except (OSError, ValueError):
         data = {}
     return {"history": list(data.get("history") or []), "pending": data.get("pending") or None,
-            "stack": str(data.get("stack") or "auto"), "asking": bool(data.get("asking"))}
+            "stack": str(data.get("stack") or "auto"), "asking": bool(data.get("asking")),
+            # Architect tokens spent before the folder was a project, [in, out] per call, owed to its ledger
+            "spent": [list(pair) for pair in data.get("spent") or []]}
 
 
 def save_session(repo: Path, session: dict) -> None:
@@ -140,7 +142,7 @@ def _task(card, cards_by_id: dict, state_dir: Path, header: dict) -> dict:
 
 def gather(repo: Path, config_path: Path | None = None) -> dict:
     """Read the facts `screen_for` needs, plus what the screens show. Never writes."""
-    from openfarm_core.automode import load_project_chunks
+    from openfarm_core.automode import load_project_chunks, token_share
     from openfarm_core.config import CONFIG_PATH, load_config
     from openfarm_core.daemon import daemon_status
     from openfarm_core.findings import list_findings
@@ -151,7 +153,7 @@ def gather(repo: Path, config_path: Path | None = None) -> dict:
     session = load_session(repo)
     facts = {"repo": repo, "name": repo.name, "cfg": None, "spec": False, "spec_text": "", "goals": [],
              "goal": None, "goal_no": 0, "tasks": [], "all_tasks": [], "running": False, "questions": [],
-             "unsorted": [],
+             "unsorted": [], "tokens": {"builders": 0, "reviewers": 0, "architect": 0, "total": 0},
              "try_needed": False, "try_plan": {}, "tried": None, "tried_any": None, "session": session,
              "asking": bool(session["asking"] and (session["pending"] or session["history"]))}
     cfg_file = Path(config_path) if config_path else repo / CONFIG_PATH
@@ -190,6 +192,7 @@ def gather(repo: Path, config_path: Path | None = None) -> dict:
     # Architect or filed as a note, and never shown as a question.
     facts["questions"] = [f for f in held if f.get("audience") == "owner"]
     facts["unsorted"] = [f for f in held if f.get("audience") != "owner"]
+    facts["tokens"] = token_share(cfg.state_dir)
     facts["try_plan"] = how_to_start(repo, cfg)
     facts["try_needed"] = facts["try_plan"].get("kind") == "web"
     if goal:
