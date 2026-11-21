@@ -31,7 +31,7 @@ from pathlib import Path
 from .cards import Card
 from .globs import matches_any
 
-CHECKS = ("scaffold", "touches", "depends", "seams", "network", "guards", "frozen", "rules")
+CHECKS = ("scaffold", "touches", "forbidden", "depends", "seams", "network", "guards", "frozen", "rules")
 
 _CODE = re.compile(r"`([^`\n]+)`")
 _TS_FUNCTION = re.compile(r"^(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)\s*[(<]")
@@ -215,6 +215,21 @@ def _check_touches(card: Card, cfg, root: Path, by_id: dict[str, Card]) -> dict:
     fix = {"touches": [*card.touches, *missing],
            "notes": [f"added {', '.join(f'`{m}`' for m in missing)} to the files this task may write"]} if missing else None
     return _result("touches", problems, fix)
+
+
+def _check_forbidden(card: Card) -> dict:
+    """A file the project forbids was taken off the task's files: its text must not still ask for that file.
+
+    No fix of its own: only the Architect can reword what the task delivers. Without this the task passed
+    every check and stopped at build time, when the builder tried to write the file anyway.
+    """
+    named = {word.strip("'\"();") for code in _CODE.findall(f"{card.title}\n{card.done_text or ''}")
+             for word in code.replace(",", " ").split()}  # `package.json` has no folder, so `named_files` misses it
+    still = [rel for rel in (card.fields.get("taken_off") or []) if {str(rel), Path(str(rel)).name} & named]
+    return _result("forbidden", [
+        f"the text still asks for `{rel}`, which this project forbids changing and which was taken off the files "
+        "this task may write; reword the task so it delivers its result without that file, and don't name the file"
+        for rel in still])
 
 
 # -- depends -------------------------------------------------------------------
@@ -432,6 +447,7 @@ def check_card(card: Card, cfg, root: Path, cards: list[Card] | None = None) -> 
     results = [
         _check_scaffold(card, cfg, root),
         _check_touches(card, cfg, root, by_id),
+        _check_forbidden(card),
         _check_depends(card, by_id),
         _check_seams(card, by_id),
         _check_network(card),

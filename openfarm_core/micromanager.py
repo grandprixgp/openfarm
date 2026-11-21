@@ -1590,18 +1590,29 @@ class Micromanager:
         self.budget.check(card_id)
         if self.card_dir is not None and "_card_dir" not in payload:
             payload = {**payload, "_card_dir": str(self.card_dir)}
-        try:
-            answer = self.backend.assist(op, payload)
-        finally:
-            usage = getattr(self.backend, "last_usage", None) or {}
-            self.budget.record(
-                card_id=card_id,
-                tokens_in=int(usage.get("tokens_in", 0) or 0),
-                tokens_out=int(usage.get("tokens_out", 0) or 0),
-                spend=float(usage.get("spend", 0.0) or 0.0),
-                tokens_in_cached=int(usage.get("tokens_in_cached", 0) or 0),
-            )
-        return answer if isinstance(answer, dict) else {}
+        for last in (False, True):
+            try:
+                answer = self.backend.assist(op, payload)
+            except Invalid as exc:
+                # An answer that cannot be read is asked for once more: one bad answer used to pause the whole build.
+                if last or exc.code != "bad-micromanager-json":
+                    raise
+                try:
+                    self.budget.check(card_id)  # the second ask is paid for like any other
+                except Refused:
+                    raise exc from None
+                continue
+            finally:
+                usage = getattr(self.backend, "last_usage", None) or {}
+                self.budget.record(
+                    card_id=card_id,
+                    tokens_in=int(usage.get("tokens_in", 0) or 0),
+                    tokens_out=int(usage.get("tokens_out", 0) or 0),
+                    spend=float(usage.get("spend", 0.0) or 0.0),
+                    tokens_in_cached=int(usage.get("tokens_in_cached", 0) or 0),
+                )
+            return answer if isinstance(answer, dict) else {}
+        return {}
 
     # -- 1. shape_and_plan ----------------------------------------------------
 

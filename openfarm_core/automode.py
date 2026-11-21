@@ -1759,6 +1759,9 @@ def preflight_plan(root: Path, cfg, store, *, backend=None, max_repairs: int = 2
         if any(c["check"] == "rules" for c in failures(checks)):
             fixed_header, fixed_body, did = _repair_card_for_eligibility(root, cfg, new_header, new_body)
             if did:
+                gone = [t for t in (new_header.get("touches") or []) if t not in (fixed_header.get("touches") or [])]
+                if gone:  # the `forbidden` check holds the task until its words stop asking for them
+                    fixed_header["taken_off"] = sorted({*(header.get("taken_off") or []), *map(str, gone)})
                 notes += _structure_notes(new_header, fixed_header)
                 if fixed_body.strip() != new_body.strip():
                     notes.append("a line was added to the Done text so it states a result that can be checked")
@@ -1824,7 +1827,7 @@ def preflight_plan(root: Path, cfg, store, *, backend=None, max_repairs: int = 2
             "repairs": list(header.get("repairs") or []),
             "state": str(header.get("state") or "ready"),
         })
-    names = ("scaffold", "touches", "depends", "seams", "rules")
+    names = ("scaffold", "touches", "forbidden", "depends", "seams", "rules")
     plan_checks = [{"check": name,
                     "status": "fail" if any(c["check"] == name and c["status"] == "fail"
                                             for e in cards for c in e["checks"]) else "pass"}
@@ -1874,6 +1877,8 @@ def _architect_repairs(root: Path, cfg, store, backend, failing: dict[str, list[
         "- seams: a card that writes a stylesheet for a page another card serves must quote that page's element ids "
         "exactly (`#id`) in its stylesheet section, style every one of them, and name no selector the page lacks.\n"
         "- depends: only existing card IDs, no loops.\n"
+        "- forbidden: the project forbids changing that file, so the task must deliver its result without it. "
+        "Reword the task, drop what cannot be done without the file, and do not name the file at all.\n"
         'Return ONLY JSON: {"cards": {"<ID>": "<the whole card file, +++ TOML header and body>"}, '
         '"changes": {"<ID>": "<one sentence on what you changed>"}}\n\n'
         + "\n\n".join(blocks) + ("\n\nCards they depend on:\n" + context if context else "")

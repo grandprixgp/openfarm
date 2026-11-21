@@ -250,3 +250,39 @@ class PlanTests(unittest.TestCase):
         self.assertTrue(plan["W1-04"]["eligible"], plan["W1-04"]["failures"])
         self.assertTrue(any("the Architect rewrote it: the stylesheet now names" in n for n in plan["W1-04"]["repairs"]))
         self.assertEqual(self.store.read("W1-04")[0]["state"], "ready")
+
+    def test_a_forbidden_file_taken_off_a_task_holds_it_until_its_words_stop_asking_for_it(self) -> None:
+        # v0.20 live run: `package.json` came off the task's files, the words still asked for an npm start script,
+        # and the task stopped twice at build time on "the config forbids this path"
+        import json
+
+        from openfarm_core.adapters.files import render_card_file
+
+        self.assertTrue(any("package.json" in f for f in self.cfg.forbidden_files), self.cfg.forbidden_files)
+        ask = "\n  - add a `start` script to `package.json`"
+        self.store.change_card("W1-02", "edit", by="architect", why="test", apply=lambda h, b: (
+            dict(h, touches=[*h["touches"], "package.json"]), b.rstrip("\n") + ask + "\n"))
+
+        plan = self._plan()
+        header = self.store.read("W1-02")[0]
+        self.assertNotIn("package.json", header["touches"])
+        self.assertEqual(header["taken_off"], ["package.json"])
+        self.assertFalse(plan["W1-02"]["eligible"])
+        self.assertEqual(header["state"], "backlog")
+        self.assertTrue(any(r.startswith("forbidden:") and "still asks for `package.json`" in r for r in header["preflight"]))
+        self.assertIn({"check": "forbidden", "status": "fail"}, plan["_checks"])
+
+        asked: list[str] = []
+
+        def architect(prompt: str) -> str:
+            asked.append(prompt)
+            header, body = self.store.read("W1-02")
+            return json.dumps({"cards": {"W1-02": render_card_file(header, body.replace(ask, ""))},
+                               "changes": {"W1-02": "the server is started with node, no start script"}})
+
+        plan = self._plan(architect)
+        self.assertIn("forbidden: the text still asks for `package.json`", asked[0])
+        self.assertIn("do not name the file at all", asked[0])
+        self.assertTrue(plan["W1-02"]["eligible"], plan["W1-02"]["failures"])
+        self.assertEqual(self.store.read("W1-02")[0]["state"], "ready")
+        self.assertIn({"check": "forbidden", "status": "pass"}, plan["_checks"])

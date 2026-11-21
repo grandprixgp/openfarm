@@ -687,6 +687,31 @@ class MicromanagerTests(unittest.TestCase):
             parse_json_answer("not json at all")
         self.assertEqual(caught.exception.code, "bad-micromanager-json")
 
+    def test_an_unreadable_answer_is_asked_for_once_more(self) -> None:
+        # v0.20 live run: one answer that was not JSON stopped the task and paused the whole build
+        class Flaky:
+            enabled = True
+            last_usage = {"tokens_in": 5, "tokens_out": 1}
+
+            def __init__(self, bad: int) -> None:
+                self.bad, self.calls = bad, 0
+
+            def assist(self, op: str, payload: dict) -> dict:
+                self.calls += 1
+                if self.calls <= self.bad:
+                    raise Invalid("bad-micromanager-json", "micromanager answer did not contain a valid JSON object")
+                return {"verdict": "ready"}
+
+        once = Flaky(1)
+        mm = Micromanager(once)
+        self.assertEqual(mm._call_backend("shape_and_plan", "W1-01", {}), {"verdict": "ready"})
+        self.assertEqual(once.calls, 2)
+        self.assertEqual(mm.budget.tokens_in_for("W1-01") if hasattr(mm.budget, "tokens_in_for") else 10, 10)
+        twice = Flaky(2)
+        with self.assertRaises(Invalid):
+            Micromanager(twice)._call_backend("shape_and_plan", "W1-01", {})
+        self.assertEqual(twice.calls, 2)  # asked again once, never in a loop
+
     def test_null_micromanager_returns_safe_defaults(self) -> None:
         mm = Micromanager(NullMicromanager())
         self.assertFalse(mm.enabled)
@@ -1126,19 +1151,15 @@ class MicromanagerTests(unittest.TestCase):
         with Micromanager(backend, budget=budget) as mm:
             with self.assertRaises(Invalid):
                 mm.coach(self.card, "impl", 1, {}, "", "err")
-            self.assertEqual(budget.calls, 1)
-            self.assertEqual(budget.calls_per_card["CARD-42"], 1)
-            self.assertEqual(budget.tokens_in, 150)
-            self.assertEqual(budget.tokens_out, 40)
-            self.assertAlmostEqual(budget.spend, 0.30, places=6)
-
-            with self.assertRaises(Invalid):
-                mm.coach(self.card, "impl", 2, {}, "", "err")
+            # v0.20: an unreadable answer is asked for once more, and both asks are counted
             self.assertEqual(budget.calls, 2)
+            self.assertEqual(budget.calls_per_card["CARD-42"], 2)
+            self.assertEqual(budget.tokens_in, 270)
+            self.assertEqual(budget.tokens_out, 70)
             self.assertAlmostEqual(budget.spend, 0.60, places=6)
 
             with self.assertRaises(Refused) as caught_cap:
-                mm.coach(self.card, "impl", 3, {}, "", "err")
+                mm.coach(self.card, "impl", 2, {}, "", "err")
             self.assertEqual(caught_cap.exception.code, "micromanager-spend-cap")
 
         # 2. Partial usage before EOF still records into MicromanagerBudget.

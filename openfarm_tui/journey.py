@@ -81,6 +81,7 @@ STACKS = [("Work it out from the idea", "auto"), ("TypeScript / Web", "typescrip
 CHECKS = [  # the plan checks, in the words the Plan screen uses
     ("scaffold", "Every function in the specs can be scaffolded"),
     ("touches", "Every file a task names is one it may touch"),
+    ("forbidden", "No task asks for a file the project forbids changing"),
     ("depends", "The order works: nothing waits on a task that comes later"),
     ("seams", "Shared pieces agree: files that must match name the same things"),
     ("network", "A task that needs the network says so"),
