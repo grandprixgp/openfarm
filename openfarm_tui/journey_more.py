@@ -21,6 +21,7 @@ import openfarm_core
 from openfarm_core.acp_setup import inspect_acp_status
 from openfarm_core.doctor import run_doctor
 from openfarm_core.errors import AdapterError, ConfigError, Refused
+from openfarm_core import model_choices
 from openfarm_core.findings import decide_finding, list_findings
 from openfarm_core.projects import edit_project, list_projects, register_project, remove_project
 from openfarm_core.providers import (
@@ -31,10 +32,12 @@ from openfarm_core.providers import (
     save_global_providers,
 )
 
-MORE = {"projects": "Projects", "providers": "Providers and sign-in", "settings": "Settings", "notes": "Notes from builders"}
+MORE = {"projects": "Projects", "providers": "Providers and sign-in", "models": "Models and effort",
+        "settings": "Settings", "notes": "Notes from builders"}
 MORE_LABELS = (
     ("projects", "Projects: switch, add or remove a project"),
     ("providers", "Providers and sign-in"),
+    ("models", "Models and effort: who plans, reviews and builds"),
     ("settings", "Settings and check-up"),
     ("notes", "Questions and notes from builders (all of them)"),
 )
@@ -65,6 +68,20 @@ class MorePanes:
             yield Input(placeholder="API key (empty keeps the saved one)", password=True, id="prov-key")
             yield Select([(label, keep) for keep, label in _KEEPS], id="prov-zdr", allow_blank=False)
             yield Static("", id="prov-status", classes="card")
+        with VerticalScroll(id="models"):
+            yield Static("Models and effort", classes="h1")
+            yield Static("Which model does each job, and how hard it thinks. A choice for this project wins over one "
+                         "for every project.", classes="sub")
+            yield Select([("Choose for this project", "project"), ("Choose for every project", "global")],
+                         id="mod-scope", allow_blank=False)
+            for role, what in (("architect", "ARCHITECT  writes the spec and the plan, answers builders"),
+                               ("reviewer", "REVIEWER  checks and coaches every task"),
+                               ("builder", "BUILDERS  write the tests and the code")):
+                yield Static(what, classes="label")
+                yield Input(placeholder="Model (empty: not chosen here)", id=f"mod-{role}-model")
+                yield Select([(effort, effort) for effort in model_choices.efforts_for(role)], id=f"mod-{role}-effort",
+                             prompt="Effort (not chosen here)")
+            yield Static("", id="mod-now", classes="card")
         with VerticalScroll(id="settings"):
             yield Static("Settings", classes="h1")
             yield Static("", id="set-project", classes="card")
@@ -84,6 +101,9 @@ class MorePanes:
         self.note = ""
         if name == "providers":
             self._load_providers()
+        if name == "models":
+            self._mod_note = ""
+            self._load_models()
         self.refresh_screen(focus=True)
 
     # projects ------------------------------------------------------------------
@@ -335,6 +355,76 @@ class MorePanes:
         self._signin = None
         self._check_signin(provider)
         self.refresh_screen()
+
+    # models ---------------------------------------------------------------------
+
+    def _models_file(self) -> Path:
+        scope = str(self.query_one("#mod-scope", Select).value)
+        return model_choices.global_path() if scope == "global" else model_choices.project_path(self.repo)
+
+    def _load_models(self) -> None:
+        """Fill the fields with what was chosen in the picked place (this project, or every project)."""
+        if self.facts.get("cfg") is None:  # no project here yet: only the choice for every project can be made
+            self.query_one("#mod-scope", Select).value = "global"
+        chosen = model_choices.load_choices(self._models_file())
+        for role in model_choices.ROLES:
+            got = chosen.get(role, {})
+            self.query_one(f"#mod-{role}-model", Input).value = got.get("model", "")
+            select = self.query_one(f"#mod-{role}-effort", Select)
+            if got.get("effort"):
+                select.value = got["effort"]
+            else:
+                select.clear()
+
+    def _models_data(self) -> dict:
+        cfg = self.facts.get("cfg")
+        try:
+            import tomllib
+
+            return tomllib.loads(Path(cfg.path).read_text(encoding="utf-8")) if cfg is not None and cfg.path else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _draw_models(self) -> None:
+        in_project = self.facts.get("cfg") is not None
+        resolved = model_choices.resolve(self._models_data(), self.repo if in_project else None)
+        words = {"project": "this project", "global": "every project",
+                 "config": "config.toml" if in_project else "each project's own settings"}
+        lines = ["[b]In use" + (" for this project" if in_project else "") + "[/]"]
+        for role in model_choices.ROLES:
+            got = resolved[role]
+            lines.append(f"{model_choices.ROLE_WORDS[role]:<10} {esc(got['model'] or 'the provider default')}"
+                         f"  [$foreground-muted]({words[got['model_from']]})[/]"
+                         f"  ·  effort {got['effort'] or 'none'}  [$foreground-muted]({words[got['effort_from']]})[/]")
+        if self._mod_note:
+            lines += ["", self._mod_note]
+        self.query_one("#mod-now", Static).update("\n".join(lines))
+
+    def _actions_models(self):
+        return ("models_save", "Save"), [("models_clear", "Clear these choices")], "Tab next field · Esc back"
+
+    def do_models_save(self, clear: bool = False) -> None:
+        target = self._models_file()
+        try:
+            for role in model_choices.ROLES:
+                effort = self.query_one(f"#mod-{role}-effort", Select)
+                model_choices.save_choice(
+                    target, role,
+                    model="" if clear else self.query_one(f"#mod-{role}-model", Input).value,
+                    effort="" if clear or effort.is_blank() else str(effort.value))
+        except (ValueError, OSError) as exc:
+            self._mod_note = f"[$error]Not saved:[/] {esc(str(exc))}"
+        else:
+            where = "every project" if target == model_choices.global_path() else "this project"
+            self._mod_note = (f"[$success]✓[/] Cleared the choices for {where}." if clear else
+                              f"[$success]✓[/] Saved for {where}. It is used from the next step; a build already "
+                              "running finishes with what it started with.")
+            self.say(f"{'Cleared' if clear else 'Saved'} the models for {where}")
+            self._load_models()
+        self.refresh_screen()
+
+    def do_models_clear(self) -> None:
+        self.do_models_save(clear=True)
 
     # settings ------------------------------------------------------------------
 

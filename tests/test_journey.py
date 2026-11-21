@@ -190,6 +190,7 @@ SCREENS = {
     "board": ("blocked", "board", "▶ Open W1-04", "col-needs"),
     "projects": ("build", "projects", "▶ Back to it", "proj-list"),
     "providers": ("build", "providers", "▶ Save", "prov-architect"),
+    "models": ("build", "models", "▶ Save", "mod-scope"),
     "settings": ("build", "settings", "▶ Run the check-up", "go"),
     "notes": ("build", "notes", "▶ Back", "go"),
 }
@@ -202,7 +203,8 @@ class _Folder(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.base = Path(tmp.name)
         patches = [mock.patch.dict(os.environ, {"OPENFARM_PROJECTS_FILE": str(self.base / "projects.json"), "EDITOR": "",
-                                                "VISUAL": "", "OPENFARM_PROVIDERS_FILE": str(self.base / "providers.toml")}),
+                                                "VISUAL": "", "OPENFARM_PROVIDERS_FILE": str(self.base / "providers.toml"),
+                                               "OPENFARM_MODELS_FILE": str(self.base / "models.toml")}),
                    mock.patch("openfarm_tui.journey_more.inspect_acp_status", return_value={"oauth_ready": True}),
                    mock.patch("openfarm_tui.journey.try_it", side_effect=AssertionError("the app must not be started")),
                    mock.patch("openfarm_tui.journey.webbrowser.open")]
@@ -221,7 +223,7 @@ async def open_screen(app, pilot, screen: str) -> None:
     overlay = SCREENS[screen][1]
     if overlay == "board":
         app.action_board()
-    elif overlay in ("projects", "providers", "settings", "notes"):
+    elif overlay in ("projects", "providers", "models", "settings", "notes"):
         from openfarm_core.projects import register_project
 
         register_project(app.repo, name="iotd")
@@ -1285,7 +1287,7 @@ class FlowTests(_Folder):
                                                                    "Questions and notes from builders (all of them)"):
                         action()
                         await pilot.pause(0.1)
-                        self.assertIn(app.screen_name, ("projects", "providers", "settings", "notes"), label)
+                        self.assertIn(app.screen_name, ("projects", "providers", "models", "settings", "notes"), label)
                         self.assertIn("Esc goes back to the project", str(app.query_one("#where").render()))
                         await pilot.press("escape")
                         await pilot.pause(0.1)
@@ -1418,6 +1420,54 @@ class FlowTests(_Folder):
             self.assertIn("Sign in…", [label for _name, label in app._actions()[1]])
 
         self.drive("idea", body)
+
+    def test_models_and_effort_are_chosen_for_this_project_or_for_every_project(self) -> None:
+        async def body(app, pilot) -> None:
+            from textual.widgets import Select
+
+            from openfarm_core import model_choices as mc
+            from openfarm_core.config import load_config
+
+            app.open_more("models")
+            await pilot.pause(0.3)
+            self.assertEqual(app.query_one("#mod-scope").value, "project")
+            self.assertIn("(config.toml)", str(app.query_one("#mod-now").render()))
+            app.query_one("#mod-architect-effort").value = "high"
+            app.query_one("#mod-builder-model").focus()
+            await pilot.pause(0.1)
+            await pilot.press(*"nl-coder")  # letters here, not keys of the screen
+            self.assertEqual((app.screen_name, app.focused.id, app.query_one("#mod-builder-model").value),
+                             ("models", "mod-builder-model", "nl-coder"))
+            await pilot.pause(0.1)
+            app.do_models_save()
+            await pilot.pause(0.2)
+            self.assertEqual(mc.load_choices(mc.project_path(app.repo)),
+                             {"architect": {"model": "", "effort": "high"}, "builder": {"model": "nl-coder", "effort": ""}})
+            now = str(app.query_one("#mod-now").render())
+            self.assertIn("Saved for this project", now)
+            self.assertIn("nl-coder  (this project)", now)
+            self.assertEqual(load_config(app.repo).role_models["implementer"].model, "nl-coder")
+
+            app.query_one("#mod-scope").value = "global"  # the other place: its own, empty, choices
+            await pilot.pause(0.2)
+            self.assertEqual(app.query_one("#mod-builder-model").value, "")
+            self.assertTrue(app.query_one("#mod-architect-effort", Select).is_blank())
+            app.query_one("#mod-reviewer-effort").value = "low"
+            app.do_models_save()
+            await pilot.pause(0.2)
+            self.assertEqual(mc.load_choices(mc.global_path()), {"reviewer": {"model": "", "effort": "low"}})
+            self.assertIn("effort low  (every project)", str(app.query_one("#mod-now").render()))
+            self.assertEqual(load_config(app.repo).micromanager.effort, "low")
+
+            app.do_models_clear()
+            await pilot.pause(0.2)
+            self.assertEqual(mc.load_choices(mc.global_path()), {})
+            self.assertEqual(mc.load_choices(mc.project_path(app.repo))["builder"]["model"], "nl-coder")  # untouched
+            await pilot.press("escape")
+            await pilot.pause(0.2)
+            self.assertEqual(app.screen_name, "build")
+
+        self.drive("build", body)
 
     def test_settings_show_the_project_and_run_the_check_up(self) -> None:
         async def body(app, pilot) -> None:

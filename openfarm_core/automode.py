@@ -588,6 +588,11 @@ def open_architect_backend(
         if timeout_s and timeout_s > 0:
             worker.timeout_s = min(float(getattr(worker, "timeout_s", timeout_s)), float(timeout_s))
         mm_model = str(getattr(getattr(cfg, "micromanager", None), "model", "") or "")
+        chosen = (getattr(cfg, "model_choices", None) or {}).get("architect") or {}
+        if chosen.get("model_from", "config") != "config":
+            mm_model = chosen["model"]
+        if chosen.get("effort_from", "config") != "config":
+            worker.effort = chosen["effort"]
         return _AcpArchitectBackend(worker, model=mm_model, root=root, state_dir=getattr(cfg, "state_dir", None)), name
     except Exception as exc:
         return None, f"couldn't start {name}: {exc}"

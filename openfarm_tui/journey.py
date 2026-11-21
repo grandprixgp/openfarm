@@ -376,6 +376,7 @@ class Journey(MorePanes, App):
         self._more: list[tuple] = []  # actions of this screen that had no room for a button
         self.shown: dict = {}  # the facts the step on screen was drawn from
         self._health_len = 26
+        self._mod_note = ""
         self._resume_wanted = False  # a task was unblocked while the last build was still ending
         self.share = ""  # who spent the tokens, in words; the top bar's tooltip and the log say it
         self._unrecorded = 0  # Architect tokens spent before the folder was a project, so not in its ledger yet
@@ -830,7 +831,7 @@ class Journey(MorePanes, App):
             return self.query_one(target).focus()
         target = {"idea": "#idea-text", "questions": "#q-options", "plan": "#plan-tasks", "build": "#build-tasks",
                   "board": "#col-needs", "projects": "#proj-list", "notes": "#notes-list",
-                  "providers": "#prov-architect"}.get(self.screen_name, "#go")
+                  "providers": "#prov-architect", "models": "#mod-scope"}.get(self.screen_name, "#go")
         if self.screen_name == "questions" and not self.query_one("#q-options", OptionList).option_count:
             target = "#q-own" if self.facts["session"]["pending"] else "#go"
         if self.screen_name == "build":  # start on the task that needs the user, not the first row
@@ -1916,6 +1917,13 @@ class Journey(MorePanes, App):
     def _preset_changed(self, event: Select.Changed) -> None:
         if self.overlay == "providers":
             self.preset_picked(str(event.value))
+
+    @on(Select.Changed, "#mod-scope")
+    def _models_scope_changed(self, _event: Select.Changed) -> None:
+        if self.overlay == "models":
+            self._mod_note = ""
+            self._load_models()
+            self.refresh_screen()
 
     @on(Select.Changed, "#prov-architect")
     def _architect_changed(self, event: Select.Changed) -> None:

@@ -28,6 +28,9 @@ tempfile.tempdir = TEST_TMP_ROOT
 # many tests that start a missing one on purpose would each wait that long.
 os.environ.setdefault("OPENFARM_SPAWN_RETRY_DELAYS", "")
 
+# v0.20: nor the owner's own choice of models for every project
+os.environ["OPENFARM_MODELS_FILE"] = os.path.join(TEST_TMP_ROOT, "no-global-models.toml")
+
 os.environ["OPENFARM_GLOBAL_HARNESS"] = os.path.join(
     tempfile.mkdtemp(prefix="openfarm-test-global-"), "harness")
 
