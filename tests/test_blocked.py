@@ -252,7 +252,8 @@ class FixTests(_Project):
         self.store.src._write("W1-01", dict(header, state="blocked"), text, "W1-01: blocked again")
         stopped("run-2", "the test writer left the allowed paths: src/select.ts")
         second = answered("And the other thing?")
-        self.assertEqual((second["for"], second["retried"]), ("architect", False))
+        self.assertEqual((second["for"], second["retried"], second["stuck"]), ("architect", False, True))
+        self.assertFalse(first["stuck"])
         header, body = self.store.read("W1-01")
         self.assertEqual(header["state"], "blocked")  # it waits for a person now
         self.assertEqual(body.count("## Answer from the Architect"), 2)  # the answer is still kept

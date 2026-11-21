@@ -644,7 +644,9 @@ class Journey(MorePanes, App):
         finally:
             self.shown, self.facts = self.facts, self.real
         where = self._where(picked)
-        room = self.size.width - len(f"openfarm · {facts['name']}") - 34
+        room = self.size.width - len(f"openfarm · {facts['name']}") - 36
+        while len(where) > room and where.count(" · ") > 1:  # the last part (minutes, then the count) goes before a word is cut
+            where = where.rpartition(" · ")[0]
         self.query_one("#where", Static).update(esc(where if len(where) <= room else where[: max(8, room - 1)] + "…"))
         line = f"{keys} · Ctrl+K everything else"
         if not view and not self.overlay and len(line) + 12 <= self.size.width - 2:  # said where there is room; Ctrl+K has it too
@@ -1196,7 +1198,7 @@ class Journey(MorePanes, App):
     def _question_sorted(self, finding: dict, outcome: dict) -> None:
         who = finding["from_card"]
         if outcome["for"] == "architect":
-            if outcome.get("retried", True):
+            if not outcome.get("stuck"):
                 self.say(f"{who} asked a question the Architect could answer; the answer is in the task")
                 return self._resume_build()
             self.say(f"{who} asked a question the Architect answered, but it has stopped the same way twice: it waits for you")
