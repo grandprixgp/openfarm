@@ -52,6 +52,7 @@ from openfarm_core.state import StateDir
 from openfarm_core.store import card_from, open_store, read_doc, write_doc
 from openfarm_core.tryit import fix_request, looks_right, try_it
 
+from .journey_more import MORE, MORE_LABELS, MorePanes
 from .journey_state import (
     PROJECT_STEPS,
     STEP_OF,
@@ -263,7 +264,7 @@ class Rail(Vertical):
         self.query_one("#goals-none", Static).set_class(bool(goals), "hidden")
 
 
-class Journey(App):
+class Journey(MorePanes, App):
     TITLE = "openfarm"
     COMMANDS = {Everything}
     CSS = """
@@ -330,8 +331,12 @@ class Journey(App):
         Binding("f9", "toggle_theme", "Theme"),
     ]
 
-    def __init__(self, repo: Path, config_path: Path | None = None, theme: str = "") -> None:
+    def __init__(self, repo: Path, config_path: Path | None = None, theme: str = "", open_at: str = "") -> None:
         super().__init__()
+        self._open_at = open_at if open_at in MORE else ""  # a pane beside the journey to start on
+        self._doctor: dict | None = None  # the last check-up, for Settings
+        self._prov_note, self._prov_preset = "", ""
+        self._signin: tuple[str, bool] | None = None  # (provider, signed in) once it has been checked
         self.repo = Path(repo)
         self.config_path = config_path
         self._theme_name = theme or ("openfarm-light" if terminal_is_light() else "openfarm-dark")
@@ -451,6 +456,7 @@ class Journey(App):
         with VerticalScroll(id="log"):
             yield Static("Everything that happened", classes="h1")
             yield Static("", id="log-text")
+        yield from self.compose_more()
 
     def on_resize(self) -> None:
         if self.screen_name:
@@ -470,6 +476,8 @@ class Journey(App):
         self.refresh_screen(focus=True)
         self.set_interval(1.0, self._tick)
         self._attach_running_build()
+        if self._open_at:
+            self.call_after_refresh(lambda: self.open_more(self._open_at))
         try:
             if self.facts["cfg"] is not None and open_store(self.repo, self.facts["cfg"]).migration()["needed"]:
                 self.call_after_refresh(self.offer_migration)
@@ -713,6 +721,8 @@ class Journey(App):
             return f"Looking at {step}{of_goal} · nothing changes from here"
         if self.overlay == "board":
             return "Board · all goals"
+        if self.overlay in MORE:
+            return f"{MORE[self.overlay]} · Esc goes back to the project"
         if not facts["spec"]:
             history, pending = facts["session"]["history"], facts["session"]["pending"]
             return f"Questions · {len(history) + 1}" if (pending and picked["screen"] == "questions") else "new project"
@@ -807,7 +817,8 @@ class Journey(App):
             target = "#go" if self.failure else "#act-3"
             return self.query_one(target).focus()
         target = {"idea": "#idea-text", "questions": "#q-options", "plan": "#plan-tasks", "build": "#build-tasks",
-                  "board": "#col-needs"}.get(self.screen_name, "#go")
+                  "board": "#col-needs", "projects": "#proj-list", "notes": "#notes-list",
+                  "providers": "#prov-architect"}.get(self.screen_name, "#go")
         if self.screen_name == "questions" and not self.query_one("#q-options", OptionList).option_count:
             target = "#q-own" if self.facts["session"]["pending"] else "#go"
         if self.screen_name == "build":  # start on the task that needs the user, not the first row
@@ -819,7 +830,7 @@ class Journey(App):
         for selector in (target, "#go", "#act-3"):
             widget = self.query_one(selector)
             if widget.display and not widget.has_class("hidden") and not getattr(widget, "disabled", False):
-                widget.focus()
+                widget.focus(scroll_visible=self.screen_name not in MORE)  # those open at their heading
                 if self.screen_name == "board" and not self.busy:  # its main button names the row the focus landed on
                     self.call_after_refresh(lambda: self._gone() or self._show_actions(*self._actions()[:2]))
                 return
@@ -1870,6 +1881,18 @@ class Journey(App):
     def _row_moved(self, event: OptionList.OptionHighlighted) -> None:
         if self.screen_name == "board" and not self.busy and not self._gone():
             self._show_actions(*self._actions()[:2])
+        if self.screen_name in ("projects", "notes") and not self.busy and not self._gone() and len(self.screen_stack) == 1:
+            self.refresh_screen()  # the card under the list is about the row picked
+
+    @on(Select.Changed, "#prov-preset")
+    def _preset_changed(self, event: Select.Changed) -> None:
+        if self.overlay == "providers":
+            self.preset_picked(str(event.value))
+
+    @on(Select.Changed, "#prov-architect")
+    def _architect_changed(self, event: Select.Changed) -> None:
+        if self.overlay == "providers":
+            self.architect_picked(str(event.value))
 
     def action_column(self, step: int) -> None:
         if self.screen_name != "board":
@@ -2117,15 +2140,11 @@ class Journey(App):
         items += [("Board: every task of every goal", self.action_board), ("Log: everything that happened", self.action_log),
                  ("Switch between the light and dark theme", self.action_toggle_theme)]
         items += [(f"Look at the {name} step", lambda step=step: self.look(step)) for step, name in zip(STEP_NAMES, STEPS)]
+        more = [(label, lambda name=name: self.open_more(name)) for name, label in MORE_LABELS]
         if self.view:
-            return [("Back to where the project is", self.action_now), *items, ("Quit", self.exit)]
+            return [("Back to where the project is", self.action_now), *items, *more, ("Quit", self.exit)]
         if self.facts.get("spec"):
             items += [("Something's wrong: ask for fix tasks", self.do_something_wrong),
                       ("New feature: add a goal", self.do_new_feature)]
         items.append(("Move this project's tasks and spec off the main branch (once)", self.offer_migration))
-        items += [(label, lambda view=view: self.exit(("classic", view))) for label, view in (
-            ("Projects: switch, add or remove a project", "projects"),
-            ("Providers and sign-in", "providers"),
-            ("Settings, doctor and the old screens", "engine"),
-            ("Questions and notes from builders (all of them)", "findings"))]
-        return [*items, ("Quit", self.exit)]
+        return [*items, *more, ("Quit", self.exit)]

@@ -187,6 +187,10 @@ SCREENS = {
     "accept": ("accept", "", "▶ Accept goal 1", "go"),
     "details": ("build", "details", "▶ Back", "go"),
     "board": ("blocked", "board", "▶ Open W1-04", "col-needs"),
+    "projects": ("build", "projects", "▶ Back to it", "proj-list"),
+    "providers": ("build", "providers", "▶ Save", "prov-architect"),
+    "settings": ("build", "settings", "▶ Run the check-up", "go"),
+    "notes": ("build", "notes", "▶ Back", "go"),
 }
 
 
@@ -197,7 +201,8 @@ class _Folder(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.base = Path(tmp.name)
         patches = [mock.patch.dict(os.environ, {"OPENFARM_PROJECTS_FILE": str(self.base / "projects.json"), "EDITOR": "",
-                                                "VISUAL": ""}),
+                                                "VISUAL": "", "OPENFARM_PROVIDERS_FILE": str(self.base / "providers.toml")}),
+                   mock.patch("openfarm_tui.journey_more.inspect_acp_status", return_value={"oauth_ready": True}),
                    mock.patch("openfarm_tui.journey.try_it", side_effect=AssertionError("the app must not be started")),
                    mock.patch("openfarm_tui.journey.webbrowser.open")]
         for patch in patches:
@@ -215,6 +220,11 @@ async def open_screen(app, pilot, screen: str) -> None:
     overlay = SCREENS[screen][1]
     if overlay == "board":
         app.action_board()
+    elif overlay in ("projects", "providers", "settings", "notes"):
+        from openfarm_core.projects import register_project
+
+        register_project(app.repo, name="iotd")
+        app.open_more(overlay)
     elif overlay:
         task = "W1-04" if overlay == "blocked" else "W1-02"
         app._open(overlay, task)
@@ -1152,17 +1162,218 @@ class FlowTests(_Folder):
 
         self.drive("try", body, size=(100, 30))
 
-    def test_the_other_screens_open_from_the_palette_and_come_back(self) -> None:
+    def test_no_older_screen_is_reachable_from_the_palette(self) -> None:
+        async def body(app, pilot) -> None:
+            left = []
+            with mock.patch.object(app, "exit", side_effect=left.append):
+                for label, action in app.palette_actions():
+                    if label != "Quit" and label.split(":")[0] in ("Projects", "Providers and sign-in", "Settings and check-up",
+                                                                   "Questions and notes from builders (all of them)"):
+                        action()
+                        await pilot.pause(0.1)
+                        self.assertIn(app.screen_name, ("projects", "providers", "settings", "notes"), label)
+                        self.assertIn("Esc goes back to the project", str(app.query_one("#where").render()))
+                        await pilot.press("escape")
+                        await pilot.pause(0.1)
+                        self.assertEqual(app.screen_name, "build")
+            self.assertEqual(left, [])  # none of them leaves this screen for an older one
+            self.assertFalse([label for label, _ in app.palette_actions() if "old" in label.lower()])
+
+        self.drive("build", body)
+
+    def test_projects_are_listed_added_opened_and_removed_without_touching_files(self) -> None:
+        async def body(app, pilot) -> None:
+            from openfarm_core.projects import list_projects, register_project
+
+            register_project(app.repo, name="demo")
+            app.open_more("projects")
+            await pilot.pause(0.2)
+            self.assertEqual(app.focused.id, "proj-list")
+            self.assertIn("● demo", str(rail_text(app, "proj-list")))
+            self.assertIn("open now", str(app.query_one("#proj-detail").render()))
+            self.assertEqual(self.label(app), "▶ Back to it")
+            other = self.base / "another one"
+            app.do_project_add()
+            await pilot.pause(0.2)
+            app.screen.query_one("#ask-text").load_text(str(other))
+            await pilot.press("ctrl+j")
+            await pilot.pause(0.2)
+            self.assertTrue(other.is_dir())
+            self.assertEqual({p["name"] for p in list_projects()}, {"demo", "another one"})
+            names = [p["id"] for p in list_projects()]
+            app.query_one("#proj-list").highlighted = names.index(next(p["id"] for p in list_projects() if p["name"] == "another one"))
+            await pilot.pause(0.2)
+            self.assertEqual(self.label(app), "▶ Open another one")
+            self.assertIn("starts at the Idea step", str(app.query_one("#proj-detail").render()))
+            left = []
+            with mock.patch.object(app, "exit", side_effect=left.append):
+                await pilot.press("enter")
+                await pilot.pause(0.1)
+            self.assertEqual(left, [("project", str(other.resolve()))])
+            app.do_project_remove()
+            await pilot.pause(0.2)
+            self.assertEqual(str(app.focused.label), "Keep it")  # Enter keeps it
+            await pilot.click("#choice-remove")
+            await pilot.pause(0.2)
+            self.assertEqual([p["name"] for p in list_projects()], ["demo"])
+            self.assertTrue(other.is_dir())  # only the list changed
+            app.do_project_remove()  # the open project stays
+            await pilot.pause(0.1)
+            self.assertIn("Open another one first", app.note)
+            self.assertEqual(len(app.screen_stack), 1)
+
+        self.drive("build", body)
+
+    def test_opening_another_project_starts_the_screen_on_it(self) -> None:
         import openfarm_tui
 
-        runs = iter([("classic", "projects"), None])
-        with mock.patch("openfarm_tui.journey.Journey.run", side_effect=lambda: next(runs)) as journey, \
-                mock.patch("openfarm_tui.app.OpenfarmApp.run") as classic, \
-                mock.patch("openfarm_tui.app.OpenfarmApp.__init__", return_value=None) as made:
-            self.assertEqual(openfarm_tui.run_textual_tui(self.base), 0)
-        self.assertEqual(journey.call_count, 2)
-        self.assertEqual(classic.call_count, 1)
-        self.assertEqual(made.call_args.kwargs["initial_view"], "projects")
+        other = self.base / "other"
+        other.mkdir()
+        runs = iter([("project", str(other)), None])
+        made = []
+
+        def journey(self_, repo, config_path=None, theme="", open_at=""):
+            made.append((Path(repo), open_at))
+
+        with mock.patch("openfarm_tui.journey.Journey.__init__", autospec=True, side_effect=journey, return_value=None), \
+                mock.patch("openfarm_tui.journey.Journey.run", side_effect=lambda: next(runs)), \
+                mock.patch("openfarm_tui.app.OpenfarmApp.__init__", side_effect=AssertionError("an older screen")):
+            self.assertEqual(openfarm_tui.run_textual_tui(self.base, initial_view="providers"), 0)
+        self.assertEqual(made, [(self.base.resolve(), "providers"), (other.resolve(), "")])
+
+    def test_providers_are_shown_changed_tested_and_saved(self) -> None:
+        async def body(app, pilot) -> None:
+            from openfarm_core.providers import load_global_providers
+
+            app.open_more("providers")
+            await pilot.pause(0.3)
+            self.assertIn("Claude is signed in", str(app.query_one("#prov-signin").render()))
+            self.assertIn("no key saved yet", str(app.query_one("#prov-status").render()))
+            app.query_one("#prov-preset").value = "custom"
+            await pilot.pause(0.1)
+            app.query_one("#prov-endpoint").focus()
+            app.query_one("#prov-endpoint").value = ""
+            await pilot.press(*"https://builders.example/v1")
+            await pilot.press("tab")
+            app.query_one("#prov-model").value = ""
+            await pilot.press(*"nl-model")  # n, l and - are letters here, not keys of the screen
+            self.assertEqual(app.screen_name, "providers")
+            self.assertEqual(app.query_one("#prov-model").value, "nl-model")
+            app.query_one("#prov-key").value = "sk-test-not-real"
+            with mock.patch("openfarm_tui.journey_more.probe_worker_endpoint",
+                            return_value={"ok": True, "latency_ms": 42, "status": 200}) as probe:
+                app.do_providers_test()
+                await app.workers.wait_for_complete()
+                await pilot.pause(0.2)
+            self.assertEqual(probe.call_args.args[0], "https://builders.example/v1")
+            self.assertIn("answered in 42 ms", str(app.query_one("#prov-status").render()))
+            app.do_providers_save()
+            await pilot.pause(0.1)
+            saved = load_global_providers()
+            self.assertEqual((saved["worker"]["preset"], saved["worker"]["endpoint"], saved["worker"]["model"]),
+                             ("custom", "https://builders.example/v1", "nl-model"))
+            self.assertTrue(saved["worker"]["key_present"])
+            self.assertEqual(app.query_one("#prov-key").value, "")  # the key is not kept on screen
+            self.assertNotIn("sk-test-not-real", (self.base / "providers.toml").read_text())
+            self.assertIn("Saved", str(app.query_one("#prov-status").render()))
+            app.query_one("#prov-endpoint").value = "not an address"
+            app.do_providers_save()
+            await pilot.pause(0.1)
+            self.assertIn("Not saved", str(app.query_one("#prov-status").render()))
+            self.assertEqual(load_global_providers()["worker"]["endpoint"], "https://builders.example/v1")
+
+        self.drive("build", body)
+
+    def test_a_preset_fills_in_its_own_address_and_the_sign_in_is_rechecked(self) -> None:
+        async def body(app, pilot) -> None:
+            from openfarm_core.providers import WORKER_PRESETS
+
+            app.open_more("providers")
+            await pilot.pause(0.3)
+            preset = next(p for p in WORKER_PRESETS if p["endpoint"] and p["id"] != app.query_one("#prov-preset").value)
+            app.query_one("#prov-preset").value = preset["id"]
+            await pilot.pause(0.2)
+            self.assertEqual(app.query_one("#prov-endpoint").value, preset["endpoint"])
+            with mock.patch("openfarm_tui.journey_more.inspect_acp_status", return_value={"oauth_ready": False}) as status:
+                app.query_one("#prov-architect").value = "codex"
+                await pilot.pause(0.1)
+                await app.workers.wait_for_complete()
+                await pilot.pause(0.2)
+            self.assertEqual(status.call_args.kwargs["provider"], "codex")
+            self.assertIn("Codex is not signed in", str(app.query_one("#prov-signin").render()))
+            self.assertIn("Sign in…", [label for _name, label in app._actions()[1]])
+
+        self.drive("idea", body)
+
+    def test_settings_show_the_project_and_run_the_check_up(self) -> None:
+        async def body(app, pilot) -> None:
+            app.open_more("settings")
+            await pilot.pause(0.2)
+            text = str(app.query_one("#set-project").render())
+            for wanted in ("Folder", "State", "Architect", "Builders", "Never touch", "Theme        dark", "Tokens"):
+                self.assertIn(wanted, text)
+            self.assertIn("Not run yet", str(app.query_one("#set-doctor").render()))
+            self.assertEqual(self.label(app), "▶ Run the check-up")
+            report = {"checks": [{"status": "ok", "label": "Git repository", "detail": "clean"},
+                                 {"status": "warn", "label": "Ignore file", "detail": "state folder not ignored", "fixable": True}],
+                      "fixes_applied": []}
+            with mock.patch("openfarm_tui.journey_more.run_doctor", return_value=report) as doctor:
+                await pilot.press("enter")
+                await app.workers.wait_for_complete()
+                await pilot.pause(0.2)
+                self.assertFalse(doctor.call_args.kwargs["fix"])
+                shown = str(app.query_one("#set-doctor").render())
+                self.assertIn("Git repository", shown)
+                self.assertIn("can be fixed", shown)
+                self.assertIn("Fix what can be fixed", [label for _name, label in app._actions()[1]])
+                app.action_act("checkup_fix")
+                await app.workers.wait_for_complete()
+                await pilot.pause(0.2)
+                self.assertTrue(doctor.call_args.kwargs["fix"])
+            app.action_act("toggle_theme")
+            await pilot.pause(0.1)
+            self.assertIn("Theme        light", str(app.query_one("#set-project").render()))
+
+        self.drive("build", body)
+
+    def test_builders_notes_are_listed_and_decided_in_the_new_screen(self) -> None:
+        async def body(app, pilot) -> None:
+            from openfarm_core.findings import list_findings
+            from openfarm_core.store import Store
+
+            store = Store(app.repo, app.facts["cfg"])
+            for number, title in ((1, "The feed has no retry"), (2, "A helper is copied in two files")):
+                store.src._write(f"FIND-{number}", {"id": f"FIND-{number}", "title": title, "state": "backlog",
+                                                    "category": "finding", "from_card": "W1-02"},
+                                 f"More about note {number}.", f"FIND-{number}: noted")
+            app.open_more("notes")
+            await pilot.pause(0.2)
+            self.assertEqual(app.focused.id, "notes-list")
+            self.assertIn("The feed has no retry", rail_text(app, "notes-list"))
+            first = str(app.query_one("#notes-detail").render())
+            await pilot.press("down")
+            await pilot.pause(0.2)
+            second = str(app.query_one("#notes-detail").render())
+            self.assertEqual({first[-18:], second[-18:]}, {"More about note 1.", "More about note 2."})
+            gone = "FIND-1" if second.endswith("note 1.") else "FIND-2"
+            app.action_act("note_dismiss")
+            await pilot.pause(0.2)
+            app.screen.query_one("#ask-text").load_text("fine as it is")
+            await pilot.press("ctrl+j")
+            await pilot.pause(0.2)
+            waiting = [f["id"] for f in list_findings(app.repo, app.facts["cfg"], state_filter="waiting")["findings"]]
+            self.assertEqual(waiting, [({"FIND-1", "FIND-2"} - {gone}).pop()])
+            await pilot.press("enter")  # keep the other for the next goal
+            await pilot.pause(0.2)
+            self.assertEqual(list_findings(app.repo, app.facts["cfg"], state_filter="waiting")["findings"], [])
+            self.assertIn("Nothing is waiting", str(app.query_one("#notes-detail").render()))
+
+        self.drive("build", body)
+
+
+def rail_text(app, list_id: str) -> str:
+    widget = app.query_one(f"#{list_id}")
+    return "\n".join(str(widget.get_option_at_index(i).prompt) for i in range(widget.option_count))
 
 
 from tests.test_store import MigrationTests as _OlderProject  # noqa: E402
