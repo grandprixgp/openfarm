@@ -64,7 +64,8 @@ BUILD_RULES = (
     "in a value first (`const net = globalThis.fetch; await net(url)`), never called by its bare name. "
     "Only a task that itself must use the network (it is the HTTP server and imports `node:http`, or it is the one "
     "client of a remote API) sets `network = true` in its header and says why in its Goal; the owner is shown this "
-    "before the build. No other task sets it."
+    "before the build. No other task sets it. Every test a task lists must FAIL before the task's code is written; a "
+    "test that would already pass (a guard against a regression) is never listed in `tests`."
 )
 
 
@@ -156,12 +157,32 @@ def failed_checks(state_dir: Path, record: dict) -> list[str]:
     return lines
 
 
+def guard_tests(state_dir: Path, record: dict) -> list[str]:
+    """Named tests that already passed before any code was written in this run: guards, which can never 'fail first'."""
+    folder = Path(state_dir) / "cards" / str(record.get("card_id")) / str(record.get("run_id")) / "gates"
+    names: list[str] = []
+    for path in sorted(folder.glob("*/fail-before.json")):
+        try:
+            gate = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        names = [str(n) for n in (gate.get("evidence") or {}).get("passing_on_base") or []] if gate.get("result") == "fail" else names
+    return names
+
+
 def triage_card(state_dir: Path, card_id: str) -> dict | None:
     """`triage` for a task's latest run, or None when it has never run."""
     runs = records(state_dir, card_id)
     if not runs:
         return None
     got = triage(runs[-1], runs[:-1])
+    guards = guard_tests(state_dir, runs[-1])
+    if guards:  # the task names a test that can't fail first: only changing the task ends this
+        got = dict(triage(dict(runs[-1], stop_code="ineligible")), guards=guards, repeated=got["repeated"],
+                   why="The task lists a test that already passes before any code is written, so it can never be shown "
+                       "to test the new code: " + "; ".join(guards) + ". It can stay in the test file as a guard, off the "
+                       "task's list.")
+        return got
     checks = failed_checks(state_dir, runs[-1])
     if checks and got["kind"] != "check":
         if runs[-1].get("stop_code") == "cannot-split":  # "too big to split" is how it ended, not why
@@ -189,6 +210,13 @@ def propose_fix(root: Path, cfg, store, card_id: str, why: str = "", backend=Non
     header, body = store.read(card_id)
     before = render_card_file(header, body)
     new_header, new_body, notes = apply_fixes(header, body, check_card(card_from(header, body), cfg, root, store.cards()))
+    runs = records(Path(cfg.state_dir), card_id)
+    guards = set(guard_tests(Path(cfg.state_dir), runs[-1])) if runs else set()
+    kept = [t for t in new_header.get("tests") or [] if str(t.get("name")) not in guards]
+    if guards and kept and len(kept) < len(new_header.get("tests") or []):
+        new_header = dict(new_header, tests=kept)
+        notes.append("took " + ", ".join(f"'{g}'" for g in sorted(guards)) + " off the task's list of tests: it already "
+                     "passes, so it stays in the test file as a guard")
     if not notes and backend is not None:
         prompt = (
             "This openfarm task card could not be built. Rewrite the card so it can be, keeping what it delivers.\n"

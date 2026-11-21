@@ -103,6 +103,29 @@ class FixTests(_Project):
         self.assertEqual((got["kind"], got["main_label"]), ("builder", "Retry"))
         self.assertIn("changed the tests it was given", got["why"])
 
+    def test_a_listed_test_that_already_passes_is_taken_off_the_list_as_the_fix(self) -> None:
+        # from the acceptance run: a fix task listed a regression guard, which can never fail first
+        from pathlib import Path
+
+        from openfarm_core.blocked import triage_card
+
+        header = _header("W1-01")
+        header["tests"] = [*header["tests"], {"name": "never hardcodes undefined", "file": header["tests"][0]["file"],
+                                              "asserts": "the page has no src=undefined"}]
+        self.store.change_card("W1-01", "create", header=header, body=BODY)
+        run = Path(self.cfg.state_dir) / "cards" / "W1-01" / "run-1"
+        (run / "gates" / "1").mkdir(parents=True)
+        (run / "gates" / "1" / "fail-before.json").write_text(json.dumps({
+            "name": "fail-before", "result": "fail", "evidence": {"passing_on_base": ["never hardcodes undefined"]}}))
+        (run / "card-record.json").write_text(json.dumps({
+            "run_id": "run-1", "card_id": "W1-01", "claimed_at": "1", "stop_code": "tests-unprovable", "detail": "x"}))
+        got = triage_card(Path(self.cfg.state_dir), "W1-01")
+        self.assertEqual((got["kind"], got["main_label"]), ("task", "Apply fix and retry"))
+        self.assertIn("never hardcodes undefined", got["why"])
+        fix = propose_fix(self.root, self.cfg, self.store, "W1-01")
+        self.assertEqual([t["name"] for t in fix["header"]["tests"]], [t["name"] for t in _header("W1-01")["tests"]])
+        self.assertIn("stays in the test file as a guard", fix["notes"][-1])
+
     def test_no_fix_is_said_plainly(self) -> None:
         self.store.change_card("W1-01", "create", header=_header("W1-01"), body=BODY)
         self.assertIsNone(propose_fix(self.root, self.cfg, self.store, "W1-01"))
