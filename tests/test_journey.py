@@ -699,6 +699,17 @@ class FlowTests(_Folder):
         async def body(app, pilot) -> None:
             self.assertEqual(self.label(app), "▶ See why W1-04 stopped")
             self.assertEqual(app.query_one("#build-tasks").highlighted, 3)  # starts on the task that needs you
+            from openfarm_core.store import Store as _Store
+
+            _store = _Store(app.repo, app.facts["cfg"])
+            _h, _t = _store.read("W1-03")
+            _store.src._write("W1-03", dict(_h, state="in_review"), _t, "W1-03: finished while the list was open")
+            app.refresh_screen()
+            await pilot.pause(0.2)
+            self.assertEqual(app.query_one("#build-tasks").highlighted, 2)  # and follows the next one that does
+            _store.src._write("W1-03", dict(_h, state="ready"), _t, "W1-03: back")
+            app.refresh_screen()
+            await pilot.pause(0.2)
             self.assertNotIn("Pause", [str(b.label) for b in app.query("#actions Button") if b.display])
             from openfarm_core.store import Store
 

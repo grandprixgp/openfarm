@@ -566,6 +566,8 @@ class Journey(App):
         self._render_activity()
         if changed or focus:
             self.call_after_refresh(self._focus_for_screen)
+        if name == "build" and not changed:
+            self.call_after_refresh(self._follow_needs)
         if changed:
             self.call_after_refresh(lambda: self.query_one(f"#{name}").scroll_home(animate=False))
 
@@ -660,11 +662,8 @@ class Journey(App):
         if self.screen_name == "questions" and not self.query_one("#q-options", OptionList).option_count:
             target = "#q-own" if self.facts["session"]["pending"] else "#go"
         if self.screen_name == "build":  # start on the task that needs the user, not the first row
-            needs = self._first("in_review") or next((t for t in self.facts["tasks"] if self.facts["questions"]
-                                                      and t["id"] == self.facts["questions"][0]["from_card"]), None) \
-                or self._first("blocked")
-            if needs:
-                self.query_one("#build-tasks", OptionList).highlighted = [t["id"] for t in self.facts["tasks"]].index(needs["id"])
+            self._needs_row = None
+            self._follow_needs()
         if self.screen_name == "board":
             target = next((f"#col-{key}" for key in ("needs", "building", "waiting", "done")
                            if self.query_one(f"#col-{key}", OptionList).option_count), "#go")
@@ -673,6 +672,17 @@ class Journey(App):
             if widget.display and not widget.has_class("hidden") and not getattr(widget, "disabled", False):
                 widget.focus()
                 return
+
+    def _follow_needs(self) -> None:
+        """Move the build list to the task that needs the user, once each time that task changes."""
+        tasks = self.facts.get("tasks") or []
+        questions = self.facts.get("questions") or []
+        needs = self._first("in_review") or next((t for t in tasks if questions and t["id"] == questions[0]["from_card"]),
+                                                 None) or self._first("blocked")
+        key = (needs["id"], needs["state"]) if needs else None
+        if key and key != getattr(self, "_needs_row", None):
+            self.query_one("#build-tasks", OptionList).highlighted = [t["id"] for t in tasks].index(needs["id"])
+        self._needs_row = key
 
     def _actions(self) -> tuple[tuple | None, list[tuple], str]:
         """The main action, the others, and the key line for the screen shown."""
