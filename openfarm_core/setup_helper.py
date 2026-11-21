@@ -11,6 +11,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from . import model_choices as mc
+from .errors import Refused
 from .providers import (
     WORKER_PRESETS,
     load_global_providers,
@@ -109,15 +110,24 @@ def run_setup(args, *, ask=input, secret=None, out=print, signed_in=None, sign_i
 
     # 2. who builds
     presets = {p["id"]: p for p in WORKER_PRESETS}
-    preset = flag("preset") or worker["preset"]
-    if not quiet and not flag("preset") and not flag("endpoint"):
+    given_preset = flag("preset")
+    if given_preset is not None and given_preset not in presets:
+        raise Refused(
+            "unknown-preset",
+            f"unknown preset {given_preset!r}; choose one of {', '.join(presets)}",
+        )
+    preset = given_preset or worker["preset"]
+    if preset not in presets:
+        preset = "custom" if "custom" in presets else WORKER_PRESETS[0]["id"]
+    if not quiet and not given_preset and not flag("endpoint"):
         out("\n2. Who builds? Any address that speaks the OpenAI chat API.")
         labels = [f"{p['id']}: {p['label']} ({p['note']})" for p in WORKER_PRESETS]
-        picked = _pick(ask, out, "", labels, next(l for l in labels if l.startswith(preset + ":")))
+        default_label = next((l for l in labels if l.startswith(preset + ":")), labels[0])
+        picked = _pick(ask, out, "", labels, default_label)
         preset = picked.split(":", 1)[0]
     changed_preset = preset != worker["preset"]
     endpoint = flag("endpoint") or ("" if changed_preset else worker["endpoint"]) or presets[preset]["endpoint"]
-    if flag("endpoint") and not flag("preset"):
+    if flag("endpoint") and not given_preset:
         preset = next((p["id"] for p in WORKER_PRESETS if p["endpoint"] == endpoint), "custom")
     if not quiet and not flag("endpoint"):
         endpoint = _pick(ask, out, "  Address", [], endpoint, free=True)
@@ -130,7 +140,16 @@ def run_setup(args, *, ask=input, secret=None, out=print, signed_in=None, sign_i
     if not quiet and not flag("no_zdr"):
         zdr = ask(f"  Ask the provider not to keep what is sent? [{'Y/n' if zdr else 'y/N'}]: ").strip().lower() \
             in (("", "y", "yes") if zdr else ("y", "yes"))
-    builder_model = flag("builder_model") or ("" if changed_preset else worker["model"]) or presets[preset]["default_model"]
+    for_project = bool(flag("project"))
+    repo = Path(getattr(args, "repo", None) or ".").expanduser().resolve()
+    target = mc.project_path(repo) if for_project else mc.global_path()
+    chosen = mc.load_choices(target)
+    existing_builder = (chosen.get("builder") or {}).get("model", "")
+    builder_model = (
+        flag("builder_model")
+        or ("" if changed_preset else (existing_builder or worker["model"]))
+        or presets[preset]["default_model"]
+    )
     key_file = Path(flag("key_file")) if flag("key_file") else Path(worker["key_file"])
     saved = save_global_providers(frontier_provider=frontier, worker_preset=preset, endpoint=endpoint, model=builder_model,
                                   key_file=key_file, api_key=api_key, zdr=zdr)
@@ -145,18 +164,16 @@ def run_setup(args, *, ask=input, secret=None, out=print, signed_in=None, sign_i
     else:
         out(f"\n3. The builders' address did not answer ({listed['builder']['error'] or 'no reason given'}). "
             "The model is taken as typed.")
+    builder_picked = False
     if not quiet and not flag("builder_model"):
         builder_model = _pick_model(ask, out, models, builder_model) if models else \
             _pick(ask, out, "  Builders' model", [], builder_model, free=True)
+        builder_picked = bool(builder_model)
     if builder_model != saved["worker"]["model"]:
         save_global_providers(frontier_provider=frontier, worker_preset=preset, endpoint=endpoint, model=builder_model,
                               key_file=key_file, zdr=zdr)
 
     # 4. models and efforts, job by job
-    for_project = bool(flag("project"))
-    repo = Path(getattr(args, "repo", None) or ".").expanduser().resolve()
-    target = mc.project_path(repo) if for_project else mc.global_path()
-    chosen = mc.load_choices(target)
     if not quiet:
         out(f"\n4. Model and effort for each job ({'this project' if for_project else 'every project'}). "
             "Enter keeps what is in brackets; an empty model means the provider's own default.")
@@ -164,7 +181,7 @@ def run_setup(args, *, ask=input, secret=None, out=print, signed_in=None, sign_i
         had = chosen.get(role, {})
         model = flag(f"{role}_model")
         if role == "builder":
-            model = builder_model if (model or for_project or had.get("model")) else ""  # providers.toml already holds it
+            model = builder_model if (model or builder_picked or for_project or had.get("model")) else ""
         elif model is None:
             model = had.get("model", "")
             if not quiet:

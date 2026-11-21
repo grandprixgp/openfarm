@@ -349,9 +349,12 @@ class MorePanes:
             return
         source = str(Path(openfarm_core.__file__).resolve().parent.parent)
         env = {**os.environ, "PYTHONPATH": source + (os.pathsep + os.environ["PYTHONPATH"] if os.environ.get("PYTHONPATH") else "")}
+        argv = [sys.executable, "-m", "openfarm_core.cli", "--repo", str(self.repo)]
+        if getattr(self, "config_path", None) is not None:
+            argv += ["--config", str(self.config_path)]
+        argv += ["acp", "login", "--provider", provider]
         with self.suspend():  # the sign-in is the provider's own, in the terminal
-            subprocess.run([sys.executable, "-m", "openfarm_core.cli", "--repo", str(self.repo), "acp", "login",
-                            "--provider", provider], env=env)
+            subprocess.run(argv, env=env)
         self._signin = None
         self._check_signin(provider)
         self.refresh_screen()

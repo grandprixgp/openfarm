@@ -14,14 +14,22 @@ are never rewritten.
 
 from __future__ import annotations
 
+import contextlib
 import os
+import tempfile
 import tomllib
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX
+    fcntl = None  # type: ignore[assignment]
 
 ROLES = ("architect", "reviewer", "builder")
 ROLE_WORDS = {"architect": "Architect", "reviewer": "Reviewer", "builder": "Builders"}
 FRONTIER_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 BUILDER_EFFORTS = ("low", "medium", "high", "max")
+_DEFAULT_TIER_EFFORTS = ("off", "low", "medium", "high", "xhigh", "max")
 BUILDER_ROLES = ("test_writer", "implementer", "checker", "planner")
 PROJECT_FILE = Path(".openfarm") / "models.toml"
 
@@ -75,32 +83,106 @@ def save_choice(path: Path, role: str, *, model: str = "", effort: str = "") -> 
         raise ValueError(f"effort {effort!r} is not one of {', '.join(efforts_for(role))}")
     if any(ch in model for ch in '"\\\n\r'):
         raise ValueError("a model name can't hold quotes, backslashes or line breaks")
-    choices = load_choices(path)
-    if model or effort:
-        choices[role] = {"model": model, "effort": effort}
-    else:
-        choices.pop(role, None)
-    lines = ["# Which model does which job. Written by openfarm (`openfarm models`); see docs/models.md.", ""]
-    for name in ROLES:
-        if name in choices:
-            lines.append(f"[{name}]")
-            lines += [f'{key} = "{value}"' for key, value in choices[name].items() if value]
-            lines.append("")
+    path = Path(path)
+    if path.is_symlink():
+        raise OSError(f"refusing to write symlink {path}")
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".toml.tmp")
-    tmp.write_text("\n".join(lines), encoding="utf-8")
-    tmp.replace(path)
-    return choices
+    lock_path = path.with_name(f".{path.name}.lock")
+    lock_fd = os.open(
+        str(lock_path),
+        os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        if fcntl is not None:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        if path.is_symlink():
+            raise OSError(f"refusing to write symlink {path}")
+        choices = load_choices(path)
+        if model or effort:
+            choices[role] = {"model": model, "effort": effort}
+        else:
+            choices.pop(role, None)
+        lines = ["# Which model does which job. Written by openfarm (`openfarm models`); see docs/models.md.", ""]
+        for name in ROLES:
+            if name in choices:
+                lines.append(f"[{name}]")
+                lines += [f'{key} = "{value}"' for key, value in choices[name].items() if value]
+                lines.append("")
+        payload = "\n".join(lines).encode("utf-8")
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_name, path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_name)
+            raise
+        return choices
+    finally:
+        if fcntl is not None:
+            with contextlib.suppress(OSError):
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+
+def _default_tier_name(data: dict) -> str:
+    raw_tiers = data.get("tiers")
+    if not isinstance(raw_tiers, dict) or not raw_tiers:
+        return ""
+    sw = data.get("swarm") if isinstance(data.get("swarm"), dict) else {}
+    default_tier = sw.get("default_tier")
+    if isinstance(default_tier, str) and default_tier in raw_tiers:
+        return default_tier
+    return next(iter(raw_tiers))
+
+
+def _tier_allowed_efforts(data: dict, model_name: str) -> tuple[str, ...]:
+    from .adapters.acp import is_acp_adapter
+
+    adapters = data.get("adapters") if isinstance(data.get("adapters"), dict) else {}
+    if is_acp_adapter(str(adapters.get("model") or "")):
+        return FRONTIER_EFFORTS
+    raw_tiers = data.get("tiers")
+    if not isinstance(raw_tiers, dict) or not raw_tiers:
+        return _DEFAULT_TIER_EFFORTS
+    default_name = _default_tier_name(data)
+    tier = raw_tiers.get(default_name)
+    if model_name and not (isinstance(tier, dict) and tier.get("model") == model_name):
+        for entry in raw_tiers.values():
+            if isinstance(entry, dict) and entry.get("model") == model_name:
+                tier = entry
+                break
+    if not isinstance(tier, dict):
+        return _DEFAULT_TIER_EFFORTS
+    if "effort_param" in tier and tier["effort_param"] == "":
+        return ()
+    if "efforts" in tier and tier["efforts"] is not None:
+        raw_efforts = tier["efforts"]
+        return tuple(str(e) for e in raw_efforts) if isinstance(raw_efforts, list) else ()
+    return _DEFAULT_TIER_EFFORTS
 
 
 def _config_values(data: dict) -> dict[str, dict[str, str]]:
     mm = data.get("micromanager") if isinstance(data.get("micromanager"), dict) else {}
     model = data.get("model") if isinstance(data.get("model"), dict) else {}
-    builder = model.get("implementer") if isinstance(model.get("implementer"), dict) else {}
+    raw_impl = model.get("implementer")
+    builder = raw_impl if isinstance(raw_impl, dict) else {}
+    impl_model = str(builder.get("model") or "") if isinstance(raw_impl, dict) else (
+        str(raw_impl) if isinstance(raw_impl, str) else ""
+    )
+    if not impl_model:
+        default_tier = _default_tier_name(data)
+        raw_tiers = data.get("tiers") if isinstance(data.get("tiers"), dict) else {}
+        if default_tier and isinstance(raw_tiers.get(default_tier), dict):
+            impl_model = str(raw_tiers[default_tier].get("model") or "")
     ladder = builder.get("effort_ladder") or model.get("effort_ladder") or []
     frontier = {"model": str(mm.get("model") or ""), "effort": str(mm.get("effort") or "medium")}
     return {"architect": dict(frontier), "reviewer": dict(frontier),
-            "builder": {"model": str(builder.get("model") or ""),
+            "builder": {"model": impl_model,
                         "effort": str(builder.get("effort") or (ladder[0] if ladder else ""))}}
 
 
@@ -137,15 +219,38 @@ def overlay(data: dict, repo: Path) -> tuple[dict, dict[str, dict[str, str]]]:
     model = dict(data.get("model") or {})
     if builder["model_from"] != "config":
         for name in BUILDER_ROLES:
-            if isinstance(model.get(name), dict):
-                model[name] = dict(model[name], model=builder["model"])
+            entry = model.get(name)
+            if isinstance(entry, dict):
+                model[name] = dict(entry, model=builder["model"])
+            else:
+                model[name] = builder["model"]
+        default_tier = _default_tier_name(data)
+        raw_tiers = data.get("tiers")
+        if default_tier and isinstance(raw_tiers, dict) and isinstance(raw_tiers.get(default_tier), dict):
+            tiers_copy = dict(raw_tiers)
+            tiers_copy[default_tier] = dict(raw_tiers[default_tier], model=builder["model"])
+            data["tiers"] = tiers_copy
     if builder["effort_from"] != "config":
-        # the first try uses the chosen effort; a retry still climbs from there
-        ladder = list(BUILDER_EFFORTS[BUILDER_EFFORTS.index(builder["effort"]):])
-        model["effort_ladder"] = ladder
-        for name in BUILDER_ROLES:
-            if isinstance(model.get(name), dict):
-                model[name] = {k: v for k, v in model[name].items()
-                               if k not in ("effort", "retry_effort", "effort_ladder")}
+        # the first try uses the chosen effort; a retry still climbs from there, bounded by each tier's allowed efforts
+        raw_ladder = list(BUILDER_EFFORTS[BUILDER_EFFORTS.index(builder["effort"]):])
+
+        def _role_model_name(name: str) -> str:
+            entry = model.get(name)
+            if isinstance(entry, dict):
+                return str(entry.get("model") or "")
+            return str(entry) if isinstance(entry, str) else ""
+
+        impl_name = _role_model_name("implementer")
+        allowed_sets = [
+            _tier_allowed_efforts(data, _role_model_name(name) or impl_name)
+            for name in BUILDER_ROLES
+        ]
+        ladder = [e for e in raw_ladder if all(e in allowed for allowed in allowed_sets)]
+        if ladder:
+            model["effort_ladder"] = ladder
+            for name in BUILDER_ROLES:
+                if isinstance(model.get(name), dict):
+                    model[name] = {k: v for k, v in model[name].items()
+                                   if k not in ("effort", "retry_effort", "effort_ladder")}
     data["model"] = model
     return data, resolved

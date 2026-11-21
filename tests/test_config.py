@@ -121,6 +121,87 @@ runs = { WS_REQUIRE_BWRAP = "1" }
         cfg = load_config(self.repo)
         self.assertEqual(cfg.runner_env["runs"], {"WS_REQUIRE_BWRAP": "1"})
 
+    def test_global_worker_inheritance_preserves_retry_effort(self) -> None:
+        import os
+        from unittest import mock
+
+        gp = self.tmp / "providers.toml"
+        gp.write_text(
+            '[frontier]\nprovider = "claude"\n\n'
+            '[worker]\npreset = "custom"\nendpoint = "https://real.example.invalid/v1"\n'
+            'model = "inherited/coder"\nzdr = false\n'
+        )
+        base_placeholder = BASE.format(state=self.state).replace(
+            'endpoint = "https://x.invalid/v1"\nallowed_endpoints = ["https://x.invalid/v1"]',
+            'endpoint = "https://api.example.invalid/v1"\n'
+            'allowed_endpoints = ["https://api.example.invalid/v1"]\n'
+            '[model.implementer]\nmodel = "lesser-coder"\neffort = "low"\nretry_effort = "high"',
+        )
+        self.write(base_placeholder)
+        with mock.patch.dict(os.environ, {"OPENFARM_PROVIDERS_FILE": str(gp)}):
+            cfg = load_config(self.repo)
+        rm = cfg.role_models["implementer"]
+        self.assertEqual(rm.model, "inherited/coder")
+        self.assertEqual(rm.effort, "low")
+        self.assertEqual(rm.retry_effort, "high")
+        self.assertEqual(cfg.effort_for_role("implementer", 2)[0], "high")
+
+    def test_parse_duration_rejects_negative_nan_inf_and_bool(self) -> None:
+        for bad in (-1, -0.5, float("nan"), float("inf"), float("-inf"), "-5s", True, False):
+            with self.assertRaises(ConfigError, msg=f"expected refusal for {bad!r}"):
+                parse_duration(bad, "test")
+
+    def test_budget_caps_reject_invalid_values(self) -> None:
+        bad_snippets = [
+            "[budget]\nconcurrent_builds = 0\n",
+            "[budget]\nconcurrent_cards = 0\n",
+            "[budget]\ntokens_per_card = -1\n",
+            "[budget]\nimplementer_attempts = -1\n",
+            "[budget]\ntest_writer_attempts = -1\n",
+            "[budget]\nmodel_build_calls_per_card = -1\n",
+            "[budget]\nmutation_build_calls_per_card = -1\n",
+            "[budget]\nspend_per_night = -1.0\n",
+            "[budget]\nfrontier_cost_ratio = -0.5\n",
+        ]
+        for snippet in bad_snippets:
+            self.write(BASE.format(state=self.state) + "\n" + snippet)
+            with self.assertRaises(ConfigError, msg=snippet):
+                load_config(self.repo)
+
+    def test_try_table_validates_keys_and_port(self) -> None:
+        self.write(BASE.format(state=self.state) + '\n[try]\nstart = "npm start"\nport = 3000\npath = "/"\n')
+        cfg = load_config(self.repo)
+        self.assertEqual(cfg.try_it["port"], 3000)
+
+        for bad in (
+            '\n[try]\nunknown_key = "x"\n',
+            '\n[try]\nport = -1\n',
+            '\n[try]\nport = 70000\n',
+        ):
+            self.write(BASE.format(state=self.state) + bad)
+            with self.assertRaises(ConfigError, msg=bad):
+                load_config(self.repo)
+
+    def test_effort_for_role_handles_missing_role_model(self) -> None:
+        self.write(
+            BASE.format(state=self.state).replace(
+                'allowed_endpoints = ["https://x.invalid/v1"]',
+                'allowed_endpoints = ["https://x.invalid/v1"]\neffort_ladder = ["medium", "high"]',
+            )
+        )
+        cfg = load_config(self.repo)
+        cfg.role_models.clear()
+        effort, param = cfg.effort_for_role("implementer", 1)
+        self.assertEqual(effort, "medium")
+        self.assertEqual(param, "reasoning_effort")
+
+    def test_runner_typescript_defaults_to_auto(self) -> None:
+        cfg = load_config(self.repo)
+        self.assertEqual(cfg.runner_typescript, "auto")
+        for runner in ("auto", "node", "vitest", "jest"):
+            self.write(BASE.format(state=self.state) + f'\n[runner]\ntypescript = "{runner}"\n')
+            self.assertEqual(load_config(self.repo).runner_typescript, runner)
+
 
 class GlobTests(unittest.TestCase):
     def test_tree_glob_does_not_match_a_prefix(self) -> None:

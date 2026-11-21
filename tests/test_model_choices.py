@@ -119,6 +119,107 @@ class ModelChoiceTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("--global", err)
 
+    def test_overlay_handles_string_and_omitted_builder_roles(self) -> None:
+        cfg_path = self.root / ".openfarm" / "config.toml"
+        cfg_path.write_text(
+            f'[project]\nname = "app"\nstate_dir = "{self.base / "state"}"\n\n'
+            '[adapters]\nlanguages = ["python"]\n\n'
+            '[model]\nendpoint = "https://x.invalid/v1"\nallowed_endpoints = ["https://x.invalid/v1"]\n'
+            'implementer = "old-model"\n\n'
+            '[policy]\ncategories = ["pattern"]\n',
+            encoding="utf-8",
+        )
+        mc.save_choice(mc.global_path(), "builder", model="new-builder", effort="high")
+        cfg = load_config(self.root)
+        for role in ("test_writer", "implementer", "checker", "planner"):
+            self.assertEqual(cfg.role_models[role].model, "new-builder", role)
+            self.assertEqual(cfg.effort_for_role(role, 1)[0], "high", role)
+
+    def test_overlay_updates_default_tier_and_intersects_tier_efforts(self) -> None:
+        cfg_path = self.root / ".openfarm" / "config.toml"
+        base_cfg = (
+            f'[project]\nname = "app"\nstate_dir = "{self.base / "state"}"\n\n'
+            '[adapters]\nlanguages = ["python"]\n\n'
+            '[model]\nendpoint = "https://x.invalid/v1"\nallowed_endpoints = ["https://x.invalid/v1"]\n'
+            'implementer = "old-model"\n\n'
+            '[policy]\ncategories = ["pattern"]\n\n'
+        )
+        # Explicit [tiers] with subset efforts (no "max") + [swarm] default_tier
+        cfg_path.write_text(
+            base_cfg
+            + '[tiers.fast]\nmodel = "old-model"\nefforts = ["low", "medium", "high"]\n\n'
+            + '[swarm]\ndefault_tier = "fast"\n',
+            encoding="utf-8",
+        )
+        mc.save_choice(mc.global_path(), "builder", model="chosen-model", effort="medium")
+        cfg = load_config(self.root)
+        self.assertEqual(cfg.tiers["fast"].model, "chosen-model")
+        self.assertEqual(cfg.member_defaults("implementer"), ("fast", "chosen-model"))
+        self.assertEqual(cfg.effort_ladder, ("medium", "high"))
+
+        # Tier with effort_param = "" must not crash load_config when global builder effort is set
+        cfg_path.write_text(
+            base_cfg + '[tiers.plain]\nmodel = "old-model"\neffort_param = ""\n',
+            encoding="utf-8",
+        )
+        mc.save_choice(mc.global_path(), "builder", model="chosen-model", effort="high")
+        cfg2 = load_config(self.root)
+        self.assertEqual(cfg2.tiers["plain"].model, "chosen-model")
+        self.assertEqual(cfg2.effort_for_role("implementer", 1), ("", ""))
+
+        # Tier with disjoint efforts (["low"] vs global "high") must not crash load_config
+        cfg_path.write_text(
+            base_cfg + '[tiers.tiny]\nmodel = "old-model"\nefforts = ["low"]\n',
+            encoding="utf-8",
+        )
+        cfg3 = load_config(self.root)
+        self.assertEqual(cfg3.tiers["tiny"].model, "chosen-model")
+
+    def test_save_choice_refuses_symlink_and_is_concurrency_safe(self) -> None:
+        import threading
+
+        target = self.base / "real-models.toml"
+        target.write_text("", encoding="utf-8")
+        link = self.base / "link-models.toml"
+        link.symlink_to(target)
+        with self.assertRaises(OSError):
+            mc.save_choice(link, "architect", model="opus")
+
+        shared = self.base / "concurrent" / "models.toml"
+        errors: list[BaseException] = []
+
+        def writer(role: str, model: str) -> None:
+            try:
+                for _ in range(10):
+                    mc.save_choice(shared, role, model=model, effort="high")
+            except BaseException as exc:
+                errors.append(exc)
+
+        t1 = threading.Thread(target=writer, args=("architect", "opus"))
+        t2 = threading.Thread(target=writer, args=("builder", "coder"))
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+        self.assertEqual(errors, [])
+        loaded = mc.load_choices(shared)
+        self.assertEqual(loaded["architect"]["model"], "opus")
+        self.assertEqual(loaded["builder"]["model"], "coder")
+
+    def test_open_architect_backend_applies_global_choice_in_new_folder(self) -> None:
+        from openfarm_core import automode
+
+        empty_dir = self.base / "brand-new"
+        empty_dir.mkdir()
+        mc.save_choice(mc.global_path(), "architect", model="opus-global", effort="xhigh")
+        worker = mock.Mock(effort="medium", timeout_s=600.0)
+        with mock.patch.object(automode, "inspect_acp_status", return_value={"oauth_ready": True}), \
+                mock.patch("openfarm_core.adapters.claude_worker.open_acp_worker", return_value=worker):
+            backend, _name = automode.open_architect_backend(empty_dir)
+        self.assertIsNotNone(backend)
+        self.assertEqual(backend._model, "opus-global")
+        self.assertEqual(worker.effort, "xhigh")
+
 
 if __name__ == "__main__":
     unittest.main()
