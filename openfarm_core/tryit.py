@@ -24,6 +24,7 @@ import time
 from pathlib import Path
 
 VIEWPORTS = (("desktop", 1440, 900), ("phone", 390, 844))
+PICTURE_WAIT = 15.0  # seconds a page's pictures get to finish loading before it is judged and photographed
 
 _STOP_WORDS = frozenset("""
     about above after again also always app application below browser build builds built button click each every
@@ -74,7 +75,10 @@ _LOOK = r"""
   }
   const readable = [...document.querySelectorAll('h1,h2,h3,p,li,span,small,a,button,td,label,figcaption')]
     .filter((el) => el.textContent.trim()).some((el) => !seen(el));
-  return JSON.stringify({ named, readable, title: document.title, text: document.body ? document.body.innerText.length : 0 });
+  const imgs = [...document.querySelectorAll('img')].filter((i) => i.getAttribute('src'));
+  const pictures = { total: imgs.length, pending: imgs.filter((i) => !i.complete).length,
+                     broken: imgs.filter((i) => i.complete && i.naturalWidth === 0).length };
+  return JSON.stringify({ named, readable, pictures, title: document.title, text: document.body ? document.body.innerText.length : 0 });
 }
 """
 
@@ -230,6 +234,11 @@ def look_at(url: str, words: list[str], out_dir: Path, browser: Path | None = No
             chrome.call("Page.navigate", {"url": url}, session)
             chrome.wait("Page.loadEventFired", 20)
             chrome.settle(1.5)  # scripts that fill the page in after it loads
+            waited = time.monotonic() + PICTURE_WAIT  # a picture set by script loads after the page's own load event
+            while time.monotonic() < waited and chrome.call("Runtime.evaluate", {
+                    "expression": "[...document.images].some((i) => i.getAttribute('src') && !i.complete)",
+                    "returnByValue": True}, session)["result"].get("value"):
+                chrome.settle(0.5)
             if not looked:
                 for event in chrome.events:
                     reply = (event.get("params") or {}).get("response") or {}
@@ -272,12 +281,20 @@ def look_at(url: str, words: list[str], out_dir: Path, browser: Path | None = No
         detail = "the page shows readable text (nothing on it carries the goal's own words, so those were not checked)"
     else:
         detail = "the page shows no text a person could read"
+    pictures = looked.get("pictures") or {}
+    bad = [f"{pictures[key]} {words}" for key, words in (
+        ("broken", "did not load"), ("pending", f"still loading after {int(PICTURE_WAIT)} seconds (too large or too slow)"))
+        if pictures.get(key)]
+    picture_checks = [{"name": "pictures", "ok": not bad,
+                       "detail": ("of the page's pictures: " + ", ".join(bad)) if bad else "the page's pictures loaded"}
+                      ] if pictures.get("total") else []
     return {"browser": str(browser), "screenshots": shots, "checks": [
         {"name": "loads", "ok": 200 <= status < 400, "detail": f"the page answered {status or 'nothing'}"},
         {"name": "seen", "ok": not hidden and (bool(shown) or bool(looked.get("readable"))), "detail": detail,
          "hidden": [n["word"] for n in hidden], "shown": shown},
         {"name": "console", "ok": not errors,
          "detail": "no errors in the page's console" if not errors else "the page logged: " + " | ".join(errors[:5])},
+        *picture_checks,
     ]}
 
 

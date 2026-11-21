@@ -96,6 +96,16 @@ class TryItTests(_Project):
         result = try_it(self.root, self.cfg, GOAL)
         self.assertTrue(result["ok"], result["checks"])
         self.assertEqual({c["name"]: c for c in result["checks"]}["seen"]["shown"], ["title", "story", "credit"])
+        self.assertTrue({c["name"]: c for c in result["checks"]}["pictures"]["ok"])
+
+    @unittest.skipUnless(find_browser(), "no headless browser on this machine")
+    def test_a_picture_that_did_not_load_fails_even_when_the_words_show(self) -> None:
+        # from the acceptance run: every check passed on a page whose picture never arrived
+        self._serve(SHOWN.replace(PIXEL, "data:image/png;base64,AAAA"))
+        result = try_it(self.root, self.cfg, GOAL)
+        self.assertIn("1 did not load", {c["name"]: c for c in result["checks"]}["pictures"]["detail"])
+        self.assertFalse(result["ok"])
+        self.assertIn("did not load", fix_request(result))
 
     @unittest.skipUnless(find_browser(), "no headless browser on this machine")
     def test_a_page_error_is_reported(self) -> None:
