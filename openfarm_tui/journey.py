@@ -427,6 +427,7 @@ class Journey(App):
             yield Static("", id="try-title", classes="h1")
             yield Static("", id="try-sub", classes="sub")
             yield Static("", id="try-checks", classes="card")
+            yield Static("", id="try-colours", classes="card")
             yield Static("", id="try-shots")
         with VerticalScroll(id="accept"):
             yield Static("", id="accept-title", classes="h1")
@@ -1574,12 +1575,14 @@ class Journey(App):
             self.query_one("#try-title", Static).update(esc(f"Goal {number} was not tried here."))
             for part in ("#try-sub", "#try-checks", "#try-shots"):
                 self.query_one(part, Static).update("")
+            self.query_one("#try-colours", Static).add_class("hidden")
             return
         if result is None:
             self.query_one("#try-title", Static).update(esc(f"Goal {number} is built. Starting it to have a look."))
             self.query_one("#try-sub", Static).update("")
             self.query_one("#try-checks", Static).update("[$foreground-muted]◌ not tried yet[/]")
             self.query_one("#try-shots", Static).update("")
+            self.query_one("#try-colours", Static).add_class("hidden")
             if not self.busy and not self.failure and facts["goal"]["id"] not in self._auto_tried:
                 self._auto_tried.add(facts["goal"]["id"])
                 self.call_after_refresh(self.do_try_again)
@@ -1600,6 +1603,16 @@ class Journey(App):
         box = self.query_one("#try-checks", Static)
         box.update("\n".join(lines))
         box.set_classes("card " + ("bad" if result["ok"] is False else "ok" if result["ok"] else ""))
+        colours = [c for c in result.get("colours") or [] if len(str(c.get("hex"))) == 7 and str(c["hex"]).startswith("#")]
+        swatches = self.query_one("#try-colours", Static)
+        swatches.set_class(not colours, "hidden")
+        if colours:  # the page's own colours, so "themed from the picture" can be judged without opening a screenshot
+            rows = ["[b]Colours on the first screen[/]  [$foreground-muted]largest first[/]"]
+            for use, label in (("background", "Backgrounds"), ("text", "Text")):
+                chips = [f"[on {c['hex']}]      [/] {c['hex']}" for c in colours if c.get("use") == use]
+                if chips:
+                    rows.append(f"{label:<12}" + "   ".join(chips))
+            swatches.update("\n".join(rows))
         names = [Path(shot).stem.replace("-", " ") for shot in result["screenshots"]]
         self.query_one("#try-shots", Static).update(
             "[b]Screenshots[/]   " + "   ".join(f"{esc(name)} [$foreground-muted]({key})[/]" for name, key in zip(names, "op"))

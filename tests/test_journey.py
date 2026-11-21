@@ -164,6 +164,8 @@ def build_project(base: Path, stage: str) -> Path:
         seen = stage == "accept"
         (out / "result.json").write_text(json.dumps({
             "kind": "web", "goal": "C1", "command": "node src/server.ts", "url": "http://127.0.0.1:8931/", "output": "",
+            "colours": [{"hex": "#101820", "use": "background"}, {"hex": "#3a5a78", "use": "background"},
+                        {"hex": "#f2efe6", "use": "text"}],
             "words": ["title", "story", "credit"], "head": code_version(root), "ok": False, "looks_right": seen,
             "screenshots": [str(out / "desktop-1440x900.png"), str(out / "phone-390x844.png")],
             "checks": [{"name": "loads", "ok": True, "detail": "the page loads at /"},
@@ -887,6 +889,19 @@ class FlowTests(_Folder):
         build_project(self.base / "try", "try")
         (self.base / "try" / "state" / "tryit" / "C1" / "result.json").unlink()
         self.app = lambda stage, theme="openfarm-dark": journey.Journey(repo=self.base / "try" / "iotd", theme=theme)
+        self.drive("try", body)
+
+    def test_try_it_shows_the_pages_colours_as_swatches(self) -> None:
+        async def body(app, pilot) -> None:
+            panel = app.query_one("#try-colours")
+            self.assertFalse(panel.has_class("hidden"))
+            text = str(panel.render())
+            self.assertIn("Colours on the first screen", text)
+            self.assertIn("Backgrounds", text)
+            self.assertIn("#101820", text)
+            self.assertIn("#3a5a78", text)
+            self.assertRegex(text, r"Text\s+.*#f2efe6")
+
         self.drive("try", body)
 
     def test_accepting_a_goal_moves_to_the_next_goals_plan_step(self) -> None:
