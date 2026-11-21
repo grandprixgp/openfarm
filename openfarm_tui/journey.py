@@ -2152,6 +2152,8 @@ class Journey(MorePanes, App):
         items += [("Board: every task of every goal", self.action_board), ("Log: everything that happened", self.action_log),
                  ("Switch between the light and dark theme", self.action_toggle_theme)]
         items += [(f"Look at the {name} step", lambda step=step: self.look(step)) for step, name in zip(STEP_NAMES, STEPS)]
+        items += [(f"Look at goal {number}: {goal['title']}", lambda number=number: self.look(goal=number))
+                  for number, goal in enumerate(self.real.get("goals") or [], 1)]
         more = [(label, lambda name=name: self.open_more(name)) for name, label in MORE_LABELS]
         if self.view:
             return [("Back to where the project is", self.action_now), *items, *more, ("Quit", self.exit)]

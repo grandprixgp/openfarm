@@ -966,6 +966,25 @@ class FlowTests(_Folder):
 
         self.drive("build", body)
 
+    def test_any_goal_can_be_opened_from_the_keyboard(self) -> None:
+        async def body(app, pilot) -> None:
+            actions = dict(app.palette_actions())
+            wanted = [label for label in actions if label.startswith("Look at goal ")]
+            self.assertEqual(len(wanted), len(app.real["goals"]))
+            actions[wanted[1]]()  # Ctrl+K, "goal 2"
+            await pilot.pause(0.2)
+            self.assertEqual((app.view["goal"], app.view["step"]), (2, "plan"))
+            self.assertIn("Goal 2 starts once goal 1 is accepted", str(app.query_one("#ahead-text").render()))
+            await pilot.press("n")
+            await pilot.pause(0.2)
+            self.assertIsNone(app.view)
+            app.query_one("#rail-goals").focus()  # and through the rail: Tab reaches it, arrows and Enter pick
+            await pilot.press("down", "enter")
+            await pilot.pause(0.2)
+            self.assertEqual(app.view["goal"], 2)
+
+        self.drive("build", body)
+
     def test_the_top_bar_keeps_its_gaps_when_the_token_count_grows(self) -> None:
         # v0.20 live run: at 491k tokens the middle ran into the project's name and its last word was cut
         async def body(app, pilot) -> None:
