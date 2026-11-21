@@ -1627,6 +1627,11 @@ def shots(out: Path) -> None:
         async with app.run_test(size=(120, 36)) as pilot:
             await open_screen(app, pilot, screen)
             app.save_screenshot(f"{screen}-{theme.split('-')[1]}.svg", path=str(out))
+            if screen == "build":  # and the journey walked: an earlier step, and a goal not reached yet
+                for name, where in (("back", {"step": "plan"}), ("ahead", {"goal": 2})):
+                    app.look(**where)
+                    await pilot.pause(0.3)
+                    app.save_screenshot(f"{name}-{theme.split('-')[1]}.svg", path=str(out))
 
     try:
         out.mkdir(parents=True, exist_ok=True)
