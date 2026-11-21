@@ -91,7 +91,10 @@ effort = "medium"
 
 - Architect and reviewer: `low`, `medium`, `high`, `xhigh`, `max`.
 - Builders: `low`, `medium`, `high`, `max`. This is the effort of the first try. A retry climbs from there, so
-  `medium` gives `medium`, `high`, `max`.
+  `medium` gives `medium`, `high`, `max`, bounded by the efforts the configured tier allows (if a tier sets
+  `effort_param = ""` or an empty `efforts` list, no builder effort ladder is injected).
+- A builder model choice applies across all builder roles (`test_writer`, `implementer`, `checker`, `planner` —
+  whether configured as tables, strings, or omitted) and the default `[tiers]` entry.
 
 ## When a change takes effect
 

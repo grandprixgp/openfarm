@@ -216,22 +216,28 @@ or key is refused, so a typo cannot quietly switch a check off. The tables, budg
 
 ## What has been tested
 
-- **The offline suite:** 1,912 tests, all passing, on Python 3.14 and Linux. Some are skipped when a tool
+- **The offline suite:** 2,064 tests, all passing, on Python 3.14 and Linux. Some are skipped when an optional tool
   such as `tsc`, `ruff` or `bwrap` is not installed.
-- **A live run on 21 Nov 2026:** a fresh TypeScript project taken from one sentence to three accepted goals
-  inside the screen: 11 tasks, the project's 51 tests passing, Try it passing at desktop and phone size. The
-  last goal's four tasks all passed first time. Of the tokens spent, builders used 67%, reviewers 25% and the
-  Architect 7%. The recording at the top of this page is that project.
+- **Hardening & live dogfooding on 21 Nov 2026:**
+  - Real `bwrap` runner passing all 25 gates.
+  - Live Claude ACP + worker greenfield build, real headless Chromium `openfarm try`, and Journey TUI pilot (plus an
+    earlier 21 Nov 2026 live TypeScript run from one sentence to three accepted goals, 11 tasks, 51 passing tests,
+    Try it at desktop and phone size, 67% builders / 25% reviewers / 7% Architect tokens — the recording at the top).
+  - Circuit breaker halting runs mid-wave, concurrent `daemon` + CLI + `openfarm web`, `land --accept-blocked`,
+    `[factory] auto_land` + `--promote-integration`, `[notifications]` webhooks, `adopt`/`init`/`try` on Python 3.14,
+    and `openfarm bench run --dry-run`.
 - **Earlier live runs** are listed in the [changelog](CHANGELOG.md).
 
 Not tested yet:
 
 - The app in a real light-coloured terminal, and the mouse in a real terminal. Both are covered by tests only.
 - Real `go`, `vitest` and `jest` binaries. They are tested through stand-ins.
-- Building on a provider other than Command Code. The presets are tested and OpenRouter's model list was read
-  live, but whole projects have only been built on Command Code.
-- Antigravity as the Architect. It only runs when a person starts it, so openfarm does not plan with it.
-- Desktop notifications on a real desktop.
+- Building whole projects on a provider other than the configured live one (Command Code). The presets are tested and
+  OpenRouter's model list was read live, but whole projects have only been built on Command Code.
+- Unattended `agy` (Antigravity as the Architect). It only runs when a person starts it, so openfarm does not plan
+  with it.
+- Desktop `notify-send` notifications on a real desktop.
+- A different model for the Architect than for the reviewer in a live build (covered by tests only).
 
 ## What changed
 

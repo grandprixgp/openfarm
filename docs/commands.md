@@ -20,14 +20,14 @@ One `openfarm` CLI with **41 subcommands**, shared exit codes (`0` ok, `1` refus
 
 | Command | Purpose |
 | --- | --- |
-| `openfarm` / `openfarm auto` / `openfarm tui` | Launch the interactive Textual Workbench (`--curses` for stdlib fallback, `--once` for snapshot) |
+| `openfarm` / `openfarm auto` / `openfarm tui` | Launch the interactive Textual Workbench (`--curses` for stdlib fallback, `--once` for snapshot, `--view` for curses views `overview\|cards\|dossier\|board\|swarm\|harness\|ops` or legacy workbench views `studio\|review\|projects\|findings\|engine\|providers`) |
 | `openfarm plan [--draft]` | Display Cards-as-the-DAG topological tiers, parallel batches, and cycle checks (or draft a wave plan) |
 | `openfarm card [add\|show\|history\|skip\|migrate]` | Add, read and drop tasks where they live (the cards branch), see who changed one and why, or move an older project's cards and spec off `main` |
 | `openfarm try [--goal C1]` | Try it: start the app, screenshot it at desktop and phone size, and check the goal's content can be seen |
 | `openfarm check CARD [--baseline]` | Verify card eligibility, configured tooling, and optional green baseline |
 | `openfarm run` | Execute Ready cards (`--follow` to carry on into tasks that were waiting, `--cards`, `--card`, `--spend`, `--profile lean\|balanced\|strict`, `--for`, `--until`, `--dry-run`) |
-| `openfarm daemon [start\|stop\|status\|logs]` | Run and manage a detached background `openfarm run` session (`<state_dir>/daemon.log`) |
-| `openfarm web [--tailscale] [--bind HOST] [--port 8787]` | Serve the stdlib Factory Companion Web UI (loopback by default; `--tailscale` exposes HTTPS via `tailscale serve`; `--bind tailscale` binds tailnet IPv4) |
+| `openfarm daemon [start\|stop\|status\|logs]` | Run and manage a detached background `openfarm run` session (`start --follow` carries on into tasks that become ready; logs at `<state_dir>/daemon.log`) |
+| `openfarm web [--tailscale] [--bind HOST] [--port 8787]` | Serve the stdlib Factory Companion Web UI (loopback by default with `Host`/`Origin` and `X-Openfarm-Token` protection; `--tailscale` exposes HTTPS via `tailscale serve`; `--bind tailscale` binds tailnet IPv4) |
 | `openfarm status` | Show farm, card queue, and harness-memory status |
 | `openfarm pause` / `resume` / `stop` | Pause/resume claims, clear circuit breaker or kill switch, or stop an active run |
 
