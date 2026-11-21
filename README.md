@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.15.0-16a34a?style=flat-square" alt="version 0.15.0">
+  <img src="https://img.shields.io/badge/version-0.20.0-16a34a?style=flat-square" alt="version 0.20.0">
   <img src="https://img.shields.io/badge/status-pre--release-d97706?style=flat-square" alt="status: pre-release">
   <img src="https://img.shields.io/badge/python-3.11%2B-7c3aed?style=flat-square" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/core%20deps-stdlib%20only-0284c7?style=flat-square" alt="core dependencies: Python standard library only">
@@ -35,7 +35,7 @@
 </p>
 
 > [!IMPORTANT]
-> **Pre-release (v0.15.0).** `openfarm_core/` is **100% Python 3.11+ stdlib-only** (`dependencies = []`). An optional Textual workbench (`pip install "openfarm[tui]"`) automatically falls back to the stdlib `curses` TUI when Textual is not installed. Merges are strictly local-only (the core has **no `git push` code path**), and neither the TUI nor the Web Companion displays dollar spend.
+> **Pre-release (v0.20.0).** `openfarm_core/` is **100% Python 3.11+ stdlib-only** (`dependencies = []`). An optional Textual workbench (`pip install "openfarm[tui]"`) automatically falls back to the stdlib `curses` TUI when Textual is not installed. Merges are strictly local-only (the core has **no `git push` code path**), and neither the TUI nor the Web Companion displays dollar spend.
 
 ---
 
@@ -195,7 +195,17 @@ Security defaults:
 
 ---
 
-## What changed in v0.10.0–v0.15.0
+## What changed in v0.10.0–v0.20.0
+
+- **`v0.20.0` — Go anywhere on the journey, and what v0.15.0 left open:**
+  - **The journey can be walked**: `[` and `]`, the mouse, or `Ctrl+K` open any step already reached and any goal, as it stands. Looking changes nothing, a step not reached yet says what has to happen first, and `n` or `Esc` returns to the step that needs you.
+  - **Three more plan checks**, each with its repair shown on the Plan step: a task whose work needs the network without `network = true`, a task listing a test that already exists and passes, and a task that contradicts a test already in the project.
+  - **A build restarts by itself** after a builder's question is answered, a fix is applied or a task is retried.
+  - **Builders' questions are sorted first**: the Architect answers what it can from the spec, a note about tooling is filed, and only a question that is yours is shown as one.
+  - **Try it judges the first screen**, at desktop and phone size separately: what you would have to scroll to is not "seen". It also shows the page's main colours as swatches.
+  - **The token share counts the Architect** too (questions, spec, plans, fixes, answers), beside builders and reviewers.
+  - **Projects, providers and sign-in, settings and builders' notes** are panes of the one screen (`openfarm_tui/journey_more.py`). Nothing in `Ctrl+K` opens an older screen; `openfarm tui --view studio|review` still does.
+  - **The theme follows the terminal** by asking it for its background colour; `COLORFGBG` is only the fallback.
 
 - **`v0.15.0` — One screen, one home for tasks, try it:**
   - **One screen** (`openfarm_tui/journey.py`) replaces the five tabs: a journey rail (Idea, Questions, Spec, Plan, Build, Try it, Accept), the one thing in front of you, one main button that Enter presses, a fixed activity strip, and two themes. Which step shows is worked out from the project's state (`openfarm_tui/journey_state.py`), so reopening lands where the project is. The older screens are behind `Ctrl+K`.
