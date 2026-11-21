@@ -14,7 +14,7 @@ from pathlib import Path
 from rich.markup import escape as esc
 from textual import work
 from textual.app import ComposeResult
-from textual.containers import VerticalScroll
+from textual.containers import Horizontal, VerticalScroll
 from textual.widgets import Input, OptionList, Select, Static
 
 import openfarm_core
@@ -70,17 +70,17 @@ class MorePanes:
             yield Static("", id="prov-status", classes="card")
         with VerticalScroll(id="models"):
             yield Static("Models and effort", classes="h1")
-            yield Static("Which model does each job, and how hard it thinks. A choice for this project wins over one "
-                         "for every project.", classes="sub")
+            yield Static("Who does each job, and how hard it thinks. This project's choice wins.", classes="sub")
             yield Select([("Choose for this project", "project"), ("Choose for every project", "global")],
                          id="mod-scope", allow_blank=False)
             for role, what in (("architect", "ARCHITECT  writes the spec and the plan, answers builders"),
                                ("reviewer", "REVIEWER  checks and coaches every task"),
                                ("builder", "BUILDERS  write the tests and the code")):
                 yield Static(what, classes="label")
-                yield Input(placeholder="Model (empty: not chosen here)", id=f"mod-{role}-model")
-                yield Select([(effort, effort) for effort in model_choices.efforts_for(role)], id=f"mod-{role}-effort",
-                             prompt="Effort (not chosen here)")
+                with Horizontal(classes="mod-row"):  # model and effort side by side, so all three jobs fit one screen
+                    yield Input(placeholder="Model (empty: not chosen here)", id=f"mod-{role}-model")
+                    yield Select([(effort, effort) for effort in model_choices.efforts_for(role)],
+                                 id=f"mod-{role}-effort", prompt="Effort (not chosen)")
             yield Static("", id="mod-now", classes="card")
         with VerticalScroll(id="settings"):
             yield Static("Settings", classes="h1")
@@ -396,8 +396,8 @@ class MorePanes:
             lines.append(f"{model_choices.ROLE_WORDS[role]:<10} {esc(got['model'] or 'the provider default')}"
                          f"  [$foreground-muted]({words[got['model_from']]})[/]"
                          f"  ·  effort {got['effort'] or 'none'}  [$foreground-muted]({words[got['effort_from']]})[/]")
-        if self._mod_note:
-            lines += ["", self._mod_note]
+        if self._mod_note:  # first, so it is on screen without scrolling
+            lines = [self._mod_note, "", *lines]
         self.query_one("#mod-now", Static).update("\n".join(lines))
 
     def _actions_models(self):

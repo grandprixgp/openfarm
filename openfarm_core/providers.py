@@ -325,7 +325,7 @@ def probe_worker_endpoint(
     try:
         with urllib.request.urlopen(req, timeout=max(0.5, float(timeout_s))) as resp:
             status = int(getattr(resp, "status", 200) or 200)
-            raw = resp.read(512 * 1024).decode("utf-8", errors="replace")
+            raw = resp.read(16 * 1024 * 1024).decode("utf-8", errors="replace")
             try:
                 parsed = json.loads(raw)
             except ValueError:

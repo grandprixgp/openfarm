@@ -296,6 +296,9 @@ class Journey(MorePanes, App):
     OptionList { height: auto; max-height: 10; border: tall $panel; background: $surface; margin-bottom: 1; }
     OptionList:focus { border: tall $primary; }
     .card { border: round $panel; padding: 0 1; margin-bottom: 1; height: auto; }
+    .mod-row { height: auto; }
+    .mod-row Input { width: 2fr; }
+    .mod-row Select { width: 1fr; }
     .card.ok { border: round $success 60%; }
     .card.bad { border: round $error; }
     .card.ask { border: round $accent; }

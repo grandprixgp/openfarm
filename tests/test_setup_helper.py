@@ -27,7 +27,8 @@ class _Models(http.server.BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         type(self).seen.append({"path": self.path, "auth": self.headers.get("Authorization"),
                                 "zdr": self.headers.get("x-cmd-zdr")})
-        body = json.dumps({"data": [{"id": m} for m in MODELS]}).encode()
+        # as long as a big provider's real list (several MB): it used to be cut at 512 KB and read as no models
+        body = json.dumps({"data": [{"id": m, "description": "x" * 400_000} for m in MODELS]}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
@@ -114,13 +115,24 @@ class SetupTests(unittest.TestCase):
         self.assertIn("2. acme/coder-2", text)
         self.assertIn("Everything is ready", text)
         self.assertEqual(result["choices"], {"architect": {"model": "opus", "effort": "xhigh"},
-                                             "reviewer": {"model": "", "effort": "medium"},
                                              "builder": {"model": "", "effort": "high"}})
         saved = load_global_providers()["worker"]
         self.assertEqual((saved["preset"], saved["endpoint"], saved["model"], saved["zdr"]),
                          ("custom", self.address, "acme/coder-2", True))
         with self.assertRaises(StopIteration):  # every prepared answer was asked for, and no more
             next(answers)
+
+    def test_a_long_model_list_is_narrowed_by_typing_part_of_a_name(self) -> None:
+        from openfarm_core.setup_helper import _pick_model
+
+        models = [f"vendor{n}/chat-{n}" for n in range(60)] + ["acme/coder-1", "acme/coder-2"]
+        answers = iter(["coder", "2"])
+        said: list[str] = []
+        self.assertEqual(_pick_model(lambda prompt: next(answers), said.append, models, "old/model"), "acme/coder-2")
+        self.assertIn("62 models. Type part of a name", said[0])
+        self.assertIn("  1. acme/coder-1", said)
+        self.assertEqual(_pick_model(lambda prompt: "", said.append, models, "old/model"), "old/model")  # Enter keeps
+        self.assertEqual(_pick_model(lambda prompt: "brand/new", said.append, models, "old/model"), "brand/new")
 
     def test_an_address_that_does_not_answer_is_said_and_setup_still_saves(self) -> None:
         said: list[str] = []

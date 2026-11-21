@@ -48,7 +48,7 @@ def _pick(ask, out, title: str, options: list[str], default: str, *, free: bool 
             out(title)
             for number, option in enumerate(options, 1):
                 out(f"  {number}. {option}{'   (now)' if option == default else ''}")
-            said = ask(f"  Number{', or type a name' if free else ''} [{default or 'none'}]: ").strip()
+            said = ask(f"  Number{', or type a name' if free else ''} [{default or 'not chosen'}]: ").strip()
         else:
             said = ask(f"{title} [{default or 'none'}]: ").strip()
         if not said:
@@ -138,7 +138,9 @@ def run_setup(args, *, ask=input, secret=None, out=print, signed_in=None, sign_i
     # 3. what the builders' address offers
     listed = catalogue(timeout_s=float(flag("timeout") or 8.0))
     models = listed["builder"]["models"]
-    if listed["builder"]["ok"]:
+    if listed["builder"]["ok"] and not models:
+        out("\n3. The builders' address answered, but not with a list of models. The model is taken as typed.")
+    elif listed["builder"]["ok"]:
         out(f"\n3. The builders' address answered and lists {len(models)} model(s).")
     else:
         out(f"\n3. The builders' address did not answer ({listed['builder']['error'] or 'no reason given'}). "
@@ -171,7 +173,8 @@ def run_setup(args, *, ask=input, secret=None, out=print, signed_in=None, sign_i
         if effort is None:
             effort = had.get("effort", "")
             if not quiet:
-                effort = _pick(ask, out, f"  {mc.ROLE_WORDS[role]}: effort", list(mc.efforts_for(role)), effort or "medium")
+                # Enter with nothing chosen leaves it unchosen, so each project's own setting still applies
+                effort = _pick(ask, out, f"  {mc.ROLE_WORDS[role]}: effort", list(mc.efforts_for(role)), effort)
         mc.save_choice(target, role, model=model or "", effort=effort or "")
 
     result = {"frontier": frontier, "signed_in": ready, "preset": preset, "endpoint": endpoint, "zdr": zdr,
