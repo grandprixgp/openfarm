@@ -23,6 +23,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.command import Hit, Hits, Provider
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.theme import Theme
 from textual.widgets import Button, ContentSwitcher, Input, OptionList, Select, Static, TextArea
@@ -532,6 +533,8 @@ class Journey(App):
         self._render_activity()
 
     def _render_activity(self) -> None:
+        if self._gone():
+            return
         self.query_one("#activity", Static).update("\n".join(esc(line) for line in self.activity[-3:]))
         if self.overlay == "log":
             self.query_one("#log-text", Static).update("\n".join(esc(line) for line in self.activity) or "Nothing yet.")
@@ -586,7 +589,13 @@ class Journey(App):
 
     # -- which screen, and drawing it --------------------------------------------
 
+    def _gone(self) -> bool:
+        """A timer or a finished thread can call in after the window has gone: there is nothing to draw on."""
+        return not self._screen_stack or self._exit or self._closing or self._closed
+
     def refresh_screen(self, focus: bool = False) -> None:
+        if self._gone():
+            return
         self.real = self.facts = gather(self.repo, self.config_path)
         picked = screen_for(self.facts)
         self.now = picked["screen"]
@@ -732,10 +741,15 @@ class Journey(App):
         self.query_one("#busy", Static).update(text)
 
     def _tick(self) -> None:
+        if self._gone():
+            return
         if self.busy:
             self._draw_busy()
         elif len(self.screen_stack) == 1 and self.facts.get("cfg") is not None:
-            self.refresh_screen()  # picks up what a running build did
+            try:
+                self.refresh_screen()  # picks up what a running build did
+            except NoMatches:  # the window is being taken down under this tick: nobody is left to show it to
+                pass
 
     def _show_actions(self, primary: tuple | None, secondary: list[tuple]) -> None:
         # Nothing is cut off: what doesn't fit beside the main button stays on its key and under Ctrl+K.
@@ -771,7 +785,7 @@ class Journey(App):
 
     def _focus_for_screen(self) -> None:
         """One focus: the input the user needs, else the main button."""
-        if len(self.screen_stack) > 1:
+        if self._gone() or len(self.screen_stack) > 1:
             return
         if self.busy or self.failure:  # the way forward is the button
             target = "#go" if self.failure else "#act-3"
@@ -790,10 +804,14 @@ class Journey(App):
             widget = self.query_one(selector)
             if widget.display and not widget.has_class("hidden") and not getattr(widget, "disabled", False):
                 widget.focus()
+                if self.screen_name == "board" and not self.busy:  # its main button names the row the focus landed on
+                    self.call_after_refresh(lambda: self._gone() or self._show_actions(*self._actions()[:2]))
                 return
 
     def _follow_needs(self) -> None:
         """Move the build list to the task that needs the user, once each time that task changes."""
+        if self._gone():
+            return
         tasks = self.facts.get("tasks") or []
         questions = self.facts.get("questions") or []
         needs = self._first("in_review") or next((t for t in tasks if questions and t["id"] == questions[0]["from_card"]),
@@ -1128,6 +1146,13 @@ class Journey(App):
         self._following = True
         self._build_bg("")
 
+    def _resume_build(self) -> None:
+        """The user just unblocked a task: the build goes back to work without a second press."""
+        self.refresh_screen(focus=True)
+        waiting = [t for t in self.facts["tasks"] if t["state"] == "ready"]
+        if waiting and not self._following and not self.facts["running"] and not self._refusal():
+            self.do_build()
+
     def _refusal(self) -> str:
         cfg = self._cfg()
         state = StateDir(cfg.state_dir)
@@ -1361,7 +1386,7 @@ class Journey(App):
             if store.states().get(target) == "blocked":
                 store.change_card(target, "retry", why="its question was answered")
             self.say(f"You answered {target}'s question; it is back in the queue")
-            self.refresh_screen(focus=True)
+            self._resume_build()
 
         self.push_screen(AskModal(f"{finding['from_card']} asks: {finding['title']}",
                                   (finding.get("body") or finding.get("body_preview") or "")[:3000]), answered)
@@ -1448,7 +1473,7 @@ class Journey(App):
         self.say(f"{self.task_id}: fix applied, " + ("back in the queue" if outcome["state"] == "ready"
                                                     else "but it still fails the plan checks"))
         self.overlay = ""
-        self.refresh_screen(focus=True)
+        self._resume_build()
 
     def do_ask_fix(self) -> None:
         task = self._find()
@@ -1466,7 +1491,7 @@ class Journey(App):
         self.say(f"{self.task_id} is back in the queue" if outcome["state"] == "ready"
                  else f"{self.task_id} still fails the plan checks")
         self.overlay = ""
-        self.refresh_screen(focus=True)
+        self._resume_build()
 
     def do_skip_task(self) -> None:
         def skipped(why: str | None) -> None:
@@ -1790,7 +1815,7 @@ class Journey(App):
 
     @on(OptionList.OptionHighlighted)
     def _row_moved(self, event: OptionList.OptionHighlighted) -> None:
-        if self.screen_name == "board" and not self.busy:
+        if self.screen_name == "board" and not self.busy and not self._gone():
             self._show_actions(*self._actions()[:2])
 
     def action_column(self, step: int) -> None:

@@ -141,6 +141,8 @@ def build_project(base: Path, stage: str) -> Path:
               "blocked": ["done", "done", "ready", "blocked"], "try": ["done"] * 4, "accept": ["done"] * 4}[stage]
     for path, state in zip(sorted((FIXTURES / "dogfood-w1").glob("W1-*.md")), states):
         header, body = parse_card_file(path.read_text())
+        if stage != "plan" and path.stem == "W1-03":
+            header = dict(header, network=True)  # the server task, as the plan step marked it
         if state == "ready":
             store.change_card(path.stem, "create", by="architect", header=header, body=body)
         else:
@@ -214,7 +216,9 @@ async def open_screen(app, pilot, screen: str) -> None:
     elif overlay:
         task = "W1-04" if overlay == "blocked" else "W1-02"
         app._open(overlay, task)
+    await pilot.pause()  # until what the screen queued for itself has run, however busy the machine
     await pilot.pause(0.2)
+    await pilot.pause()
 
 
 @unittest.skipUnless(textual_available(), "textual optional extra not installed")
@@ -276,6 +280,8 @@ class ScreenTests(_Folder):
                 self.assertEqual(len(app.query("#actions Button.-primary")), 1, where)
                 self.assertIs(list(app.query("#actions Button"))[-1], app.query_one("#go"), f"{where}: main button last")
                 self.assertTrue(str(app.query_one("#keys").render()).endswith("Ctrl+K everything else"), where)
+                await pilot.pause()  # a busy machine lays the buttons out a moment after their words change
+                await pilot.pause(0.2)
                 self._fits(app, size, screen)
 
         for screen in SCREENS:
@@ -325,6 +331,9 @@ class FlowTests(_Folder):
         self.opened = mock.patch("openfarm_tui.journey.open_architect_backend", return_value=(self.backend, "Claude"))
         self.opened.start()
         self.addCleanup(self.opened.stop)
+        self.builds = mock.patch("openfarm_tui.journey.start_daemon")  # no test starts a real build by accident
+        self.started = self.builds.start()
+        self.addCleanup(self.builds.stop)
 
     def drive(self, stage: str, body, size=(120, 36)) -> None:
         async def run() -> None:
@@ -538,13 +547,21 @@ class FlowTests(_Folder):
         async def body(app, pilot) -> None:
             from openfarm_core.store import Store
 
-            self.assertNotIn("may use the network", str(app.query_one("#plan-checks").render()))
+            # the plan step marked the server task itself, and says so twice: as a repair, and as a warning
+            box = str(app.query_one("#plan-checks").render())
+            self.assertIn("✓ A task that needs the network says so", box)
+            self.assertIn("Repaired W1-03: marked as allowed to use the network", box)
+            self.assertIn("W1-03 may use the network", box)
+            self.assertNotIn("W1-02 may use the network", box)
             store = Store(app.repo, app.facts["cfg"])
+            self.assertIs(store.read("W1-03")[0]["network"], True)
             header, text = store.read("W1-03")
-            store.src._write("W1-03", dict(header, network=True), text, "W1-03: it is the server")
+            store.change_card("W1-03", "edit", why="unmarked by hand", apply=lambda h, b: ({k: v for k, v in h.items() if k != "network"}, b))
             app.refresh_screen()
             await pilot.pause(0.1)
-            self.assertIn("W1-03 may use the network", str(app.query_one("#plan-checks").render()))
+            box = str(app.query_one("#plan-checks").render())  # taken off by hand: parked, with the reason
+            self.assertIn("✗ A task that needs the network says so", box)
+            self.assertIn("not marked `network = true`", box)
 
         self.drive("plan", body)
 
@@ -698,6 +715,9 @@ class FlowTests(_Folder):
             self.assertIn("openfarm-iotd/1.0", store.read("W1-01")[1])
             self.assertNotEqual(store.read("W1-01")[0]["state"], "blocked")  # back in the plan, re-checked
             self.assertEqual(app.facts["questions"], [])
+            await self.settle(app, pilot)
+            self.started.assert_called_once()  # and the build goes back to work without being told to
+            self.assertIn("Starting the build", "\n".join(app.activity))
 
         self.drive("build", body)
 
