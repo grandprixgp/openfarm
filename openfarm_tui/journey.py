@@ -1892,13 +1892,18 @@ class Journey(MorePanes, App):
         store = open_store(self.repo, cfg)
         header, body = store.read(task["id"])
         glyph, colour, words = self._state_words(task)
-        out = [f"[b]{esc(task['id'])} · {esc(task['title'])}[/]   [{colour}]{glyph} {esc(words)}[/]", "",
-               "[b]Spec[/]", esc(body.strip()), "", "[b]Tests[/]"]
+        out = [f"[b]{esc(task['id'])} · {esc(task['title'])}[/]   [{colour}]{glyph} {esc(words.replace(' (Space: why)', ''))}[/]", ""]
+        if task["state"] == "backlog":  # "Space: why" is answered first, not under the spec
+            out += ["[b]Why it can't be built yet[/]",
+                    *([f"  [$error]✗[/] {esc(r)}" for r in task["parked"]] or ["  A plan check held it back, and left no reason."]),
+                    "[$foreground-muted]  Esc, then Repair asks the Architect to fix it (offered once nothing is being built), "
+                    "or e to edit the task yourself.[/]", ""]
+        out += ["[b]Spec[/]", esc(body.strip()), "", "[b]Tests[/]"]
         out += [f"  {esc(t.get('name', ''))}  [$foreground-muted]{esc(t.get('file', ''))}[/]" for t in header.get("tests") or []] or ["  none named"]
         out += ["", "[b]Files it may touch[/]", *[f"  {esc(f)}" for f in task["files"]]]
-        if task["repairs"] or task["parked"]:
+        if task["repairs"] or (task["parked"] and task["state"] != "backlog"):
             out += ["", "[b]Plan checks[/]", *[f"  [$accent]↻[/] {esc(r)}" for r in task["repairs"]],
-                    *[f"  [$error]✗[/] {esc(r)}" for r in task["parked"]]]
+                    *[f"  [$error]✗[/] {esc(r)}" for r in task["parked"] if task["state"] != "backlog"]]
         tries = records(cfg.state_dir, task["id"])
         if task["triage"]:
             out += ["", "[b]Why it stopped[/]", esc(task["triage"]["why"])]

@@ -613,6 +613,10 @@ class FlowTests(_Folder):
             text = str(app.query_one("#details-text").render())
             for part in ("W1-04", "Spec", "Tests", "Plan checks", "History", "openfarm/preflight", "Diff"):
                 self.assertIn(part, text)
+            # "Space: why" is answered before the spec, where it used to sit below three sections
+            self.assertLess(text.index("Why it can't be built yet"), text.index("Spec"))
+            self.assertLess(text.index("W1-03 serves the page with `#art`"), text.index("Spec"))
+            self.assertNotIn("(Space: why)", text)
             await pilot.press("escape")
             await pilot.pause(0.1)
             self.assertEqual(app.screen_name, "plan")
