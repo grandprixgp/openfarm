@@ -265,7 +265,7 @@ print(json.dumps(out))
         }
         argv = confine_lib.boundary_argv(
             [str(self.fake), json.dumps(targets), str(Path.home()), str(self.outside),
-             str(self.tmp / "beside-the-mounts.txt")],
+             "/beside-the-mounts.txt"],
             session_dir=self.session, home_dir=self.home,
             hide_globs=["seams/**", "*.secret"],
         )
