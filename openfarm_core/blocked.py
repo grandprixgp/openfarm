@@ -225,7 +225,8 @@ def _spec(root: Path, cfg) -> str:
 def settle_question(root: Path, cfg, store, finding: dict, backend=None) -> dict:
     """Decide who a builder's question is for, and deal with it when it is not the owner's.
 
-    Returns `{"for": "owner" | "architect" | "nobody", "answer"}`. A note about the tooling is filed and nobody is
+    Returns `{"for": "owner" | "architect" | "nobody", "answer", "retried"}`. `retried` is False when the task had
+    already stopped the same way twice running: answering again would only build it again. A note about the tooling is filed and nobody is
     asked. A question the spec, the task or the code settles is answered by the Architect: the answer goes into the
     task, as the owner's would, and a stopped task goes back in the queue. Only a choice about what the product
     should do or look like, which nothing written settles, is left for the owner, and is marked so it is asked once.
@@ -270,9 +271,15 @@ def settle_question(root: Path, cfg, store, finding: dict, backend=None) -> dict
     store.change_card(target, "edit", by="architect", why=f"the Architect's answer to its question ({fid})",
                       apply=lambda h, b: (h, b.rstrip() + f"\n\n## Answer from the Architect\n\n{title}\n\n{answer}\n"))
     decide_finding(root, cfg, fid, "folded", reason=answer, target_card=target)
+    retried = False
     if store.states().get(target) == "blocked":
-        store.change_card(target, "retry", by="architect", why="its question was answered")
-    return {"for": "architect", "answer": answer}
+        runs = records(cfg.state_dir, target)
+        same = len(runs) >= 2 and all(
+            (runs[-1].get(key) or "") == (runs[-2].get(key) or "") for key in ("stop_code", "detail"))
+        if not same:  # stopped the same way twice: an answer did not help, so the task waits for a person
+            store.change_card(target, "retry", by="architect", why="its question was answered")
+            retried = True
+    return {"for": "architect", "answer": answer, "retried": retried}
 
 
 def given_back(record: dict | None) -> bool:

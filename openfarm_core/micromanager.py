@@ -1818,6 +1818,14 @@ class Micromanager:
 
                 problem = typescript_scaffold_edit_problem(
                     edit.format, edit.search or "", edit.replace or "", edit.content)
+                if problem.startswith("a parameter default"):
+                    # The repair the plan check makes to a task's words, made to the stub: `n = 3` becomes `n?`.
+                    from .packs.typescript import typescript_without_param_defaults
+
+                    content = None if edit.content is None else typescript_without_param_defaults(edit.content)
+                    replace = typescript_without_param_defaults(edit.replace or "")
+                    if not typescript_scaffold_edit_problem(edit.format, edit.search or "", replace, content):
+                        edit.content, edit.replace, problem = content, replace, ""
                 if problem:
                     raise Refused(
                         "scaffold-missing-todo",

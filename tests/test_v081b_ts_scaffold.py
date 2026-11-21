@@ -112,9 +112,35 @@ class ScaffoldGrammarTests(unittest.TestCase):
         for label, text in REFUSED.items():
             with self.subTest(label):
                 self.assertNotEqual(typescript_scaffold_problem(text), "")
+                if label == "a parameter default":
+                    continue  # the grammar refuses it; the stub is repaired, see the test below
                 with self.assertRaises(Refused) as caught:
                     _scaffold({"format": "whole_file", "content": text})
                 self.assertEqual(caught.exception.code, "scaffold-missing-todo")
+
+    def test_a_parameter_default_is_taken_out_of_the_stub_not_refused(self) -> None:
+        # the v0.20 live run: the plan check had made `n` optional in the task, the stub came back with
+        # `n: number = 3` anyway, was refused, and the task stopped three times over
+        from openfarm_core.packs.typescript import typescript_without_param_defaults
+
+        stub = ('// n = 3 by default\n'
+                'export function pickNotable(entries: WikiEntry[], n: number = 3): Notable[] {\n'
+                '  throw new Error("not = implemented");\n}\n'
+                'export async function get(kind: "a" | "b", opts: { ua?: string } = {}, f: typeof fetch = fetch, sep = ","): '
+                'Promise<Map<string, number>> { throw new Error("no"); }\n')
+        [edit] = _scaffold({"format": "whole_file", "content": stub})
+        self.assertIn("pickNotable(entries: WikiEntry[], n?: number): Notable[]", edit.content)
+        self.assertIn('get(kind: "a" | "b", opts?: { ua?: string }, f?: typeof fetch, sep?): Promise<Map<string, number>>',
+                      edit.content)
+        self.assertIn("// n = 3 by default", edit.content)  # comments and strings are left alone
+        self.assertIn('"not = implemented"', edit.content)
+        self.assertEqual(typescript_scaffold_problem(edit.content), "")
+        [edit] = _scaffold({"format": "whole_file", "content": "export function f(a = evil()) { throw new Error(); }\n"})
+        self.assertEqual(edit.content, "export function f(a?) { throw new Error(); }\n")  # the code that ran is gone
+        self.assertEqual(typescript_without_param_defaults("export const f = (a: number): void => { throw new Error('x'); };"),
+                         "export const f = (a: number): void => { throw new Error('x'); };")
+        with self.assertRaises(Refused):  # anything else wrong with it is still refused
+            _scaffold({"format": "whole_file", "content": "export function f(a = 1) { return a; }\n"})
 
 
 class SearchReplaceTests(unittest.TestCase):

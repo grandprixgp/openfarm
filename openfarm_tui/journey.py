@@ -1196,8 +1196,10 @@ class Journey(MorePanes, App):
     def _question_sorted(self, finding: dict, outcome: dict) -> None:
         who = finding["from_card"]
         if outcome["for"] == "architect":
-            self.say(f"{who} asked a question the Architect could answer; the answer is in the task")
-            return self._resume_build()
+            if outcome.get("retried", True):
+                self.say(f"{who} asked a question the Architect could answer; the answer is in the task")
+                return self._resume_build()
+            self.say(f"{who} asked a question the Architect answered, but it has stopped the same way twice: it waits for you")
         if outcome["for"] == "nobody":
             self.say(f"{who} left a note about the tooling; it is filed with the builders' notes")
         self.refresh_screen()

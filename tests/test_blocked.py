@@ -218,6 +218,48 @@ class FixTests(_Project):
         self.assertEqual(self.store.read("W1-01")[0]["state"], "blocked")
         self.assertNotIn("Answer from", self.store.read("W1-01")[1])
 
+    def test_an_answer_does_not_rebuild_a_task_that_stopped_the_same_way_twice(self) -> None:
+        # v0.20 live run: a task stopped three times for one reason while each try's question was answered and retried
+        from openfarm_core.blocked import settle_question
+
+        def stopped(run: str, detail: str) -> None:
+            folder = Path(self.cfg.state_dir) / "cards" / "W1-01" / run
+            folder.mkdir(parents=True)
+            (folder / "card-record.json").write_text(json.dumps(
+                {"card_id": "W1-01", "claimed_at": run, "final_state": "blocked", "stop_code": "refused", "detail": detail}))
+
+        asked = []
+
+        def answered(title: str) -> dict:
+            from openfarm_core.findings import list_findings
+
+            if not asked:
+                finding = self._question(title, "It is not said.")
+            else:
+                fid = f"FIND-{len(asked) + 1}"
+                self.store.src._write(fid, {"id": fid, "title": title, "state": "backlog", "category": "finding",
+                                            "from_card": "W1-01"}, "It is not said.", f"{fid}: asked")
+                finding = next(f for f in list_findings(self.root, self.cfg)["findings"] if f["id"] == fid)
+            asked.append(title)
+            return settle_question(self.root, self.cfg, self.store, finding,
+                                   backend=lambda prompt: json.dumps({"for": "architect", "answer": "Do it the plain way."}))
+
+        stopped("run-1", "the test writer left the allowed paths: src/select.ts")
+        first = answered("Which way round?")
+        self.assertEqual(self.store.read("W1-01")[0]["state"], "ready")
+        self.assertTrue(first["retried"])  # one stop: the answer may be what was missing
+        header, text = self.store.read("W1-01")
+        self.store.src._write("W1-01", dict(header, state="blocked"), text, "W1-01: blocked again")
+        stopped("run-2", "the test writer left the allowed paths: src/select.ts")
+        second = answered("And the other thing?")
+        self.assertEqual((second["for"], second["retried"]), ("architect", False))
+        header, body = self.store.read("W1-01")
+        self.assertEqual(header["state"], "blocked")  # it waits for a person now
+        self.assertEqual(body.count("## Answer from the Architect"), 2)  # the answer is still kept
+        self.assertEqual(self._waiting(), [])
+        stopped("run-3", "the reviewer turned the work down")
+        self.assertTrue(answered("A third thing?")["retried"])  # a different stop is a new situation
+
     def test_with_no_architect_the_question_goes_to_the_owner(self) -> None:
         from openfarm_core.blocked import settle_question
 
