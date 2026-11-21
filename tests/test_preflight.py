@@ -286,3 +286,13 @@ class PlanTests(unittest.TestCase):
         self.assertTrue(plan["W1-02"]["eligible"], plan["W1-02"]["failures"])
         self.assertEqual(self.store.read("W1-02")[0]["state"], "ready")
         self.assertIn({"check": "forbidden", "status": "pass"}, plan["_checks"])
+
+
+class LanguageWordTests(unittest.TestCase):
+    def test_a_word_of_the_language_is_not_something_a_task_renames(self) -> None:
+        # v0.20 goal 3 run: "returns `undefined` instead of ..." gave the task leave to change three unrelated tests
+        from openfarm_core.preflight import _spellings
+
+        for word in ("undefined", "null", "Promise", "string"):
+            self.assertEqual(_spellings(word), [], word)
+        self.assertEqual(_spellings("pickNotable"), ["pickNotable"])

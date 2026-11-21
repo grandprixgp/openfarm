@@ -389,6 +389,11 @@ def _existing_tests(root: Path, limit: int = 400) -> list[str]:
     return sorted(out)
 
 
+_LANGUAGE_WORDS = frozenset(
+    "undefined null true false void never unknown string number boolean object symbol bigint Date Error Promise "
+    "Array Map None True False self this async await const return export import function class".split())
+
+
 def _spellings(span: str) -> list[str]:
     """The ways a test would write the thing a card names: `#hero` is also `id="hero"`."""
     span = span.strip()
@@ -396,7 +401,8 @@ def _spellings(span: str) -> list[str]:
     if found:
         name = found.group(1) or found.group(2)
         return [f'id="{name}"', f"id='{name}'", f'id=\\"{name}\\"', f"#{name}"]
-    return [span] if len(span) >= 4 and not _PATH.match(span) else []
+    # a word of the language is in every test: naming `undefined` on a "replace" line renames nothing
+    return [span] if len(span) >= 4 and not _PATH.match(span) and span not in _LANGUAGE_WORDS else []
 
 
 def _check_frozen(card: Card, root: Path) -> dict:
