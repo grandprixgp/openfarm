@@ -482,6 +482,7 @@ def initialize_project(
                 f"    return {_toml_str(project_slug)}\n\n\n"
                 '__all__ = ["SCHEMA_VERSION", "ensure_non_empty_label", "project_name"]\n'
             ),
+            "tests/__init__.py": "",
             "tests/test_baseline.py": (
                 "import sys\n"
                 "import unittest\n"

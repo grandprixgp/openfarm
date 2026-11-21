@@ -252,6 +252,7 @@ class Store:
                     self.src._write(card_id, header, body, msg, commit=False)
                     self._note(card_id, kind, by, why, {"state": [state, new_state]})
                     Git(self.src.worktree).commit_all(msg)
+                    return self._outcome(card_id, header, [])
                 elif kind in ("release", "retry"):
                     self.src.release(card_id, reason=why)
                     header, body = self.read(card_id)

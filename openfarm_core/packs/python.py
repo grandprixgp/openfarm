@@ -79,9 +79,12 @@ _UNITTEST_TOP_SCRIPT = (
 #: Lists unittest ids, one per line, without running anything. Import failures
 #: are printed as `ERROR <id>` so a listing never silently shrinks.
 _LIST_SCRIPT = (
-    "import sys, unittest\n"
+    "import os, sys, unittest\n"
     "start, top = sys.argv[1], sys.argv[2]\n"
-    "suite = unittest.defaultTestLoader.discover(start, top_level_dir=top)\n"
+    "use_top = top if (not os.path.isdir(start) or os.path.isfile(os.path.join(start, '__init__.py'))) else None\n"
+    "if use_top is None and top and top != '.':\n"
+    "    sys.path.insert(0, os.path.abspath(top))\n"
+    "suite = unittest.defaultTestLoader.discover(start, top_level_dir=use_top)\n"
     "def walk(item):\n"
     "    if isinstance(item, unittest.TestSuite):\n"
     "        for child in item:\n"
@@ -280,8 +283,15 @@ class PythonPack(OwnMutationMixin, Pack):
             self.notes.append(note)
 
     def try_it(self, worktree: Path) -> dict:
-        for main in sorted(Path(worktree).glob("*/__main__.py")) + sorted(Path(worktree).glob("src/*/__main__.py")):
+        root = Path(worktree)
+        for main in sorted(root.glob("*/__main__.py")):
             return {"kind": "cli", "sample": [self.python, "-m", main.parent.name, "--help"]}
+        for main in sorted(root.glob("src/*/__main__.py")):
+            return {
+                "kind": "cli",
+                "sample": [self.python, "-m", main.parent.name, "--help"],
+                "env": {"PYTHONPATH": str(root / "src")},
+            }
         return {}
 
     def configure(self, worktree: Path) -> None:
@@ -313,6 +323,14 @@ class PythonPack(OwnMutationMixin, Pack):
         start = self.test_dir if top == "." else f"{top}/{self.test_dir}"
         return start, top
 
+    def _start_is_package(self, start: str) -> bool:
+        """True unless `start` exists on disk as a plain directory without `__init__.py`."""
+        worktree = getattr(self, "worktree", None)
+        if worktree is None:
+            return True
+        start_dir = Path(worktree) / start
+        return not start_dir.is_dir() or (start_dir / "__init__.py").is_file()
+
     def commands(self, purpose: str, unit: str = "", tests: list[str] | None = None,
                  files: list[str] | None = None,
                  extra_flags: list[str] | None = None) -> dict:
@@ -320,6 +338,7 @@ class PythonPack(OwnMutationMixin, Pack):
         extra = list(extra_flags or [])
         start, top = self._roots(unit)
         py = self.python
+        py_env = {"PYTHONDONTWRITEBYTECODE": "1"}
 
         if purpose == "test":
             if self.runner == "pytest":
@@ -331,7 +350,7 @@ class PythonPack(OwnMutationMixin, Pack):
                     argv.append(top)
                 if tests:
                     argv += ["-k", " or ".join(str(t) for t in tests)]
-                return {"argv": argv + extra}
+                return {"argv": argv + extra, "env": py_env}
             if files:
                 modules = [_module_of(str(f), top) for f in files]
                 k_flags: list[str] = []
@@ -339,12 +358,18 @@ class PythonPack(OwnMutationMixin, Pack):
                     k_flags += ["-k", str(name)]
                 if top != ".":
                     return {"argv": [py, "-c", _UNITTEST_TOP_SCRIPT, top,
-                                     "-v", *k_flags, *modules] + extra}
-                return {"argv": [py, "-m", "unittest", "-v", *k_flags, *modules] + extra}
-            argv = [py, "-m", "unittest", "discover", "-s", start, "-t", top, "-v"]
+                                     "-v", *k_flags, *modules] + extra, "env": py_env}
+                return {"argv": [py, "-m", "unittest", "-v", *k_flags, *modules] + extra,
+                        "env": py_env}
+            argv = [py, "-m", "unittest", "discover", "-s", start]
+            if self._start_is_package(start):
+                argv += ["-t", top]
+            elif top != "." and self.worktree is not None:
+                py_env["PYTHONPATH"] = str((Path(self.worktree) / top).resolve())
+            argv.append("-v")
             for name in tests or []:
                 argv += ["-k", str(name)]
-            return {"argv": argv + extra}
+            return {"argv": argv + extra, "env": py_env}
 
         if purpose == "list":
             if self.runner == "pytest":
@@ -352,23 +377,23 @@ class PythonPack(OwnMutationMixin, Pack):
                         "-p", "no:cacheprovider", "--color=no"]
                 if top != ".":
                     argv.append(top)
-                return {"argv": argv + extra}
-            return {"argv": [py, "-c", _LIST_SCRIPT, start, top] + extra}
+                return {"argv": argv + extra, "env": py_env}
+            return {"argv": [py, "-c", _LIST_SCRIPT, start, top] + extra, "env": py_env}
 
         if purpose in ("lint", "ws-lint", "typecheck"):
             root = "." if purpose == "ws-lint" else top
             argv = [py, "-c", _CHECK_SCRIPT, root]
             if self.use_ruff and purpose != "typecheck":
                 argv.append("ruff")
-            return {"argv": argv + extra}
+            return {"argv": argv + extra, "env": py_env}
 
         if purpose == "build":
-            return {"argv": [py, "-c", _CHECK_SCRIPT, top] + extra}
+            return {"argv": [py, "-c", _CHECK_SCRIPT, top] + extra, "env": py_env}
 
         if purpose in ("format", "fmt-check"):
             if not self.use_ruff:
                 # Nothing to format with: an honest no-op, named in the dossier.
-                return {"argv": [py, "-c", "pass"]}
+                return {"argv": [py, "-c", "pass"], "env": py_env}
             names = [str(f) for f in (files or [])]
             argv = ["ruff", "format", "--no-cache", *self._ruff_config_args(names)]
             if purpose == "fmt-check":
@@ -378,7 +403,8 @@ class PythonPack(OwnMutationMixin, Pack):
         if purpose == "mutation":
             # openfarm's own mutation runner (v0.8.5): the card's named tests
             # against small changes to the production files it changed.
-            return {"argv": self._own_mutation_argv(files, tests, unit=unit) + extra}
+            return {"argv": self._own_mutation_argv(files, tests, unit=unit) + extra,
+                    "env": py_env}
 
         return {"argv": list(extra)}
 
@@ -453,7 +479,12 @@ class PythonPack(OwnMutationMixin, Pack):
         if "::" in binary or "/" in head:
             return None
         module = head.rpartition(".")[0]
-        return module.replace(".", "/") + ".py" if module else None
+        rel = module.replace(".", "/") + ".py" if module else None
+        if rel and self.worktree is not None and not (self.worktree / rel).is_file():
+            under_tests = f"{self.test_dir}/{rel}"
+            if (self.worktree / under_tests).is_file():
+                return under_tests
+        return rel
 
 
     # -- files ----------------------------------------------------------------

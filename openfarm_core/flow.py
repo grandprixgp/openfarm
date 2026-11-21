@@ -2592,7 +2592,10 @@ class CardRun:
         for path in self._test_paths():
             full = self.worktree / path
             if full.exists():
-                out[path] = full.read_text()
+                try:
+                    out[path] = full.read_text()
+                except UnicodeDecodeError:
+                    out[path] = "<binary file>"
         return out
 
     # -- step 6: named tests exist, and fail before the code ------------------
@@ -3054,7 +3057,10 @@ class CardRun:
         for path in self.frozen_tests:
             full = self.worktree / path
             if full.exists():
-                out[path] = full.read_text()
+                try:
+                    out[path] = full.read_text()
+                except UnicodeDecodeError:
+                    out[path] = "<binary file>"
         return out
 
     def _stash_diff(self) -> dict:
@@ -3462,7 +3468,14 @@ class CardRun:
         commit = ref or self.base_commit
         for path in paths:
             if at_base:
-                content = self.git.show_blob(f"{commit}:{path}")
+                raw_blob = self.git.show_blob_bytes(f"{commit}:{path}")
+                if raw_blob is None:
+                    content = None
+                else:
+                    try:
+                        content = raw_blob.decode("utf-8")
+                    except UnicodeDecodeError:
+                        content = None
             else:
                 full = self.worktree / path
                 try:
@@ -3692,11 +3705,11 @@ class CardRun:
                     overlay = sorted(set(self.frozen_tests) | set(self.phase_a_stub_files)
                                      | {p.strip() for p in frozen_changed if p.strip()})
                     for rel in overlay:
-                        blob = self.git.show_blob(f"{self.frozen_commit}:{rel}")
+                        blob = self.git.show_blob_bytes(f"{self.frozen_commit}:{rel}")
                         if blob is not None:
                             dst = trial_wt / rel
                             dst.parent.mkdir(parents=True, exist_ok=True)
-                            dst.write_text(blob)
+                            dst.write_bytes(blob)
                     env = self.cfg.runner_env.get(unit, {})
                     rev_result = self.runner.exec(
                         kind=runner_kind("test"),

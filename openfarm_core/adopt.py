@@ -79,8 +79,15 @@ def baseline_known_failing(root: Path, language: str, *, target_dir: Path,
             and not (root / getattr(pack, "test_dir", "tests")).is_dir()):
         return {"ran": False, "known_failing": [], "notes": notes}
 
-    argv = pack.commands("test")["argv"]
+    cmd = pack.commands("test")
+    argv = cmd["argv"]
     env = dict(os.environ)
+    for key, val in (cmd.get("env") or {}).items():
+        key_s, val_s = str(key), str(val)
+        if key_s == "PYTHONPATH" and env.get("PYTHONPATH"):
+            env[key_s] = f"{val_s}{os.pathsep}{env['PYTHONPATH']}"
+        else:
+            env[key_s] = val_s
     # Cargo builds into openfarm's state, not into the repository being adopted.
     env["CARGO_TARGET_DIR"] = str(target_dir)
     try:

@@ -206,7 +206,7 @@ class Git:
         self.extra_env = dict(env or {})
 
     def _run(self, args: list[str], check: bool = True,
-             timeout: float = 300.0) -> subprocess.CompletedProcess:
+             timeout: float = 300.0, text: bool = True) -> subprocess.CompletedProcess:
         _check_subcommand(list(args))
         env = dict(os.environ)
         env.update(_ENV)
@@ -220,13 +220,15 @@ class Git:
                     "-c", "core.fsmonitor=false",
                     *args,
                 ],
-                cwd=self.cwd, capture_output=True, text=True,
+                cwd=self.cwd, capture_output=True, text=text,
                 env=env, timeout=timeout)
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise Infra("git-failed", f"git {args[0]} could not run: {exc}") from exc
         if check and result.returncode != 0:
+            err = (result.stderr.decode("utf-8", errors="replace")
+                   if isinstance(result.stderr, bytes) else result.stderr)
             raise Infra("git-failed",
-                        f"git {' '.join(args)} failed: {result.stderr.strip()[:500]}")
+                        f"git {' '.join(args)} failed: {err.strip()[:500]}")
         return result
 
     # -- queries --------------------------------------------------------------
@@ -438,6 +440,11 @@ class Git:
     def show_blob(self, spec: str) -> str | None:
         """A file's content at a commit, or None when it did not exist."""
         result = self._run(["show", spec], check=False)
+        return result.stdout if result.returncode == 0 else None
+
+    def show_blob_bytes(self, spec: str) -> bytes | None:
+        """A file's raw bytes at a commit, or None when it did not exist."""
+        result = self._run(["show", spec], check=False, text=False)
         return result.stdout if result.returncode == 0 else None
 
     def untracked_files(self, paths: list[str] | None = None) -> list[str]:

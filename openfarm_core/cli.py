@@ -1789,18 +1789,17 @@ def _member_token_breakdown(board: Board, split: dict) -> dict:
 
 def _notify_run_event(cfg, event: str, title: str, body: str) -> None:
     """Best-effort lifecycle notification; never raises into the run loop."""
-    try:
+    with contextlib.suppress(Exception):
         from .notify import send_notification
         send_notification(cfg, event, title, body)
-    except Exception:
-        pass
 
 
 def _notify_card_outcome(cfg, card_id: str, outcome: dict) -> None:
     final_state = str(outcome.get("final_state") or "").lower().replace("-", "_")
-    if final_state == "in_review":
-        auto_land = outcome.get("auto_land")
-        if isinstance(auto_land, dict) and auto_land.get("landed"):
+    auto_land = outcome.get("auto_land")
+    auto_landed = isinstance(auto_land, dict) and bool(auto_land.get("landed"))
+    if final_state == "in_review" or (final_state == "done" and auto_landed):
+        if auto_landed:
             body = f"{card_id} auto-landed onto {auto_land.get('integration_branch', '')}"
         else:
             body = str(outcome.get("detail") or f"{card_id} is ready for review")
@@ -1853,6 +1852,8 @@ def _maybe_auto_land(
         )
         outcome["auto_land"] = landed
         if landed.get("landed"):
+            outcome["final_state"] = "done"
+            outcome["auto_landed"] = True
             event_bus.emit(
                 kind="card_auto_landed",
                 card_id=card.id,
@@ -3631,6 +3632,8 @@ def build_parser() -> argparse.ArgumentParser:
     dmn_p.add_argument("--spend", type=float, default=None, help="optional spend cap for daemon start")
     dmn_p.add_argument("--profile", choices=("lean", "balanced", "strict"), default=None)
     dmn_p.add_argument("--card", action="append", default=[], help="specific card id(s) to run")
+    dmn_p.add_argument("--follow", action="store_true",
+                       help="keep running through dependent tasks as they unblock")
     dmn_p.add_argument("--tail", type=int, default=80, help="number of log lines for daemon logs")
 
     web_p = sub.add_parser(
@@ -4428,6 +4431,7 @@ def cmd_daemon(args) -> int:
             profile=getattr(args, "profile", None),
             card_ids=list(getattr(args, "card", None) or []),
             config_path=cfg_p,
+            follow=bool(getattr(args, "follow", False)),
         )
         if args.json:
             print(json.dumps(res, indent=2))

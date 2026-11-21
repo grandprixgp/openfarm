@@ -187,6 +187,7 @@ class DirectRunner:
             raise Invalid("no-argv", "the runner needs a command to run")
 
         run_env = dict(os.environ)
+        run_env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
         if env:
             run_env.update({str(k): str(v) for k, v in env.items()})
         if target_dir:
@@ -321,7 +322,8 @@ class CmdRunner:
             "kind": kind, "argv": list(argv),
             "cwd": str(cwd or self.repo),
             "target_dir": str(target_dir or ""),
-            "unit": unit, "env": dict(env or {}),
+            "unit": unit,
+            "env": {"PYTHONDONTWRITEBYTECODE": "1", **dict(env or {})},
             "timeout_s": timeout_s or self.timeout_s,
         })
         cls = str(result.get("class", INFRA))

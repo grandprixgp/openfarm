@@ -365,16 +365,35 @@ def how_to_start(root: Path, cfg) -> dict:
         plan = dict(pack.try_it(root) or {})
     except Exception:  # noqa: BLE001 - a pack that can't answer is the same as no answer
         plan = {}
+    pack_env = dict(plan.get("env") or {})
     if own.get("start"):
         plan = {"kind": "web", "start": shlex.split(own["start"]), "port_env": "PORT"}
+        if pack_env:
+            plan["env"] = pack_env
     elif own.get("sample"):
         plan = {"kind": "cli", "sample": shlex.split(own["sample"])}
+        if pack_env:
+            plan["env"] = pack_env
     if plan:
         port = int(own.get("port") or plan.get("port") or 0)
         raw_path = str(own.get("path") or plan.get("path") or "/").strip() or "/"
         path = raw_path if raw_path.startswith("/") else "/" + raw_path
         plan.update(port=port, path=path)
     return plan
+
+
+def _plan_env(plan: dict, extra: dict[str, str] | None = None) -> dict[str, str]:
+    """Merge `plan["env"]` and `extra` onto `os.environ`, prepending `PYTHONPATH`."""
+    env = dict(os.environ)
+    for key, val in (plan.get("env") or {}).items():
+        key_s, val_s = str(key), str(val)
+        if key_s == "PYTHONPATH" and env.get("PYTHONPATH"):
+            env[key_s] = f"{val_s}{os.pathsep}{env['PYTHONPATH']}"
+        else:
+            env[key_s] = val_s
+    if extra:
+        env.update({str(k): str(v) for k, v in extra.items()})
+    return env
 
 
 def _free_port() -> int:
@@ -416,7 +435,8 @@ def try_it(root: Path, cfg, goal: dict | None = None, *, out_dir: Path | None = 
     elif plan["kind"] == "cli":
         result["command"] = shlex.join(plan["sample"])
         try:
-            done = subprocess.run(plan["sample"], cwd=root, capture_output=True, text=True, timeout=120, check=False)
+            done = subprocess.run(plan["sample"], cwd=root, env=_plan_env(plan),
+                                  capture_output=True, text=True, timeout=120, check=False)
             result["output"] = (done.stdout + done.stderr).strip()[-6000:]
             result["checks"] = [{"name": "runs", "ok": done.returncode == 0,
                                  "detail": f"the sample command finished with code {done.returncode}"}]
@@ -431,7 +451,7 @@ def try_it(root: Path, cfg, goal: dict | None = None, *, out_dir: Path | None = 
         with log.open("w", encoding="utf-8") as sink:
             try:
                 server = subprocess.Popen(plan["start"], cwd=root, stdout=sink, stderr=subprocess.STDOUT,
-                                          env={**os.environ, plan.get("port_env") or "PORT": str(port)},
+                                          env=_plan_env(plan, {plan.get("port_env") or "PORT": str(port)}),
                                           start_new_session=True)
             except OSError as exc:
                 server = None
