@@ -156,6 +156,19 @@ class ScaffoldGrammarTests(unittest.TestCase):
 class SearchReplaceTests(unittest.TestCase):
     CLASS = "export class Ring {\n  push(v: number): void { throw new Error(); }\n"
 
+    def test_a_member_added_to_an_existing_interface_is_a_declaration(self) -> None:
+        # v0.20 live run: `home?: (now: Date) => Promise<string>;` added to an interface was refused as
+        # "a statement starting 'home'", the stub was dropped and the task stopped
+        from openfarm_core.packs.typescript import typescript_scaffold_edit_problem
+
+        before = "export interface ServerDeps {\n  now: () => Date;\n}\n"
+        after = "export interface ServerDeps {\n  now: () => Date;\n  home?: (now: Date) => Promise<string>;\n}\n"
+        self.assertEqual(typescript_scaffold_edit_problem("search_replace", before, after, None), "")
+        sneaky = "export interface ServerDeps {\n  now: () => Date;\n  x: number;\n}\nevil();\ninterface Y {\n}\n"
+        self.assertNotEqual(typescript_scaffold_edit_problem("search_replace", before, sneaky, None), "")
+        code = "export function f() {\n  go();\n}\n"
+        self.assertNotEqual(typescript_scaffold_edit_problem("search_replace", code, code.replace("go();", "go();\n  more();"), None), "")
+
     def test_rewriting_existing_logic_is_refused(self) -> None:
         with self.assertRaises(Refused):
             _scaffold({"format": "search_replace", "search": "return a + b;",

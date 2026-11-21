@@ -3014,16 +3014,20 @@ def typescript_scaffold_edit_problem(fmt: str, search: str, replace: str,
         return "it is inserted in the middle of a statement"
     if after and not (after[0].isalnum() or after[0] in "_$#}@;"):
         return "it is inserted in the middle of a statement"
+    if _opens_class_body(before, "interface"):
+        # Members added to an interface that is already there: judged as an interface of their own, so a line
+        # that closes the body and goes on with code is still seen as code.
+        return typescript_scaffold_problem("interface _Added {\n" + added + "\n}\n")
     return typescript_scaffold_problem(added, in_class=_opens_class_body(before))
 
 
-def _opens_class_body(masked: str) -> bool:
-    """True when the innermost `{` still open at the end of `masked` is a class's."""
+def _opens_class_body(masked: str, word: str = "class") -> bool:
+    """True when the innermost `{` still open at the end of `masked` is a class's (or, with `word`, an interface's)."""
     stack: list[bool] = []
     header = ""
     for ch in masked:
         if ch == "{":
-            stack.append(bool(re.search(r"\bclass\b", header)))
+            stack.append(bool(re.search(rf"\b{word}\b", header)))
             header = ""
         elif ch == "}":
             if not stack:
