@@ -479,7 +479,7 @@ PRETTIER_CONFIG_FILES = (
 )
 
 #: `[runner]` settings this pack reads, with the value used when one is absent.
-DEFAULT_SETTINGS = {"typescript": "node", "typescript_typecheck": "auto",
+DEFAULT_SETTINGS = {"typescript": "auto", "typescript_typecheck": "auto",
                     "typescript_format": "auto", "link_node_modules": True}
 
 _NODE_TEST_SCRIPT_RE = re.compile(r"(?:^|\s|&&|;)node(?:\s+\S+)*\s+--test(?:\s|$)")
@@ -582,7 +582,7 @@ def runner_settings(base: Path) -> dict:
 def settings_from_config(cfg) -> dict:
     """The same settings from a loaded `Config`, for code that has one."""
     return {
-        "typescript": getattr(cfg, "runner_typescript", "node"),
+        "typescript": getattr(cfg, "runner_typescript", "auto"),
         "typescript_typecheck": getattr(cfg, "typescript_typecheck", "auto"),
         "typescript_format": getattr(cfg, "typescript_format", "auto"),
         "link_node_modules": getattr(cfg, "link_node_modules", True),
@@ -616,11 +616,8 @@ def resolve_tooling(worktree: Path, settings: dict | None = None) -> dict:
     raw_settings = settings if settings is not None else runner_settings(base)
     chosen = dict(DEFAULT_SETTINGS)
     chosen.update(raw_settings)
-    if settings is not None and settings.get("typescript") in ("node", "vitest", "jest"):
-        runner_kind = str(settings["typescript"])
-    elif (settings is None and (base / ".openfarm" / "config.toml").is_file()
-          and raw_settings.get("typescript") in ("node", "vitest", "jest")):
-        runner_kind = str(raw_settings["typescript"])
+    if chosen.get("typescript") in ("node", "vitest", "jest"):
+        runner_kind = str(chosen["typescript"])
     else:
         runner_kind = detect_runner(root)
     runner_bin = _tool_bin(base, runner_kind) if runner_kind in ("vitest", "jest") else ""
@@ -1080,7 +1077,7 @@ class TypeScriptPack(OwnMutationMixin, Pack):
         if purpose == "mutation":
             # openfarm's own mutation runner (v0.8.5): the card's named tests
             # against small changes to the production files it changed.
-            return {"argv": self._own_mutation_argv(files, tests) + extra}
+            return {"argv": self._own_mutation_argv(files, tests, unit=unit) + extra}
 
         return {"argv": list(extra)}
 

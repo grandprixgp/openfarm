@@ -189,22 +189,27 @@ def _validate_safe_path(
     return norm
 
 
+_TS_JS_TEST_RE = re.compile(r"(?:\.(?:test|spec)|_test)\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs)$")
+
+
 def _is_test_path(path: str, card: Card) -> bool:
     norm = normalise(path)
     test_edits = {normalise(p) for p in card.test_edits}
     test_files = {normalise(t.file) for t in card.tests if t.file}
     if norm in test_edits or norm in test_files:
         return True
-    parts = norm.split("/")
-    if "tests" in parts or "test" in parts:
+    parts = [p for p in norm.split("/") if p]
+    if not parts:
+        return False
+    dirs = [p.lower() for p in parts[:-1]]
+    if any(d in ("tests", "test", "__tests__") for d in dirs):
         return True
-    name = parts[-1]
-    if (
-        name.endswith("_test.rs")
-        or name.endswith("_test.py")
-        or name.endswith("_test.go")
-        or name.startswith("test_")
-    ):
+    name = parts[-1].lower()
+    if _TS_JS_TEST_RE.search(name):
+        return True
+    if name.endswith(("_test.rs", "_tests.rs", "_test.py", "_test.go")):
+        return True
+    if name == "conftest.py" or (name.startswith("test_") and name.endswith(".py")):
         return True
     return False
 
@@ -1592,7 +1597,17 @@ class Micromanager:
             payload = {**payload, "_card_dir": str(self.card_dir)}
         for last in (False, True):
             try:
-                answer = self.backend.assist(op, payload)
+                try:
+                    answer = self.backend.assist(op, payload)
+                finally:
+                    usage = getattr(self.backend, "last_usage", None) or {}
+                    self.budget.record(
+                        card_id=card_id,
+                        tokens_in=int(usage.get("tokens_in", 0) or 0),
+                        tokens_out=int(usage.get("tokens_out", 0) or 0),
+                        spend=float(usage.get("spend", 0.0) or 0.0),
+                        tokens_in_cached=int(usage.get("tokens_in_cached", 0) or 0),
+                    )
             except Invalid as exc:
                 # An answer that cannot be read is asked for once more: one bad answer used to pause the whole build.
                 if last or exc.code != "bad-micromanager-json":
@@ -1602,15 +1617,6 @@ class Micromanager:
                 except Refused:
                     raise exc from None
                 continue
-            finally:
-                usage = getattr(self.backend, "last_usage", None) or {}
-                self.budget.record(
-                    card_id=card_id,
-                    tokens_in=int(usage.get("tokens_in", 0) or 0),
-                    tokens_out=int(usage.get("tokens_out", 0) or 0),
-                    spend=float(usage.get("spend", 0.0) or 0.0),
-                    tokens_in_cached=int(usage.get("tokens_in_cached", 0) or 0),
-                )
             return answer if isinstance(answer, dict) else {}
         return {}
 
@@ -1848,10 +1854,12 @@ class Micromanager:
                         f"`throw new Error(...)` ({problem})",
                     )
             elif edit.path.endswith(".go"):
-                if "panic(" not in body:
+                from .packs.go import valid_go_scaffold
+
+                if not valid_go_scaffold(body):
                     raise Refused(
                         "scaffold-missing-todo",
-                        f"{edit.path}: Go production scaffold must contain `panic(...)` stubs only",
+                        f"{edit.path}: Go production scaffold must contain `panic(...)` stubs or pure type/interface declarations only",
                     )
             elif not _valid_production_scaffold(body):
                 raise Refused(

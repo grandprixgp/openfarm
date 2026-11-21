@@ -66,6 +66,16 @@ _CHECK_SCRIPT = (
     "sys.exit(1 if bad else 0)\n"
 )
 
+#: Runs unittest module(s) with a unit folder on `sys.path` and as cwd, so
+#: multi-unit counter-tests import their unit's packages cleanly.
+_UNITTEST_TOP_SCRIPT = (
+    "import os, sys, unittest\n"
+    "top = os.path.abspath(sys.argv[1])\n"
+    "sys.path.insert(0, top)\n"
+    "os.chdir(top)\n"
+    "unittest.main(module=None, argv=['unittest', *sys.argv[2:]])\n"
+)
+
 #: Lists unittest ids, one per line, without running anything. Import failures
 #: are printed as `ERROR <id>` so a listing never silently shrinks.
 _LIST_SCRIPT = (
@@ -324,7 +334,13 @@ class PythonPack(OwnMutationMixin, Pack):
                 return {"argv": argv + extra}
             if files:
                 modules = [_module_of(str(f), top) for f in files]
-                return {"argv": [py, "-m", "unittest", "-v", *modules] + extra}
+                k_flags: list[str] = []
+                for name in tests or []:
+                    k_flags += ["-k", str(name)]
+                if top != ".":
+                    return {"argv": [py, "-c", _UNITTEST_TOP_SCRIPT, top,
+                                     "-v", *k_flags, *modules] + extra}
+                return {"argv": [py, "-m", "unittest", "-v", *k_flags, *modules] + extra}
             argv = [py, "-m", "unittest", "discover", "-s", start, "-t", top, "-v"]
             for name in tests or []:
                 argv += ["-k", str(name)]
@@ -362,7 +378,7 @@ class PythonPack(OwnMutationMixin, Pack):
         if purpose == "mutation":
             # openfarm's own mutation runner (v0.8.5): the card's named tests
             # against small changes to the production files it changed.
-            return {"argv": self._own_mutation_argv(files, tests) + extra}
+            return {"argv": self._own_mutation_argv(files, tests, unit=unit) + extra}
 
         return {"argv": list(extra)}
 

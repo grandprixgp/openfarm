@@ -172,8 +172,65 @@ _TS_SWAPS = [("===", "!=="), ("!==", "==="), ("==", "!="), ("!=", "=="),
 _WORD = re.compile(r"[A-Za-z0-9_$]")
 
 
-def _code_spans(text: str, *, raw_backtick: bool = False) -> list[tuple[int, int]]:
-    """The parts of a TS/Go file outside strings, templates/raw strings, and comments."""
+_REGEX_PRE_WORDS = frozenset({
+    "return", "case", "throw", "typeof", "void", "delete",
+    "in", "instanceof", "new", "yield", "await", "of", "else", "do",
+})
+_REGEX_PRE_CHARS = set("(,=[!&|?:;{}~^%+-*<>")
+
+
+def _can_start_regex(text: str, slash_idx: int) -> bool:
+    """True when `/` at `slash_idx` can begin a JS/TS regex literal rather than division."""
+    j = slash_idx - 1
+    while j >= 0 and text[j] in " \t\r\n":
+        j -= 1
+    if j < 0:
+        return True
+    ch = text[j]
+    if ch in _REGEX_PRE_CHARS:
+        if ch in "+-" and j > 0 and text[j - 1] == ch:
+            return False  # postfix ++ or -- followed by division
+        return True
+    if ch.isalnum() or ch in "_$":
+        k = j
+        while k >= 0 and (text[k].isalnum() or text[k] in "_$"):
+            k -= 1
+        return text[k + 1:j + 1] in _REGEX_PRE_WORDS
+    return False
+
+
+def _scan_regex_literal(text: str, i: int) -> int:
+    """Return index past `/pattern/flags` starting at `i`, or -1 if not a regex literal."""
+    n = len(text)
+    j = i + 1
+    in_class = False
+    while j < n:
+        c = text[j]
+        if c in "\r\n":
+            return -1
+        if c == "\\":
+            if j + 1 >= n or text[j + 1] in "\r\n":
+                return -1
+            j += 2
+            continue
+        if c == "[":
+            in_class = True
+        elif c == "]" and in_class:
+            in_class = False
+        elif c == "/" and not in_class:
+            j += 1
+            while j < n and text[j].isalpha():
+                j += 1
+            return j
+        j += 1
+    return -1
+
+
+def _code_spans(text: str, *, raw_backtick: bool = False,
+                regex_literals: bool | None = None) -> list[tuple[int, int]]:
+    """The parts of a TS/Go file outside strings, templates/raw strings, regexes, and comments."""
+    if regex_literals is None:
+        regex_literals = not raw_backtick
     spans, i, start, n = [], 0, 0, len(text)
     while i < n:
         ch = text[i]
@@ -196,6 +253,13 @@ def _code_spans(text: str, *, raw_backtick: bool = False) -> list[tuple[int, int
                 i += 1
             start = i
             continue
+        if regex_literals and ch == "/" and _can_start_regex(text, i):
+            end = _scan_regex_literal(text, i)
+            if end > 0:
+                spans.append((start, i))
+                i = end
+                start = i
+                continue
         i += 1
     spans.append((start, n))
     return [(a, b) for a, b in spans if b > a]

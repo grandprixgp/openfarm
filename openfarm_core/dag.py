@@ -24,14 +24,21 @@ def build_card_dag(cards: list) -> dict:
     work_cards = [
         c for c in cards
         if not is_finding_id_or_header(c.id, getattr(c, "fields", None))
-        and str(getattr(c, "state", "ready")).lower() not in ("split", "dismissed", "folded", "promoted")
+        and str(getattr(c, "state", "ready")).lower() not in ("split", "dropped", "dismissed", "folded", "promoted")
     ]
     by_id = {c.id: c for c in work_cards}
     edges: list[dict] = []
     deps_map: dict[str, list[str]] = {}
+    raw_deps_map: dict[str, list[str]] = {}
+    unmet_deps: dict[str, list[str]] = {}
     for c in work_cards:
-        valid_deps = [d for d in (getattr(c, "deps", None) or []) if d in by_id]
+        raw_deps = [str(d) for d in (getattr(c, "deps", None) or []) if str(d)]
+        raw_deps_map[c.id] = raw_deps
+        valid_deps = [d for d in raw_deps if d in by_id]
+        missing_deps = [d for d in raw_deps if d not in by_id]
         deps_map[c.id] = valid_deps
+        if missing_deps:
+            unmet_deps[c.id] = missing_deps
         for d in valid_deps:
             edges.append({"from": d, "to": c.id})
 
@@ -107,15 +114,17 @@ def build_card_dag(cards: list) -> dict:
         })
 
     done_ids = {c.id for c in work_cards if str(c.state).lower() == "done"}
+
+    def _deps_met(cid: str) -> bool:
+        return not unmet_deps.get(cid) and all(d in done_ids for d in deps_map[cid])
+
     ready_now = [
         c.id for c in work_cards
-        if str(c.state).lower() == "ready"
-        and all(d in done_ids for d in deps_map[c.id])
+        if str(c.state).lower() == "ready" and _deps_met(c.id)
     ]
     blocked_by_deps = [
         c.id for c in work_cards
-        if str(c.state).lower() == "ready"
-        and not all(d in done_ids for d in deps_map[c.id])
+        if str(c.state).lower() == "ready" and not _deps_met(c.id)
     ]
 
     return {
@@ -125,6 +134,7 @@ def build_card_dag(cards: list) -> dict:
         "conflicts": all_conflicts,
         "ready_now": ready_now,
         "blocked_by_deps": blocked_by_deps,
+        "unmet_deps": unmet_deps,
         "cards": [
             {
                 "id": c.id,
@@ -132,7 +142,8 @@ def build_card_dag(cards: list) -> dict:
                 "state": str(c.state).lower(),
                 "wave": _card_wave(c),
                 "tier": depth[c.id] + 1,
-                "depends": deps_map[c.id],
+                "depends": raw_deps_map[c.id],
+                "unmet_depends": unmet_deps.get(c.id, []),
                 "touches": list(c.touches),
             }
             for c in work_cards
