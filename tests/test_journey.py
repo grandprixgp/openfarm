@@ -951,6 +951,21 @@ class FlowTests(_Folder):
 
         self.drive("questions", body)
 
+    def test_a_question_that_could_not_be_sorted_is_sorted_again_later(self) -> None:
+        # v0.20 live run: the second of two questions hit "W1-04 is building; stop it first" and was never looked at again
+        async def body(app, pilot) -> None:
+            finding = {"id": "FIND-9", "from_card": "W1-01", "title": "t", "body": ""}
+            app._sorting.add("FIND-9")
+            with mock.patch("openfarm_tui.journey.settle_question", side_effect=RuntimeError("W1-01 is building; stop it first")), \
+                    mock.patch("openfarm_tui.journey.open_architect_backend", return_value=(None, "")):
+                app._sort_questions([finding])
+                await app.workers.wait_for_complete()
+                await pilot.pause(0.1)
+            self.assertIn("could not be sorted: W1-01 is building", "\n".join(app.activity))
+            self.assertNotIn("FIND-9", app._sorting)
+
+        self.drive("build", body)
+
     def test_the_top_bar_keeps_its_gaps_when_the_token_count_grows(self) -> None:
         # v0.20 live run: at 491k tokens the middle ran into the project's name and its last word was cut
         async def body(app, pilot) -> None:

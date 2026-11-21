@@ -1192,8 +1192,10 @@ class Journey(MorePanes, App):
         for finding in findings:
             try:
                 outcome = settle_question(self.repo, cfg, open_store(self.repo, cfg), finding, backend)
-            except Exception as exc:  # noqa: BLE001 - shown in the strip; it is asked again next time the app opens
+            except Exception as exc:  # noqa: BLE001 - shown in the strip
                 self.call_from_thread(self.say, f"{finding['from_card']}'s question could not be sorted: {exc}")
+                # e.g. its task went back to building on an earlier answer: sorted again if it ever holds the task up
+                self.call_from_thread(self._sorting.discard, finding["id"])
                 continue
             self.call_from_thread(self._question_sorted, finding, outcome)
 
