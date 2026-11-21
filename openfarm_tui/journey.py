@@ -53,6 +53,7 @@ from openfarm_core.store import card_from, open_store, read_doc, write_doc
 from openfarm_core.tryit import fix_request, looks_right, try_it
 
 from .journey_more import MORE, MORE_LABELS, MorePanes
+from .terminal import ask_background
 from .journey_state import (
     PROJECT_STEPS,
     STEP_OF,
@@ -99,7 +100,10 @@ PHASES = {  # what the build reports -> what it means for the reader
 
 
 def terminal_is_light() -> bool:
-    """Follow the terminal where it says what it is (`COLORFGBG` ends in the background colour)."""
+    """Follow the terminal: ask it for its background colour, and where it does not say, read `COLORFGBG`."""
+    asked = ask_background() if sys.stdin.isatty() and sys.stdout.isatty() else None
+    if asked is not None:
+        return asked
     last = os.environ.get("COLORFGBG", "").rpartition(";")[2]
     return last.isdigit() and int(last) in (7, 15)
 

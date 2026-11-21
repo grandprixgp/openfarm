@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -1438,11 +1439,68 @@ class ThemeTests(unittest.TestCase):
     def test_the_theme_follows_the_terminal(self) -> None:
         from openfarm_tui import journey
 
-        with mock.patch.dict(os.environ, {"COLORFGBG": "0;15"}):
-            self.assertTrue(journey.terminal_is_light())
-            self.assertEqual(journey.Journey(repo=Path(".")).__dict__["_theme_name"], "openfarm-light")
-        with mock.patch.dict(os.environ, {"COLORFGBG": "15;0"}):
-            self.assertFalse(journey.terminal_is_light())
+        with mock.patch("openfarm_tui.journey.ask_background", return_value=None):  # a terminal that does not say
+            with mock.patch.dict(os.environ, {"COLORFGBG": "0;15"}):
+                self.assertTrue(journey.terminal_is_light())
+                self.assertEqual(journey.Journey(repo=Path(".")).__dict__["_theme_name"], "openfarm-light")
+            with mock.patch.dict(os.environ, {"COLORFGBG": "15;0"}):
+                self.assertFalse(journey.terminal_is_light())
+
+    def test_the_terminal_is_asked_for_its_colour_so_no_variable_is_needed(self) -> None:
+        from openfarm_tui import journey
+        from openfarm_tui.terminal import background_is_light
+
+        self.assertTrue(background_is_light("\033]11;rgb:ffff/ffff/ffff\033\\"))
+        self.assertTrue(background_is_light("\033]11;rgb:fa/f4/e8\007"))
+        self.assertFalse(background_is_light("\033]11;rgb:1e1e/1e1e/2e2e\033\\"))
+        self.assertIsNone(background_is_light("\033[?62;22c"))
+        env = {k: v for k, v in os.environ.items() if k != "COLORFGBG"}
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch("sys.stdin.isatty", return_value=True), \
+                mock.patch("sys.stdout.isatty", return_value=True):
+            with mock.patch("openfarm_tui.journey.ask_background", return_value=True):
+                self.assertEqual(journey.Journey(repo=Path(".")).__dict__["_theme_name"], "openfarm-light")
+            with mock.patch("openfarm_tui.journey.ask_background", return_value=False):
+                self.assertEqual(journey.Journey(repo=Path(".")).__dict__["_theme_name"], "openfarm-dark")
+            with mock.patch("openfarm_tui.journey.ask_background", return_value=False), \
+                    mock.patch.dict(os.environ, {"COLORFGBG": "0;15"}):
+                self.assertFalse(journey.terminal_is_light())  # what the terminal says wins over the variable
+
+    def test_asking_a_terminal_reads_its_answer_and_leaves_it_as_it_was(self) -> None:
+        import pty
+        import termios
+        import threading
+
+        from openfarm_tui.terminal import ask_background
+
+        def terminal(answer: bytes):
+            ours, theirs = pty.openpty()
+            asked = []
+
+            def play() -> None:
+                asked.append(os.read(ours, 64))
+                os.write(ours, answer)
+
+            thread = threading.Thread(target=play, daemon=True)
+            thread.start()
+            before = termios.tcgetattr(theirs)
+            try:
+                return ask_background(theirs, wait_s=5), asked, before == termios.tcgetattr(theirs), thread
+            finally:
+                thread.join(5)
+                os.close(ours)
+                os.close(theirs)
+
+        light, asked, restored, _ = terminal(b"\033]11;rgb:ffff/fafa/f0f0\033\\\033[?62;22c")
+        self.assertIs(light, True)
+        self.assertEqual(asked, [b"\033]11;?\033\\\033[c"])
+        self.assertTrue(restored)
+        dark, _, restored, _ = terminal(b"\033]11;rgb:0000/0000/0000\007\033[?1;2c")
+        self.assertIs(dark, False)
+        started = time.monotonic()
+        unknown, _, restored, _ = terminal(b"\033[?1;2c")  # knows what it is, not its colour: no waiting
+        self.assertIsNone(unknown)
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertTrue(restored)
 
 
 def shots(out: Path) -> None:
