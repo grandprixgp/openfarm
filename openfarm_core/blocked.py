@@ -65,7 +65,9 @@ BUILD_RULES = (
     "Only a task that itself must use the network (it is the HTTP server and imports `node:http`, or it is the one "
     "client of a remote API) sets `network = true` in its header and says why in its Goal; the owner is shown this "
     "before the build. No other task sets it. Every test a task lists must FAIL before the task's code is written; a "
-    "test that would already pass (a guard against a regression) is never listed in `tests`."
+    "test that would already pass (a guard against a regression) is never listed in `tests`. Tests that exist already "
+    "must keep passing and the builder may not edit them: a task never renames or moves an element id, export or "
+    "route that an existing test checks; it adds beside it."
 )
 
 
@@ -191,6 +193,13 @@ def triage_card(state_dir: Path, card_id: str) -> dict | None:
         # Every try broke a rule the task's own text asks for: retrying the same task can't end differently.
         if got["kind"] == "builder" and all(c.startswith("a build rule") for c in checks) and int(runs[-1].get("attempts") or 0) > 1:
             got.update(triage(dict(runs[-1], stop_code="cannot-split")), why=got["why"])
+    # The builder kept breaking a test that was there before and that it may not edit: the task asks for a change
+    # the existing tests forbid, so only a different task ends this.
+    broke_old = [c for c in checks if c.startswith("suite:")]
+    if got["kind"] == "builder" and broke_old and runs[-1].get("stop_code") in ("no-progress", "attempts"):
+        got.update(triage(dict(runs[-1], stop_code="ineligible")),
+                   why="What the task asks for breaks a test that was already there, and the builder may not change that "
+                       "test. " + "; ".join(broke_old) + ". The task has to keep that test passing, or say how.")
     got["checks"] = checks
     return got
 

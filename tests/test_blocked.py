@@ -126,6 +126,26 @@ class FixTests(_Project):
         self.assertEqual([t["name"] for t in fix["header"]["tests"]], [t["name"] for t in _header("W1-01")["tests"]])
         self.assertIn("stays in the test file as a guard", fix["notes"][-1])
 
+    def test_a_task_that_keeps_breaking_an_older_test_is_a_wrong_task(self) -> None:
+        # from the acceptance run: the task moved an id an existing test checks; "Retry" could never work
+        import tempfile
+        from pathlib import Path
+
+        from openfarm_core.blocked import triage_card
+
+        state = Path(tempfile.mkdtemp())
+        run = state / "cards" / "W1-09" / "run-1"
+        (run / "gates" / "1").mkdir(parents=True)
+        (run / "gates" / "1" / "suite.json").write_text(json.dumps({
+            "name": "suite", "result": "fail", "detail": "1 red test(s) not on known_failing: page has hero structure"}))
+        (run / "card-record.json").write_text(json.dumps({
+            "run_id": "run-1", "card_id": "W1-09", "claimed_at": "1", "stop_code": "no-progress", "attempts": 3,
+            "detail": "the same error signature came back twice"}))
+        got = triage_card(state, "W1-09")
+        self.assertEqual((got["kind"], got["main_label"]), ("task", "Apply fix and retry"))
+        self.assertIn("breaks a test that was already there", got["why"])
+        self.assertIn("page has hero structure", got["why"])
+
     def test_no_fix_is_said_plainly(self) -> None:
         self.store.change_card("W1-01", "create", header=_header("W1-01"), body=BODY)
         self.assertIsNone(propose_fix(self.root, self.cfg, self.store, "W1-01"))
