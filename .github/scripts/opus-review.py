@@ -374,7 +374,16 @@ def main() -> int:
         f"\n\n---\n"
         f"<sub>Tier-2 review · `{model}` via Anthropic Messages API · head `{head_sha[:9]}` · "
         f"tokens: in={totals['input']}, cache_read={totals['cache_read']}, "
-        f"cache_write={totals['cache_create']}, out={totals['output']}</sub>"
+        f"cache_write={totals['cache_create']}, out={totals['output']}</sub>\n\n"
+        "<details>\n"
+        "<summary>Atlas Review System · 4-Tier Review &amp; Escalation Funnel</summary>\n\n"
+        "| Tier | Stage | Who Runs | Purpose |\n"
+        "|---|---|---|---|\n"
+        "| **Tier 0** | Local Deterministic Gates | Build, lint, type &amp; test suites | Mandatory local baseline before any PR opens. |\n"
+        "| **Tier 1** | Draft PR Pre-Filter | Fresh-context fast model + CodeRabbit | Catches routine defects on Draft PRs before frontier spend. |\n"
+        "| **Tier 2** | **Cross-Family Frontier Review** *(this comment)* | **Frontier reviewer** (Opus / Sol) | Seam-scoped static audit for cross-boundary faults &amp; invariant re-checks. |\n"
+        "| **Tier 3** | Frontier Adoption | Frontier engineer adopts PR branch | Takes over on repeated Tier-1 failures or Tier-2 Blockers — no weak-model retry loops. |\n\n"
+        "</details>"
     )
     comment_body = header + final_text.strip() + footer
 
