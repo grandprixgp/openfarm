@@ -1,0 +1,130 @@
+# Tier-2 Claude Opus PR Review Workflow (Direct Anthropic Messages API)
+# Calls https://api.anthropic.com/v1/messages directly and posts via Atlas Review System [bot].
+
+name: Claude Opus PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches:
+      - "master"
+      - "main"
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  claude-opus-review:
+    # Job-level concurrency so skipped issue_comment events never cancel an in-flight review.
+    concurrency:
+      group: claude-review-${{ github.event.pull_request.number || github.event.issue.number }}
+      cancel-in-progress: true
+    # Public-repo & Two-Lane gating:
+    # - On pull_request: same-repo non-draft PRs only (external forks never access secrets).
+    # - On issue_comment: OWNER / MEMBER / COLLABORATOR `@claude` trigger only.
+    if: >-
+      (
+        github.event_name == 'pull_request'
+        && github.event.pull_request.head.repo.full_name == github.repository
+        && !github.event.pull_request.draft
+        && !contains(github.event.pull_request.title, '[skip-claude]')
+        && !contains(github.event.pull_request.labels.*.name, 'skip-claude')
+      )
+      || (
+        github.event_name == 'issue_comment'
+        && github.event.issue.pull_request
+        && contains(github.event.comment.body, '@claude')
+        && (
+          github.event.comment.author_association == 'OWNER'
+          || github.event.comment.author_association == 'MEMBER'
+          || github.event.comment.author_association == 'COLLABORATOR'
+        )
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Resolve PR metadata
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUM: ${{ github.event.pull_request.number || github.event.issue.number }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          json=$(gh pr view "$PR_NUM" --repo "${{ github.repository }}" \
+            --json number,title,body,baseRefName,baseRefOid,headRefName,headRefOid,labels,isDraft)
+          echo "number=$(jq -r '.number' <<< "$json")" >> "$GITHUB_OUTPUT"
+          echo "base_ref=$(jq -r '.baseRefName' <<< "$json")" >> "$GITHUB_OUTPUT"
+          echo "base_sha=$(jq -r '.baseRefOid' <<< "$json")" >> "$GITHUB_OUTPUT"
+          echo "head_ref=$(jq -r '.headRefName' <<< "$json")" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$(jq -r '.headRefOid' <<< "$json")" >> "$GITHUB_OUTPUT"
+          echo "labels=$(jq -r '[.labels[].name] | join(", ")' <<< "$json")" >> "$GITHUB_OUTPUT"
+          {
+            echo "title<<EOF_TITLE"
+            jq -r '.title // ""' <<< "$json"
+            echo "EOF_TITLE"
+            echo "body<<EOF_BODY"
+            jq -r '.body // ""' <<< "$json"
+            echo "EOF_BODY"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout PR head with full base..head history
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.pr.outputs.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch base commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "${{ steps.pr.outputs.base_sha }}" "${{ steps.pr.outputs.base_ref }}" || true
+
+      - name: Ensure ripgrep is installed
+        shell: bash
+        run: |
+          if ! command -v rg >/dev/null 2>&1; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq ripgrep
+          fi
+
+      - name: Run Claude Opus focused review via Anthropic Messages API
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_MODEL: claude-opus-5-5
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          BASE_SHA: ${{ steps.pr.outputs.base_sha }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          PR_TITLE: ${{ steps.pr.outputs.title }}
+          PR_BODY: ${{ steps.pr.outputs.body }}
+          PR_LABELS: ${{ steps.pr.outputs.labels }}
+          REVIEW_PROMPT_PATH: /tmp/claude-review-prompt.md
+          REVIEW_OUT: /tmp/opus-review.md
+        shell: bash
+        run: |
+          set -euo pipefail
+          git show "origin/${{ steps.pr.outputs.base_ref }}:.github/scripts/opus-review.py" > /tmp/opus-review.py
+          git show "origin/${{ steps.pr.outputs.base_ref }}:.github/claude-review-prompt.md" > /tmp/claude-review-prompt.md
+          python3 /tmp/opus-review.py
+
+      - name: Mint Atlas Review System bot token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.REVIEW_APP_ID }}
+          private-key: ${{ secrets.REVIEW_APP_PRIVATE_KEY }}
+
+      - name: Post review comment to PR
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh pr comment "${{ steps.pr.outputs.number }}" \
+            --repo "${{ github.repository }}" \
+            --body-file /tmp/opus-review.md
