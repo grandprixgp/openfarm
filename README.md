@@ -259,3 +259,5 @@ python3 -m unittest discover -s tests -t .
 <!-- TODO(maintainer): choose a licence, add a LICENSE file, and replace this section. -->
 
 Not decided yet. Until a licence is added, no rights to use, copy or modify this code are granted.
+
+<!-- Atlas Review System smoke test (do not merge) -->
