@@ -254,6 +254,11 @@ adapters, and send tests with every change. Run them from the repository root:
 python3 -m unittest discover -s tests -t .
 ```
 
+Pull requests from repository branches run through the **Atlas Review System** 4-tier review funnel:
+local tests first (Tier 0), fast draft pre-filtering (Tier 1), cross-family frontier review via
+`.github/workflows/claude-review.yml` and read-only MCP inspection (Tier 2), and maintainer adoption on blockers (Tier 3).
+External fork PRs never access repository secrets; maintainer comment triggers (`@claude review`, `@gemini review`) are gated to repository collaborators.
+
 ## Licence
 
 <!-- TODO(maintainer): choose a licence, add a LICENSE file, and replace this section. -->
